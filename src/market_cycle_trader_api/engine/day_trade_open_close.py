@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 from typing import Any, Callable
 
@@ -108,14 +108,6 @@ def _session_path_drawdown(group: pd.DataFrame) -> float:
 
 
 def _expected_session_bar_starts(session_date: Any) -> pd.DatetimeIndex:
-    """Return the official NYSE regular-session 15-minute bar starts for a date.
-
-    The exchange calendar handles holidays, daylight-saving changes, and official
-    shortened sessions. These boundaries are used to guarantee that Open→Close
-    always has the official opening bar and final regular-session bar. Internal
-    IEX gaps are tracked as data-quality metadata instead of discarding the whole
-    trading session.
-    """
     label = pd.Timestamp(session_date).normalize()
     if not _NYSE_CALENDAR.is_session(label):
         return pd.DatetimeIndex([], tz="UTC")
@@ -136,15 +128,6 @@ def _regular_session_quality(
     *,
     now_utc: pd.Timestamp | None = None,
 ) -> dict[str, Any]:
-    """Validate Open→Close boundaries and describe internal source-bar quality.
-
-    A session is usable only after its official NYSE close and only when both the
-    official 09:30 opening bar and the final regular-session source bar are
-    present. Missing *internal* 15-minute bars do not invalidate a historical
-    session; they are surfaced through quality metadata because the audit showed
-    that strict 26/26 completeness unnecessarily removed many otherwise usable
-    IEX sessions from the common portfolio panel.
-    """
     expected = _expected_session_bar_starts(session_date)
     if expected.empty:
         return {
@@ -203,12 +186,6 @@ def _regular_session_quality(
 
 
 def _training_round_trip_cost_rate(open_price: pd.Series, config: Any) -> pd.Series:
-    """Approximate proportional open-to-close execution cost for model labels.
-
-    Exact cent-rounded regulatory fees remain in the financial simulator. The
-    training target uses a smooth proportional estimate so the model does not
-    learn discontinuities caused by per-trade cent rounding.
-    """
     slip = 2.0 * max(0.0, float(getattr(config, "slippage_bps", 0.0))) / 10_000.0
     commission = 2.0 * max(0.0, float(getattr(config, "commission_rate", 0.0)))
     sec = max(0.0, float(getattr(config, "sec_fee_rate", 0.0)))
@@ -219,13 +196,6 @@ def _training_round_trip_cost_rate(open_price: pd.Series, config: Any) -> pd.Ser
 
 
 def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
-    """Aggregate 15-minute source bars into one leak-free decision row/session.
-
-    The position for each session is selected before the regular-session open.
-    Therefore every price/volume feature is based only on completed prior
-    sessions. This permits a clean historical simulation that executes at the
-    official session open without using the same opening print as an input.
-    """
     data = bars.copy().sort_index()
     data.index = pd.to_datetime(data.index, utc=True)
     local_index = data.index.tz_convert(MARKET_TIMEZONE)
@@ -249,8 +219,8 @@ def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
 
         quality = _regular_session_quality(group, session_date)
         if not bool(quality["usable"]):
-            # The current in-progress session and historical sessions without an
-            # official opening/final bar are never valid Open→Close observations.
+
+
             continue
 
         expected_starts = _expected_session_bar_starts(session_date)
@@ -313,8 +283,8 @@ def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     volume_std = volume.rolling(20).std()
     raw_features["volume_zscore_20"] = _safe_divide(volume - volume_mean, volume_std)
 
-    # Leak-free historical indicators: today's position is selected before the
-    # regular-session open, so only completed prior sessions may be inputs.
+
+
     shifted = raw_features.shift(1)
     for column in shifted.columns:
         daily[column] = shifted[column]
@@ -345,7 +315,6 @@ def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
         - float(config.rotation_downside_penalty) * daily["forward_downside"]
         - float(config.rotation_drawdown_penalty) * daily["forward_max_drawdown"]
     )
-    daily["forward_log_utility"] = daily["forward_risk_adjusted_utility"]
     daily["open_to_close_return"] = intraday_return
 
     required = OPEN_CLOSE_FEATURES + [
@@ -394,7 +363,6 @@ def _panel_session_quality_summary(
     frames: dict[str, pd.DataFrame],
     common_dates: pd.DatetimeIndex,
 ) -> dict[str, Any]:
-    """Summarize retained internal IEX gaps for auditability."""
     counts: dict[str, int] = {
         "COMPLETE": 0,
         "INTERNAL_GAP": 0,
@@ -1214,7 +1182,7 @@ def _simulate(
         "initial_capital": initial,
         "strategy_ending_capital": ending,
         "strategy_return": ending / initial - 1,
-        # Legacy keys point at the fair same-session benchmark so existing UI/API remains compatible.
+
         "buy_hold_ending_capital": benchmark_ending,
         "buy_hold_return": benchmark_ending / initial - 1,
         "excess_return": ending / initial - benchmark_ending / initial,

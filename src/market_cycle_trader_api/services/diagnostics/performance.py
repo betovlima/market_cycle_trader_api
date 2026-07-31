@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from pymongo.database import Database
 
@@ -61,9 +60,9 @@ def build_performance_diagnostics(
     is_day_trade = str((metrics or {}).get("strategy_mode", "")).startswith("COMPOUND_ROTATION_DAY_TRADE")
     day_trade_diagnostics = {}
 
-    # Relative-performance drawdown episodes. A new relative high closes the
-    # previous episode. This identifies periods where the strategy loses ground
-    # versus buy-and-hold, not absolute strategy drawdowns.
+
+
+
     episodes: list[dict[str, Any]] = []
     peak_idx = 0
     in_episode = False
@@ -270,8 +269,8 @@ def build_performance_diagnostics(
         key=lambda item: float(item["relative_drawdown"]),
     )[:10]
 
-    # Post-exit counterfactuals are diagnostic only. Future prices are NEVER
-    # fed back into training or into the policy.
+
+
     exit_diagnostics: list[dict[str, Any]] = []
     if (not is_day_trade) and (not trade_frame.empty) and "action" in trade_frame:
         sells = trade_frame.loc[

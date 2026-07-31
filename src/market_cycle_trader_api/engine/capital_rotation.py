@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from copy import deepcopy
 import math
-import os
 import subprocess
 import threading
 from typing import Any, Callable
@@ -33,68 +32,6 @@ ROTATION_FEATURES = [
     "distance_from_low_20",
     "volume_zscore_20",
 ]
-
-
-DAY_TRADE_ROTATION_FEATURES = ROTATION_FEATURES + [
-    "session_return",
-    "session_vwap_distance",
-    "session_range_position",
-    "opening_gap",
-    "minutes_from_open_norm",
-    "minutes_to_close_norm",
-]
-
-DAY_TRADE_TIMEZONE = "America/New_York"
-DAY_TRADE_SESSION_OPEN_MINUTE = 9 * 60 + 30
-DAY_TRADE_SESSION_LAST_BAR_MINUTE = 15 * 60 + 45
-DAY_TRADE_LAST_ENTRY_DECISION_MINUTE = 15 * 60 + 15
-DAY_TRADE_FORCE_FLAT_DECISION_MINUTE = 15 * 60 + 30
-
-
-def _is_day_trade(config: Any) -> bool:
-    return str(getattr(config, "strategy_mode", "")) == "COMPOUND_ROTATION_DAY_TRADE_15M"
-
-
-def _rotation_feature_names(config: Any) -> list[str]:
-    return DAY_TRADE_ROTATION_FEATURES if _is_day_trade(config) else ROTATION_FEATURES
-
-
-def _local_market_timestamp(timestamp: pd.Timestamp) -> pd.Timestamp:
-    value = pd.Timestamp(timestamp)
-    value = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
-    return value.tz_convert(DAY_TRADE_TIMEZONE)
-
-
-def _day_trade_constrained_action(
-    timestamp: pd.Timestamp,
-    current_position: int,
-    proposed_action: int,
-    config: Any,
-) -> int:
-    if not _is_day_trade(config):
-        return int(proposed_action)
-    local = _local_market_timestamp(timestamp)
-    minute = local.hour * 60 + local.minute
-    # Decision at 15:30 executes at the 15:45 bar open. This guarantees the
-    # account is flat before the regular US session closes at 16:00 ET.
-    if minute >= DAY_TRADE_FORCE_FLAT_DECISION_MINUTE:
-        return 0
-    # Do not open a brand-new position late enough that only one bar remains
-    # before the mandatory flattening decision.
-    if current_position == 0 and minute >= DAY_TRADE_LAST_ENTRY_DECISION_MINUTE:
-        return 0
-    return int(proposed_action)
-
-
-def _is_last_bar_of_session(
-    execution_dates: pd.DatetimeIndex,
-    index: int,
-) -> bool:
-    current = _local_market_timestamp(execution_dates[index]).date()
-    if index + 1 >= len(execution_dates):
-        return True
-    following = _local_market_timestamp(execution_dates[index + 1]).date()
-    return current != following
 
 
 @dataclass
@@ -319,16 +256,6 @@ def build_rotation_frame(
     data = bars.copy().sort_index()
     data.index = pd.to_datetime(data.index, utc=True)
 
-    if _is_day_trade(config):
-        local_index = data.index.tz_convert(DAY_TRADE_TIMEZONE)
-        minutes = local_index.hour * 60 + local_index.minute
-        regular_session = (
-            (minutes >= DAY_TRADE_SESSION_OPEN_MINUTE)
-            & (minutes <= DAY_TRADE_SESSION_LAST_BAR_MINUTE)
-        )
-        data = data.loc[regular_session].copy()
-        if data.empty:
-            return data
 
     close = data["close"].astype(float)
     open_price = data["open"].astype(float)
@@ -371,50 +298,11 @@ def build_rotation_frame(
         volume_std,
     )
 
-    if _is_day_trade(config):
-        local_index = data.index.tz_convert(DAY_TRADE_TIMEZONE)
-        session_key = pd.Series(
-            local_index.date,
-            index=data.index,
-            dtype="object",
-        )
-        session_open = open_price.groupby(session_key).transform("first")
-        session_high = high.groupby(session_key).cummax()
-        session_low = low.groupby(session_key).cummin()
-        typical = (high + low + close) / 3.0
-        cumulative_volume = volume.groupby(session_key).cumsum()
-        cumulative_pv = (typical * volume).groupby(session_key).cumsum()
-        session_vwap = _safe_divide(cumulative_pv, cumulative_volume)
 
-        session_closes = close.groupby(session_key).last()
-        previous_session_close = session_closes.shift(1)
-        previous_close_by_bar = session_key.map(previous_session_close)
 
-        minutes = local_index.hour * 60 + local_index.minute
-        session_range = (session_high - session_low).replace(0, np.nan)
-        data["session_return"] = _safe_divide(close, session_open) - 1
-        data["session_vwap_distance"] = _safe_divide(close, session_vwap) - 1
-        data["session_range_position"] = (
-            _safe_divide(close - session_low, session_range) - 0.5
-        )
-        data["opening_gap"] = (
-            _safe_divide(session_open, previous_close_by_bar) - 1
-        )
-        data["minutes_from_open_norm"] = np.clip(
-            (minutes - DAY_TRADE_SESSION_OPEN_MINUTE) / 390.0,
-            0.0,
-            1.0,
-        )
-        data["minutes_to_close_norm"] = np.clip(
-            (16 * 60 - minutes) / 390.0,
-            0.0,
-            1.0,
-        )
 
-    # Label only. At close t, the strategy can execute at open t+1.
-    # V8.1.0 no longer rewards return alone. The supervised target is the
-    # net one-week log return minus penalties for adverse excursion and
-    # path drawdown. This moves the objective toward smoother compounding.
+
+
     entry_open = open_price.shift(-1)
     exit_close = close.shift(-horizon_days)
     gross_log_return = np.log(_safe_divide(exit_close, entry_open))
@@ -464,10 +352,9 @@ def build_rotation_frame(
         - float(config.rotation_downside_penalty) * data["forward_downside"]
         - float(config.rotation_drawdown_penalty) * data["forward_max_drawdown"]
     )
-    # Backward-compatible alias used only by older exports/debugging.
-    data["forward_log_utility"] = data["forward_risk_adjusted_utility"]
 
-    required = _rotation_feature_names(config) + ["open", "high", "low", "close", "volume"]
+
+    required = ROTATION_FEATURES + ["open", "high", "low", "close", "volume"]
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna(subset=required)
     return data
@@ -508,7 +395,7 @@ def _normalization(
     config: Any,
 ) -> dict[str, tuple[pd.Series, pd.Series]]:
     result: dict[str, tuple[pd.Series, pd.Series]] = {}
-    features = _rotation_feature_names(config)
+    features = ROTATION_FEATURES
     for symbol, frame in frames.items():
         sample = frame.loc[train_dates, features]
         mean = sample.mean()
@@ -527,7 +414,7 @@ def _state_vector(
     config: Any,
 ) -> np.ndarray:
     chunks = []
-    features = _rotation_feature_names(config)
+    features = ROTATION_FEATURES
     for symbol in symbols:
         mean, std = normalization[symbol]
         values = (
@@ -555,7 +442,7 @@ def _build_qrdqn_feature_cache(
     config: Any,
 ) -> dict[pd.Timestamp, np.ndarray]:
     matrices: list[np.ndarray] = []
-    features = _rotation_feature_names(config)
+    features = ROTATION_FEATURES
     for symbol in symbols:
         mean, std = normalization[symbol]
         values = (
@@ -816,7 +703,7 @@ def _fit_xgb_models(
                 device=effective_device,
             )
             model.fit(
-                frame[_rotation_feature_names(config)],
+                frame[ROTATION_FEATURES],
                 frame["forward_risk_adjusted_utility"],
             )
             fitted[symbol] = model
@@ -841,9 +728,9 @@ def _xgb_utilities(
     timestamp: pd.Timestamp,
     config: Any,
 ) -> np.ndarray:
-    values = [0.0]  # action 0 = cash
+    values = [0.0]
     for symbol in symbols:
-        row = frames[symbol].loc[[timestamp], _rotation_feature_names(config)]
+        row = frames[symbol].loc[[timestamp], ROTATION_FEATURES]
         prediction = float(models[symbol].predict(row)[0])
         values.append(prediction)
     return np.asarray(values, dtype=np.float64)
@@ -991,16 +878,18 @@ class _ReplayBuffer:
         self.rewards = np.zeros(capacity, dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.float32)
+        self.bootstrap_discounts = np.zeros(capacity, dtype=np.float32)
         self.size = 0
         self.position = 0
 
-    def add(self, state, action, reward, next_state, done) -> None:
+    def add(self, state, action, reward, next_state, done, bootstrap_discount) -> None:
         i = self.position
         self.states[i] = state
         self.actions[i] = int(action)
         self.rewards[i] = float(reward)
         self.next_states[i] = next_state
         self.dones[i] = float(done)
+        self.bootstrap_discounts[i] = float(bootstrap_discount)
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
@@ -1012,19 +901,54 @@ class _ReplayBuffer:
             self.rewards[indices],
             self.next_states[indices],
             self.dones[indices],
+            self.bootstrap_discounts[indices],
         )
+
+
+class _NStepAccumulator:
+    def __init__(self, n_step: int, gamma: float) -> None:
+        self.n_step = max(1, int(n_step))
+        self.gamma = float(gamma)
+        self.pending: list[tuple[np.ndarray, int, float, np.ndarray, bool]] = []
+
+    def _emit_one(self):
+        count = min(self.n_step, len(self.pending))
+        first_state, first_action, _, _, _ = self.pending[0]
+        reward = 0.0
+        final_next_state = self.pending[count - 1][3]
+        final_done = self.pending[count - 1][4]
+        for offset in range(count):
+            reward += (self.gamma ** offset) * float(self.pending[offset][2])
+            if self.pending[offset][4]:
+                count = offset + 1
+                final_next_state = self.pending[offset][3]
+                final_done = True
+                break
+        self.pending.pop(0)
+        return (
+            first_state,
+            first_action,
+            float(reward),
+            final_next_state,
+            final_done,
+            float(self.gamma ** count),
+        )
+
+    def append(self, state, action, reward, next_state, done):
+        self.pending.append((state, int(action), float(reward), next_state, bool(done)))
+        emitted = []
+        if len(self.pending) >= self.n_step:
+            emitted.append(self._emit_one())
+        if done:
+            while self.pending:
+                emitted.append(self._emit_one())
+        return emitted
 
 
 def _qrdqn_action_snapshot(
     network: _QRNetwork,
     state: np.ndarray,
 ) -> tuple[int, float, np.ndarray]:
-    """Return the original greedy action plus all mean action values.
-
-    The greedy action is still selected with ``torch.argmax`` exactly as in
-    V1.9.2. The extra NumPy copy exists only for V1.9.3 post-mortem
-    diagnostics and cannot influence the selected action.
-    """
     torch = network.torch
     with torch.no_grad():
         tensor = torch.as_tensor(
@@ -1093,12 +1017,7 @@ def _qrdqn_validation_growth(
             and action != position
         ):
             action = position
-        action = _day_trade_constrained_action(
-            now,
-            position,
-            action,
-            config,
-        )
+        action = int(action)
         if price_cache is not None:
             log_return = _training_transition_log_return_cached(
                 price_cache,
@@ -1164,9 +1083,9 @@ def _train_qrdqn(
         except Exception:
             pass
 
-    # Pandas .loc in every RL step was a major CPU bottleneck. Build the
-    # normalized feature and price views once per fold and use NumPy lookups
-    # throughout training/validation.
+
+
+
     cache_dates = train_dates.union(calibration_dates)
     feature_cache = _build_qrdqn_feature_cache(
         frames,
@@ -1202,8 +1121,8 @@ def _train_qrdqn(
         device_name,
     )
 
-    # Deterministic per-fold initialization without relying on the global
-    # torch RNG. This is safe when independent folds train concurrently.
+
+
     generator = torch.Generator(device=online.device)
     generator.manual_seed(seed)
     for module in online.model.modules():
@@ -1233,6 +1152,11 @@ def _train_qrdqn(
     buffer = _ReplayBuffer(
         int(config.qrdqn_replay_size),
         len(sample_state),
+    )
+    n_step = max(1, int(getattr(config, "qrdqn_n_step", 1)))
+    n_step_accumulator = _NStepAccumulator(
+        n_step,
+        float(config.qrdqn_gamma),
     )
 
     quantile_count = int(config.qrdqn_n_quantiles)
@@ -1267,10 +1191,10 @@ def _train_qrdqn(
     early_stopping_patience = int(
         getattr(config, "qrdqn_early_stopping_patience", 4)
     )
-    # Legacy/full-training mode keeps the previous checkpoint behavior:
-    # every validation checkpoint is eligible, but training never stops early.
-    # Early-stopping mode is intentionally stricter: checkpoints and patience
-    # only start after the minimum training budget has actually been reached.
+
+
+
+
     checkpoint_selection_start_step = (
         min_training_steps if early_stopping_enabled else 0
     )
@@ -1324,12 +1248,7 @@ def _train_qrdqn(
             and action != position
         ):
             action = position
-        action = _day_trade_constrained_action(
-            now,
-            position,
-            action,
-            config,
-        )
+        action = int(action)
 
         log_return = _training_transition_log_return_cached(
             price_cache,
@@ -1359,7 +1278,14 @@ def _train_qrdqn(
         )
         done = date_idx + 1 >= episode_end
 
-        buffer.add(state, action, reward, next_state, done)
+        for transition in n_step_accumulator.append(
+            state,
+            action,
+            reward,
+            next_state,
+            done,
+        ):
+            buffer.add(*transition)
         position = action
         holding = next_holding
 
@@ -1370,6 +1296,7 @@ def _train_qrdqn(
                 rewards,
                 next_states,
                 dones,
+                bootstrap_discounts,
             ) = buffer.sample(int(config.qrdqn_batch_size), rng)
 
             states_t = torch.as_tensor(
@@ -1397,6 +1324,11 @@ def _train_qrdqn(
                 dtype=torch.float32,
                 device=online.device,
             )
+            bootstrap_discounts_t = torch.as_tensor(
+                bootstrap_discounts,
+                dtype=torch.float32,
+                device=online.device,
+            )
 
             current_all = online.quantiles(states_t)
             batch_index = torch.arange(
@@ -1415,7 +1347,7 @@ def _train_qrdqn(
                     :,
                 ]
                 target_quantiles = rewards_t[:, None] + (
-                    float(config.qrdqn_gamma)
+                    bootstrap_discounts_t[:, None]
                     * (1.0 - dones_t[:, None])
                     * next_target
                 )
@@ -1476,9 +1408,9 @@ def _train_qrdqn(
                     stopped_early = True
                     break
             else:
-                # The score can still be computed for monitoring, but an
-                # immature checkpoint cannot become the final model and cannot
-                # consume early-stopping patience.
+
+
+
                 ignored_pre_min_validation_evals += 1
 
         if progress_callback is not None and (
@@ -1519,6 +1451,7 @@ def _train_qrdqn(
         "checkpoint_selection_start_step": checkpoint_selection_start_step,
         "eligible_validation_evals": eligible_validation_evals,
         "ignored_pre_min_validation_evals": ignored_pre_min_validation_evals,
+        "n_step": n_step,
     }
 
 
@@ -1554,12 +1487,7 @@ def _qrdqn_policy(
         ):
             proposed_action = current_position
             min_hold_guard_applied = True
-        action = _day_trade_constrained_action(
-            timestamp,
-            current_position,
-            proposed_action,
-            config,
-        )
+        action = int(proposed_action)
 
         if decision_diagnostics is not None:
             labels = ["CASH", *symbols]
@@ -1681,102 +1609,6 @@ def _equal_weight_benchmark(
         final_cash += quantity * sell_price - float(fees["total_fee"])
     series.iloc[-1] = final_cash
     return series
-
-
-def _same_session_forward_return(
-    frame: pd.DataFrame,
-    execution_timestamp: pd.Timestamp,
-    base_price: float,
-    horizon_bars: int,
-) -> float | None:
-    """Counterfactual return from execution open to a later bar close.
-
-    Horizons never cross the regular-session date. This keeps the diagnostic
-    consistent with the no-overnight Day Trade mandate.
-    """
-    if not np.isfinite(base_price) or base_price <= 0:
-        return None
-    timestamp = pd.Timestamp(execution_timestamp)
-    try:
-        location = frame.index.get_loc(timestamp)
-    except KeyError:
-        return None
-    if isinstance(location, slice) or not isinstance(location, (int, np.integer)):
-        return None
-    target_location = int(location) + int(horizon_bars) - 1
-    if target_location < int(location) or target_location >= len(frame):
-        return None
-    target_timestamp = pd.Timestamp(frame.index[target_location])
-    if _local_market_timestamp(timestamp).date() != _local_market_timestamp(target_timestamp).date():
-        return None
-    target_price = float(frame.iloc[target_location]["close"])
-    if not np.isfinite(target_price) or target_price <= 0:
-        return None
-    return float(target_price / base_price - 1.0)
-
-
-def _enrich_day_trade_rotation_trades(
-    trades: pd.DataFrame,
-    frames: dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    """Attach post-rotation counterfactuals to the BUY leg of rotations.
-
-    This is diagnostic-only instrumentation. It does not alter actions, rewards,
-    training data, or checkpoint selection.
-    """
-    if trades.empty or "rotation_id" not in trades.columns:
-        return trades
-    output = trades.copy()
-    rotation_ids = [
-        value
-        for value in output["rotation_id"].dropna().astype(str).unique().tolist()
-        if value
-    ]
-    for rotation_id in rotation_ids:
-        group = output.loc[output["rotation_id"].astype(str) == rotation_id]
-        sells = group.loc[group["action"].astype(str).eq("SELL")]
-        buys = group.loc[group["action"].astype(str).eq("BUY")]
-        if sells.empty or buys.empty:
-            continue
-        sell_index = sells.index[0]
-        buy_index = buys.index[0]
-        sold_asset = str(output.at[sell_index, "asset"])
-        bought_asset = str(output.at[buy_index, "asset"])
-        execution_timestamp = pd.Timestamp(output.at[buy_index, "timestamp"])
-        sold_price = float(output.at[sell_index, "execution_price"])
-        bought_price = float(output.at[buy_index, "execution_price"])
-        advantages: dict[int, float | None] = {}
-        for horizon in (1, 2, 4, 8):
-            sold_return = _same_session_forward_return(
-                frames[sold_asset], execution_timestamp, sold_price, horizon
-            )
-            bought_return = _same_session_forward_return(
-                frames[bought_asset], execution_timestamp, bought_price, horizon
-            )
-            advantage = (
-                float(bought_return - sold_return)
-                if sold_return is not None and bought_return is not None
-                else None
-            )
-            output.at[buy_index, f"from_return_after_{horizon}bar"] = sold_return
-            output.at[buy_index, f"to_return_after_{horizon}bar"] = bought_return
-            output.at[buy_index, f"rotation_advantage_{horizon}bar"] = advantage
-            advantages[horizon] = advantage
-
-        preferred = advantages.get(4)
-        if preferred is None:
-            available = [advantages[h] for h in (2, 1, 8) if advantages.get(h) is not None]
-            preferred = available[0] if available else None
-        if preferred is None:
-            classification = "INSUFFICIENT_FUTURE_BARS"
-        elif preferred >= 0.002:
-            classification = "GOOD_ROTATION"
-        elif preferred <= -0.002:
-            classification = "BAD_ROTATION"
-        else:
-            classification = "NEUTRAL_ROTATION"
-        output.at[buy_index, "rotation_classification"] = classification
-    return output
 
 
 def _simulate_exact(
@@ -1978,63 +1810,9 @@ def _simulate_exact(
         elif position > 0:
             holding_days += 1
 
-        # Safety invariant for Day Trade: even if a bar is missing or a model
-        # decision does not reach the scheduled flattening point, liquidate at
-        # the last available regular-session close. No position crosses days.
-        if (
-            _is_day_trade(config)
-            and position > 0
-            and _is_last_bar_of_session(execution_dates, idx)
-        ):
-            symbol = symbols[position - 1]
-            price = float(
-                slippage(
-                    float(frames[symbol].loc[execution_date, "close"]),
-                    "SELL",
-                    config,
-                )
-            )
-            fees = fee_calculator("SELL", quantity, price, config)
-            gross = quantity * price
-            realized = (
-                quantity * (price - entry_price)
-                - float(fees["total_fee"])
-            )
-            cash += gross - float(fees["total_fee"])
-            total_fees += float(fees["total_fee"])
-            turnover += gross
-            position_return = (
-                price / entry_price - 1
-                if np.isfinite(entry_price) and entry_price > 0
-                else 0.0
-            )
-            day_trades.append(
-                {
-                    "timestamp": execution_date,
-                    "action": "SELL",
-                    "asset": symbol,
-                    "reason": "DAY_TRADE_FORCE_FLAT",
-                    "execution_price": price,
-                    "quantity": quantity,
-                    "gross_trade_value": gross,
-                    **fees,
-                    "realized_pnl": realized,
-                    "position_return": position_return,
-                    "holding_bars": holding_days,
-                    "entry_timestamp": entry_time,
-                    "entry_price": (
-                        entry_price if np.isfinite(entry_price) else None
-                    ),
-                    "cash_after_trade": cash,
-                    "shares_after_trade": 0.0,
-                    "walk_forward_fold": fold_id,
-                }
-            )
-            position = 0
-            quantity = 0.0
-            entry_price = float("nan")
-            entry_time = None
-            holding_days = 0
+
+
+
 
         records.extend(day_trades)
         if trade_callback is not None:
@@ -2071,10 +1849,6 @@ def _simulate_exact(
             {
                 "timestamp": execution_date,
                 "close": float("nan"),
-                "bottom_probability": float("nan"),
-                "top_probability": float("nan"),
-                "predicted_bottom_signal": False,
-                "predicted_top_signal": False,
                 "strategy_equity": equity,
                 "buy_hold_equity": float(benchmark.loc[execution_date]),
                 "trade_action": trade_action,
@@ -2103,7 +1877,7 @@ def _simulate_exact(
             }
         )
 
-    # Bookkeeping liquidation at the last close. It is not a model decision.
+
     if position > 0 and prediction_rows:
         final_date = execution_dates[-1]
         symbol = symbols[position - 1]
@@ -2175,8 +1949,6 @@ def _simulate_exact(
     if not trades.empty:
         trades["timestamp"] = pd.to_datetime(trades["timestamp"], utc=True)
         trades = trades.sort_values("timestamp").reset_index(drop=True)
-        if _is_day_trade(config):
-            trades = _enrich_day_trade_rotation_trades(trades, frames)
 
     strategy_curve = pd.Series(
         [float(row["strategy_equity"]) for row in prediction_rows],
@@ -2213,8 +1985,7 @@ def _simulate_exact(
     )
     years = max(days / 365.25, 1 / 365.25)
 
-    is_day_trade = _is_day_trade(config)
-    periods_per_year = 252.0 * 26.0 if is_day_trade else 252.0
+    periods_per_year = 252.0
     metrics = {
         "portfolio_rotation": True,
         "strategy_mode": config.strategy_mode,
@@ -2226,15 +1997,11 @@ def _simulate_exact(
         "symbol": "PORTFOLIO",
         "backend": backend,
         "assets": symbols,
-        "timeframe": "15Min" if is_day_trade else "1Day",
+        "timeframe": "1Day",
         "decision_horizon_days": int(config.rotation_horizon_days),
-        "decision_horizon_bars": int(config.rotation_horizon_days) if is_day_trade else None,
-        "decision_horizon_label": (
-            "one regular trading session (Open→Close)"
-            if is_day_trade
-            else f"{int(config.rotation_horizon_days)} trading sessions"
-        ),
-        "overnight_positions_allowed": not is_day_trade,
+        "decision_horizon_bars": None,
+        "decision_horizon_label": f"{int(config.rotation_horizon_days)} trading sessions",
+        "overnight_positions_allowed": True,
         "benchmark_name": "Equal-weight buy-and-hold",
         "walk_forward_enabled": bool(config.rotation_walk_forward_enabled),
         "walk_forward_purge_days": int(config.rotation_purge_days),
@@ -2264,9 +2031,9 @@ def _simulate_exact(
         "simulated_sells": sells,
         "capital_rotations": int(rotation_count),
         "cycles_per_year": float(buys / years),
-        "average_holding_days": avg_holding if not is_day_trade else avg_holding / 26.0,
+        "average_holding_days": avg_holding,
         "average_holding_bars": avg_holding,
-        "average_holding_minutes": avg_holding * 15.0 if is_day_trade and np.isfinite(avg_holding) else None,
+        "average_holding_minutes": None,
         "geometric_trade_return": _geometric_trade_return(trades),
         "total_transaction_fees": float(total_fees),
         "turnover_ratio": float(turnover / max(initial, 1e-9)),
@@ -2275,94 +2042,51 @@ def _simulate_exact(
         "test_calendar_years": years,
     }
 
-    if is_day_trade:
-        summary = "\n".join(
-            [
-                "COMPOUND CAPITAL ROTATION — DAY TRADE 15M",
-                "",
-                f"Model: {metrics['strategy_label']}",
-                f"Assets: {', '.join(symbols)}",
-                "Decision data: regular-session 15-minute candles",
-                "Utility context: 4 bars (1 hour)",
-                "Overnight exposure: prohibited",
-                "Forced flattening: decision at 15:30 ET, execution at the 15:45 bar; last-bar close is a safety fallback",
-                "Capital pool: one shared account, reinvested after every exit/rotation",
-                f"Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}",
-                f"Validation: expanding walk-forward, purge={config.rotation_purge_days} bars, fold test={config.rotation_walk_forward_test_days} bars",
-                "",
-                "OUT-OF-SAMPLE WALK-FORWARD",
-                f"Initial capital: ${initial:,.2f}",
-                f"Ending capital: ${ending:,.2f}",
-                f"Total return: {metrics['strategy_return']:.2%}",
-                f"CAGR: {metrics['strategy_cagr']:.2%}",
-                f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}",
-                f"Sharpe estimate (15-minute annualization): {metrics['strategy_sharpe']:.3f}",
-                f"Capital rotations: {rotation_count}",
-                f"Buys: {buys}",
-                f"Sells: {sells}",
-                f"Average holding bars: {avg_holding:.2f}",
-                f"Transaction fees: ${total_fees:,.2f}",
-                "",
-                "BENCHMARK",
-                "Equal-weight buy-and-hold is retained only as a market reference; it is not a Day Trade policy.",
-                f"Benchmark ending capital: ${benchmark_ending:,.2f}",
-                f"Benchmark return: {metrics['buy_hold_return']:.2%}",
-                "",
-                "METHOD",
-                "- QR-DQN uses only information available at the close of each 15-minute bar.",
-                "- Position changes execute at the next 15-minute bar open.",
-                "- The state adds same-session return, cumulative VWAP distance, range position, opening gap and time-of-day features.",
-                "- The policy is forced to CASH before the regular session closes.",
-                "- Every fold is trained only on information available before that fold.",
-                "- The purge gap is measured in 15-minute bars.",
-            ]
-        )
-    else:
-        summary = "\n".join(
-            [
-                "COMPOUND CAPITAL ROTATION — SWING",
-                "",
-                f"Model: {metrics['strategy_label']}",
-                f"Assets: {', '.join(symbols)}",
-                "Decision data: daily candles",
-                f"Utility horizon: {config.rotation_horizon_days} trading sessions",
-                "Capital pool: one shared account, reinvested after every exit/rotation",
-                "Decision objective: maximize smoother net compounded wealth, not predict exact tops.",
-                f"Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}",
-                f"Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions",
-                "",
-                "OUT-OF-SAMPLE WALK-FORWARD",
-                f"Initial capital: ${initial:,.2f}",
-                f"Ending capital: ${ending:,.2f}",
-                f"Total return: {metrics['strategy_return']:.2%}",
-                f"CAGR: {metrics['strategy_cagr']:.2%}",
-                f"Compound log growth: {metrics['compound_log_growth']:.6f}",
-                f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}",
-                f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}",
-                f"Capital rotations: {rotation_count}",
-                f"Buys: {buys}",
-                f"Sells including final liquidation: {sells}",
-                f"Cycles/year: {metrics['cycles_per_year']:.2f}",
-                f"Average holding days: {avg_holding:.2f}",
-                f"Time in market: {exposure:.2%}",
-                f"Transaction fees: ${total_fees:,.2f}",
-                "",
-                "BENCHMARK",
-                "Equal-weight buy-and-hold across the same available assets.",
-                f"Benchmark ending capital: ${benchmark_ending:,.2f}",
-                f"Benchmark return: {metrics['buy_hold_return']:.2%}",
-                f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}",
-                "",
-                "METHOD",
-                "- Signals use information available at the current daily close.",
-                "- Position changes execute at the next daily open.",
-                f"- XGBoost Utility predicts {config.rotation_horizon_days}-session risk-adjusted capital utility.",
-                "- QR-DQN reward is net log wealth minus downside/drawdown penalties.",
-                "- Every fold is trained only on information available before that fold.",
-                f"- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.",
-                "- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.",
-            ]
-        )
+    summary = "\n".join(
+        [
+            "COMPOUND CAPITAL ROTATION — SWING",
+            "",
+            f"Model: {metrics['strategy_label']}",
+            f"Assets: {', '.join(symbols)}",
+            "Decision data: daily candles",
+            f"Utility horizon: {config.rotation_horizon_days} trading sessions",
+            "Capital pool: one shared account, reinvested after every exit/rotation",
+            "Decision objective: maximize smoother net compounded wealth, not predict exact tops.",
+            f"Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}",
+            f"Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions",
+            "",
+            "OUT-OF-SAMPLE WALK-FORWARD",
+            f"Initial capital: ${initial:,.2f}",
+            f"Ending capital: ${ending:,.2f}",
+            f"Total return: {metrics['strategy_return']:.2%}",
+            f"CAGR: {metrics['strategy_cagr']:.2%}",
+            f"Compound log growth: {metrics['compound_log_growth']:.6f}",
+            f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}",
+            f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}",
+            f"Capital rotations: {rotation_count}",
+            f"Buys: {buys}",
+            f"Sells including final liquidation: {sells}",
+            f"Cycles/year: {metrics['cycles_per_year']:.2f}",
+            f"Average holding days: {avg_holding:.2f}",
+            f"Time in market: {exposure:.2%}",
+            f"Transaction fees: ${total_fees:,.2f}",
+            "",
+            "BENCHMARK",
+            "Equal-weight buy-and-hold across the same available assets.",
+            f"Benchmark ending capital: ${benchmark_ending:,.2f}",
+            f"Benchmark return: {metrics['buy_hold_return']:.2%}",
+            f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}",
+            "",
+            "METHOD",
+            "- Signals use information available at the current daily close.",
+            "- Position changes execute at the next daily open.",
+            f"- XGBoost Utility predicts {config.rotation_horizon_days}-session risk-adjusted capital utility.",
+            f"- QR-DQN uses {int(getattr(config, 'qrdqn_n_step', 1))}-step discounted risk-adjusted returns.",
+            "- Every fold is trained only on information available before that fold.",
+            f"- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.",
+            "- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.",
+        ]
+    )
 
     return RotationRunResult(
         backend=backend,
@@ -2402,8 +2126,8 @@ def _build_walk_forward_folds(
         test_end = min(len(common_dates), test_start + test_days)
         if test_end - test_start < min_test_days:
             if folds:
-                # Keep every realized session out-of-sample by extending the
-                # last fold rather than discarding a short final fragment.
+
+
                 folds[-1]["test_end_index"] = len(common_dates)
                 folds[-1]["test_end"] = common_dates[-1]
                 folds[-1]["decision_dates"] = common_dates[
@@ -2688,7 +2412,7 @@ def run_rotation_models(
         fallback_reasons: list[str] = []
         for repetition in range(xgb_repetitions):
             seed = int(config.random_state) + repetition * seed_step
-            rep_config = replace(config, random_state=seed)
+            rep_config = config.model_copy(update={"random_state": seed})
             policies: dict[int, Callable] = {}
             margin_details: list[dict[str, Any]] = []
             for fold_position, fold in enumerate(folds, start=1):
@@ -2892,15 +2616,15 @@ def run_rotation_models(
         )
         effective_workers = min(requested_workers, len(folds))
 
-        # Reproducibility rule:
-        # Do not mutate PyTorch's global CPU thread count here.
-        #
-        # V8.1.8 left the runtime thread configuration untouched. V8.1.9
-        # changed it automatically while adding fold parallelism. QR-DQN is
-        # highly path-dependent, so a different floating-point reduction path
-        # can produce a materially different learned policy.
-        #
-        # Parallel fold workers control only the outer fold executor.
+
+
+
+
+
+
+
+
+
         torch_runtime_num_threads = None
         if qrdqn_plan.selected == "cpu":
             try:
@@ -2911,7 +2635,7 @@ def run_rotation_models(
 
         for repetition in range(qrdqn_repetitions):
             seed = int(config.random_state) + repetition * seed_step
-            rep_config = replace(config, random_state=seed)
+            rep_config = config.model_copy(update={"random_state": seed})
             policies: dict[int, Callable] = {}
             training_details: dict[int, dict[str, Any]] = {}
             decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
@@ -2926,10 +2650,10 @@ def run_rotation_models(
                 fold: dict[str, Any],
             ) -> tuple[int, Callable, dict[str, Any]]:
                 fold_id = int(fold["fold_id"])
-                # One seed identifies the entire walk-forward repetition.
-                # V8.1.8 used the same random_state for every fold.
-                # V8.1.9 accidentally changed the experiment by deriving
-                # a new stochastic seed for every fold.
+
+
+
+
                 fold_seed = seed
 
                 def update_fold(local_fraction: float) -> None:
@@ -3088,15 +2812,14 @@ def run_rotation_models(
                     "qrdqn_min_training_steps": int(
                         rep_config.qrdqn_min_training_steps
                     ),
+                    "qrdqn_n_step": int(getattr(rep_config, "qrdqn_n_step", 1)),
                     "qrdqn_best_step_min": int(min(best_steps)),
                     "qrdqn_best_step_max": int(max(best_steps)),
                     "qrdqn_early_stopped_folds": int(early_count),
                     "diagnostics_version": "1.9.3",
-                    "q_value_diagnostics_enabled": bool(_is_day_trade(rep_config)),
+                    "q_value_diagnostics_enabled": False,
                     "policy_modified_by_diagnostics": False,
-                    "rotation_counterfactual_horizons_bars": (
-                        [1, 2, 4, 8] if _is_day_trade(rep_config) else []
-                    ),
+                    "rotation_counterfactual_horizons_bars": [],
                     "parallel_models_enabled": bool(
                         getattr(config, "rotation_parallel_models", True)
                     ),
@@ -3120,6 +2843,9 @@ def run_rotation_models(
                 f"Fold seed mode: shared repetition seed ({seed})\n"
             )
             result.summary += (
+                f"N-step return: {int(getattr(rep_config, 'qrdqn_n_step', 1))}\n"
+            )
+            result.summary += (
                 f"Mean training steps used: {np.mean(used_steps):.0f}/"
                 f"{int(rep_config.qrdqn_training_steps)}\n"
             )
@@ -3137,11 +2863,6 @@ def run_rotation_models(
             result.summary += f"Early-stopped folds: {early_count}/{len(folds)}\n"
             if qrdqn_plan.fallback_reason:
                 result.summary += f"Fallback: {qrdqn_plan.fallback_reason}\n"
-            if _is_day_trade(rep_config):
-                result.summary += "\nV1.9.3 DIAGNOSTICS\n"
-                result.summary += "Q-values and rotation counterfactuals: enabled\n"
-                result.summary += "Policy modification by diagnostics: NO\n"
-                result.summary += "Counterfactual horizons: 1, 2, 4 and 8 same-session bars\n"
             family_results.append(result)
             report_family(
                 "qrdqn",

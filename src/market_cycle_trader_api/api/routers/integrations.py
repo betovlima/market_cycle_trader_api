@@ -51,7 +51,7 @@ def test_alpaca_integration(
             feed=payload.feed,
         )
         return iso_value(result)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Alpaca connection failed: {exc}") from exc
 
 

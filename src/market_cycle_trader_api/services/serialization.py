@@ -34,9 +34,7 @@ def downsample_documents(rows: list[dict[str, Any]], maximum_points: int = 650) 
     important_indexes = {
         index
         for index, row in enumerate(rows)
-        if str(row.get("trade_action", "")) in {"BUY", "SELL", "FINAL_SELL"}
-        or bool(row.get("predicted_bottom_signal"))
-        or bool(row.get("predicted_top_signal"))
+        if str(row.get("trade_action", "")) in {"BUY", "SELL", "ROTATE", "FINAL_SELL"}
     }
     regular_count = max(2, maximum_points - len(important_indexes))
     step = max(1, len(rows) // regular_count)
