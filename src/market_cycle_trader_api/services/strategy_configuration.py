@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from typing import Any, TypeVar
+from datetime import datetime
+from importlib import resources
+from typing import Any
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 from pymongo.database import Database
 
 from ..infrastructure.persistence.mongo_repository import (
@@ -16,13 +18,13 @@ from ..infrastructure.persistence.mongo_repository import (
     SETTINGS_HISTORY_COLLECTION,
     SETTINGS_METADATA_FIELDS,
     SETTINGS_SCHEMA_VERSION,
-    STRATEGY_POLICY_COLLECTION,
-    STRATEGY_POLICY_HISTORY_COLLECTION,
     bson_value,
     utc_now,
 )
+from ..core.system_rules import IMMUTABLE_STRATEGY_FIELDS, system_rules_payload
 from ..schemas.requests import BacktestRequest
-from ..schemas.strategy_policy import StrategyPolicy
+
+CANONICAL_PARAMETERIZATION = "001_xgboost_high_performance_seed_3042.json"
 
 
 class StrategyConfigurationError(RuntimeError):
@@ -37,10 +39,7 @@ class StrategyConfigurationNotFound(StrategyConfigurationError):
     pass
 
 
-ModelT = TypeVar("ModelT", bound=BaseModel)
-
-
-def _operational(document: dict[str, Any]) -> dict[str, Any]:
+def _operational_document(document: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in document.items()
@@ -48,9 +47,20 @@ def _operational(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _hash(payload: dict[str, Any]) -> str:
+def _normalized_operational_payload(document: dict[str, Any]) -> dict[str, Any]:
+    payload = _operational_document(document)
+    for field in IMMUTABLE_STRATEGY_FIELDS:
+        payload.pop(field, None)
+    repetitions = int(payload.get("rotation_xgb_repetitions") or 1)
+    payload.setdefault("rotation_seed_ensemble_enabled", repetitions >= 3)
+    payload.setdefault("rotation_seed_ensemble_method", "majority_vote")
+    payload.setdefault("rotation_seed_ensemble_min_agreement", 0.4)
+    return payload
+
+
+def _configuration_hash(configuration: dict[str, Any]) -> str:
     encoded = json.dumps(
-        bson_value(payload),
+        bson_value(configuration),
         sort_keys=True,
         separators=(",", ":"),
         default=str,
@@ -70,14 +80,24 @@ def _metadata(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _public(document: dict[str, Any], validator: type[ModelT], field_name: str) -> dict[str, Any]:
-    validated = validator.model_validate(_operational(document))
-    payload = validated.model_dump(mode="json")
+def _public_configuration(document: dict[str, Any]) -> dict[str, Any]:
+    validated = BacktestRequest.model_validate(_normalized_operational_payload(document))
+    configuration = validated.model_dump(mode="json")
     return {
-        field_name: payload,
-        "configuration_hash": _hash(payload),
+        "system_rules": system_rules_payload(),
+        "configuration": configuration,
+        "configuration_hash": _configuration_hash(configuration),
         "metadata": _metadata(document),
     }
+
+
+def get_strategy_configuration(db: Database) -> dict[str, Any]:
+    document = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+    if document is None:
+        raise StrategyConfigurationNotFound(
+            "The active strategy configuration does not exist."
+        )
+    return _public_configuration(document)
 
 
 def _assert_no_active_backtest(db: Database) -> None:
@@ -87,14 +107,21 @@ def _assert_no_active_backtest(db: Database) -> None:
     )
     if active is not None:
         raise StrategyConfigurationConflict(
-            "Configuration cannot be changed while an analysis is active."
+            "Strategy parameters cannot be changed while a backtest is queued or running. "
+            f"Active job: {active.get('id', 'unknown')} ({active.get('status', 'unknown')})."
         )
 
 
-def _archive(
+def _canonical_configuration() -> BacktestRequest:
+    package = resources.files("market_cycle_trader_api.parameterizations")
+    raw = json.loads(
+        package.joinpath(CANONICAL_PARAMETERIZATION).read_text(encoding="utf-8")
+    )
+    return BacktestRequest.model_validate(raw)
+
+
+def _archive_previous(
     db: Database,
-    collection: str,
-    history_collection: str,
     document: dict[str, Any],
     *,
     source: str,
@@ -102,9 +129,9 @@ def _archive(
     change_type: str,
     changed_fields: list[str],
 ) -> str:
-    copy = deepcopy(document)
-    original_id = copy.pop("_id", None)
-    result = db[history_collection].insert_one(
+    archived = deepcopy(document)
+    original_id = archived.pop("_id", None)
+    result = db[SETTINGS_HISTORY_COLLECTION].insert_one(
         {
             "captured_at": utc_now(),
             "source": source,
@@ -112,98 +139,120 @@ def _archive(
             "note": note,
             "original_document_id": str(original_id),
             "original_revision": int(document.get("revision") or 1),
+            "target_schema_version": SETTINGS_SCHEMA_VERSION,
             "changed_fields": changed_fields,
-            "document": bson_value(copy),
+            "document": bson_value(archived),
         }
     )
     return str(result.inserted_id)
 
 
-def _changed_fields(previous: dict[str, Any], next_payload: dict[str, Any]) -> list[str]:
-    before = _operational(previous)
+def _changed_fields(
+    previous: dict[str, Any],
+    next_configuration: dict[str, Any],
+) -> list[str]:
+    previous_configuration = _normalized_operational_payload(previous)
     return sorted(
         key
-        for key in set(before) | set(next_payload)
-        if bson_value(before.get(key)) != bson_value(next_payload.get(key))
+        for key in set(previous_configuration) | set(next_configuration)
+        if bson_value(previous_configuration.get(key))
+        != bson_value(next_configuration.get(key))
     )
 
 
-def _replace(
+def _replace_configuration(
     db: Database,
+    configuration: BacktestRequest,
     *,
-    collection: str,
-    history_collection: str,
-    document_id: str,
-    validator: type[ModelT],
-    payload: dict[str, Any],
     note: str,
     source: str,
     change_type: str,
     expected_revision: int | None,
-    schema_version: int,
-    response_field: str,
 ) -> dict[str, Any]:
     _assert_no_active_backtest(db)
-    target = db[collection]
-    previous = target.find_one({"_id": document_id})
+    collection = db[SETTINGS_COLLECTION]
+    previous = collection.find_one({"_id": "default"})
     if previous is None:
-        raise StrategyConfigurationNotFound("The active configuration does not exist.")
+        raise StrategyConfigurationNotFound(
+            "The active strategy configuration does not exist."
+        )
+
     current_revision = int(previous.get("revision") or 1)
     if expected_revision is not None and expected_revision != current_revision:
         raise StrategyConfigurationConflict(
+            "The strategy configuration changed after it was read. "
             f"Expected revision {expected_revision}, current revision {current_revision}."
         )
-    validated = validator.model_validate(payload)
-    clean = bson_value(validated.model_dump(mode="python"))
-    changed = _changed_fields(previous, clean)
-    if not changed:
-        response = _public(previous, validator, response_field)
-        response.update({"status": "unchanged", "changed_fields": [], "history_id": None})
-        return response
-    history_id = _archive(
+
+    payload = bson_value(configuration.model_dump(mode="python"))
+    changed_fields = _changed_fields(previous, payload)
+    if not changed_fields:
+        result = _public_configuration(previous)
+        result.update(
+            {
+                "status": "unchanged",
+                "changed_fields": [],
+                "history_id": None,
+                "message": "The supplied configuration matches the active configuration.",
+            }
+        )
+        return result
+
+    now = utc_now()
+    next_revision = current_revision + 1
+    document = {
+        "_id": "default",
+        **payload,
+        "created_at": previous.get("created_at") or now,
+        "updated_at": now,
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "revision": next_revision,
+        "configuration_name": "api-managed-xgboost-strategy",
+        "configuration_note": note,
+        "bootstrap_source": source,
+    }
+
+    history_id = _archive_previous(
         db,
-        collection,
-        history_collection,
         previous,
         source=source,
         note=note,
         change_type=change_type,
-        changed_fields=changed,
+        changed_fields=changed_fields,
     )
-    now = utc_now()
-    next_revision = current_revision + 1
-    stored = {
-        "_id": document_id,
-        **clean,
-        "created_at": previous.get("created_at") or now,
-        "updated_at": now,
-        "schema_version": schema_version,
-        "revision": next_revision,
-        "configuration_name": previous.get("configuration_name") or "managed",
-        "configuration_note": note,
-        "bootstrap_source": source,
-    }
-    query: dict[str, Any] = {"_id": document_id}
-    query["revision"] = current_revision if "revision" in previous else {"$exists": False}
-    result = target.replace_one(query, stored, upsert=False)
+
+    query: dict[str, Any] = {"_id": "default"}
+    if "revision" in previous:
+        query["revision"] = current_revision
+    else:
+        query["revision"] = {"$exists": False}
+
+    result = collection.replace_one(query, document, upsert=False)
     if result.matched_count != 1:
-        raise StrategyConfigurationConflict("The configuration changed concurrently.")
-    response = _public(stored, validator, response_field)
+        raise StrategyConfigurationConflict(
+            "The strategy configuration was updated concurrently. Read it again and retry."
+        )
+
+    stored = collection.find_one({"_id": "default"})
+    if stored is None:
+        raise StrategyConfigurationError(
+            "The updated strategy configuration could not be read from MongoDB."
+        )
+    BacktestRequest.model_validate(_normalized_operational_payload(stored))
+
+    response = _public_configuration(stored)
     response.update(
         {
             "status": "updated",
-            "changed_fields": changed,
+            "changed_fields": changed_fields,
             "history_id": history_id,
+            "message": (
+                f"Strategy configuration updated to revision {next_revision}. "
+                "New backtests and future paper plans will use the new parameters."
+            ),
         }
     )
     return response
-
-
-def get_strategy_configuration(db: Database) -> dict[str, Any]:
-    document = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
-    if document is None:
-        raise StrategyConfigurationNotFound("The active configuration does not exist.")
-    return _public(document, BacktestRequest, "configuration")
 
 
 def patch_strategy_configuration(
@@ -216,21 +265,18 @@ def patch_strategy_configuration(
 ) -> dict[str, Any]:
     current = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
     if current is None:
-        raise StrategyConfigurationNotFound("The active configuration does not exist.")
-    merged = {**_operational(current), **changes}
-    return _replace(
+        raise StrategyConfigurationNotFound(
+            "The active strategy configuration does not exist."
+        )
+    merged = {**_normalized_operational_payload(current), **changes}
+    validated = BacktestRequest.model_validate(merged)
+    return _replace_configuration(
         db,
-        collection=SETTINGS_COLLECTION,
-        history_collection=SETTINGS_HISTORY_COLLECTION,
-        document_id="default",
-        validator=BacktestRequest,
-        payload=merged,
+        validated,
         note=note,
         source=source,
         change_type="patch",
         expected_revision=expected_revision,
-        schema_version=SETTINGS_SCHEMA_VERSION,
-        response_field="configuration",
     )
 
 
@@ -242,73 +288,55 @@ def replace_strategy_configuration(
     source: str,
     expected_revision: int | None,
 ) -> dict[str, Any]:
-    return _replace(
+    return _replace_configuration(
         db,
-        collection=SETTINGS_COLLECTION,
-        history_collection=SETTINGS_HISTORY_COLLECTION,
-        document_id="default",
-        validator=BacktestRequest,
-        payload=configuration.model_dump(mode="python"),
+        configuration,
         note=note,
         source=source,
         change_type="replace",
         expected_revision=expected_revision,
-        schema_version=SETTINGS_SCHEMA_VERSION,
-        response_field="configuration",
     )
 
 
-def get_strategy_policy(db: Database) -> dict[str, Any]:
-    document = db[STRATEGY_POLICY_COLLECTION].find_one({"_id": "active"})
-    if document is None:
-        raise StrategyConfigurationNotFound("The active runtime policy does not exist.")
-    return _public(document, StrategyPolicy, "policy")
-
-
-def replace_strategy_policy(
+def reset_strategy_configuration(
     db: Database,
-    policy: StrategyPolicy,
     *,
     note: str,
     source: str,
     expected_revision: int | None,
 ) -> dict[str, Any]:
-    return _replace(
+    return _replace_configuration(
         db,
-        collection=STRATEGY_POLICY_COLLECTION,
-        history_collection=STRATEGY_POLICY_HISTORY_COLLECTION,
-        document_id="active",
-        validator=StrategyPolicy,
-        payload=policy.model_dump(mode="python"),
+        _canonical_configuration(),
         note=note,
         source=source,
-        change_type="replace",
+        change_type="canonical_reset",
         expected_revision=expected_revision,
-        schema_version=1,
-        response_field="policy",
     )
 
 
-def _history_items(
+def list_strategy_configuration_history(
     db: Database,
     *,
-    history_collection: str,
-    validator: type[ModelT],
-    response_field: str,
     limit: int,
 ) -> list[dict[str, Any]]:
-    cursor = db[history_collection].find({}).sort("captured_at", -1).limit(max(1, min(int(limit), 200)))
+    cursor = db[SETTINGS_HISTORY_COLLECTION].find({}).sort("captured_at", -1).limit(
+        max(1, min(int(limit), 200))
+    )
     items: list[dict[str, Any]] = []
     for record in cursor:
-        stored = dict(record.get("document") or {})
+        stored_document = dict(record.get("document") or {})
         try:
-            payload = validator.model_validate(_operational(stored)).model_dump(mode="json")
+            operational = BacktestRequest.model_validate(
+                _normalized_operational_payload(stored_document)
+            ).model_dump(mode="json")
             valid = True
-            error = None
+            validation_error = None
         except ValidationError as exc:
-            payload = bson_value(_operational(stored))
+            operational = bson_value(_normalized_operational_payload(stored_document))
             valid = False
-            error = str(exc)
+            validation_error = str(exc)
+
         items.append(
             {
                 "history_id": str(record.get("_id")),
@@ -316,63 +344,16 @@ def _history_items(
                 "source": record.get("source"),
                 "change_type": record.get("change_type"),
                 "note": record.get("note"),
+                "original_document_id": record.get("original_document_id"),
                 "original_revision": record.get("original_revision"),
                 "changed_fields": list(record.get("changed_fields") or []),
                 "valid_for_current_schema": valid,
-                "validation_error": error,
-                "configuration_hash": _hash(payload),
-                response_field: payload,
+                "validation_error": validation_error,
+                "configuration_hash": _configuration_hash(operational),
+                "configuration": operational,
             }
         )
     return items
-
-
-def list_strategy_configuration_history(db: Database, *, limit: int) -> list[dict[str, Any]]:
-    return _history_items(
-        db,
-        history_collection=SETTINGS_HISTORY_COLLECTION,
-        validator=BacktestRequest,
-        response_field="configuration",
-        limit=limit,
-    )
-
-
-def list_strategy_policy_history(db: Database, *, limit: int) -> list[dict[str, Any]]:
-    return _history_items(
-        db,
-        history_collection=STRATEGY_POLICY_HISTORY_COLLECTION,
-        validator=StrategyPolicy,
-        response_field="policy",
-        limit=limit,
-    )
-
-
-def _restore(
-    db: Database,
-    *,
-    history_collection: str,
-    history_id: str,
-    validator: type[ModelT],
-    replace_func,
-    note: str,
-    source: str,
-    expected_revision: int | None,
-) -> dict[str, Any]:
-    try:
-        object_id = ObjectId(history_id)
-    except (InvalidId, TypeError) as exc:
-        raise StrategyConfigurationNotFound("Invalid history id.") from exc
-    record = db[history_collection].find_one({"_id": object_id})
-    if record is None:
-        raise StrategyConfigurationNotFound("The requested history entry does not exist.")
-    validated = validator.model_validate(_operational(dict(record.get("document") or {})))
-    return replace_func(
-        db,
-        validated,
-        note=note,
-        source=source,
-        expected_revision=expected_revision,
-    )
 
 
 def restore_strategy_configuration(
@@ -383,33 +364,24 @@ def restore_strategy_configuration(
     source: str,
     expected_revision: int | None,
 ) -> dict[str, Any]:
-    return _restore(
-        db,
-        history_collection=SETTINGS_HISTORY_COLLECTION,
-        history_id=history_id,
-        validator=BacktestRequest,
-        replace_func=replace_strategy_configuration,
-        note=note,
-        source=source,
-        expected_revision=expected_revision,
+    try:
+        object_id = ObjectId(history_id)
+    except (InvalidId, TypeError) as exc:
+        raise StrategyConfigurationNotFound("Invalid strategy history id.") from exc
+
+    record = db[SETTINGS_HISTORY_COLLECTION].find_one({"_id": object_id})
+    if record is None:
+        raise StrategyConfigurationNotFound(
+            "The requested strategy history entry does not exist."
+        )
+    configuration = BacktestRequest.model_validate(
+        _normalized_operational_payload(dict(record.get("document") or {}))
     )
-
-
-def restore_strategy_policy(
-    db: Database,
-    history_id: str,
-    *,
-    note: str,
-    source: str,
-    expected_revision: int | None,
-) -> dict[str, Any]:
-    return _restore(
+    return _replace_configuration(
         db,
-        history_collection=STRATEGY_POLICY_HISTORY_COLLECTION,
-        history_id=history_id,
-        validator=StrategyPolicy,
-        replace_func=replace_strategy_policy,
+        configuration,
         note=note,
         source=source,
+        change_type="history_restore",
         expected_revision=expected_revision,
     )

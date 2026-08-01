@@ -5,6 +5,7 @@ import io
 from typing import Any
 
 import matplotlib.pyplot as plt
+import pandas as pd
 from fastapi import HTTPException
 from fastapi.responses import Response
 
@@ -16,90 +17,7 @@ from ..infrastructure.persistence.mongo_repository import (
     TRADES_COLLECTION,
 )
 from .diagnostics.performance import build_performance_diagnostics
-from .serialization import downsample_documents, iso_value
-
-
-SENSITIVE_DIAGNOSTIC_TOKENS = (
-    "reason",
-    "cause",
-    "score",
-    "utility",
-    "seed",
-    "model",
-    "backend",
-    "configuration",
-    "training",
-    "calibration",
-    "feed",
-    "margin",
-)
-
-
-def _public_diagnostics(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _public_diagnostics(item)
-            for key, item in value.items()
-            if not any(token in str(key).lower() for token in SENSITIVE_DIAGNOSTIC_TOKENS)
-        }
-    if isinstance(value, list):
-        return [_public_diagnostics(item) for item in value]
-    return iso_value(value)
-
-PUBLIC_METRIC_MAP = {
-    "initial_capital": "initial_capital",
-    "strategy_ending_capital": "ending_capital",
-    "strategy_return": "return",
-    "buy_hold_ending_capital": "benchmark_ending_capital",
-    "buy_hold_return": "benchmark_return",
-    "excess_return": "excess_return",
-    "strategy_cagr": "cagr",
-    "strategy_sharpe": "sharpe",
-    "strategy_sortino": "sortino",
-    "strategy_maximum_drawdown": "maximum_drawdown",
-    "capital_rotations": "rotations",
-    "rotations": "rotations",
-    "average_holding_days": "average_holding_days",
-    "market_exposure": "exposure",
-    "exposure": "exposure",
-    "walk_forward_fold_count": "fold_count",
-    "fold_count": "fold_count",
-    "positive_fold_rate": "positive_fold_rate",
-    "beat_buy_hold_fold_rate": "beat_benchmark_fold_rate",
-    "worst_fold_return": "worst_fold_return",
-    "median_fold_return": "median_fold_return",
-    "median_fold_excess_return": "median_fold_excess_return",
-    "robust_score": "robust_score",
-}
-
-
-
-def _public_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for source, target in PUBLIC_METRIC_MAP.items():
-        if source in metrics and target not in payload:
-            payload[target] = iso_value(metrics.get(source))
-    return payload
-
-
-def _public_trade(document: dict[str, Any]) -> dict[str, Any]:
-    allowed = (
-        "timestamp",
-        "date",
-        "action",
-        "asset",
-        "execution_price",
-        "price",
-        "quantity",
-        "total_fee",
-        "realized_pnl",
-        "position_return",
-        "cash_after_trade",
-        "capital_after_trade",
-        "cash_after",
-        "cash",
-    )
-    return {key: iso_value(document.get(key)) for key in allowed if document.get(key) is not None}
+from .serialization import clean_mongo_rows, downsample_documents, iso_value
 
 
 def diagnostic_csv_rows(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
@@ -108,6 +26,7 @@ def diagnostic_csv_rows(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
         "underperformance_periods": "UNDERPERFORMANCE_PERIOD",
         "exit_diagnostics": "EXIT_COUNTERFACTUAL",
         "rotation_diagnostics": "ROTATION_COUNTERFACTUAL",
+        "q_delta_buckets": "Q_DELTA_BUCKET",
         "holding_distribution": "HOLDING_DISTRIBUTION",
         "asset_performance": "ASSET_PERFORMANCE",
         "session_performance": "SESSION_PERFORMANCE",
@@ -115,81 +34,136 @@ def diagnostic_csv_rows(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
     for section, diagnostic_type in sections.items():
         for item in diagnostics.get(section, []):
             row = dict(item)
-            row.pop("q_delta", None)
-            row.pop("score", None)
-            row.pop("predicted_utility", None)
             row["diagnostic_type"] = diagnostic_type
+            if section == "underperformance_periods":
+                row["dominant_assets"] = ", ".join(
+                    f"{entry.get('asset')}:{entry.get('days')}"
+                    for entry in item.get("dominant_assets", [])
+                )
             rows.append(row)
     return rows
 
 
-def build_run_payload(run: dict[str, Any], index: int) -> dict[str, Any]:
+def build_run_payload(run: dict[str, Any]) -> dict[str, Any]:
     db = database()
     job_id = str(run["job_id"])
     symbol = str(run["symbol"])
     backend = str(run["backend"])
     run_filter = {"job_id": job_id, "symbol": symbol, "backend": backend}
-    raw_predictions = list(db[PREDICTIONS_COLLECTION].find(run_filter, {"_id": 0}).sort("timestamp", 1))
-    trades = list(db[TRADES_COLLECTION].find(run_filter, {"_id": 0}).sort([("timestamp", 1), ("sequence", 1)]))
-    diagnostics = build_performance_diagnostics(db, raw_predictions, trades, run.get("metrics", {}))
+    raw_predictions = list(
+        db[PREDICTIONS_COLLECTION].find(run_filter, {"_id": 0}).sort("timestamp", 1)
+    )
+    trades = list(
+        db[TRADES_COLLECTION]
+        .find(run_filter, {"_id": 0})
+        .sort([("timestamp", 1), ("sequence", 1)])
+    )
+    diagnostics = build_performance_diagnostics(
+        db,
+        raw_predictions,
+        trades,
+        run.get("metrics", {}),
+    )
     series = [
         {
             "timestamp": iso_value(row.get("timestamp")),
-            "portfolioEquity": iso_value(row.get("strategy_equity")),
-            "benchmarkEquity": iso_value(row.get("buy_hold_equity")),
+            "strategyEquity": iso_value(row.get("strategy_equity")),
+            "buyHoldEquity": iso_value(row.get("buy_hold_equity")),
         }
         for row in downsample_documents(raw_predictions)
     ]
     return {
-        "key": f"result_{index}",
-        "label": "Portfolio result",
-        "metrics": _public_metrics(run.get("metrics", {})),
+        "key": f"{symbol}_{backend}",
+        "symbol": symbol,
+        "backend": backend,
+        "metrics": iso_value(run.get("metrics", {})),
+        "summary": run.get("summary", ""),
         "series": series,
-        "trades": [_public_trade(item) for item in trades],
-        "diagnostics": _public_diagnostics(diagnostics),
+        "trades": clean_mongo_rows(trades),
+        "diagnostics": iso_value(diagnostics),
+        "downloads": {
+            "predictions": f"/api/jobs/{job_id}/runs/{symbol}/{backend}/predictions.csv",
+            "trades": f"/api/jobs/{job_id}/runs/{symbol}/{backend}/trades.csv",
+            "diagnostics": f"/api/jobs/{job_id}/runs/{symbol}/{backend}/diagnostics.csv",
+            "summary": f"/api/jobs/{job_id}/runs/{symbol}/{backend}/summary.txt",
+            "chart": f"/api/jobs/{job_id}/runs/{symbol}/{backend}/chart.png",
+        },
     }
 
 
-
-def _operational_result(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not rows:
-        return []
-    aggregate = [
-        row
-        for row in rows
-        if bool((row.get("metrics") or {}).get("seed_ensemble") or row.get("seed_ensemble"))
-        or str(row.get("backend") or "").lower().endswith("ensemble")
-    ]
-    return [aggregate[-1] if aggregate else rows[0]]
-
-def _public_comparison(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for index, row in enumerate(rows, start=1):
-        public = {"key": f"result_{index}", "label": "Portfolio result"}
-        public.update(_public_metrics(row))
-        result.append(public)
-    return result
+def build_robustness_summary(comparison_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in comparison_rows:
+        if row.get("portfolio_rotation"):
+            family = str(row.get("model_family") or row.get("backend") or "")
+            groups.setdefault(family, []).append(row)
+    summaries: list[dict[str, Any]] = []
+    for family, rows in groups.items():
+        capitals = pd.Series([float(row["strategy_ending_capital"]) for row in rows], dtype=float)
+        excess = pd.Series([float(row["excess_return"]) for row in rows], dtype=float)
+        cagrs = pd.Series([float(row["strategy_cagr"]) for row in rows], dtype=float)
+        drawdowns = pd.Series([float(row["strategy_maximum_drawdown"]) for row in rows], dtype=float)
+        sharpe = pd.Series([float(row["strategy_sharpe"]) for row in rows], dtype=float)
+        summaries.append(
+            {
+                "model_family": family,
+                "model_label": "XGBoost Utility" if family == "xgboost_utility" else family,
+                "runs": len(rows),
+                "beat_buy_hold_runs": int((excess > 0).sum()),
+                "beat_buy_hold_rate": float((excess > 0).mean()),
+                "ending_capital_min": float(capitals.min()),
+                "ending_capital_median": float(capitals.median()),
+                "ending_capital_mean": float(capitals.mean()),
+                "ending_capital_max": float(capitals.max()),
+                "excess_return_median": float(excess.median()),
+                "cagr_median": float(cagrs.median()),
+                "drawdown_median": float(drawdowns.median()),
+                "drawdown_worst": float(drawdowns.min()),
+                "sharpe_median": float(sharpe.median()),
+                "seeds": [row.get("random_seed") for row in rows],
+            }
+        )
+    return summaries
 
 
 def build_results(job_id: str) -> dict[str, Any]:
     db = database()
     comparison = db[COMPARISONS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0})
     if comparison is None:
-        raise HTTPException(status_code=404, detail="Results are not available yet.")
-    runs = list(db[RUNS_COLLECTION].find({"job_id": job_id}, {"_id": 0}).sort([("symbol", 1), ("backend", 1)]))
-    public_comparison = _operational_result(list(comparison.get("results", [])))
-    public_runs = _operational_result(runs)
+        raise HTTPException(status_code=404, detail="Backtest results are not available yet.")
+    runs = list(
+        db[RUNS_COLLECTION]
+        .find({"job_id": job_id}, {"_id": 0})
+        .sort([("symbol", 1), ("backend", 1)])
+    )
+    comparison_rows = comparison.get("results", [])
+    run_payloads = [build_run_payload(run) for run in runs]
+    first_metrics = run_payloads[0].get("metrics", {}) if run_payloads else {}
+    reproducibility = {
+        key: first_metrics.get(key)
+        for key in (
+            "strategy_configuration_sha256",
+            "market_data_signature_sha256",
+            "market_data_signatures",
+            "runtime_versions",
+            "deterministic_execution",
+            "numeric_thread_limit",
+            "xgb_n_jobs",
+        )
+        if key in first_metrics
+    }
     return {
         "jobId": job_id,
-        "comparison": _public_comparison(public_comparison),
-        "runs": [build_run_payload(run, index) for index, run in enumerate(public_runs, start=1)],
-        "failures": [
-            {"message": "An analysis result could not be completed."}
-            for _ in comparison.get("failures", [])
-        ],
+        "comparison": iso_value(comparison_rows),
+        "robustnessSummary": iso_value(build_robustness_summary(comparison_rows)),
+        "runs": run_payloads,
+        "failures": iso_value(comparison.get("failures", [])),
+        "effectiveConfig": iso_value(comparison.get("effective_config", {})),
+        "reproducibility": iso_value(reproducibility),
         "downloads": {
             "zip": f"/api/jobs/{job_id}/export.zip",
             "comparison": f"/api/jobs/{job_id}/comparison.csv",
+            "comparisonChart": f"/api/jobs/{job_id}/comparison.png",
         },
     }
 
@@ -214,7 +188,11 @@ def csv_bytes(rows: list[dict[str, Any]], excluded_fields: set[str] | None = Non
     return buffer.getvalue().encode("utf-8-sig")
 
 
-def csv_response(rows: list[dict[str, Any]], filename: str, excluded_fields: set[str] | None = None) -> Response:
+def csv_response(
+    rows: list[dict[str, Any]],
+    filename: str,
+    excluded_fields: set[str] | None = None,
+) -> Response:
     payload = csv_bytes(rows, excluded_fields=excluded_fields)
     return Response(
         content=payload,
@@ -228,9 +206,11 @@ def csv_response(rows: list[dict[str, Any]], filename: str, excluded_fields: set
 
 
 def require_run(job_id: str, symbol: str, backend: str) -> dict[str, Any]:
-    run = database()[RUNS_COLLECTION].find_one({"job_id": job_id, "symbol": symbol.upper(), "backend": backend.lower()})
+    run = database()[RUNS_COLLECTION].find_one(
+        {"job_id": job_id, "symbol": symbol.upper(), "backend": backend.lower()}
+    )
     if run is None:
-        raise HTTPException(status_code=404, detail="Result not found.")
+        raise HTTPException(status_code=404, detail="Strategy result not found.")
     return run
 
 
@@ -238,4 +218,8 @@ def figure_response(figure: Any, filename: str) -> Response:
     buffer = io.BytesIO()
     figure.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
     plt.close(figure)
-    return Response(content=buffer.getvalue(), media_type="image/png", headers={"Content-Disposition": f'inline; filename="{filename}"'})
+    return Response(
+        content=buffer.getvalue(),
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )

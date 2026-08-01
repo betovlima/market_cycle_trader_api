@@ -7,6 +7,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class PaperTradingSettings(BaseModel):
+    """Administrative paper-execution settings stored in MongoDB.
+
+    Strategy/model parameters are intentionally not repeated here. The paper
+    trader always consumes the locked XGBoost configuration from
+    ``backtest_settings`` so research and execution cannot drift silently.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
@@ -41,6 +48,13 @@ class PaperTradingSettings(BaseModel):
 
 
 class PaperTradingState(BaseModel):
+    """Persistent strategy sleeve state.
+
+    The Alpaca paper account can contain much more cash than the strategy. This
+    state isolates the strategy's own cash/position so it starts with the same
+    locked initial capital used by the backtest and reinvests only its own P&L.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     initial_capital: float = Field(gt=0)
@@ -85,6 +99,22 @@ class PaperTradePlan(BaseModel):
     current_asset: str
     target_asset: str
     action: Literal["hold", "buy", "sell_to_cash", "rotate", "stay_in_cash"]
+    random_state: int
+    ensemble_enabled: bool = False
+    ensemble_method: str | None = None
+    ensemble_seeds: list[int] = Field(default_factory=list)
+    ensemble_agreement: float | None = Field(default=None, ge=0, le=1)
     strategy_configuration_sha256: str
+    system_rules: dict
+    model_refresh_policy: str
+    effective_switch_margin: float
+    calibrated_candidate_margin: float
+    calibration_score: float
+    selected_utility: float
+    utilities: dict[str, float]
+    training_end: str
+    calibration_start: str
+    calibration_end: str
+    final_fit_end: str
     state_snapshot: dict
     created_at: str

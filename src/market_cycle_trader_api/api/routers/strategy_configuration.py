@@ -9,26 +9,26 @@ from ...core.runtime import database, refresh_locked_configuration_status
 from ...schemas.strategy_configuration import (
     StrategyConfigurationPatchRequest,
     StrategyConfigurationReplaceRequest,
+    StrategyConfigurationResetRequest,
     StrategyConfigurationRestoreRequest,
-    StrategyPolicyReplaceRequest,
 )
 from ...services.strategy_configuration import (
     StrategyConfigurationConflict,
     StrategyConfigurationError,
     StrategyConfigurationNotFound,
     get_strategy_configuration,
-    get_strategy_policy,
     list_strategy_configuration_history,
-    list_strategy_policy_history,
     patch_strategy_configuration,
     replace_strategy_configuration,
-    replace_strategy_policy,
+    reset_strategy_configuration,
     restore_strategy_configuration,
-    restore_strategy_policy,
 )
 from .parameter_bootstrap import require_parameter_bootstrap_token
 
-router = APIRouter(prefix="/api/admin", tags=["administration"])
+router = APIRouter(
+    prefix="/api/admin/strategy-configuration",
+    tags=["strategy configuration"],
+)
 
 
 def _translate_error(exc: Exception) -> HTTPException:
@@ -37,13 +37,22 @@ def _translate_error(exc: Exception) -> HTTPException:
     if isinstance(exc, StrategyConfigurationNotFound):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, ValidationError):
-        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors(include_url=False))
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(include_url=False),
+        )
     if isinstance(exc, StrategyConfigurationError):
-        return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
-    return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected configuration error.")
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Unexpected strategy configuration error.",
+    )
 
 
-@router.get("/strategy-configuration")
+@router.get("")
 def read_strategy_configuration(
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
 ) -> dict[str, Any]:
@@ -53,7 +62,7 @@ def read_strategy_configuration(
         raise _translate_error(exc) from exc
 
 
-@router.patch("/strategy-configuration")
+@router.patch("")
 def update_strategy_configuration(
     request: StrategyConfigurationPatchRequest,
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
@@ -63,7 +72,7 @@ def update_strategy_configuration(
             database(),
             request.changes,
             note=request.note,
-            source="administration-api",
+            source="strategy-configuration-api",
             expected_revision=request.expected_revision,
         )
         refresh_locked_configuration_status()
@@ -72,7 +81,7 @@ def update_strategy_configuration(
         raise _translate_error(exc) from exc
 
 
-@router.put("/strategy-configuration")
+@router.put("")
 def replace_active_strategy_configuration(
     request: StrategyConfigurationReplaceRequest,
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
@@ -82,7 +91,7 @@ def replace_active_strategy_configuration(
             database(),
             request.configuration,
             note=request.note,
-            source="administration-api",
+            source="strategy-configuration-api",
             expected_revision=request.expected_revision,
         )
         refresh_locked_configuration_status()
@@ -91,7 +100,25 @@ def replace_active_strategy_configuration(
         raise _translate_error(exc) from exc
 
 
-@router.get("/strategy-configuration/history")
+@router.post("/reset")
+def reset_active_strategy_configuration(
+    request: StrategyConfigurationResetRequest,
+    _: Annotated[None, Depends(require_parameter_bootstrap_token)],
+) -> dict[str, Any]:
+    try:
+        result = reset_strategy_configuration(
+            database(),
+            note=request.note,
+            source="strategy-configuration-api",
+            expected_revision=request.expected_revision,
+        )
+        refresh_locked_configuration_status()
+        return result
+    except (StrategyConfigurationError, ValidationError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.get("/history")
 def read_strategy_configuration_history(
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -100,7 +127,7 @@ def read_strategy_configuration_history(
     return {"count": len(items), "items": items}
 
 
-@router.post("/strategy-configuration/history/{history_id}/restore")
+@router.post("/history/{history_id}/restore")
 def restore_archived_strategy_configuration(
     history_id: str,
     request: StrategyConfigurationRestoreRequest,
@@ -111,65 +138,7 @@ def restore_archived_strategy_configuration(
             database(),
             history_id,
             note=request.note,
-            source="administration-api",
-            expected_revision=request.expected_revision,
-        )
-        refresh_locked_configuration_status()
-        return result
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
-
-
-@router.get("/strategy-policy")
-def read_strategy_policy(
-    _: Annotated[None, Depends(require_parameter_bootstrap_token)],
-) -> dict[str, Any]:
-    try:
-        return get_strategy_policy(database())
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
-
-
-@router.put("/strategy-policy")
-def replace_active_strategy_policy(
-    request: StrategyPolicyReplaceRequest,
-    _: Annotated[None, Depends(require_parameter_bootstrap_token)],
-) -> dict[str, Any]:
-    try:
-        result = replace_strategy_policy(
-            database(),
-            request.policy,
-            note=request.note,
-            source="administration-api",
-            expected_revision=request.expected_revision,
-        )
-        refresh_locked_configuration_status()
-        return result
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
-
-
-@router.get("/strategy-policy/history")
-def read_strategy_policy_history(
-    _: Annotated[None, Depends(require_parameter_bootstrap_token)],
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-) -> dict[str, Any]:
-    items = list_strategy_policy_history(database(), limit=limit)
-    return {"count": len(items), "items": items}
-
-
-@router.post("/strategy-policy/history/{history_id}/restore")
-def restore_archived_strategy_policy(
-    history_id: str,
-    request: StrategyConfigurationRestoreRequest,
-    _: Annotated[None, Depends(require_parameter_bootstrap_token)],
-) -> dict[str, Any]:
-    try:
-        result = restore_strategy_policy(
-            database(),
-            history_id,
-            note=request.note,
-            source="administration-api",
+            source="strategy-configuration-api",
             expected_revision=request.expected_revision,
         )
         refresh_locked_configuration_status()

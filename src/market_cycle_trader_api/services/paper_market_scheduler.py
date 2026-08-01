@@ -16,7 +16,6 @@ from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_PLANS_COLLECTION,
     get_paper_trading_settings,
     get_settings,
-    get_strategy_policy,
     bson_value,
     update_paper_trade_plan,
     utc_now,
@@ -26,6 +25,7 @@ from ..infrastructure.trading.alpaca_paper import (
     create_paper_trading_client,
 )
 from ..schemas.paper_trading import PaperTradingSettings
+from ..schemas.requests import BacktestRequest
 from .reproducibility import strategy_configuration_fingerprint
 from .paper_trading import (
     execute_prepared_paper_plan,
@@ -54,39 +54,12 @@ def _utc_stamp(value: Any) -> pd.Timestamp:
 def _public_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
     if document is None:
         return None
-    allowed = {
-        "run_id",
-        "status",
-        "phase",
-        "created_at",
-        "updated_at",
-        "requested_at",
-        "expected_market_open",
-        "execution_session",
-        "plan_id",
-        "action",
-        "target_asset",
-        "strategy_cash",
-        "managed_symbol",
-        "last_message",
-        "finished_at",
-        "execution_started_at",
-    }
-    payload = {
+    hidden = {"_id", "active_key", "worker_id", "lease_expires_at"}
+    return {
         key: bson_value(value)
         for key, value in document.items()
-        if key in allowed
+        if key not in hidden
     }
-    if "strategy_cash" in payload:
-        payload["available_cash"] = payload.pop("strategy_cash")
-    status = str(payload.get("status") or "")
-    if status in {"armed", "preparing", "prepared", "executing"}:
-        payload["last_message"] = "Paper execution is being processed."
-    elif status == "completed":
-        payload["last_message"] = "Paper execution completed."
-    elif status:
-        payload["last_message"] = "Paper execution requires attention."
-    return payload
 
 
 def _log_update(message: str) -> dict[str, Any]:
@@ -360,7 +333,7 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
         {
             "$set": {
                 "status": "preparing",
-                "phase": "preparing_plan",
+                "phase": "training_xgboost_and_preparing_plan",
                 "worker_id": worker_id,
                 "lease_expires_at": now + timedelta(hours=6),
                 "updated_at": now,
@@ -372,12 +345,8 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
 
 
 def _active_strategy_hash(db: Any) -> str:
-    return strategy_configuration_fingerprint(
-        {
-            "configuration": get_settings(db),
-            "policy": get_strategy_policy(db),
-        }
-    )
+    strategy = BacktestRequest.model_validate(get_settings(db))
+    return strategy_configuration_fingerprint(strategy)
 
 
 def _plan_matches_active_strategy(db: Any, plan: dict[str, Any] | None) -> bool:
@@ -403,7 +372,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             db,
             run_id,
             status="failed",
-            message="The expected market open arrived before a valid plan was prepared.",
+            message="The expected market open arrived before a valid XGBoost plan was prepared.",
         )
         return
 
@@ -434,7 +403,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     claimed = _claim_for_preparation(db, run_id, worker_id)
     if claimed is None:
         return
-    _append_log(db, run_id, "Preparing the next paper decision.")
+    _append_log(db, run_id, "Preparing the locked XGBoost decision for the next regular session.")
     try:
         existing = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
             {"execution_session": str(run["execution_session"])},
@@ -456,7 +425,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                         "cancelled_at": utc_now(),
                         "cancel_reason": (
                             "Replaced because the active strategy configuration or fixed "
-                            "runtime policy changed before execution."
+                            "system rules changed before execution."
                         ),
                     },
                 )
@@ -481,7 +450,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 {
                     "status": "cancelled",
                     "cancelled_at": utc_now(),
-                    "cancel_reason": "Cancellation requested while the plan was being prepared.",
+                    "cancel_reason": "Cancellation requested while the XGBoost plan was being prepared.",
                 },
             )
             _finish_run(
@@ -505,7 +474,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                     "decision_date": str(plan["decision_date"]),
                     "updated_at": now_utc,
                     "last_message": (
-                        f"Plan prepared: action={plan['action']}, target={plan['target_asset']}."
+                        f"XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
                     ),
                 },
                 "$unset": {
@@ -517,7 +486,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 "$push": {
                     "logs": {
                         "$each": [
-                            f"{now_utc.isoformat()} — Plan prepared: action={plan['action']}, target={plan['target_asset']}."
+                            f"{now_utc.isoformat()} — XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
                         ],
                         "$slice": -100,
                     }
@@ -599,7 +568,7 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 "status": "cancelled",
                 "cancelled_at": now_utc,
                 "cancel_reason": (
-                    "Active configuration changed after this plan was prepared."
+                    "Active strategy configuration changed after this plan was prepared."
                 ),
             },
         )
@@ -750,7 +719,7 @@ class PaperMarketScheduler:
         try:
             _recover_stale_runs(database())
         except Exception:
-            
+            # The loop will retry after MongoDB becomes available.
             pass
         self._thread = threading.Thread(
             target=self._run,
@@ -774,8 +743,8 @@ class PaperMarketScheduler:
                 _advance_one(db, self._worker_id)
                 delay_seconds = scheduler_poll_seconds(db)
             except Exception:
-                
-                
+                # Run-specific exceptions are persisted by the state machine. A
+                # global dependency failure is retried using the safe default delay.
                 delay_seconds = 10.0
             self._stop.wait(delay_seconds)
 

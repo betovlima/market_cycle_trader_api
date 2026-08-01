@@ -549,13 +549,13 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
+    """Build the validated champion folds independently of the public report window.
 
-
-
-
-
-
-
+    The public ``analysis_start_date`` chooses where the simulated account starts.
+    It must never move the train/calibration/purge boundaries, because doing so
+    creates a different model and makes an overlapping date range incomparable
+    with the validated champion run.
+    """
 
     purge = max(int(config.rotation_purge_days), int(config.rotation_horizon_days))
     calibration_days = int(config.rotation_walk_forward_calibration_days)
@@ -567,7 +567,7 @@ def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> li
     if first_test_start >= len(common_dates) - min_test_days:
         available_test_rows = max(0, len(common_dates) - first_test_start)
         raise ValueError(
-            'Not enough history for the configured walk-forward protocol: '
+            'Not enough history for the locked champion walk-forward protocol: '
             f'available_test_rows={available_test_rows}, minimum_test={min_test_days}, '
             f'rows={len(common_dates)}, minimum_train={min_train}, '
             f'calibration={calibration_days}, purge={purge}.'
@@ -603,18 +603,18 @@ def _analysis_decision_dates(
     folds: list[dict[str, Any]],
     config: Any,
 ) -> pd.DatetimeIndex:
+    """Return decision/execution dates for the requested public window.
 
-
-
-
-
-
+    Fold policies are trained on the fixed champion schedule. The requested
+    analysis start only selects the first execution session and resets the
+    simulated account to ``initial_capital`` in cash.
+    """
 
     if not folds:
         raise ValueError('No walk-forward fold is available for the analysis window.')
 
-    protocol_oos_start = int(folds[0]['test_start_index'])
-    protocol_oos_end = int(folds[-1]['test_end_index'])
+    champion_oos_start = int(folds[0]['test_start_index'])
+    champion_oos_end = int(folds[-1]['test_end_index'])
 
     requested_start = pd.Timestamp(getattr(config, 'analysis_start_date', config.start_date))
     requested_start = (
@@ -624,20 +624,20 @@ def _analysis_decision_dates(
     )
     requested_execution_start = int(common_dates.searchsorted(requested_start, side='left'))
 
-    if requested_execution_start >= protocol_oos_end:
+    if requested_execution_start >= champion_oos_end:
         raise ValueError(
-            'The requested analysis start is after the last available evaluation '
+            'The requested analysis start is after the last available champion '
             f'out-of-sample session: requested={requested_start.date()}, '
-            f'last={common_dates[protocol_oos_end - 1].date()}.'
+            f'last={common_dates[champion_oos_end - 1].date()}.'
         )
 
-    execution_start = max(protocol_oos_start, requested_execution_start)
-    if execution_start >= protocol_oos_end:
+    execution_start = max(champion_oos_start, requested_execution_start)
+    if execution_start >= champion_oos_end:
         raise ValueError('The requested analysis interval contains no executable session.')
 
-    
-    
-    return common_dates[execution_start - 1:protocol_oos_end]
+    # One session before execution_start is required to calculate the signal
+    # at the close and execute it at the next session open.
+    return common_dates[execution_start - 1:champion_oos_end]
 
 def _scheduled_policy(policies: dict[int, Callable[[pd.Timestamp, int, int], tuple[int, float]]], decision_to_fold: dict[pd.Timestamp, int]) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
 
@@ -732,6 +732,7 @@ def _majority_vote_policy(
     *,
     minimum_agreement: float,
 ) -> Callable:
+    """Combine seed policies without selecting the best seed after observing returns."""
 
     if not policies:
         raise ValueError('At least one seed policy is required for the ensemble.')
@@ -783,7 +784,12 @@ def run_rotation_models(
     progress_callback: Callable[[float, str, int], None] | None = None,
     trade_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[RotationRunResult]:
+    """Run seed studies and a production ensemble on the same walk-forward folds."""
 
+    if config.strategy_mode != 'COMPOUND_ROTATION_SWING_XGBOOST':
+        raise ValueError('This version supports only COMPOUND_ROTATION_SWING_XGBOOST.')
+    if list(config.rotation_models) != ['xgboost_utility']:
+        raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
 
     frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
     symbols = sorted(frames)
@@ -791,8 +797,7 @@ def run_rotation_models(
     xgb_plan = resolve_xgboost_compute_plan(config)
     repetitions = int(config.rotation_xgb_repetitions)
     seed_step = int(config.rotation_seed_step)
-    ensemble_enabled = repetitions > 1
-    ensemble_minimum_agreement = (repetitions // 2 + 1) / repetitions
+    ensemble_enabled = bool(config.rotation_seed_ensemble_enabled and repetitions > 1)
     if repetitions <= 0:
         raise ValueError('At least one XGBoost repetition is required.')
 
@@ -938,8 +943,8 @@ def run_rotation_models(
         result.backend = unique_backend
         result.metrics['backend'] = unique_backend
         result.metrics['model_family'] = 'xgboost_utility'
-        result.metrics['evaluation_schedule_locked'] = True
-        result.metrics['protocol_oos_start'] = folds[0]['test_start']
+        result.metrics['champion_fold_schedule_locked'] = True
+        result.metrics['champion_oos_start'] = folds[0]['test_start']
         result.metrics['requested_analysis_start'] = pd.Timestamp(all_decision_dates[1])
         result.metrics['requested_analysis_end'] = pd.Timestamp(all_decision_dates[-1])
         result.metrics['random_seed'] = seed
@@ -1002,7 +1007,7 @@ def run_rotation_models(
             fold_id = int(fold['fold_id'])
             ensemble_policies[fold_id] = _majority_vote_policy(
                 policies_by_fold[fold_id],
-                minimum_agreement=ensemble_minimum_agreement,
+                minimum_agreement=float(config.rotation_seed_ensemble_min_agreement),
             )
         ensemble_scheduled = _scheduled_policy(ensemble_policies, decision_to_fold)
         ensemble_label = 'XGBoost Seed Ensemble'
@@ -1023,13 +1028,16 @@ def run_rotation_models(
         ensemble_result.metrics['model_family'] = 'xgboost_utility'
         ensemble_result.metrics['strategy_label'] = ensemble_label
         ensemble_result.metrics['seed_ensemble'] = True
+        ensemble_result.metrics['ensemble_method'] = str(config.rotation_seed_ensemble_method)
         ensemble_result.metrics['ensemble_seeds'] = seed_values
-        ensemble_result.metrics['ensemble_min_agreement'] = float(ensemble_minimum_agreement)
+        ensemble_result.metrics['ensemble_min_agreement'] = float(
+            config.rotation_seed_ensemble_min_agreement
+        )
         ensemble_result.metrics['random_seed'] = None
         ensemble_result.metrics['repetition_index'] = repetitions + 1
         ensemble_result.metrics['repetition_count'] = repetitions
-        ensemble_result.metrics['evaluation_schedule_locked'] = True
-        ensemble_result.metrics['protocol_oos_start'] = folds[0]['test_start']
+        ensemble_result.metrics['champion_fold_schedule_locked'] = True
+        ensemble_result.metrics['champion_oos_start'] = folds[0]['test_start']
         ensemble_result.metrics['requested_analysis_start'] = pd.Timestamp(all_decision_dates[1])
         ensemble_result.metrics['requested_analysis_end'] = pd.Timestamp(all_decision_dates[-1])
         ensemble_result.metrics['walk_forward_fold_count'] = len(folds)
@@ -1048,9 +1056,10 @@ def run_rotation_models(
         ensemble_result.metrics['numeric_thread_limit'] = int(config.numeric_thread_limit)
         ensemble_result.metrics['xgb_n_jobs'] = int(config.xgb_n_jobs)
         ensemble_result.summary += '\n\nPRODUCTION SEED ENSEMBLE\n'
+        ensemble_result.summary += f'Method: {config.rotation_seed_ensemble_method}\n'
         ensemble_result.summary += f'Seeds: {", ".join(str(seed) for seed in seed_values)}\n'
         ensemble_result.summary += (
-            f'Minimum agreement: {ensemble_minimum_agreement:.0%}\n'
+            f'Minimum agreement: {float(config.rotation_seed_ensemble_min_agreement):.0%}\n'
         )
         ensemble_result.summary += (
             'The production decision combines seed policies instead of selecting the '

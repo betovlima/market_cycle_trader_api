@@ -10,21 +10,21 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from market_cycle_trader_api.core.environment import load_project_environment  
+from market_cycle_trader_api.core.environment import load_project_environment  # noqa: E402
 
 load_project_environment()
 
-from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (  
+from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (  # noqa: E402
     create_client,
     ensure_database,
     get_database,
 )
-from market_cycle_trader_api.services.paper_trading import execute_prepared_paper_plan  
+from market_cycle_trader_api.services.paper_trading import execute_prepared_paper_plan  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Execute a prepared Alpaca Paper plan."
+        description="Execute a prepared XGBoost plan against Alpaca paper trading only."
     )
     parser.add_argument("--plan-id", default=None)
     parser.add_argument("--execute", action="store_true")

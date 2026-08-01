@@ -146,7 +146,7 @@ def download_stock_bars(
         try:
             bars = client.get_stock_bars(request)
             return normalize_alpaca_frame(bars.df, symbol)
-        except Exception as exc:  
+        except Exception as exc:  # Alpaca SDK exposes several transport error types.
             last_error = exc
             if attempt < 2:
                 time.sleep(2**attempt)

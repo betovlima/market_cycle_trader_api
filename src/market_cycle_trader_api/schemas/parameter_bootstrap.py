@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class BootstrapParametersRequest(BaseModel):
-
+    """Explicit confirmation for automatic parameter bootstrap and schema repair."""
 
     model_config = ConfigDict(extra="forbid")
 

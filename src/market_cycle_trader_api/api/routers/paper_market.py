@@ -51,6 +51,13 @@ def start_next_session(
     _: StartNextSessionRequest,
     __: Annotated[None, Depends(require_paper_market_token)],
 ) -> dict[str, Any]:
+    """Arm one XGBoost/Alpaca paper run for the next regular equity session.
+
+    The endpoint never executes in the current session. It persists the request,
+    prepares the decision after a completed daily candle, and submits paper
+    orders only after the next regular open plus the configured safety delay.
+    """
+
     try:
         return arm_next_session(database())
     except RuntimeError as exc:

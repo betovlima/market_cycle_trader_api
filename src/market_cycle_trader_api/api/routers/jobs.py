@@ -8,17 +8,16 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
 
+from ...core.config import strategy_lifecycle
 from ...core.runtime import database
 from ...infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     bson_value,
     get_alpaca_credentials,
     get_settings,
-    get_strategy_policy,
     utc_now,
 )
 from ...schemas.requests import BacktestExecutionRequest, BacktestRequest, PublicBacktestRequest
-from ...schemas.strategy_policy import StrategyPolicy
 from ...services.jobs import public_job, require_job, run_job
 from ...services.results import build_results
 
@@ -27,37 +26,56 @@ router = APIRouter(tags=["jobs"])
 
 @router.post("/api/jobs", status_code=202)
 def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
+    """Queue a job using locked strategy settings and a public date range.
+
+    The browser may choose only ``start_date`` and ``end_date``. Every strategy,
+    model, execution, fee, and market-data setting remains controlled by MongoDB.
+    """
     db = database()
     if db[JOBS_COLLECTION].find_one({"status": {"$in": ["queued", "running"]}}, {"_id": 1}) is not None:
-        raise HTTPException(status_code=409, detail="Another analysis is already running.")
+        raise HTTPException(status_code=409, detail="Another backtest is already running.")
 
     try:
-        configuration = BacktestRequest.model_validate(get_settings(db))
-        policy = StrategyPolicy.model_validate(get_strategy_policy(db))
-        get_alpaca_credentials()
-    except (RuntimeError, ValidationError) as exc:
-        raise HTTPException(status_code=503, detail="The analysis service is not ready.") from exc
+        stored_settings = get_settings(db)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        locked_configuration = BacktestRequest.model_validate(stored_settings)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Stored strategy configuration is invalid: {exc}",
+        ) from exc
+
+    if locked_configuration.market_data_provider == "alpaca":
+        try:
+            get_alpaca_credentials()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
         request = BacktestExecutionRequest.model_validate(
             {
-                **configuration.model_dump(mode="python"),
-                "start_date": policy.training_start_date.isoformat(),
-                "end_date": policy.training_end_date.isoformat() if policy.training_end_date else None,
-                "market_data_provider": policy.market_data_provider,
-                "alpaca_historical_feed": policy.historical_feed,
-                "alpaca_live_feed": policy.live_feed,
+                **locked_configuration.model_dump(mode="python"),
                 "analysis_start_date": date_range.start_date.isoformat(),
-                "analysis_end_date": date_range.end_date.isoformat() if date_range.end_date else None,
+                "analysis_end_date": (
+                    date_range.end_date.isoformat() if date_range.end_date else None
+                ),
             }
         )
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail="The requested analysis window is invalid.") from exc
+        raise HTTPException(
+            status_code=422,
+            detail=f"Requested date range is invalid: {exc}",
+        ) from exc
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
-    payload = bson_value(request.model_dump(mode="python"))
-    repetitions = int(payload["rotation_xgb_repetitions"])
-    total_runs = repetitions + int(repetitions > 1)
+    request_payload = request.model_dump(mode="python")
+    payload = bson_value(request_payload)
+    lifecycle = strategy_lifecycle(payload["strategy_mode"])
+    total_runs = int(payload["rotation_xgb_repetitions"])
+    if bool(payload.get("rotation_seed_ensemble_enabled")) and total_runs > 1:
+        total_runs += 1
     job = {
         "id": job_id,
         "status": "queued",
@@ -68,6 +86,7 @@ def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
         "started_at": None,
         "finished_at": None,
         "completed_runs": 0,
+        "strategy_lifecycle": lifecycle,
         "total_runs": total_runs,
         "request": payload,
         "public_date_range": {
@@ -77,7 +96,7 @@ def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
         "configuration_locked": True,
         "live_trades": [],
         "live_trade_count": 0,
-        "logs": ["Analysis queued."],
+        "logs": ["Backtest queued."],
     }
     db[JOBS_COLLECTION].insert_one(job)
     threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
@@ -98,5 +117,5 @@ def get_job(job_id: str) -> dict[str, Any]:
 def get_results(job_id: str) -> dict[str, Any]:
     job = require_job(job_id)
     if job.get("status") != "completed":
-        raise HTTPException(status_code=409, detail="The analysis has not completed.")
+        raise HTTPException(status_code=409, detail="The backtest has not completed.")
     return build_results(job_id)

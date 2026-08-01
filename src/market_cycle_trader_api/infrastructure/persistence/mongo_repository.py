@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -14,8 +14,6 @@ MONGO_URI = str(os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "").strip()
 MONGO_DATABASE = str(os.getenv("MONGO_DATABASE") or "").strip()
 SETTINGS_COLLECTION = "backtest_settings"
 SETTINGS_HISTORY_COLLECTION = "backtest_settings_history"
-STRATEGY_POLICY_COLLECTION = "strategy_runtime_policy"
-STRATEGY_POLICY_HISTORY_COLLECTION = "strategy_runtime_policy_history"
 JOBS_COLLECTION = "backtest_jobs"
 RUNS_COLLECTION = "backtest_runs"
 PREDICTIONS_COLLECTION = "backtest_predictions"
@@ -33,7 +31,7 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
-SETTINGS_SCHEMA_VERSION = 17
+SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",
@@ -84,8 +82,6 @@ def bson_value(value: Any) -> Any:
         return stamp.to_pydatetime()
     if isinstance(value, datetime):
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-    if isinstance(value, date):
-        return value.isoformat()
     if isinstance(value, np.generic):
         return bson_value(value.item())
     if isinstance(value, float):
@@ -98,6 +94,8 @@ def bson_value(value: Any) -> Any:
 
 
 def ensure_database(db: Database) -> None:
+    """Create storage indexes without mutating the locked strategy document."""
+
     db[JOBS_COLLECTION].create_index(
         [("status", ASCENDING), ("created_at", DESCENDING)],
         name="ix_jobs_status_created",
@@ -130,10 +128,6 @@ def ensure_database(db: Database) -> None:
     db[SETTINGS_HISTORY_COLLECTION].create_index(
         [("captured_at", DESCENDING)],
         name="ix_settings_history_captured",
-    )
-    db[STRATEGY_POLICY_HISTORY_COLLECTION].create_index(
-        [("captured_at", DESCENDING)],
-        name="ix_strategy_policy_history_captured",
     )
     db[PAPER_TRADING_SETTINGS_HISTORY_COLLECTION].create_index(
         [("captured_at", DESCENDING)],
@@ -205,26 +199,20 @@ def get_alpaca_credentials() -> dict[str, str]:
 
 
 def get_settings(db: Database) -> dict[str, Any]:
+    """Return the complete locked document without applying code defaults."""
+
     document = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
     if document is None:
-        raise RuntimeError("The active configuration was not found in MongoDB.")
+        raise RuntimeError(
+            "Locked strategy configuration was not found in MongoDB. "
+            "Run scripts/apply_locked_config.py with a complete JSON configuration."
+        )
     return {
         key: bson_value(value)
         for key, value in document.items()
         if key not in SETTINGS_METADATA_FIELDS
     }
 
-
-
-def get_strategy_policy(db: Database) -> dict[str, Any]:
-    document = db[STRATEGY_POLICY_COLLECTION].find_one({"_id": "active"})
-    if document is None:
-        raise RuntimeError("Strategy runtime policy was not found in MongoDB.")
-    return {
-        key: bson_value(value)
-        for key, value in document.items()
-        if key not in SETTINGS_METADATA_FIELDS
-    }
 
 def dataframe_documents(frame: pd.DataFrame, *, job_id: str, symbol: str, backend: str) -> list[dict[str, Any]]:
     if frame.empty:

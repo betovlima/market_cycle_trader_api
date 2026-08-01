@@ -9,11 +9,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from market_cycle_trader_api.core.environment import load_project_environment  
+from market_cycle_trader_api.core.environment import load_project_environment  # noqa: E402
 
 load_project_environment()
 
-from market_cycle_trader_api.infrastructure.trading.alpaca_paper import (  
+from market_cycle_trader_api.infrastructure.trading.alpaca_paper import (  # noqa: E402
     account_snapshot,
     clock_snapshot,
     create_unverified_paper_trading_client,
