@@ -10,3 +10,4 @@ matplotlib
 yfinance
 alpaca-py==0.43.5
 xgboost>=3.0
+scikit-learn
