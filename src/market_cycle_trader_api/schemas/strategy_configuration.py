@@ -4,13 +4,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ..core.system_rules import IMMUTABLE_STRATEGY_FIELDS
 from .requests import BacktestRequest
+from .strategy_policy import StrategyPolicy
 
 
 class StrategyConfigurationPatchRequest(BaseModel):
-    """Apply a validated partial update to the active strategy configuration."""
-
     model_config = ConfigDict(extra="forbid")
 
     confirm_update: Literal[True]
@@ -22,19 +20,10 @@ class StrategyConfigurationPatchRequest(BaseModel):
     @classmethod
     def validate_changes(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not value:
-            raise ValueError("At least one strategy parameter must be supplied.")
-        immutable = sorted(set(value) & set(IMMUTABLE_STRATEGY_FIELDS))
-        if immutable:
-            raise ValueError(
-                "These values are fixed system rules and cannot be changed: "
-                + ", ".join(immutable)
-            )
-        allowed = set(BacktestRequest.model_fields)
-        unknown = sorted(set(value) - allowed)
+            raise ValueError("At least one parameter must be supplied.")
+        unknown = sorted(set(value) - set(BacktestRequest.model_fields))
         if unknown:
-            raise ValueError(
-                "Unknown or non-operational strategy fields: " + ", ".join(unknown)
-            )
+            raise ValueError("Unknown fields: " + ", ".join(unknown))
         return value
 
     @field_validator("note")
@@ -44,8 +33,6 @@ class StrategyConfigurationPatchRequest(BaseModel):
 
 
 class StrategyConfigurationReplaceRequest(BaseModel):
-    """Replace the complete active strategy configuration after validation."""
-
     model_config = ConfigDict(extra="forbid")
 
     confirm_replace: Literal[True]
@@ -59,17 +46,11 @@ class StrategyConfigurationReplaceRequest(BaseModel):
         return " ".join(str(value).split())
 
 
-class StrategyConfigurationResetRequest(BaseModel):
-    """Restore the bundled canonical configuration."""
-
+class StrategyConfigurationRestoreRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    confirm_reset: Literal[True]
-    note: str = Field(
-        default="Restore the bundled canonical strategy configuration.",
-        min_length=3,
-        max_length=500,
-    )
+    confirm_restore: Literal[True]
+    note: str = Field(min_length=3, max_length=500)
     expected_revision: int | None = Field(default=None, ge=1)
 
     @field_validator("note")
@@ -78,12 +59,11 @@ class StrategyConfigurationResetRequest(BaseModel):
         return " ".join(str(value).split())
 
 
-class StrategyConfigurationRestoreRequest(BaseModel):
-    """Restore a previously archived strategy configuration."""
-
+class StrategyPolicyReplaceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    confirm_restore: Literal[True]
+    confirm_replace: Literal[True]
+    policy: StrategyPolicy
     note: str = Field(min_length=3, max_length=500)
     expected_revision: int | None = Field(default=None, ge=1)
 

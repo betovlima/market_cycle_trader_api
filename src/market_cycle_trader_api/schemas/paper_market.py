@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class StartNextSessionRequest(BaseModel):
-    """Explicit confirmation required before arming paper-market automation."""
+
 
     model_config = ConfigDict(extra="forbid")
 
@@ -19,7 +19,7 @@ class StartNextSessionRequest(BaseModel):
 
 
 class CancelPaperMarketRequest(BaseModel):
-    """Explicit confirmation required before cancelling an armed run."""
+
 
     model_config = ConfigDict(extra="forbid")
 

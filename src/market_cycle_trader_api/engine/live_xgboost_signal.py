@@ -36,7 +36,6 @@ class LiveXGBoostDecision:
     compute_fallback_reason: str | None
     random_state: int
     ensemble_enabled: bool
-    ensemble_method: str | None
     ensemble_seeds: list[int]
     ensemble_agreement: float | None
 
@@ -48,18 +47,14 @@ def build_live_xgboost_decision(
     current_asset: str | None,
     holding_sessions: int,
 ) -> LiveXGBoostDecision:
-    """Retrain on every completed session and decide the next-open target.
 
-    The live plan uses the same fixed historical protocol and seed ensemble as
-    the backtest. Each paper plan is rebuilt after the latest regular-session
-    daily candle is complete, so newly available information is incorporated
-    without allowing future bars into the decision.
-    """
 
-    if config.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise ValueError("Paper execution supports only COMPOUND_ROTATION_SWING_XGBOOST.")
-    if list(config.rotation_models) != ["xgboost_utility"]:
-        raise ValueError("Paper execution requires rotation_models=['xgboost_utility'].")
+
+
+
+
+
+
     if config.timeframe != "1Day":
         raise ValueError("Paper execution requires 1Day market data.")
 
@@ -195,11 +190,12 @@ def build_live_xgboost_decision(
         calibration_scores.append(float(best_score))
         effective_margins.append(float(effective_margin))
 
-    ensemble_enabled = bool(config.rotation_seed_ensemble_enabled and len(policies) > 1)
+    ensemble_enabled = len(policies) > 1
+    ensemble_minimum_agreement = (len(policies) // 2 + 1) / len(policies)
     if ensemble_enabled:
         combined_policy = _majority_vote_policy(
             policies,
-            minimum_agreement=float(config.rotation_seed_ensemble_min_agreement),
+            minimum_agreement=ensemble_minimum_agreement,
         )
         target_position, selected_utility = combined_policy(
             decision_date,
@@ -243,11 +239,6 @@ def build_live_xgboost_decision(
         ),
         random_state=int(config.random_state),
         ensemble_enabled=ensemble_enabled,
-        ensemble_method=(
-            str(config.rotation_seed_ensemble_method)
-            if ensemble_enabled
-            else None
-        ),
         ensemble_seeds=[int(seed) for seed in seeds],
         ensemble_agreement=float(agreement),
     )

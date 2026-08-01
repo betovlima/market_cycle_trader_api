@@ -11,11 +11,6 @@ import numpy as np
 import pandas as pd
 
 from ..core.environment import load_project_environment
-from ..core.system_rules import system_rules_payload
-
-# The backtest engine runs in a separate Python process. Load the API .env in
-# this process as well instead of relying only on environment inheritance from
-# Uvicorn. Real system/Railway variables keep priority because override=False.
 load_project_environment()
 
 from ..infrastructure.persistence.mongo_repository import (
@@ -128,7 +123,6 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "repetition_index",
         "repetition_count",
         "seed_ensemble",
-        "ensemble_method",
         "ensemble_seeds",
         "ensemble_min_agreement",
         "strategy_mode",
@@ -316,34 +310,7 @@ def main() -> None:
         db = get_database(client)
         ensure_database(db)
         config = load_config(db, args.job_id)
-        print("Local simulation only. No broker order will be created.", flush=True)
-        print(f"Assets: {', '.join(config.assets)}", flush=True)
-        print(f"Strategy: {config.strategy_mode}", flush=True)
-        print(f"Models: {', '.join(config.rotation_models)}", flush=True)
-        print(
-            "XGBoost execution: "
-            f"base_seed={config.random_state}, "
-            f"seeds={list(config.ensemble_seeds)}, "
-            f"ensemble={config.rotation_seed_ensemble_enabled}, "
-            f"workers={config.xgb_n_jobs}, "
-            f"deterministic={config.deterministic_execution}",
-            flush=True,
-        )
-        print(
-            f"Training history: {config.start_date} → "
-            f"{config.effective_analysis_end_date or 'latest available session'}",
-            flush=True,
-        )
-        print(
-            f"Requested analysis window: {config.analysis_start_date} → "
-            f"{config.analysis_end_date or 'latest available session'}",
-            flush=True,
-        )
-        print(
-            "Champion walk-forward schedule locked; the public date range "
-            "changes only the simulated account window.",
-            flush=True,
-        )
+        print("Analysis execution started.", flush=True)
         comparisons, failures = run_job(args.job_id, config, db)
         comparisons.sort(key=lambda item: str(item.get("backend", "")))
         replace_comparison(
@@ -352,12 +319,7 @@ def main() -> None:
             comparison=comparisons,
             failures=failures,
             effective_config=bson_value(
-                {
-                    "system_rules": system_rules_payload(),
-                    "strategy_parameters": config.model_dump(mode="python"),
-                    "analysis_start_date": config.analysis_start_date,
-                    "analysis_end_date": config.analysis_end_date,
-                }
+                config.model_dump(mode="python")
             ),
         )
         if not comparisons:

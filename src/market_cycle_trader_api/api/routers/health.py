@@ -36,11 +36,11 @@ def _readiness_payload() -> tuple[bool, dict[str, Any]]:
 
 @router.get("/api/health/live")
 def liveness() -> dict[str, str]:
-    """Railway liveness probe.
 
-    This endpoint intentionally does not depend on MongoDB documents. A new
-    environment can therefore deploy before its first parameter bootstrap.
-    """
+
+
+
+
 
     return {
         "status": "ok",
@@ -50,14 +50,12 @@ def liveness() -> dict[str, str]:
 
 @router.get("/api/health/ready")
 def readiness() -> JSONResponse:
-    """Operational readiness probe for MongoDB, strategy settings, and engine."""
-
     ready, payload = _readiness_payload()
     return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 
 @router.get("/api/health")
 def health() -> JSONResponse:
-    """Backward-compatible alias for the operational readiness probe."""
+
 
     return readiness()

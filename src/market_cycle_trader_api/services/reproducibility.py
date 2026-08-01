@@ -9,8 +9,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..core.system_rules import system_rules_payload
-from ..schemas.requests import BacktestRequest
 
 
 def _package_version(package_name: str) -> str | None:
@@ -32,13 +30,11 @@ def _sha256_json(payload: Any) -> str:
 
 
 def locked_configuration_payload(config: Any) -> dict[str, Any]:
-    return {
-        "system_rules": system_rules_payload(),
-        "strategy_parameters": {
-            field_name: getattr(config, field_name)
-            for field_name in BacktestRequest.model_fields
-        },
-    }
+    if hasattr(config, "model_dump"):
+        return config.model_dump(mode="json")
+    if isinstance(config, dict):
+        return dict(config)
+    raise TypeError("Unsupported configuration payload.")
 
 
 def strategy_configuration_fingerprint(config: Any) -> str:

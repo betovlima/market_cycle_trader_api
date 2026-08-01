@@ -60,7 +60,7 @@ def _float_value(value: Any, default: float = 0.0) -> float:
 
 
 def create_unverified_paper_trading_client():
-    """Create a client permanently restricted to Alpaca paper trading."""
+
 
     TradingClient, *_ = _require_trading_sdk()
     credentials = get_alpaca_credentials()
@@ -72,7 +72,7 @@ def create_unverified_paper_trading_client():
 
 
 def create_paper_trading_client(db: Any):
-    """Create a paper-only client verified against the MongoDB account binding."""
+
 
     from ...schemas.paper_trading import PaperTradingSettings
     from ..persistence.mongo_repository import get_paper_trading_settings

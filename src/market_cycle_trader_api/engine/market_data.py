@@ -19,7 +19,7 @@ REQUIRED_BAR_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
 def effective_execution_end_date(config: Any) -> str | None:
-    """Return the runtime analysis end without changing the locked history start."""
+
 
     analysis_end = getattr(config, "analysis_end_date", None)
     if analysis_end:
@@ -267,7 +267,7 @@ def complete_market_history(
     initial_rows: int | None = None,
     history_backfill_rows: int = 0,
 ) -> pd.DataFrame:
-    """Validate that the Alpaca-only cache reaches the locked historical start."""
+
 
     effective_frame = filter_non_trading_rows(frame, config.timeframe)
     effective_frame = effective_frame[
@@ -303,12 +303,12 @@ def _download_alpaca_bars(
     start_date: str,
     end_date: str | None,
 ) -> pd.DataFrame:
-    """Download the requested range from Alpaca in bounded date chunks.
 
-    Chunking avoids relying on one large SDK request and makes the historical
-    bootstrap deterministic for long ranges while still using Alpaca as the
-    only market-data provider.
-    """
+
+
+
+
+
 
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)

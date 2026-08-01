@@ -5,8 +5,8 @@ from typing import AsyncIterator
 
 from .core.environment import load_project_environment
 
-# Load market_cycle_trader_api/.env before importing modules that read
-# environment variables at import time, such as the MongoDB repository.
+
+
 load_project_environment()
 
 from fastapi import FastAPI
