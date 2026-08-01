@@ -86,9 +86,9 @@ class ParameterBootstrapTests(unittest.TestCase):
         strategy = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
         paper = db[PAPER_TRADING_SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertEqual(strategy["random_state"], 3042)
-        self.assertTrue(strategy["deterministic_execution"])
+        self.assertFalse(strategy["deterministic_execution"])
         self.assertEqual(strategy["numeric_thread_limit"], 1)
-        self.assertEqual(strategy["xgb_n_jobs"], 1)
+        self.assertEqual(strategy["xgb_n_jobs"], -1)
         self.assertTrue(paper["enabled"])
 
     @patch(
@@ -115,19 +115,19 @@ class ParameterBootstrapTests(unittest.TestCase):
         "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
         return_value=None,
     )
-    def test_v9_strategy_document_receives_only_safe_deterministic_fields(
+    def test_v10_strategy_document_restores_promoted_execution_policy(
         self, _ensure_database
     ) -> None:
         db = _Database()
         bootstrap_missing_parameterizations(db, source="test")
 
         strategy = db[SETTINGS_COLLECTION].documents["default"]
-        strategy["schema_version"] = 9
+        strategy["schema_version"] = 10
         strategy["random_state"] = 42
         strategy["configuration_name"] = "manually-promoted-seed-42"
-        strategy["xgb_n_jobs"] = -1
-        strategy.pop("deterministic_execution", None)
-        strategy.pop("numeric_thread_limit", None)
+        strategy["xgb_n_jobs"] = 1
+        strategy["deterministic_execution"] = True
+        strategy["numeric_thread_limit"] = 1
 
         result = bootstrap_missing_parameterizations(db, source="test")
         self.assertEqual(result["summary"]["migrated_existing"], 1)
@@ -135,8 +135,8 @@ class ParameterBootstrapTests(unittest.TestCase):
         migrated = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertEqual(migrated["random_state"], 42)
         self.assertEqual(migrated["configuration_name"], "manually-promoted-seed-42")
-        self.assertEqual(migrated["xgb_n_jobs"], 1)
-        self.assertTrue(migrated["deterministic_execution"])
+        self.assertEqual(migrated["xgb_n_jobs"], -1)
+        self.assertFalse(migrated["deterministic_execution"])
         self.assertEqual(migrated["numeric_thread_limit"], 1)
 
     @patch(

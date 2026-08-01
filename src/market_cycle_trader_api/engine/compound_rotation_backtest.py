@@ -279,6 +279,13 @@ def main() -> None:
         print(f"Strategy: {config.strategy_mode}", flush=True)
         print(f"Models: {', '.join(config.rotation_models)}", flush=True)
         print(
+            "XGBoost execution: "
+            f"seed={config.random_state}, "
+            f"workers={config.xgb_n_jobs}, "
+            f"deterministic={config.deterministic_execution}",
+            flush=True,
+        )
+        print(
             f"Training history: {config.start_date} → "
             f"{config.effective_analysis_end_date or 'latest available session'}",
             flush=True,

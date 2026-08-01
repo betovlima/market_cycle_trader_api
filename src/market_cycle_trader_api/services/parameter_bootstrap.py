@@ -45,9 +45,9 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="xgboost-high-performance-cpu-seed-3042-deterministic-v1.12.10",
+        configuration_name="xgboost-high-performance-cpu-seed-3042-v1.12.11",
         configuration_note=(
-            "Bundled deterministic XGBoost-only CPU parameterization for the Alpaca paper-market runtime."
+            "Bundled high-performance XGBoost-only CPU parameterization restored to the promoted seed 3042 runtime."
         ),
     ),
     ParameterizationDefinition(
@@ -122,12 +122,14 @@ def _strategy_schema_migration(
     *,
     source: str,
 ) -> tuple[dict[str, Any], bool]:
-    """Apply the v10 deterministic runtime fields without replacing strategy choices.
+    """Restore the promoted high-performance execution policy in schema v11.
 
-    The migration is intentionally narrow: it preserves assets, seed, model
-    hyperparameters, dates, costs, and every promoted strategy value. It only
-    makes the execution policy explicit in MongoDB and moves XGBoost to one
-    worker so the same database document controls deterministic runs.
+    Version 1.12.10 changed the promoted document from ``xgb_n_jobs=-1``
+    to a single-worker deterministic mode. That was not the configuration
+    that produced the champion result. This migration is intentionally
+    narrow and automatic: it snapshots the existing document, restores only
+    the XGBoost execution-policy fields, and preserves assets, seed, model
+    hyperparameters, dates, costs, and all other strategy choices.
     """
 
     if definition.collection != SETTINGS_COLLECTION:
@@ -149,22 +151,25 @@ def _strategy_schema_migration(
     history.update(
         {
             "captured_at": now,
-            "note": "Automatic v1.12.10 deterministic execution schema migration.",
+            "note": "Automatic v1.12.11 restoration of the promoted high-performance XGBoost execution policy.",
             "source": source,
         }
     )
     db[SETTINGS_HISTORY_COLLECTION].insert_one(history)
 
     previous_note = str(existing.get("configuration_note") or "").strip()
-    migration_note = "Deterministic execution fields added by v1.12.10 schema migration."
+    migration_note = (
+        "Promoted seed 3042 execution policy restored automatically by v1.12.11 "
+        "after the v1.12.10 single-worker experiment reduced performance."
+    )
     configuration_note = (
         f"{previous_note} {migration_note}".strip()
         if previous_note
         else migration_note
     )
     updates = {
-        "xgb_n_jobs": 1,
-        "deterministic_execution": True,
+        "xgb_n_jobs": -1,
+        "deterministic_execution": False,
         "numeric_thread_limit": 1,
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "updated_at": now,
@@ -218,11 +223,11 @@ def bootstrap_missing_parameterizations(
     *,
     source: str,
 ) -> dict[str, Any]:
-    """Insert missing documents and apply only versioned safe schema migrations.
+    """Insert missing documents and apply versioned, idempotent migrations.
 
-    Existing promoted strategy values are preserved. The v10 migration adds
-    explicit deterministic execution controls in MongoDB and snapshots the
-    previous document before changing those fields.
+    Existing promoted strategy values are preserved. The v11 migration
+    automatically restores the promoted seed 3042 execution policy and
+    snapshots the previous document before changing the affected fields.
     """
 
     ensure_database(db)
@@ -250,7 +255,7 @@ def bootstrap_missing_parameterizations(
                     ),
                     "valid": valid,
                     "message": (
-                        "Existing strategy document was safely migrated to the deterministic v10 schema."
+                        "Existing strategy document was safely migrated to the v11 promoted high-performance execution policy."
                         if migrated and valid
                         else message
                     ),

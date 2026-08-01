@@ -7,7 +7,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import pandas as pd
 from fastapi import HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import (
@@ -192,11 +192,16 @@ def csv_response(
     rows: list[dict[str, Any]],
     filename: str,
     excluded_fields: set[str] | None = None,
-) -> StreamingResponse:
-    return StreamingResponse(
-        io.BytesIO(csv_bytes(rows, excluded_fields=excluded_fields)),
+) -> Response:
+    payload = csv_bytes(rows, excluded_fields=excluded_fields)
+    return Response(
+        content=payload,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+            "Cache-Control": "no-store",
+        },
     )
 
 

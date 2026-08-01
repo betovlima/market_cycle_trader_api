@@ -43,9 +43,9 @@ def test_manifest_is_stable_for_same_configuration_and_bars() -> None:
 
     assert first["strategy_configuration_sha256"] == second["strategy_configuration_sha256"]
     assert first["market_data_signature_sha256"] == second["market_data_signature_sha256"]
-    assert first["deterministic_execution"] is True
+    assert first["deterministic_execution"] is False
     assert first["numeric_thread_limit"] == 1
-    assert first["xgb_n_jobs"] == 1
+    assert first["xgb_n_jobs"] == -1
 
 
 def test_market_data_signature_changes_when_price_changes() -> None:
