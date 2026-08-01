@@ -28,6 +28,12 @@ class _DeleteResult:
         self.deleted_count = deleted_count
 
 
+class _UpdateResult:
+    def __init__(self, matched_count: int) -> None:
+        self.matched_count = matched_count
+        self.modified_count = matched_count
+
+
 class _Cursor(list):
     pass
 
@@ -67,6 +73,20 @@ class _Collection:
         self.documents.clear()
         return _DeleteResult(count)
 
+    def delete_one(self, query: dict):
+        document_id = query.get("_id")
+        existed = document_id in self.documents
+        self.documents.pop(document_id, None)
+        return _DeleteResult(1 if existed else 0)
+
+    def update_one(self, query: dict, update: dict):
+        document_id = query.get("_id")
+        document = self.documents.get(document_id)
+        if document is None:
+            return _UpdateResult(0)
+        document.update(copy.deepcopy(update.get("$set", {})))
+        return _UpdateResult(1)
+
 
 class _Database:
     def __init__(self) -> None:
@@ -87,13 +107,16 @@ class ParameterBootstrapTests(unittest.TestCase):
         "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
         return_value=None,
     )
-    def test_bootstrap_installs_one_canonical_strategy_and_is_idempotent(
+    def test_bootstrap_installs_documents_and_is_idempotent(
         self, _ensure_database
     ) -> None:
         db = _Database()
 
         first = bootstrap_missing_parameterizations(db, source="test")
-        self.assertEqual(first["mode"], "canonical_strategy_reset_and_insert_missing")
+        self.assertEqual(
+            first["mode"],
+            "insert_missing_repair_invalid_preserve_valid_api_configuration",
+        )
         self.assertEqual(first["summary"]["inserted"], 2)
 
         strategy = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
@@ -101,52 +124,68 @@ class ParameterBootstrapTests(unittest.TestCase):
         self.assertIsNotNone(strategy)
         self.assertIsNotNone(paper)
         self.assertEqual(strategy["random_state"], 3042)
-        self.assertEqual(strategy["schema_version"], 14)
+        self.assertEqual(strategy["schema_version"], 15)
+        self.assertEqual(strategy["revision"], 1)
         self.assertEqual(strategy["alpaca_historical_feed"], "sip")
         self.assertEqual(strategy["alpaca_live_feed"], "iex")
-        self.assertEqual(strategy["xgb_n_jobs"], -1)
-        self.assertFalse(strategy["deterministic_execution"])
         self.assertTrue(paper["enabled"])
 
         second = bootstrap_missing_parameterizations(db, source="test")
         self.assertEqual(second["summary"]["inserted"], 0)
-        self.assertEqual(second["summary"]["migrated_existing"], 0)
+        self.assertEqual(second["summary"]["repaired_invalid"], 0)
         self.assertEqual(second["summary"]["skipped_existing_valid"], 2)
-        self.assertEqual(len(db[SETTINGS_COLLECTION].documents), 1)
 
     @patch(
         "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
         return_value=None,
     )
-    def test_strategy_drift_and_extra_documents_are_archived_and_replaced(
-        self, _ensure_database
-    ) -> None:
+    def test_valid_api_changes_survive_future_deploys(self, _ensure_database) -> None:
         db = _Database()
         bootstrap_missing_parameterizations(db, source="test")
 
-        drifted = db[SETTINGS_COLLECTION].documents["default"]
-        drifted["random_state"] = 42
-        drifted["alpaca_historical_feed"] = "sip"
-        drifted["configuration_name"] = "manual-strategy"
+        strategy = db[SETTINGS_COLLECTION].documents["default"]
+        strategy["random_state"] = 42
+        strategy["rotation_xgb_n_estimators"] = 450
+        strategy["alpaca_historical_feed"] = "iex"
+        strategy["start_date"] = "2020-07-27"
+        strategy["revision"] = 7
+        strategy["configuration_name"] = "api-managed-xgboost-strategy"
+
+        result = bootstrap_missing_parameterizations(db, source="test")
+        self.assertEqual(result["summary"]["repaired_invalid"], 0)
+
+        preserved = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+        self.assertEqual(preserved["random_state"], 42)
+        self.assertEqual(preserved["rotation_xgb_n_estimators"], 450)
+        self.assertEqual(preserved["alpaca_historical_feed"], "iex")
+        self.assertEqual(preserved["start_date"], "2020-07-27")
+        self.assertEqual(preserved["revision"], 7)
+
+    @patch(
+        "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
+        return_value=None,
+    )
+    def test_invalid_strategy_is_archived_and_repaired(self, _ensure_database) -> None:
+        db = _Database()
+        bootstrap_missing_parameterizations(db, source="test")
+
+        db[SETTINGS_COLLECTION].documents["default"].pop("random_state")
         db[SETTINGS_COLLECTION].documents["old-strategy"] = {
             "_id": "old-strategy",
             "random_state": 7,
         }
 
         result = bootstrap_missing_parameterizations(db, source="test")
-        self.assertEqual(result["summary"]["migrated_existing"], 1)
+        self.assertEqual(result["summary"]["repaired_invalid"], 1)
         self.assertEqual(len(db[SETTINGS_COLLECTION].documents), 1)
 
-        canonical = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
-        self.assertEqual(canonical["random_state"], 3042)
-        self.assertEqual(canonical["alpaca_historical_feed"], "sip")
-        self.assertEqual(canonical["alpaca_live_feed"], "iex")
-        self.assertEqual(canonical["schema_version"], 14)
+        repaired = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+        self.assertEqual(repaired["random_state"], 3042)
+        self.assertEqual(repaired["schema_version"], 15)
+        self.assertGreaterEqual(repaired["revision"], 2)
 
         history = db[SETTINGS_HISTORY_COLLECTION].audit
         self.assertEqual(len(history), 2)
-        archived_ids = {item["original_document_id"] for item in history}
-        self.assertEqual(archived_ids, {"default", "old-strategy"})
 
     @patch(
         "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",

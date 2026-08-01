@@ -31,7 +31,7 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
-SETTINGS_SCHEMA_VERSION = 14
+SETTINGS_SCHEMA_VERSION = 15
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",
@@ -40,6 +40,7 @@ SETTINGS_METADATA_FIELDS = frozenset({
     "configuration_name",
     "configuration_note",
     "bootstrap_source",
+    "revision",
 })
 
 

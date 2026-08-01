@@ -1,30 +1,38 @@
-# Market Cycle Trader API v1.12.14
+# Market Cycle Trader API v1.12.15
 
 FastAPI backend for the XGBoost-only Compound Capital Rotation strategy.
 
 ## Market data
 
-The application uses the Alpaca API exclusively:
+The application uses the Alpaca API exclusively. The active MongoDB strategy document selects the historical and live feeds used by new backtests and paper plans.
 
-- `sip` for historical training, backtests, diagnostics, and daily signal preparation;
-- `iex` for recent/live market-data connectivity;
-- Alpaca Paper for order execution.
-
-The historical cache is stored in MongoDB collection `alpaca_market_bars`. Its unique key includes symbol, timeframe, feed, adjustment, and timestamp, so SIP and IEX records cannot be mixed.
+The historical cache is stored in MongoDB collection `alpaca_market_bars`. Its unique key includes symbol, timeframe, feed, adjustment, and timestamp, so records from different Alpaca feeds are not mixed.
 
 ## Automatic Railway deployment
 
-The Railway pre-deploy phase automatically:
+The Railway pre-deploy phase executes `scripts/bootstrap_parameters.py` automatically. It:
 
-1. validates the canonical strategy bundled with the release;
-2. archives every existing document from `backtest_settings`;
-3. clears that collection and inserts one canonical `_id="default"` document;
-4. preserves valid paper-trading settings or inserts them when missing;
-5. downloads missing historical bars from Alpaca SIP in bounded date ranges;
-6. validates that every configured asset reaches the locked historical start;
-7. starts the API only after the database and historical cache are ready.
+1. creates storage indexes;
+2. inserts the initial strategy when `backtest_settings/default` is missing;
+3. preserves every valid strategy configuration changed through the API;
+4. archives and repairs the strategy automatically only when the stored schema is invalid;
+5. removes extra strategy documents while preserving the valid `default` document;
+6. inserts missing paper-trading settings.
 
-No manual MongoDB migration is required.
+Historical data is loaded and refreshed on demand by the backtest and signal workflows. A long market-data download no longer blocks deployment.
+
+## Strategy configuration API
+
+All routes use the `X-Parameter-Bootstrap-Token` header.
+
+- `GET /api/admin/strategy-configuration`: read the active configuration and revision.
+- `PATCH /api/admin/strategy-configuration`: update selected parameters.
+- `PUT /api/admin/strategy-configuration`: replace the complete validated configuration.
+- `POST /api/admin/strategy-configuration/reset`: restore the bundled initial configuration.
+- `GET /api/admin/strategy-configuration/history`: list archived configurations.
+- `POST /api/admin/strategy-configuration/history/{history_id}/restore`: restore an archived configuration.
+
+Each update is validated with `BacktestRequest`, archived before replacement, assigned a new revision, and made available immediately to new backtests. Updates are rejected while a backtest is queued or running.
 
 ## Runtime modules
 
