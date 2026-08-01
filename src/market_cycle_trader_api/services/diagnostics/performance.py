@@ -8,6 +8,7 @@ from pymongo.database import Database
 from .common import (
     _classify_relative_episode,
     _diagnostic_trade_frame,
+    _future_market_prices,
     _market_close_series,
     _safe_float,
 )
@@ -306,8 +307,8 @@ def build_performance_diagnostics(
                 if not asset or sale_price is None or sale_price <= 0:
                     continue
 
-                prices = asset_series.get(asset, pd.Series(dtype=float))
-                future = prices.loc[prices.index > sold_at]
+                prices = asset_series.get(asset)
+                future = _future_market_prices(prices, sold_at)
                 if future.empty:
                     continue
 

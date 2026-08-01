@@ -71,6 +71,15 @@ def _classify_relative_episode(
     return "RELATIVE_UNDERPERFORMANCE"
 
 
+def _empty_market_series() -> pd.Series:
+    """Return an empty price series with the index type used by market data."""
+    return pd.Series(
+        data=[],
+        index=pd.DatetimeIndex([], tz="UTC"),
+        dtype=float,
+    )
+
+
 def _market_close_series(
     db: Database,
     symbol: str,
@@ -91,7 +100,7 @@ def _market_close_series(
         .sort("timestamp", 1)
     )
     if not rows:
-        return pd.Series(dtype=float)
+        return _empty_market_series()
 
     frame = pd.DataFrame(rows)
     frame["timestamp"] = pd.to_datetime(
@@ -100,12 +109,74 @@ def _market_close_series(
         errors="coerce",
     )
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp", "close"])
+    frame = frame.dropna(subset=["timestamp", "close"]).sort_values(
+        "timestamp"
+    )
     if frame.empty:
-        return pd.Series(dtype=float)
+        return _empty_market_series()
 
-    return pd.Series(
+    series = pd.Series(
         frame["close"].astype(float).to_numpy(),
         index=pd.DatetimeIndex(frame["timestamp"]),
         dtype=float,
-    ).sort_index()
+    )
+    series = series.loc[~series.index.duplicated(keep="last")]
+    return series.sort_index()
+
+
+def _future_market_prices(
+    prices: pd.Series | None,
+    sold_at: Any,
+) -> pd.Series:
+    """Return prices strictly after an exit timestamp without index errors.
+
+    Diagnostics may legitimately have no future bars for exits close to the
+    latest cached market session. In that case, or when a malformed series is
+    received, this helper returns a typed empty series instead of comparing a
+    RangeIndex with a pandas Timestamp.
+    """
+    if prices is None or prices.empty:
+        return _empty_market_series()
+
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        return _empty_market_series()
+
+    try:
+        exit_timestamp = pd.Timestamp(sold_at)
+    except (TypeError, ValueError):
+        return _empty_market_series()
+
+    if pd.isna(exit_timestamp):
+        return _empty_market_series()
+
+    if exit_timestamp.tzinfo is None:
+        exit_timestamp = exit_timestamp.tz_localize("UTC")
+    else:
+        exit_timestamp = exit_timestamp.tz_convert("UTC")
+
+    normalized_index = pd.to_datetime(
+        prices.index,
+        utc=True,
+        errors="coerce",
+    )
+    numeric_values = pd.to_numeric(prices.to_numpy(), errors="coerce")
+    normalized = pd.DataFrame(
+        {
+            "timestamp": normalized_index,
+            "close": numeric_values,
+        }
+    ).dropna(subset=["timestamp", "close"])
+
+    if normalized.empty:
+        return _empty_market_series()
+
+    normalized = normalized.sort_values("timestamp").drop_duplicates(
+        subset=["timestamp"],
+        keep="last",
+    )
+    series = pd.Series(
+        normalized["close"].astype(float).to_numpy(),
+        index=pd.DatetimeIndex(normalized["timestamp"]),
+        dtype=float,
+    )
+    return series.loc[series.index > exit_timestamp]
