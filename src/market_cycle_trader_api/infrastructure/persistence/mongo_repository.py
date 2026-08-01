@@ -10,9 +10,10 @@ import pandas as pd
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.database import Database
 
-MONGO_URI = os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "mongodb://127.0.0.1:27017"
-MONGO_DATABASE = os.getenv("MONGO_DATABASE", "extrema_backtest")
+MONGO_URI = str(os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "").strip()
+MONGO_DATABASE = str(os.getenv("MONGO_DATABASE") or "").strip()
 SETTINGS_COLLECTION = "backtest_settings"
+SETTINGS_HISTORY_COLLECTION = "backtest_settings_history"
 JOBS_COLLECTION = "backtest_jobs"
 RUNS_COLLECTION = "backtest_runs"
 PREDICTIONS_COLLECTION = "backtest_predictions"
@@ -23,87 +24,24 @@ MARKET_BARS_COLLECTION = "market_bars"
 ALPACA_MARKET_BARS_COLLECTION = "alpaca_market_bars"
 INTEGRATIONS_COLLECTION = "integrations"
 ALPACA_INTEGRATION_ID = "alpaca"
-SETTINGS_SCHEMA_VERSION = 7
-ACTIVE_STRATEGY_MODES = {
-    "COMPOUND_ROTATION_SWING_XGBOOST",
-    "COMPOUND_ROTATION_SWING_QRDQN",
-    "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE",
-}
-
-DEFAULT_SETTINGS: dict[str, Any] = {
-    "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY"],
-    "strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST",
-    "start_date": "2016-01-01",
-    "end_date": None,
-    "timeframe": "1Day",
-    "market_data_provider": "alpaca",
-    "alpaca_feed": "iex",
-    "alpaca_adjustment": "all",
-    "rotation_models": ["xgboost_utility"],
-    "rotation_horizon_days": 40,
-    "rotation_minimum_training_rows": 700,
-    "rotation_walk_forward_enabled": True,
-    "rotation_walk_forward_calibration_days": 126,
-    "rotation_walk_forward_test_days": 504,
-    "rotation_walk_forward_min_test_days": 126,
-    "rotation_purge_days": 60,
-    "rotation_downside_penalty": 0.20,
-    "rotation_drawdown_penalty": 0.35,
-    "rotation_min_holding_days": 2,
-    "rotation_min_expected_edge": 0.001,
-    "rotation_cash_threshold": 0.0,
-    "rotation_switch_margin": 0.005,
-    "rotation_switch_margin_candidates": [0.0, 0.0025, 0.005, 0.01],
-    "rotation_xgb_n_estimators": 300,
-    "rotation_xgb_learning_rate": 0.035,
-    "rotation_xgb_max_depth": 3,
-    "rotation_accelerator": "auto",
-    "rotation_allow_cpu_fallback": True,
-    "rotation_parallel_models": True,
-    "rotation_xgb_repetitions": 1,
-    "rotation_qrdqn_repetitions": 1,
-    "rotation_seed_step": 1000,
-    "qrdqn_training_steps": 15000,
-    "qrdqn_parallel_folds": 2,
-    "qrdqn_early_stopping_enabled": False,
-    "qrdqn_early_stopping_patience": 4,
-    "qrdqn_min_training_steps": 5000,
-    "qrdqn_episode_days": 252,
-    "qrdqn_replay_size": 30000,
-    "qrdqn_learning_starts": 750,
-    "qrdqn_batch_size": 128,
-    "qrdqn_learning_rate": 0.0003,
-    "qrdqn_gamma": 0.99,
-    "qrdqn_n_step": 10,
-    "qrdqn_n_quantiles": 25,
-    "qrdqn_hidden_dim": 128,
-    "qrdqn_target_update_steps": 250,
-    "qrdqn_eval_every_steps": 1000,
-    "qrdqn_epsilon_start": 1.0,
-    "qrdqn_epsilon_end": 0.05,
-    "initial_capital": 10000.0,
-    "whole_shares": False,
-    "slippage_bps": 0.0,
-    "commission_rate": 0.0,
-    "sec_fee_rate": 0.0000206,
-    "taf_fee_per_share": 0.000195,
-    "taf_fee_cap": 9.79,
-    "cat_fee_per_share": 0.000003,
-    "xgb_min_child_weight": 5.0,
-    "xgb_subsample": 0.85,
-    "xgb_colsample_bytree": 0.85,
-    "xgb_reg_alpha": 0.10,
-    "xgb_reg_lambda": 2.0,
-    "xgb_n_jobs": -1,
-    "yfinance_auto_adjust": True,
-    "yfinance_repair": False,
-    "yfinance_timeout": 30,
-    "yfinance_fallback_period": "max",
-    "mongo_cache_enabled": True,
-    "mongo_refresh_overlap_days": 7,
-    "mongo_write_batch_size": 1000,
-    "random_state": 42,
-}
+PAPER_TRADING_SETTINGS_COLLECTION = "paper_trading_settings"
+PAPER_TRADING_SETTINGS_HISTORY_COLLECTION = "paper_trading_settings_history"
+PAPER_TRADING_STATE_COLLECTION = "paper_trading_state"
+PAPER_TRADE_PLANS_COLLECTION = "paper_trade_plans"
+PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
+PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
+PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
+PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
+SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_METADATA_FIELDS = frozenset({
+    "_id",
+    "created_at",
+    "updated_at",
+    "schema_version",
+    "configuration_name",
+    "configuration_note",
+    "bootstrap_source",
+})
 
 
 def utc_now() -> datetime:
@@ -111,10 +49,21 @@ def utc_now() -> datetime:
 
 
 def create_client() -> MongoClient:
-    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000, connectTimeoutMS=2000, maxPoolSize=30, minPoolSize=1, retryWrites=True)
+    if not MONGO_URI:
+        raise RuntimeError("MONGO_URL is required in the server environment.")
+    return MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=2000,
+        connectTimeoutMS=2000,
+        maxPoolSize=30,
+        minPoolSize=1,
+        retryWrites=True,
+    )
 
 
 def get_database(client: MongoClient | None = None) -> Database:
+    if not MONGO_DATABASE:
+        raise RuntimeError("MONGO_DATABASE is required in the server environment.")
     active_client = client or create_client()
     active_client.admin.command("ping")
     return active_client[MONGO_DATABASE]
@@ -145,92 +94,124 @@ def bson_value(value: Any) -> Any:
 
 
 def ensure_database(db: Database) -> None:
-    settings = db[SETTINGS_COLLECTION]
-    existing = settings.find_one({"_id": "default"})
-    now = utc_now()
-    if existing is None:
-        settings.insert_one({"_id": "default", **DEFAULT_SETTINGS, "created_at": now, "updated_at": now, "schema_version": SETTINGS_SCHEMA_VERSION})
-    else:
-        set_values: dict[str, Any] = {"updated_at": now, "schema_version": SETTINGS_SCHEMA_VERSION}
-        if existing.get("strategy_mode") not in ACTIVE_STRATEGY_MODES:
-            set_values.update({
-                "strategy_mode": DEFAULT_SETTINGS["strategy_mode"],
-                "rotation_models": DEFAULT_SETTINGS["rotation_models"],
-                "rotation_horizon_days": DEFAULT_SETTINGS["rotation_horizon_days"],
-                "rotation_purge_days": DEFAULT_SETTINGS["rotation_purge_days"],
-            })
-        for key, value in DEFAULT_SETTINGS.items():
-            if key not in existing:
-                set_values[key] = value
-        keep = set(DEFAULT_SETTINGS) | {"_id", "created_at", "updated_at", "schema_version"}
-        unset_values = {key: "" for key in existing if key not in keep}
-        update: dict[str, Any] = {"$set": set_values}
-        if unset_values:
-            update["$unset"] = unset_values
-        settings.update_one({"_id": "default"}, update)
+    """Create storage indexes without mutating the locked strategy document."""
 
-    db[JOBS_COLLECTION].create_index([("status", ASCENDING), ("created_at", DESCENDING)], name="ix_jobs_status_created")
-    db[RUNS_COLLECTION].create_index([("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING)], unique=True, name="uq_backtest_run")
-    db[PREDICTIONS_COLLECTION].create_index([("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING), ("timestamp", ASCENDING)], unique=True, name="uq_backtest_prediction")
-    db[TRADES_COLLECTION].create_index([("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING), ("timestamp", ASCENDING), ("sequence", ASCENDING)], unique=True, name="uq_backtest_trade")
-    db[COMPARISONS_COLLECTION].create_index([("job_id", ASCENDING)], unique=True, name="uq_backtest_comparison")
-    db[FAILURES_COLLECTION].create_index([("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING)], unique=True, name="uq_backtest_failure")
+    db[JOBS_COLLECTION].create_index(
+        [("status", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_jobs_status_created",
+    )
+    db[RUNS_COLLECTION].create_index(
+        [("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING)],
+        unique=True,
+        name="uq_backtest_run",
+    )
+    db[PREDICTIONS_COLLECTION].create_index(
+        [("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING), ("timestamp", ASCENDING)],
+        unique=True,
+        name="uq_backtest_prediction",
+    )
+    db[TRADES_COLLECTION].create_index(
+        [("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING), ("timestamp", ASCENDING), ("sequence", ASCENDING)],
+        unique=True,
+        name="uq_backtest_trade",
+    )
+    db[COMPARISONS_COLLECTION].create_index(
+        [("job_id", ASCENDING)],
+        unique=True,
+        name="uq_backtest_comparison",
+    )
+    db[FAILURES_COLLECTION].create_index(
+        [("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING)],
+        unique=True,
+        name="uq_backtest_failure",
+    )
+    db[SETTINGS_HISTORY_COLLECTION].create_index(
+        [("captured_at", DESCENDING)],
+        name="ix_settings_history_captured",
+    )
+    db[PAPER_TRADING_SETTINGS_HISTORY_COLLECTION].create_index(
+        [("captured_at", DESCENDING)],
+        name="ix_paper_settings_history_captured",
+    )
+    db[PAPER_TRADE_PLANS_COLLECTION].create_index(
+        [("decision_date", DESCENDING)],
+        unique=True,
+        name="uq_paper_plan_decision_date",
+    )
+    db[PAPER_TRADE_PLANS_COLLECTION].create_index(
+        [("status", ASCENDING), ("expected_market_open", ASCENDING)],
+        name="ix_paper_plan_status_open",
+    )
+    db[PAPER_TRADE_ORDERS_COLLECTION].create_index(
+        [("client_order_id", ASCENDING)],
+        unique=True,
+        name="uq_paper_client_order_id",
+    )
+    db[PAPER_TRADE_ORDERS_COLLECTION].create_index(
+        [("plan_id", ASCENDING), ("created_at", ASCENDING)],
+        name="ix_paper_orders_plan_created",
+    )
+    db[PAPER_MARKET_RUNS_COLLECTION].create_index(
+        [("active_key", ASCENDING)],
+        unique=True,
+        sparse=True,
+        name="uq_paper_market_active_key",
+    )
+    db[PAPER_MARKET_RUNS_COLLECTION].create_index(
+        [("created_at", DESCENDING)],
+        name="ix_paper_market_created",
+    )
+    db[PAPER_MARKET_RUNS_COLLECTION].create_index(
+        [("status", ASCENDING), ("expected_market_open", ASCENDING)],
+        name="ix_paper_market_status_open",
+    )
+    db[PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION].create_index(
+        [("recorded_at", DESCENDING)],
+        name="ix_paper_portfolio_recorded",
+    )
+    db[PARAMETER_BOOTSTRAP_RUNS_COLLECTION].create_index(
+        [("finished_at", DESCENDING)],
+        name="ix_parameter_bootstrap_finished",
+    )
 
 
-def mask_api_key(value: str | None) -> str | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if len(text) <= 8:
-        return "*" * len(text)
-    return f"{text[:4]}{'*' * max(4, len(text) - 8)}{text[-4:]}"
 
+def _environment_value(*names: str) -> str:
+    for name in names:
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
 
-def get_alpaca_integration_status(db: Database) -> dict[str, Any]:
-    ensure_database(db)
-    document = db[INTEGRATIONS_COLLECTION].find_one({"_id": ALPACA_INTEGRATION_ID}, {"secret_key": 0}) or {}
-    api_key_id = str(document.get("api_key_id") or "").strip()
-    return {"configured": bool(api_key_id), "api_key_id_masked": mask_api_key(api_key_id), "updated_at": bson_value(document.get("updated_at"))}
-
-
-def get_alpaca_credentials(db: Database) -> dict[str, str]:
-    ensure_database(db)
-    document = db[INTEGRATIONS_COLLECTION].find_one({"_id": ALPACA_INTEGRATION_ID}) or {}
-    api_key_id = str(document.get("api_key_id") or "").strip()
-    secret_key = str(document.get("secret_key") or "").strip()
+def get_alpaca_credentials() -> dict[str, str]:
+    api_key_id = _environment_value("ALPACA_API_KEY_ID", "APCA_API_KEY_ID")
+    secret_key = _environment_value(
+        "ALPACA_SECRET_KEY",
+        "ALPACA_API_SECRET_KEY",
+        "APCA_API_SECRET_KEY",
+    )
     if not api_key_id or not secret_key:
-        raise RuntimeError("Alpaca API credentials are not configured.")
+        raise RuntimeError(
+            "Alpaca API credentials are not configured in the server environment. "
+            "Set ALPACA_API_KEY_ID and ALPACA_SECRET_KEY."
+        )
     return {"api_key_id": api_key_id, "secret_key": secret_key}
 
 
-def save_alpaca_credentials(db: Database, *, api_key_id: str, secret_key: str) -> dict[str, Any]:
-    ensure_database(db)
-    api_key_id = str(api_key_id or "").strip()
-    secret_key = str(secret_key or "").strip()
-    if not api_key_id or not secret_key:
-        raise ValueError("Both Alpaca API Key ID and Secret Key are required.")
-    now = utc_now()
-    db[INTEGRATIONS_COLLECTION].update_one({"_id": ALPACA_INTEGRATION_ID}, {"$set": {"api_key_id": api_key_id, "secret_key": secret_key, "updated_at": now}, "$setOnInsert": {"created_at": now}}, upsert=True)
-    return get_alpaca_integration_status(db)
-
-
-def delete_alpaca_credentials(db: Database) -> None:
-    ensure_database(db)
-    db[INTEGRATIONS_COLLECTION].delete_one({"_id": ALPACA_INTEGRATION_ID})
-
-
 def get_settings(db: Database) -> dict[str, Any]:
-    ensure_database(db)
-    document = db[SETTINGS_COLLECTION].find_one({"_id": "default"}) or {}
-    stored = {key: bson_value(value) for key, value in document.items() if key in DEFAULT_SETTINGS}
-    return {**DEFAULT_SETTINGS, **stored}
+    """Return the complete locked document without applying code defaults."""
 
-
-def update_settings(db: Database, changes: dict[str, Any]) -> dict[str, Any]:
-    cleaned = {key: bson_value(value) for key, value in changes.items() if key in DEFAULT_SETTINGS}
-    if cleaned:
-        db[SETTINGS_COLLECTION].update_one({"_id": "default"}, {"$set": {**cleaned, "updated_at": utc_now()}}, upsert=True)
-    return get_settings(db)
+    document = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+    if document is None:
+        raise RuntimeError(
+            "Locked strategy configuration was not found in MongoDB. "
+            "Run scripts/apply_locked_config.py with a complete JSON configuration."
+        )
+    return {
+        key: bson_value(value)
+        for key, value in document.items()
+        if key not in SETTINGS_METADATA_FIELDS
+    }
 
 
 def dataframe_documents(frame: pd.DataFrame, *, job_id: str, symbol: str, backend: str) -> list[dict[str, Any]]:
@@ -260,7 +241,7 @@ def trade_documents(frame: pd.DataFrame, *, job_id: str, symbol: str, backend: s
     return documents
 
 
-def insert_in_batches(collection: Any, documents: list[dict[str, Any]], *, batch_size: int = 1000) -> int:
+def insert_in_batches(collection: Any, documents: list[dict[str, Any]], *, batch_size: int) -> int:
     inserted = 0
     size = max(1, int(batch_size))
     for start in range(0, len(documents), size):
@@ -269,7 +250,7 @@ def insert_in_batches(collection: Any, documents: list[dict[str, Any]], *, batch
     return inserted
 
 
-def replace_run_result(db: Database, *, job_id: str, symbol: str, backend: str, metrics: dict[str, Any], summary: str, predictions: pd.DataFrame, trades: pd.DataFrame, batch_size: int = 1000) -> None:
+def replace_run_result(db: Database, *, job_id: str, symbol: str, backend: str, metrics: dict[str, Any], summary: str, predictions: pd.DataFrame, trades: pd.DataFrame, batch_size: int) -> None:
     run_filter = {"job_id": job_id, "symbol": symbol, "backend": backend}
     db[PREDICTIONS_COLLECTION].delete_many(run_filter)
     db[TRADES_COLLECTION].delete_many(run_filter)
@@ -289,3 +270,82 @@ def replace_comparison(db: Database, *, job_id: str, comparison: list[dict[str, 
         db[FAILURES_COLLECTION].insert_many([{"job_id": job_id, "symbol": str(item.get("symbol", "")).upper(), "backend": str(item.get("backend", "")).lower(), "error": str(item.get("error", "")), "created_at": now} for item in failures], ordered=False)
 
 
+
+
+def get_paper_trading_settings(db: Database) -> dict[str, Any]:
+    document = db[PAPER_TRADING_SETTINGS_COLLECTION].find_one({"_id": "default"})
+    if document is None:
+        raise RuntimeError(
+            "Paper-trading settings were not found in MongoDB. "
+            "Call POST /api/admin/setup/initialize first."
+        )
+    return {
+        key: bson_value(value)
+        for key, value in document.items()
+        if key not in {"_id", "created_at", "updated_at", "schema_version", "configuration_name", "configuration_note", "bootstrap_source"}
+    }
+
+
+def get_paper_trading_state(db: Database) -> dict[str, Any]:
+    document = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"})
+    if document is None:
+        raise RuntimeError(
+            "Paper-trading state is not initialized. "
+            "Call POST /api/admin/setup/initialize first."
+        )
+    return {
+        key: bson_value(value)
+        for key, value in document.items()
+        if key not in {"_id", "created_at", "updated_at", "schema_version", "configuration_name", "configuration_note", "bootstrap_source"}
+    }
+
+
+def replace_paper_trading_state(db: Database, state: dict[str, Any]) -> None:
+    now = utc_now()
+    db[PAPER_TRADING_STATE_COLLECTION].replace_one(
+        {"_id": "default"},
+        {
+            "_id": "default",
+            **bson_value(state),
+            "schema_version": 1,
+            "updated_at": now,
+            "created_at": (
+                db[PAPER_TRADING_STATE_COLLECTION].find_one(
+                    {"_id": "default"}, {"created_at": 1}
+                ) or {}
+            ).get("created_at", now),
+        },
+        upsert=True,
+    )
+
+
+def insert_paper_trade_plan(db: Database, plan: dict[str, Any], *, replace: bool = False) -> None:
+    document = {**bson_value(plan), "updated_at": utc_now()}
+    if replace:
+        db[PAPER_TRADE_PLANS_COLLECTION].replace_one(
+            {"decision_date": document["decision_date"]},
+            document,
+            upsert=True,
+        )
+        return
+    db[PAPER_TRADE_PLANS_COLLECTION].insert_one(document)
+
+
+def update_paper_trade_plan(db: Database, plan_id: str, changes: dict[str, Any]) -> None:
+    db[PAPER_TRADE_PLANS_COLLECTION].update_one(
+        {"plan_id": plan_id},
+        {"$set": {**bson_value(changes), "updated_at": utc_now()}},
+    )
+
+
+def insert_paper_trade_order(db: Database, order: dict[str, Any]) -> None:
+    db[PAPER_TRADE_ORDERS_COLLECTION].insert_one(
+        {**bson_value(order), "created_at": utc_now(), "updated_at": utc_now()}
+    )
+
+
+def update_paper_trade_order(db: Database, client_order_id: str, changes: dict[str, Any]) -> None:
+    db[PAPER_TRADE_ORDERS_COLLECTION].update_one(
+        {"client_order_id": client_order_id},
+        {"$set": {**bson_value(changes), "updated_at": utc_now()}},
+    )

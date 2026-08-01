@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+python-dotenv>=1.0,<2
 pymongo
 numpy
 pandas
@@ -9,4 +10,3 @@ matplotlib
 yfinance
 alpaca-py==0.43.5
 xgboost>=3.0
-torch>=2.10

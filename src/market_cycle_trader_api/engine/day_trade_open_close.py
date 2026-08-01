@@ -186,11 +186,11 @@ def _regular_session_quality(
 
 
 def _training_round_trip_cost_rate(open_price: pd.Series, config: Any) -> pd.Series:
-    slip = 2.0 * max(0.0, float(getattr(config, "slippage_bps", 0.0))) / 10_000.0
-    commission = 2.0 * max(0.0, float(getattr(config, "commission_rate", 0.0)))
-    sec = max(0.0, float(getattr(config, "sec_fee_rate", 0.0)))
-    taf_per_share = max(0.0, float(getattr(config, "taf_fee_per_share", 0.0)))
-    cat_per_share = max(0.0, float(getattr(config, "cat_fee_per_share", 0.0)))
+    slip = 2.0 * max(0.0, float(config.slippage_bps)) / 10_000.0
+    commission = 2.0 * max(0.0, float(config.commission_rate))
+    sec = max(0.0, float(config.sec_fee_rate))
+    taf_per_share = max(0.0, float(config.taf_fee_per_share))
+    cat_per_share = max(0.0, float(config.cat_fee_per_share))
     share_based = (taf_per_share + 2.0 * cat_per_share) / open_price.clip(lower=1e-9)
     return (slip + commission + sec + share_based).clip(lower=0.0, upper=0.25)
 
@@ -402,12 +402,30 @@ def _build_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, 
     min_test = int(config.rotation_walk_forward_min_test_days)
     min_train = int(config.rotation_minimum_training_rows)
 
-    first_test = min_train + purge + calibration + purge
-    if first_test >= len(common_dates) - min_test:
+    minimum_first_test = min_train + purge + calibration + purge
+    requested_start = pd.Timestamp(
+        getattr(config, "analysis_start_date", config.start_date)
+    )
+    requested_start = (
+        requested_start.tz_localize("UTC")
+        if requested_start.tzinfo is None
+        else requested_start.tz_convert("UTC")
+    )
+    requested_test_start = int(common_dates.searchsorted(requested_start, side="left"))
+    first_test = max(minimum_first_test, requested_test_start)
+
+    if requested_test_start >= len(common_dates):
         raise ValueError(
-            "Not enough Open-Close sessions for expanding walk-forward: "
-            f"sessions={len(common_dates)}, minimum_train={min_train}, "
-            f"calibration={calibration}, purge={purge}, minimum_test={min_test}."
+            "The requested analysis start is after the last available common session: "
+            f"requested={requested_start.date()}, last={common_dates[-1].date()}."
+        )
+    if first_test >= len(common_dates) - min_test:
+        available_test_rows = max(0, len(common_dates) - first_test)
+        raise ValueError(
+            "Not enough Open-Close out-of-sample sessions for the requested analysis window: "
+            f"available_test_rows={available_test_rows}, minimum_test={min_test}, "
+            f"requested_start={requested_start.date()}, sessions={len(common_dates)}, "
+            f"minimum_train={min_train}, calibration={calibration}, purge={purge}."
         )
 
     folds: list[dict[str, Any]] = []
@@ -498,8 +516,8 @@ def _utility_matrix(
 
 
 def _resolve_qrdqn_plan(config: Any) -> ComputePlan:
-    requested = str(getattr(config, "rotation_accelerator", "auto")).lower()
-    allow_fallback = bool(getattr(config, "rotation_allow_cpu_fallback", True))
+    requested = str(config.rotation_accelerator).lower()
+    allow_fallback = bool(config.rotation_allow_cpu_fallback)
     version = None
     cuda_available = False
     gpu_name = None
@@ -528,8 +546,8 @@ def _resolve_qrdqn_plan(config: Any) -> ComputePlan:
 
 
 def _resolve_xgb_plan(config: Any) -> ComputePlan:
-    requested = str(getattr(config, "rotation_accelerator", "auto")).lower()
-    allow_fallback = bool(getattr(config, "rotation_allow_cpu_fallback", True))
+    requested = str(config.rotation_accelerator).lower()
+    allow_fallback = bool(config.rotation_allow_cpu_fallback)
     version = None
     cuda_available = False
     gpu_name = None
@@ -773,7 +791,7 @@ def _fit_xgb_models(
     except ImportError as exc:
         raise RuntimeError("XGBoost Utility requires xgboost.") from exc
 
-    allow_fallback = bool(getattr(config, "rotation_allow_cpu_fallback", True))
+    allow_fallback = bool(config.rotation_allow_cpu_fallback)
 
     def fit(effective: str) -> dict[str, Any]:
         models: dict[str, Any] = {}
@@ -1227,7 +1245,7 @@ def _simulate(
             "",
             f"Model: {metrics['strategy_label']}",
             f"Assets: {', '.join(symbols)}",
-            f"Market-data source: {str(getattr(config, 'market_data_provider', 'alpaca')).upper()} 15-minute bars aggregated into one session decision row",
+            f"Market-data source: {str(config.market_data_provider).upper()} 15-minute bars aggregated into one session decision row",
             "Decision timing: once per session before the regular-session open",
             "Execution rule: at most one BUY at the regular-session open and one SELL at the same-session close",
             "Intraday rotations: prohibited",

@@ -10,7 +10,16 @@ import pandas as pd
 from ..infrastructure.market_data.alpaca import download_stock_bars
 from ..infrastructure.persistence.mongo_repository import ALPACA_MARKET_BARS_COLLECTION, MARKET_BARS_COLLECTION, create_client, get_alpaca_credentials, get_database
 
-MINIMUM_BARS_BY_TIMEFRAME = {"1Day": 800, "15Min": 800}
+
+
+def effective_execution_end_date(config: Any) -> str | None:
+    """Return the runtime analysis end without changing the locked history start."""
+
+    analysis_end = getattr(config, "analysis_end_date", None)
+    if analysis_end:
+        return str(analysis_end)
+    locked_end = getattr(config, "end_date", None)
+    return str(locked_end) if locked_end else None
 
 
 def normalize_end_date(value: str | None) -> str | None:
@@ -83,7 +92,7 @@ def download_yfinance_bars(symbol: str, config: Any, start_date: str | None = No
         raise RuntimeError("yfinance is not installed.") from exc
     interval = "1d" if config.timeframe == "1Day" else "15m"
     requested_start = start_date or config.start_date
-    requested_end = end_date if end_date is not None else config.end_date
+    requested_end = end_date if end_date is not None else effective_execution_end_date(config)
     normalized_end = normalize_end_date(requested_end)
     download_end = None
     if normalized_end:
@@ -188,7 +197,8 @@ def _read_frame(collection: Any, identity: dict[str, Any], start: pd.Timestamp, 
 
 def load_yfinance_bars(symbol: str, config: Any) -> pd.DataFrame:
     start = pd.Timestamp(config.start_date, tz="UTC")
-    normalized_end = normalize_end_date(config.end_date)
+    execution_end = effective_execution_end_date(config)
+    normalized_end = normalize_end_date(execution_end)
     end = pd.Timestamp(normalized_end, tz="UTC") if normalized_end else None
     if not config.mongo_cache_enabled:
         return download_yfinance_bars(symbol, config)
@@ -213,7 +223,7 @@ def load_yfinance_bars(symbol: str, config: Any) -> pd.DataFrame:
                 _upsert_frame(collection, historical, identity, config.mongo_write_batch_size)
             refresh = max(start, last_ts - pd.Timedelta(int(config.mongo_refresh_overlap_days), unit="D"))
             if end is None or refresh < end:
-                recent = download_yfinance_bars(symbol, config, refresh.strftime("%Y-%m-%d"), config.end_date)
+                recent = download_yfinance_bars(symbol, config, refresh.strftime("%Y-%m-%d"), execution_end)
                 _upsert_frame(collection, recent, identity, config.mongo_write_batch_size)
         cached = _read_frame(collection, identity, start, end)
         if cached.empty:
@@ -227,21 +237,18 @@ def load_yfinance_bars(symbol: str, config: Any) -> pd.DataFrame:
 
 
 def _download_alpaca_bars(symbol: str, config: Any, start_date: str, end_date: str | None) -> pd.DataFrame:
-    client = create_client()
-    try:
-        credentials = get_alpaca_credentials(get_database(client))
-    finally:
-        client.close()
+    credentials = get_alpaca_credentials()
     frame = download_stock_bars(api_key_id=credentials["api_key_id"], secret_key=credentials["secret_key"], symbol=symbol, timeframe=config.timeframe, start=start_date, end=normalize_end_date(end_date), feed=config.alpaca_feed, adjustment=config.alpaca_adjustment)
     return trim_downloaded_range(frame, start_date, end_date, config.timeframe)
 
 
 def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
     start = pd.Timestamp(config.start_date, tz="UTC")
-    normalized_end = normalize_end_date(config.end_date)
+    execution_end = effective_execution_end_date(config)
+    normalized_end = normalize_end_date(execution_end)
     end = pd.Timestamp(normalized_end, tz="UTC") if normalized_end else None
     if not config.mongo_cache_enabled:
-        return _download_alpaca_bars(symbol, config, config.start_date, config.end_date)
+        return _download_alpaca_bars(symbol, config, config.start_date, execution_end)
     client = create_client()
     try:
         db = get_database(client)
@@ -252,7 +259,7 @@ def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
         first = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", 1)])
         last = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", -1)])
         if first is None:
-            _upsert_frame(collection, _download_alpaca_bars(symbol, config, config.start_date, config.end_date), identity, config.mongo_write_batch_size)
+            _upsert_frame(collection, _download_alpaca_bars(symbol, config, config.start_date, execution_end), identity, config.mongo_write_batch_size)
         else:
             first_ts = pd.Timestamp(first["timestamp"])
             first_ts = first_ts.tz_localize("UTC") if first_ts.tzinfo is None else first_ts.tz_convert("UTC")
@@ -263,7 +270,7 @@ def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
                 _upsert_frame(collection, historical, identity, config.mongo_write_batch_size)
             refresh = max(start, last_ts - pd.Timedelta(int(config.mongo_refresh_overlap_days), unit="D"))
             if end is None or refresh < end:
-                recent = _download_alpaca_bars(symbol, config, refresh.isoformat(), config.end_date)
+                recent = _download_alpaca_bars(symbol, config, refresh.isoformat(), execution_end)
                 _upsert_frame(collection, recent, identity, config.mongo_write_batch_size)
         cached = _read_frame(collection, identity, start, end)
         if cached.empty:
@@ -294,7 +301,14 @@ def validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     result = result.replace([np.inf, -np.inf], np.nan).dropna(subset=required)
     result = result[(result[["open", "high", "low", "close"]] > 0).all(axis=1)]
     result = result[result["volume"] >= 0]
-    minimum = MINIMUM_BARS_BY_TIMEFRAME[config.timeframe]
+    minimum = (
+        int(config.rotation_minimum_training_rows)
+        + int(config.rotation_horizon_days)
+        + int(config.rotation_purge_days)
+    )
     if len(result) < minimum:
-        raise ValueError(f"Only {len(result)} valid {config.timeframe} bars were loaded; at least {minimum} are required.")
+        raise ValueError(
+            f"Only {len(result)} valid {config.timeframe} bars were loaded; "
+            f"at least {minimum} are required by the locked training, horizon and purge settings."
+        )
     return result
