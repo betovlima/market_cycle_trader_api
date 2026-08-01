@@ -402,30 +402,12 @@ def _build_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, 
     min_test = int(config.rotation_walk_forward_min_test_days)
     min_train = int(config.rotation_minimum_training_rows)
 
-    minimum_first_test = min_train + purge + calibration + purge
-    requested_start = pd.Timestamp(
-        getattr(config, "analysis_start_date", config.start_date)
-    )
-    requested_start = (
-        requested_start.tz_localize("UTC")
-        if requested_start.tzinfo is None
-        else requested_start.tz_convert("UTC")
-    )
-    requested_test_start = int(common_dates.searchsorted(requested_start, side="left"))
-    first_test = max(minimum_first_test, requested_test_start)
-
-    if requested_test_start >= len(common_dates):
-        raise ValueError(
-            "The requested analysis start is after the last available common session: "
-            f"requested={requested_start.date()}, last={common_dates[-1].date()}."
-        )
+    first_test = min_train + purge + calibration + purge
     if first_test >= len(common_dates) - min_test:
-        available_test_rows = max(0, len(common_dates) - first_test)
         raise ValueError(
-            "Not enough Open-Close out-of-sample sessions for the requested analysis window: "
-            f"available_test_rows={available_test_rows}, minimum_test={min_test}, "
-            f"requested_start={requested_start.date()}, sessions={len(common_dates)}, "
-            f"minimum_train={min_train}, calibration={calibration}, purge={purge}."
+            "Not enough Open-Close sessions for expanding walk-forward: "
+            f"sessions={len(common_dates)}, minimum_train={min_train}, "
+            f"calibration={calibration}, purge={purge}, minimum_test={min_test}."
         )
 
     folds: list[dict[str, Any]] = []

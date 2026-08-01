@@ -1,9 +1,7 @@
+.env
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
-venv/
-.env
 .pytest_cache/
-.mypy_cache/
-.idea/
-.vscode/
+configs/
+*_private_runtime_config.json

@@ -10,14 +10,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..core.environment import load_project_environment
-from ..core.system_rules import system_rules_payload
-
-# The backtest engine runs in a separate Python process. Load the API .env in
-# this process as well instead of relying only on environment inheritance from
-# Uvicorn. Real system/Railway variables keep priority because override=False.
-load_project_environment()
-
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     bson_value,
@@ -27,9 +19,9 @@ from ..infrastructure.persistence.mongo_repository import (
     replace_comparison,
     replace_run_result,
 )
-from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
-from ..services.reproducibility import build_reproducibility_manifest
+from ..schemas.requests import BacktestRequest
 from .capital_rotation import run_rotation_models
+from .day_trade_open_close import run_open_close_models
 from .market_data import load_market_bars, validate_and_clean_bars
 
 
@@ -95,11 +87,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(db: Any, job_id: str) -> BacktestExecutionRequest:
+def load_config(db: Any, job_id: str) -> BacktestRequest:
     job = db[JOBS_COLLECTION].find_one({"id": job_id}, {"_id": 0, "request": 1})
     if job is None:
         raise ValueError(f"Backtest job not found: {job_id}")
-    return BacktestExecutionRequest.model_validate(job.get("request") or {})
+    return BacktestRequest.model_validate(job.get("request") or {})
 
 
 def emit_progress(percent: float, stage: str, completed_runs: int = 0) -> None:
@@ -127,10 +119,6 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "random_seed",
         "repetition_index",
         "repetition_count",
-        "seed_ensemble",
-        "ensemble_method",
-        "ensemble_seeds",
-        "ensemble_min_agreement",
         "strategy_mode",
         "strategy_label",
         "assets",
@@ -150,13 +138,6 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "buy_hold_cagr",
         "compound_log_growth",
         "risk_adjusted_compound_score",
-        "robust_score",
-        "positive_fold_ratio",
-        "folds_above_benchmark_ratio",
-        "worst_fold_return",
-        "median_fold_return",
-        "median_fold_excess_return",
-        "fold_return_standard_deviation",
         "walk_forward_fold_count",
         "walk_forward_purge_days",
         "downside_penalty",
@@ -189,30 +170,19 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "turnover_ratio",
         "effective_compute_device",
         "gpu_name",
-        "deterministic_execution",
-        "numeric_thread_limit",
-        "xgb_n_jobs",
-        "strategy_configuration_sha256",
-        "market_data_signature_sha256",
-        "market_data_history_complete",
-        "market_data_incomplete_assets",
-        "market_data_backfilled_assets",
-        "python_version",
-        "xgboost_version",
-        "scikit_learn_version",
-        "numpy_version",
-        "pandas_version",
-        "scipy_version",
-        "threadpoolctl_version",
+        "qrdqn_parallel_folds_effective",
+        "qrdqn_training_steps_mean_used",
+        "qrdqn_early_stopped_folds",
     )
     row = {key: metrics.get(key) for key in keys}
     row.update({"symbol": "PORTFOLIO", "portfolio_rotation": True})
     return row
 
 
-def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def run_job(job_id: str, config: BacktestRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
+    is_day_trade = config.strategy_mode == "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE"
     emit_progress(2.0, "Preparing shared-capital rotation")
     total_assets = max(1, len(config.assets))
     for asset_position, symbol in enumerate(config.assets, start=1):
@@ -222,39 +192,24 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         )
         try:
             raw = load_market_bars(symbol, config)
-            cleaned = validate_and_clean_bars(raw, config)
-            bars_by_symbol[symbol] = cleaned
-            provenance = dict(cleaned.attrs.get("market_data_provenance", {}))
-            first_session = pd.Timestamp(cleaned.index.min()).date().isoformat()
-            last_session = pd.Timestamp(cleaned.index.max()).date().isoformat()
-            backfill_rows = int(provenance.get("history_backfill_rows") or 0)
-            source_label = str(
-                provenance.get("effective_provider")
-                or provenance.get("provider")
-                or config.market_data_provider
-            )
-            print(
-                "MARKET_DATA|"
-                f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
-                f"source={source_label}|backfill_rows={backfill_rows}|"
-                f"complete={bool(provenance.get('history_complete', True))}",
-                flush=True,
-            )
+            bars_by_symbol[symbol] = validate_and_clean_bars(raw, config)
             emit_progress(
                 3.0 + 12.0 * (asset_position / total_assets),
-                (
-                    f"Loaded market data {asset_position}/{total_assets} — {symbol} "
-                    f"({first_session} → {last_session}, {source_label})"
-                ),
+                f"Loaded market data {asset_position}/{total_assets} — {symbol}",
             )
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
-    reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
-    emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
-    results = run_rotation_models(
+    emit_progress(
+        17.0,
+        "Building aligned Open→Close session panel and walk-forward folds"
+        if is_day_trade
+        else "Building aligned daily panel and walk-forward folds",
+    )
+    runner = run_open_close_models if is_day_trade else run_rotation_models
+    results = runner(
         bars_by_symbol,
         config,
         calculate_reference_fees,
@@ -265,23 +220,6 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
-        result.metrics.update(reproducibility)
-        result.summary += "\n\nREPRODUCIBILITY\n"
-        result.summary += (
-            f"Configuration SHA-256: {reproducibility['strategy_configuration_sha256']}\n"
-        )
-        result.summary += (
-            f"Market data SHA-256: {reproducibility['market_data_signature_sha256']}\n"
-        )
-        result.summary += (
-            f"Complete requested history: {reproducibility.get('market_data_history_complete')}\n"
-        )
-        result.summary += (
-            "Backfilled assets: "
-            f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
-        )
-        result.summary += f"Python: {reproducibility.get('python_version')}\n"
-        result.summary += f"XGBoost: {reproducibility.get('xgboost_version')}\n"
         emit_progress(
             92.0 + 6.0 * ((result_position - 1) / total_results),
             f"Saving {result.metrics.get('strategy_label', result.backend)} results to MongoDB",
@@ -320,30 +258,6 @@ def main() -> None:
         print(f"Assets: {', '.join(config.assets)}", flush=True)
         print(f"Strategy: {config.strategy_mode}", flush=True)
         print(f"Models: {', '.join(config.rotation_models)}", flush=True)
-        print(
-            "XGBoost execution: "
-            f"base_seed={config.random_state}, "
-            f"seeds={list(config.ensemble_seeds)}, "
-            f"ensemble={config.rotation_seed_ensemble_enabled}, "
-            f"workers={config.xgb_n_jobs}, "
-            f"deterministic={config.deterministic_execution}",
-            flush=True,
-        )
-        print(
-            f"Training history: {config.start_date} → "
-            f"{config.effective_analysis_end_date or 'latest available session'}",
-            flush=True,
-        )
-        print(
-            f"Requested analysis window: {config.analysis_start_date} → "
-            f"{config.analysis_end_date or 'latest available session'}",
-            flush=True,
-        )
-        print(
-            "Champion walk-forward schedule locked; the public date range "
-            "changes only the simulated account window.",
-            flush=True,
-        )
         comparisons, failures = run_job(args.job_id, config, db)
         comparisons.sort(key=lambda item: str(item.get("backend", "")))
         replace_comparison(
@@ -351,14 +265,7 @@ def main() -> None:
             job_id=args.job_id,
             comparison=comparisons,
             failures=failures,
-            effective_config=bson_value(
-                {
-                    "system_rules": system_rules_payload(),
-                    "strategy_parameters": config.model_dump(mode="python"),
-                    "analysis_start_date": config.analysis_start_date,
-                    "analysis_end_date": config.analysis_end_date,
-                }
-            ),
+            effective_config=bson_value(config.model_dump(mode="python")),
         )
         if not comparisons:
             raise SystemExit(1)

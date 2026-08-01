@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import time
 from typing import Any
 
 import pandas as pd
@@ -141,19 +140,8 @@ def download_stock_bars(
         feed=_feed_value(feed),
         adjustment=_adjustment_value(adjustment),
     )
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            bars = client.get_stock_bars(request)
-            return normalize_alpaca_frame(bars.df, symbol)
-        except Exception as exc:  # Alpaca SDK exposes several transport error types.
-            last_error = exc
-            if attempt < 2:
-                time.sleep(2**attempt)
-
-    raise RuntimeError(
-        f"Alpaca historical data request failed for {symbol} after 3 attempts: {last_error}"
-    ) from last_error
+    bars = client.get_stock_bars(request)
+    return normalize_alpaca_frame(bars.df, symbol)
 
 
 def test_connection(
