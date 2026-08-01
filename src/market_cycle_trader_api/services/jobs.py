@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from typing import Any
@@ -9,15 +10,72 @@ from typing import Any
 from fastapi import HTTPException
 
 from ..core.config import ENGINE_MODULE, SOURCE_ROOT
+from ..core.environment import load_project_environment
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, JOBS_COLLECTION, RUNS_COLLECTION, utc_now
 from .serialization import iso_value
 
 
+PUBLIC_JOB_FIELDS = frozenset({
+    "id",
+    "status",
+    "stage",
+    "progress",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "completed_runs",
+    "total_runs",
+    "return_code",
+    "error",
+    "public_date_range",
+})
+
+_PRIVATE_LOG_PREFIXES = (
+    "Locked execution snapshot queued from MongoDB:",
+)
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(ALPACA_API_KEY_ID|ALPACA_SECRET_KEY|MONGO_URL)\b\s*[:=]\s*([^\s,;]+)"
+)
+_MONGODB_CREDENTIAL_PATTERN = re.compile(
+    r"(mongodb(?:\+srv)?://)([^@\s]+)@",
+    flags=re.IGNORECASE,
+)
+
+
+def _public_log_line(raw_line: Any) -> str | None:
+    line = str(raw_line).strip()
+    if not line or line.startswith(_PRIVATE_LOG_PREFIXES):
+        return None
+
+    line = _SECRET_ASSIGNMENT_PATTERN.sub(r"\1=***", line)
+    line = _MONGODB_CREDENTIAL_PATTERN.sub(r"\1***@", line)
+    return line
+
+
 def public_job(document: dict[str, Any] | None) -> dict[str, Any] | None:
     if document is None:
         return None
-    return {key: iso_value(value) for key, value in document.items() if key not in {"_id", "process_id"}}
+
+    payload = {
+        key: iso_value(value)
+        for key, value in document.items()
+        if key in PUBLIC_JOB_FIELDS
+    }
+
+    raw_logs = document.get("logs")
+    if isinstance(raw_logs, list):
+        public_logs = [
+            line
+            for raw_line in raw_logs
+            if (line := _public_log_line(raw_line)) is not None
+        ]
+        payload["logs"] = public_logs[-120:]
+    else:
+        payload["logs"] = []
+
+    return payload
 
 
 def require_job(job_id: str) -> dict[str, Any]:
@@ -75,6 +133,9 @@ def append_log(job_id: str, raw_line: str) -> None:
 
 
 def run_job(job_id: str) -> None:
+    # Refresh local .env values before creating the engine subprocess. This is
+    # harmless on Railway and ensures local secrets are inherited by the child.
+    load_project_environment()
     db = database()
     db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0}})
     python_path = str(SOURCE_ROOT)

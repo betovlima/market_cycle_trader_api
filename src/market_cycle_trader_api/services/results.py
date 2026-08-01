@@ -107,7 +107,7 @@ def build_robustness_summary(comparison_rows: list[dict[str, Any]]) -> list[dict
         summaries.append(
             {
                 "model_family": family,
-                "model_label": "XGBoost Utility" if family == "xgboost_utility" else "QR-DQN" if family == "qrdqn" else family,
+                "model_label": "XGBoost Utility" if family == "xgboost_utility" else family,
                 "runs": len(rows),
                 "beat_buy_hold_runs": int((excess > 0).sum()),
                 "beat_buy_hold_rate": float((excess > 0).mean()),
@@ -143,7 +143,6 @@ def build_results(job_id: str) -> dict[str, Any]:
         "robustnessSummary": iso_value(build_robustness_summary(comparison_rows)),
         "runs": [build_run_payload(run) for run in runs],
         "failures": iso_value(comparison.get("failures", [])),
-        "effectiveConfig": iso_value(comparison.get("effective_config", {})),
         "downloads": {
             "zip": f"/api/jobs/{job_id}/export.zip",
             "comparison": f"/api/jobs/{job_id}/comparison.csv",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "market-cycle-trader-api"
-version = "1.10.3"
+version = "1.12.2"
 description = "FastAPI backend for Market Cycle Trader research and backtesting."
 requires-python = ">=3.11,<3.15"
 dynamic = ["dependencies"]
@@ -17,3 +17,6 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.package-data]
+"market_cycle_trader_api.parameterizations" = ["*.json"]

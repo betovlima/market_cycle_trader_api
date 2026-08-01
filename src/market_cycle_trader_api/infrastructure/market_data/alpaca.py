@@ -121,8 +121,8 @@ def download_stock_bars(
     timeframe: str,
     start: str | datetime | pd.Timestamp,
     end: str | datetime | pd.Timestamp | None,
-    feed: str = "iex",
-    adjustment: str = "all",
+    feed: str,
+    adjustment: str,
 ) -> pd.DataFrame:
     Adjustment, DataFeed, StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit = _require_alpaca()
 
@@ -148,7 +148,7 @@ def test_connection(
     *,
     api_key_id: str,
     secret_key: str,
-    feed: str = "iex",
+    feed: str,
     symbol: str = "SPY",
 ) -> dict[str, Any]:
     end = datetime.now(timezone.utc)

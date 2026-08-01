@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import copy
+import unittest
+from unittest.mock import patch
+
+from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
+    PAPER_TRADING_SETTINGS_COLLECTION,
+    SETTINGS_COLLECTION,
+)
+from market_cycle_trader_api.services.parameter_bootstrap import (
+    bootstrap_missing_parameterizations,
+    parameterization_status,
+)
+
+
+class _WriteResult:
+    def __init__(self, upserted_id=None) -> None:
+        self.upserted_id = upserted_id
+
+
+class _InsertResult:
+    inserted_id = "audit"
+
+
+class _Collection:
+    def __init__(self) -> None:
+        self.documents: dict[str, dict] = {}
+        self.audit: list[dict] = []
+
+    def find_one(self, query: dict, *args, **kwargs):
+        document_id = query.get("_id")
+        document = self.documents.get(document_id)
+        return copy.deepcopy(document) if document is not None else None
+
+    def update_one(self, query: dict, update: dict, *, upsert: bool = False):
+        document_id = query.get("_id")
+        if document_id in self.documents:
+            return _WriteResult()
+        if not upsert:
+            return _WriteResult()
+        document = copy.deepcopy(update["$setOnInsert"])
+        self.documents[document_id] = document
+        return _WriteResult(upserted_id=document_id)
+
+    def insert_one(self, document: dict):
+        self.audit.append(copy.deepcopy(document))
+        return _InsertResult()
+
+
+class _Database:
+    def __init__(self) -> None:
+        self.collections: dict[str, _Collection] = {}
+
+    def __getitem__(self, name: str) -> _Collection:
+        return self.collections.setdefault(name, _Collection())
+
+
+class ParameterBootstrapTests(unittest.TestCase):
+    def test_missing_status_reports_both_documents(self) -> None:
+        db = _Database()
+        items = parameterization_status(db)
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(item["status"] == "missing" for item in items))
+
+    @patch(
+        "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
+        return_value=None,
+    )
+    def test_bootstrap_is_idempotent(self, _ensure_database) -> None:
+        db = _Database()
+
+        first = bootstrap_missing_parameterizations(db, source="test")
+        self.assertEqual(first["summary"]["inserted"], 2)
+        self.assertEqual(first["summary"]["skipped_existing_valid"], 0)
+
+        second = bootstrap_missing_parameterizations(db, source="test")
+        self.assertEqual(second["summary"]["inserted"], 0)
+        self.assertEqual(second["summary"]["skipped_existing_valid"], 2)
+
+        strategy = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+        paper = db[PAPER_TRADING_SETTINGS_COLLECTION].find_one({"_id": "default"})
+        self.assertEqual(strategy["random_state"], 3042)
+        self.assertTrue(paper["enabled"])
+
+    @patch(
+        "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
+        return_value=None,
+    )
+    def test_existing_valid_document_is_never_overwritten(self, _ensure_database) -> None:
+        db = _Database()
+        bootstrap_missing_parameterizations(db, source="test")
+
+        existing = db[SETTINGS_COLLECTION].documents["default"]
+        existing["random_state"] = 42
+        existing["configuration_name"] = "manually-promoted-seed-42"
+
+        result = bootstrap_missing_parameterizations(db, source="test")
+        self.assertEqual(result["summary"]["inserted"], 0)
+        self.assertEqual(result["summary"]["skipped_existing_valid"], 2)
+        preserved = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+        self.assertEqual(preserved["random_state"], 42)
+        self.assertEqual(preserved["configuration_name"], "manually-promoted-seed-42")
+
+    @patch(
+        "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
+        return_value=None,
+    )
+    def test_legacy_paper_settings_without_account_id_are_valid_for_automatic_binding(
+        self, _ensure_database
+    ) -> None:
+        db = _Database()
+        bootstrap_missing_parameterizations(db, source="test")
+
+        paper = db[PAPER_TRADING_SETTINGS_COLLECTION].documents["default"]
+        paper.pop("paper_account_id", None)
+
+        result = bootstrap_missing_parameterizations(db, source="test")
+        item = next(
+            value
+            for value in result["results"]
+            if value["collection"] == PAPER_TRADING_SETTINGS_COLLECTION
+        )
+        self.assertTrue(item["valid"])
+        self.assertEqual(item["status"], "skipped_existing_valid")
+
+
+
+if __name__ == "__main__":
+    unittest.main()

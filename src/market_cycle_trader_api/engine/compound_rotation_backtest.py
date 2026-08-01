@@ -10,6 +10,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.environment import load_project_environment
+
+# The backtest engine runs in a separate Python process. Load the API .env in
+# this process as well instead of relying only on environment inheritance from
+# Uvicorn. Real system/Railway variables keep priority because override=False.
+load_project_environment()
+
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     bson_value,
@@ -19,9 +26,8 @@ from ..infrastructure.persistence.mongo_repository import (
     replace_comparison,
     replace_run_result,
 )
-from ..schemas.requests import BacktestRequest
+from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
 from .capital_rotation import run_rotation_models
-from .day_trade_open_close import run_open_close_models
 from .market_data import load_market_bars, validate_and_clean_bars
 
 
@@ -87,11 +93,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(db: Any, job_id: str) -> BacktestRequest:
+def load_config(db: Any, job_id: str) -> BacktestExecutionRequest:
     job = db[JOBS_COLLECTION].find_one({"id": job_id}, {"_id": 0, "request": 1})
     if job is None:
         raise ValueError(f"Backtest job not found: {job_id}")
-    return BacktestRequest.model_validate(job.get("request") or {})
+    return BacktestExecutionRequest.model_validate(job.get("request") or {})
 
 
 def emit_progress(percent: float, stage: str, completed_runs: int = 0) -> None:
@@ -170,19 +176,15 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "turnover_ratio",
         "effective_compute_device",
         "gpu_name",
-        "qrdqn_parallel_folds_effective",
-        "qrdqn_training_steps_mean_used",
-        "qrdqn_early_stopped_folds",
     )
     row = {key: metrics.get(key) for key in keys}
     row.update({"symbol": "PORTFOLIO", "portfolio_rotation": True})
     return row
 
 
-def run_job(job_id: str, config: BacktestRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
-    is_day_trade = config.strategy_mode == "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE"
     emit_progress(2.0, "Preparing shared-capital rotation")
     total_assets = max(1, len(config.assets))
     for asset_position, symbol in enumerate(config.assets, start=1):
@@ -202,14 +204,8 @@ def run_job(job_id: str, config: BacktestRequest, db: Any) -> tuple[list[dict[st
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
-    emit_progress(
-        17.0,
-        "Building aligned Open→Close session panel and walk-forward folds"
-        if is_day_trade
-        else "Building aligned daily panel and walk-forward folds",
-    )
-    runner = run_open_close_models if is_day_trade else run_rotation_models
-    results = runner(
+    emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
+    results = run_rotation_models(
         bars_by_symbol,
         config,
         calculate_reference_fees,
@@ -258,6 +254,21 @@ def main() -> None:
         print(f"Assets: {', '.join(config.assets)}", flush=True)
         print(f"Strategy: {config.strategy_mode}", flush=True)
         print(f"Models: {', '.join(config.rotation_models)}", flush=True)
+        print(
+            f"Training history: {config.start_date} → "
+            f"{config.effective_analysis_end_date or 'latest available session'}",
+            flush=True,
+        )
+        print(
+            f"Requested analysis window: {config.analysis_start_date} → "
+            f"{config.analysis_end_date or 'latest available session'}",
+            flush=True,
+        )
+        print(
+            "Champion walk-forward schedule locked; the public date range "
+            "changes only the simulated account window.",
+            flush=True,
+        )
         comparisons, failures = run_job(args.job_id, config, db)
         comparisons.sort(key=lambda item: str(item.get("backend", "")))
         replace_comparison(

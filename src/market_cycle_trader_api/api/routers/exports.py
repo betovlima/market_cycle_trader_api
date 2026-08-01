@@ -251,15 +251,6 @@ def export_zip(job_id: str) -> StreamingResponse:
             "failures.csv",
             csv_bytes(comparison.get("failures", [])),
         )
-        archive.writestr(
-            "effective_config.json",
-            json.dumps(
-                iso_value(comparison.get("effective_config", {})),
-                indent=2,
-                ensure_ascii=False,
-            ),
-        )
-
         for run in runs:
             symbol = str(run["symbol"])
             backend = str(run["backend"])

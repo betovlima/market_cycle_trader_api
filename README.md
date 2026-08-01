@@ -1,44 +1,18 @@
-# market_cycle_trader_api
+# Market Cycle Trader API
 
-FastAPI backend for Market Cycle Trader v1.10.3.
+Market Cycle Trader API is a FastAPI backend for backtesting and operating an XGBoost-based capital rotation strategy.
 
-## Local
+The service manages historical market data, walk-forward model execution, strategy configuration stored in MongoDB, portfolio state, scheduled next-session decisions, and Alpaca paper-trading orders using an isolated strategy budget.
 
-```powershell
-python -m pip install -r requirements.txt
-.\run_local.ps1
-```
+## Main features
 
-Alternative:
-
-```powershell
-python -m uvicorn market_cycle_trader_api.main:app --app-dir src --host 127.0.0.1 --port 8000 --reload
-```
-
-Swagger: `http://127.0.0.1:8000/docs`
-
-## Packages
-
-- `api/routers` — HTTP endpoints.
-- `schemas` — Pydantic contracts and validation.
-- `services` — application orchestration and result construction.
-- `core` — application/runtime configuration.
-- `infrastructure` — MongoDB and market-data adapters.
-- `engine/compound_rotation_backtest.py` — focused backtest entry point.
-- `engine/capital_rotation.py` — Swing XGBoost/QR-DQN engine.
-- `engine/day_trade_open_close.py` — Day Trade Open→Close engine.
-- `engine/market_data.py` — active market-data loading and cache path.
-
-The API contains no legacy extrema/Fibonacci strategy implementation.
-
-## Railway
-
-Use root directory `/market_cycle_trader_api` and config path `/market_cycle_trader_api/railway.toml`.
-
-Required production variables:
-
-```text
-MONGO_URL
-MONGO_DATABASE
-CORS_ORIGINS
-```
+- XGBoost-only strategy runtime
+- Walk-forward backtesting
+- Alpaca historical market data integration
+- Automated Alpaca paper-trading execution
+- Next-session BUY, HOLD, SELL, and rotation decisions
+- Isolated paper portfolio with a configurable strategy budget
+- MongoDB configuration and execution persistence
+- Automated environment initialization through administrative APIs
+- Portfolio status, order history, and process logs
+- Railway-ready deployment
