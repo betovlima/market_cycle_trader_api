@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import resources
@@ -13,6 +14,7 @@ from ..infrastructure.persistence.mongo_repository import (
     PARAMETER_BOOTSTRAP_RUNS_COLLECTION,
     PAPER_TRADING_SETTINGS_COLLECTION,
     SETTINGS_COLLECTION,
+    SETTINGS_HISTORY_COLLECTION,
     SETTINGS_SCHEMA_VERSION,
     bson_value,
     ensure_database,
@@ -43,9 +45,9 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="xgboost-high-performance-cpu-seed-3042-v1.12.0",
+        configuration_name="xgboost-high-performance-cpu-seed-3042-deterministic-v1.12.10",
         configuration_note=(
-            "Bundled XGBoost-only CPU parameterization for the Alpaca paper-market runtime."
+            "Bundled deterministic XGBoost-only CPU parameterization for the Alpaca paper-market runtime."
         ),
     ),
     ParameterizationDefinition(
@@ -112,6 +114,74 @@ def _validate_existing(
     return True, "Existing document is valid and was preserved unchanged."
 
 
+
+def _strategy_schema_migration(
+    db: Database,
+    definition: ParameterizationDefinition,
+    existing: dict[str, Any],
+    *,
+    source: str,
+) -> tuple[dict[str, Any], bool]:
+    """Apply the v10 deterministic runtime fields without replacing strategy choices.
+
+    The migration is intentionally narrow: it preserves assets, seed, model
+    hyperparameters, dates, costs, and every promoted strategy value. It only
+    makes the execution policy explicit in MongoDB and moves XGBoost to one
+    worker so the same database document controls deterministic runs.
+    """
+
+    if definition.collection != SETTINGS_COLLECTION:
+        return existing, False
+
+    current_schema = int(existing.get("schema_version") or 0)
+    operational = _operational_document(existing)
+    migration_required = (
+        current_schema < SETTINGS_SCHEMA_VERSION
+        or "deterministic_execution" not in operational
+        or "numeric_thread_limit" not in operational
+    )
+    if not migration_required:
+        return existing, False
+
+    now = _utc_now()
+    history = deepcopy(existing)
+    history.pop("_id", None)
+    history.update(
+        {
+            "captured_at": now,
+            "note": "Automatic v1.12.10 deterministic execution schema migration.",
+            "source": source,
+        }
+    )
+    db[SETTINGS_HISTORY_COLLECTION].insert_one(history)
+
+    previous_note = str(existing.get("configuration_note") or "").strip()
+    migration_note = "Deterministic execution fields added by v1.12.10 schema migration."
+    configuration_note = (
+        f"{previous_note} {migration_note}".strip()
+        if previous_note
+        else migration_note
+    )
+    updates = {
+        "xgb_n_jobs": 1,
+        "deterministic_execution": True,
+        "numeric_thread_limit": 1,
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "updated_at": now,
+        "configuration_note": configuration_note,
+        "bootstrap_source": source,
+    }
+    db[SETTINGS_COLLECTION].update_one(
+        {"_id": definition.document_id},
+        {"$set": updates},
+        upsert=False,
+    )
+    migrated = db[SETTINGS_COLLECTION].find_one({"_id": definition.document_id})
+    if migrated is None:
+        raise RuntimeError("Strategy configuration disappeared during schema migration.")
+    definition.validator.model_validate(_operational_document(migrated))
+    return migrated, True
+
 def parameterization_status(db: Database) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for definition in DEFINITIONS:
@@ -148,11 +218,11 @@ def bootstrap_missing_parameterizations(
     *,
     source: str,
 ) -> dict[str, Any]:
-    """Insert bundled documents only when their exact `_id` is absent.
+    """Insert missing documents and apply only versioned safe schema migrations.
 
-    Existing documents are never replaced, merged, or repaired. This makes the
-    operation safe to call repeatedly and prevents an HTTP request from
-    silently changing a promoted strategy or live paper-market setting.
+    Existing promoted strategy values are preserved. The v10 migration adds
+    explicit deterministic execution controls in MongoDB and snapshots the
+    previous document before changing those fields.
     """
 
     ensure_database(db)
@@ -162,15 +232,28 @@ def bootstrap_missing_parameterizations(
     for definition in DEFINITIONS:
         existing = db[definition.collection].find_one({"_id": definition.document_id})
         if existing is not None:
-            valid, message = _validate_existing(definition, existing)
+            migrated_existing, migrated = _strategy_schema_migration(
+                db, definition, existing, source=source
+            )
+            valid, message = _validate_existing(definition, migrated_existing)
             results.append(
                 {
                     "key": definition.key,
                     "collection": definition.collection,
                     "document_id": definition.document_id,
-                    "status": "skipped_existing_valid" if valid else "skipped_existing_invalid",
+                    "status": (
+                        "migrated_existing"
+                        if migrated and valid
+                        else "skipped_existing_valid"
+                        if valid
+                        else "skipped_existing_invalid"
+                    ),
                     "valid": valid,
-                    "message": message,
+                    "message": (
+                        "Existing strategy document was safely migrated to the deterministic v10 schema."
+                        if migrated and valid
+                        else message
+                    ),
                 }
             )
             continue
@@ -227,6 +310,9 @@ def bootstrap_missing_parameterizations(
     finished_at = _utc_now()
     summary = {
         "inserted": sum(item["status"] == "inserted" for item in results),
+        "migrated_existing": sum(
+            item["status"] == "migrated_existing" for item in results
+        ),
         "skipped_existing_valid": sum(
             item["status"] == "skipped_existing_valid" for item in results
         ),
@@ -240,13 +326,13 @@ def bootstrap_missing_parameterizations(
             "started_at": started_at,
             "finished_at": finished_at,
             "source": source,
-            "mode": "insert_missing_documents_only",
+            "mode": "insert_missing_and_safe_schema_migrations",
             "summary": summary,
             "results": results,
         }
     )
     return {
-        "mode": "insert_missing_documents_only",
+        "mode": "insert_missing_and_safe_schema_migrations",
         "started_at": started_at,
         "finished_at": finished_at,
         "summary": summary,

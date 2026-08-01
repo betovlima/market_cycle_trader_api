@@ -27,6 +27,7 @@ from ..infrastructure.persistence.mongo_repository import (
     replace_run_result,
 )
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
+from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
 from .market_data import load_market_bars, validate_and_clean_bars
 
@@ -176,6 +177,18 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "turnover_ratio",
         "effective_compute_device",
         "gpu_name",
+        "deterministic_execution",
+        "numeric_thread_limit",
+        "xgb_n_jobs",
+        "strategy_configuration_sha256",
+        "market_data_signature_sha256",
+        "python_version",
+        "xgboost_version",
+        "scikit_learn_version",
+        "numpy_version",
+        "pandas_version",
+        "scipy_version",
+        "threadpoolctl_version",
     )
     row = {key: metrics.get(key) for key in keys}
     row.update({"symbol": "PORTFOLIO", "portfolio_rotation": True})
@@ -204,6 +217,7 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
+    reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
     emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
     results = run_rotation_models(
         bars_by_symbol,
@@ -216,6 +230,16 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
+        result.metrics.update(reproducibility)
+        result.summary += "\n\nREPRODUCIBILITY\n"
+        result.summary += (
+            f"Configuration SHA-256: {reproducibility['strategy_configuration_sha256']}\n"
+        )
+        result.summary += (
+            f"Market data SHA-256: {reproducibility['market_data_signature_sha256']}\n"
+        )
+        result.summary += f"Python: {reproducibility.get('python_version')}\n"
+        result.summary += f"XGBoost: {reproducibility.get('xgboost_version')}\n"
         emit_progress(
             92.0 + 6.0 * ((result_position - 1) / total_results),
             f"Saving {result.metrics.get('strategy_label', result.backend)} results to MongoDB",

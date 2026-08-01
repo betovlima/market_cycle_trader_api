@@ -36,10 +36,14 @@ class _Collection:
     def update_one(self, query: dict, update: dict, *, upsert: bool = False):
         document_id = query.get("_id")
         if document_id in self.documents:
+            if "$set" in update:
+                self.documents[document_id].update(copy.deepcopy(update["$set"]))
             return _WriteResult()
         if not upsert:
             return _WriteResult()
-        document = copy.deepcopy(update["$setOnInsert"])
+        document = copy.deepcopy(update.get("$setOnInsert", {}))
+        if "$set" in update:
+            document.update(copy.deepcopy(update["$set"]))
         self.documents[document_id] = document
         return _WriteResult(upserted_id=document_id)
 
@@ -72,6 +76,7 @@ class ParameterBootstrapTests(unittest.TestCase):
 
         first = bootstrap_missing_parameterizations(db, source="test")
         self.assertEqual(first["summary"]["inserted"], 2)
+        self.assertEqual(first["summary"]["migrated_existing"], 0)
         self.assertEqual(first["summary"]["skipped_existing_valid"], 0)
 
         second = bootstrap_missing_parameterizations(db, source="test")
@@ -81,6 +86,9 @@ class ParameterBootstrapTests(unittest.TestCase):
         strategy = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
         paper = db[PAPER_TRADING_SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertEqual(strategy["random_state"], 3042)
+        self.assertTrue(strategy["deterministic_execution"])
+        self.assertEqual(strategy["numeric_thread_limit"], 1)
+        self.assertEqual(strategy["xgb_n_jobs"], 1)
         self.assertTrue(paper["enabled"])
 
     @patch(
@@ -101,6 +109,35 @@ class ParameterBootstrapTests(unittest.TestCase):
         preserved = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertEqual(preserved["random_state"], 42)
         self.assertEqual(preserved["configuration_name"], "manually-promoted-seed-42")
+
+
+    @patch(
+        "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
+        return_value=None,
+    )
+    def test_v9_strategy_document_receives_only_safe_deterministic_fields(
+        self, _ensure_database
+    ) -> None:
+        db = _Database()
+        bootstrap_missing_parameterizations(db, source="test")
+
+        strategy = db[SETTINGS_COLLECTION].documents["default"]
+        strategy["schema_version"] = 9
+        strategy["random_state"] = 42
+        strategy["configuration_name"] = "manually-promoted-seed-42"
+        strategy["xgb_n_jobs"] = -1
+        strategy.pop("deterministic_execution", None)
+        strategy.pop("numeric_thread_limit", None)
+
+        result = bootstrap_missing_parameterizations(db, source="test")
+        self.assertEqual(result["summary"]["migrated_existing"], 1)
+
+        migrated = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+        self.assertEqual(migrated["random_state"], 42)
+        self.assertEqual(migrated["configuration_name"], "manually-promoted-seed-42")
+        self.assertEqual(migrated["xgb_n_jobs"], 1)
+        self.assertTrue(migrated["deterministic_execution"])
+        self.assertEqual(migrated["numeric_thread_limit"], 1)
 
     @patch(
         "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",

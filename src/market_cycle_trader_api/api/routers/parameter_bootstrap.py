@@ -50,7 +50,7 @@ def get_parameterization_status(
 ) -> dict[str, Any]:
     items = parameterization_status(database())
     return {
-        "mode": "insert_missing_documents_only",
+        "mode": "insert_missing_and_safe_schema_migrations",
         "all_present": all(item["status"] != "missing" for item in items),
         "all_valid": all(item["valid"] for item in items),
         "items": items,

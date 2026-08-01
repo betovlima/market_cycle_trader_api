@@ -1,10 +1,13 @@
 from __future__ import annotations
+from contextlib import nullcontext
 from dataclasses import dataclass
 import math
 import subprocess
 from typing import Any, Callable
 import numpy as np
 import pandas as pd
+from threadpoolctl import threadpool_limits
+
 ROTATION_FEATURES = ['return_1', 'return_3', 'return_5', 'return_10', 'return_20', 'vol_5', 'vol_20', 'ema_distance_5', 'ema_distance_10', 'ema_distance_20', 'ema_distance_50', 'ema_5_vs_20', 'ema_20_vs_50', 'rsi_14', 'atr_pct_14', 'distance_from_high_20', 'distance_from_low_20', 'volume_zscore_20']
 
 @dataclass
@@ -259,6 +262,12 @@ def _curve_risk_adjusted_score(curve: pd.Series, config: Any) -> float:
     score = (logs - float(config.rotation_downside_penalty) * downside - float(config.rotation_drawdown_penalty) * aligned).sum()
     return float(score)
 
+def _numeric_thread_context(config: Any):
+    if not bool(config.deterministic_execution):
+        return nullcontext()
+    return threadpool_limits(limits=int(config.numeric_thread_limit))
+
+
 def _fit_xgb_models(frames: dict[str, pd.DataFrame], symbols: list[str], train_dates: pd.DatetimeIndex, config: Any, device_name: str) -> tuple[dict[str, Any], str, str | None]:
     try:
         from xgboost import XGBRegressor
@@ -268,13 +277,36 @@ def _fit_xgb_models(frames: dict[str, pd.DataFrame], symbols: list[str], train_d
 
     def fit_on_device(effective_device: str) -> dict[str, Any]:
         fitted: dict[str, Any] = {}
-        for symbol in symbols:
-            frame = frames[symbol].loc[train_dates].dropna(subset=['forward_risk_adjusted_utility'])
-            if len(frame) < int(config.rotation_minimum_training_rows):
-                raise ValueError(f'{symbol}: only {len(frame)} utility rows are available; {config.rotation_minimum_training_rows} are required.')
-            model = XGBRegressor(n_estimators=int(config.rotation_xgb_n_estimators), learning_rate=float(config.rotation_xgb_learning_rate), max_depth=int(config.rotation_xgb_max_depth), min_child_weight=float(config.xgb_min_child_weight), subsample=float(config.xgb_subsample), colsample_bytree=float(config.xgb_colsample_bytree), reg_alpha=float(config.xgb_reg_alpha), reg_lambda=float(config.xgb_reg_lambda), objective='reg:squarederror', tree_method='hist', random_state=int(config.random_state), n_jobs=int(config.xgb_n_jobs), device=effective_device)
-            model.fit(frame[ROTATION_FEATURES], frame['forward_risk_adjusted_utility'])
-            fitted[symbol] = model
+        with _numeric_thread_context(config):
+            for symbol in symbols:
+                frame = frames[symbol].loc[train_dates].dropna(
+                    subset=['forward_risk_adjusted_utility']
+                )
+                if len(frame) < int(config.rotation_minimum_training_rows):
+                    raise ValueError(
+                        f'{symbol}: only {len(frame)} utility rows are available; '
+                        f'{config.rotation_minimum_training_rows} are required.'
+                    )
+                model = XGBRegressor(
+                    n_estimators=int(config.rotation_xgb_n_estimators),
+                    learning_rate=float(config.rotation_xgb_learning_rate),
+                    max_depth=int(config.rotation_xgb_max_depth),
+                    min_child_weight=float(config.xgb_min_child_weight),
+                    subsample=float(config.xgb_subsample),
+                    colsample_bytree=float(config.xgb_colsample_bytree),
+                    reg_alpha=float(config.xgb_reg_alpha),
+                    reg_lambda=float(config.xgb_reg_lambda),
+                    objective='reg:squarederror',
+                    tree_method='hist',
+                    random_state=int(config.random_state),
+                    n_jobs=int(config.xgb_n_jobs),
+                    device=effective_device,
+                )
+                model.fit(
+                    frame[ROTATION_FEATURES],
+                    frame['forward_risk_adjusted_utility'],
+                )
+                fitted[symbol] = model
         return fitted
     try:
         return (fit_on_device(device_name), device_name, None)
@@ -754,11 +786,14 @@ def run_rotation_models(bars_by_symbol: dict[str, pd.DataFrame], config: Any, fe
             item.update(margin_by_fold.get(item['fold_id'], {}))
         effective_values = [item['effective_switch_margin'] for item in margin_details]
         candidate_values = [item['calibrated_candidate_margin'] for item in margin_details]
-        result.metrics.update({'walk_forward_fold_count': len(folds), 'walk_forward_folds': fold_metrics, 'calibrated_candidate_margin_mean': float(np.mean(candidate_values)), 'effective_switch_margin_mean': float(np.mean(effective_values)), 'effective_switch_margin_min': float(np.min(effective_values)), 'effective_switch_margin_max': float(np.max(effective_values)), 'calibrated_switch_margin': float(np.mean(candidate_values)), 'effective_switch_margin': float(np.mean(effective_values)), 'requested_accelerator': xgb_plan.requested, 'effective_compute_device': effective_device, 'cuda_available': xgb_plan.cuda_available, 'gpu_name': xgb_plan.gpu_name, 'framework_version': xgb_plan.framework_version, 'cuda_build': xgb_plan.cuda_build, 'cpu_fallback_used': bool(xgb_plan.fallback_used or fallback_reasons), 'compute_fallback_reason': fallback_reasons[-1] if fallback_reasons else xgb_plan.fallback_reason})
+        result.metrics.update({'walk_forward_fold_count': len(folds), 'walk_forward_folds': fold_metrics, 'calibrated_candidate_margin_mean': float(np.mean(candidate_values)), 'effective_switch_margin_mean': float(np.mean(effective_values)), 'effective_switch_margin_min': float(np.min(effective_values)), 'effective_switch_margin_max': float(np.max(effective_values)), 'calibrated_switch_margin': float(np.mean(candidate_values)), 'effective_switch_margin': float(np.mean(effective_values)), 'requested_accelerator': xgb_plan.requested, 'effective_compute_device': effective_device, 'cuda_available': xgb_plan.cuda_available, 'gpu_name': xgb_plan.gpu_name, 'framework_version': xgb_plan.framework_version, 'cuda_build': xgb_plan.cuda_build, 'cpu_fallback_used': bool(xgb_plan.fallback_used or fallback_reasons), 'compute_fallback_reason': fallback_reasons[-1] if fallback_reasons else xgb_plan.fallback_reason, 'deterministic_execution': bool(rep_config.deterministic_execution), 'numeric_thread_limit': int(rep_config.numeric_thread_limit), 'xgb_n_jobs': int(rep_config.xgb_n_jobs)})
         result.summary += '\n\nROBUSTNESS / COMPUTE\n'
         result.summary += f'Seed: {seed}\n'
         result.summary += f'Repetition: {repetition + 1}/{repetitions}\n'
         result.summary += f'Compute device: {effective_device.upper()}\n'
+        result.summary += f'Deterministic execution: {bool(rep_config.deterministic_execution)}\n'
+        result.summary += f'XGBoost workers: {int(rep_config.xgb_n_jobs)}\n'
+        result.summary += f'Numeric thread limit: {int(rep_config.numeric_thread_limit)}\n'
         if fallback_reasons:
             result.summary += f'Fallback: {fallback_reasons[-1]}\n'
         results.append(result)

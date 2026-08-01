@@ -115,6 +115,8 @@ class BacktestRequest(BaseModel):
     xgb_reg_alpha: float = Field(ge=0)
     xgb_reg_lambda: float = Field(ge=0)
     xgb_n_jobs: int = Field(ge=-1)
+    deterministic_execution: bool
+    numeric_thread_limit: int = Field(ge=1, le=128)
 
     yfinance_auto_adjust: bool
     yfinance_repair: bool
@@ -177,6 +179,15 @@ class BacktestRequest(BaseModel):
 
         if self.xgb_n_jobs == 0:
             raise ValueError("xgb_n_jobs must be -1 or a positive integer.")
+        if self.deterministic_execution:
+            if self.xgb_n_jobs != 1:
+                raise ValueError(
+                    "Deterministic execution requires xgb_n_jobs=1 in MongoDB."
+                )
+            if self.numeric_thread_limit != 1:
+                raise ValueError(
+                    "Deterministic execution requires numeric_thread_limit=1 in MongoDB."
+                )
         if not self.rotation_walk_forward_enabled:
             raise ValueError("Compound Capital Rotation requires expanding walk-forward validation.")
         if self.rotation_walk_forward_min_test_days > self.rotation_walk_forward_test_days:

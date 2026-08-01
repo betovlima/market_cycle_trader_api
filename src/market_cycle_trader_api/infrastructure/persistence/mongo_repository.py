@@ -32,7 +32,7 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 10
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",

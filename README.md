@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.12.9
+# Market Cycle Trader API v1.12.10
 
 FastAPI backend for the XGBoost-only Compound Capital Rotation strategy.
 

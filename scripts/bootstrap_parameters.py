@@ -27,8 +27,8 @@ from market_cycle_trader_api.services.parameter_bootstrap import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Insert every bundled parameterization whose _id is missing. "
-            "Existing documents are never modified."
+            "Insert missing bundled parameterizations and apply versioned safe "
+            "schema migrations to existing strategy documents."
         )
     )
     parser.add_argument(
