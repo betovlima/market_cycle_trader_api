@@ -18,6 +18,10 @@
   "market_data_provider": "alpaca",
   "alpaca_feed": "iex",
   "alpaca_adjustment": "all",
+  "market_data_history_backfill_enabled": true,
+  "market_data_history_backfill_provider": "alpaca",
+  "market_data_history_start_tolerance_days": 10,
+  "market_data_require_complete_history": true,
   "rotation_models": [
     "xgboost_utility"
   ],
@@ -63,10 +67,6 @@
   "xgb_n_jobs": -1,
   "deterministic_execution": false,
   "numeric_thread_limit": 1,
-  "yfinance_auto_adjust": true,
-  "yfinance_repair": false,
-  "yfinance_timeout": 30,
-  "yfinance_fallback_period": "max",
   "mongo_cache_enabled": true,
   "mongo_refresh_overlap_days": 7,
   "mongo_write_batch_size": 1000,

@@ -14,7 +14,7 @@ from market_cycle_trader_api.core.environment import load_project_environment  #
 load_project_environment()
 
 from market_cycle_trader_api.infrastructure.market_data.alpaca import (  # noqa: E402
-    test_connection,
+    test_connection as verify_alpaca_connection,
 )
 from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (  # noqa: E402
     create_client,
@@ -33,7 +33,7 @@ def main() -> int:
     finally:
         client.close()
 
-    result = test_connection(
+    result = verify_alpaca_connection(
         api_key_id=credentials["api_key_id"],
         secret_key=credentials["secret_key"],
         feed=config.alpaca_feed,

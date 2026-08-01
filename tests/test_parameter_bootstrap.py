@@ -38,6 +38,9 @@ class _Collection:
         if document_id in self.documents:
             if "$set" in update:
                 self.documents[document_id].update(copy.deepcopy(update["$set"]))
+            if "$unset" in update:
+                for field in update["$unset"]:
+                    self.documents[document_id].pop(field, None)
             return _WriteResult()
         if not upsert:
             return _WriteResult()
@@ -89,6 +92,11 @@ class ParameterBootstrapTests(unittest.TestCase):
         self.assertFalse(strategy["deterministic_execution"])
         self.assertEqual(strategy["numeric_thread_limit"], 1)
         self.assertEqual(strategy["xgb_n_jobs"], -1)
+        self.assertTrue(strategy["market_data_history_backfill_enabled"])
+        self.assertEqual(strategy["market_data_history_backfill_provider"], "alpaca")
+        self.assertEqual(strategy["market_data_history_start_tolerance_days"], 10)
+        self.assertTrue(strategy["market_data_require_complete_history"])
+        self.assertEqual(strategy["schema_version"], 13)
         self.assertTrue(paper["enabled"])
 
     @patch(
@@ -138,6 +146,44 @@ class ParameterBootstrapTests(unittest.TestCase):
         self.assertEqual(migrated["xgb_n_jobs"], -1)
         self.assertFalse(migrated["deterministic_execution"])
         self.assertEqual(migrated["numeric_thread_limit"], 1)
+
+
+    @patch(
+        "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",
+        return_value=None,
+    )
+    def test_v12_strategy_document_migrates_to_alpaca_only_history_backfill(
+        self, _ensure_database
+    ) -> None:
+        db = _Database()
+        bootstrap_missing_parameterizations(db, source="test")
+
+        strategy = db[SETTINGS_COLLECTION].documents["default"]
+        strategy["schema_version"] = 12
+        strategy["market_data_provider"] = "alpaca"
+        strategy["market_data_history_backfill_enabled"] = True
+        strategy["market_data_history_backfill_provider"] = "yahoo"
+        strategy["yfinance_auto_adjust"] = True
+        strategy["yfinance_repair"] = False
+        strategy["yfinance_timeout"] = 30
+        strategy["yfinance_fallback_period"] = "max"
+        strategy["random_state"] = 42
+
+        result = bootstrap_missing_parameterizations(db, source="test")
+        self.assertEqual(result["summary"]["migrated_existing"], 1)
+
+        migrated = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
+        self.assertEqual(migrated["random_state"], 42)
+        self.assertTrue(migrated["market_data_history_backfill_enabled"])
+        self.assertEqual(migrated["market_data_history_backfill_provider"], "alpaca")
+        self.assertEqual(migrated["market_data_history_start_tolerance_days"], 10)
+        self.assertTrue(migrated["market_data_require_complete_history"])
+        self.assertEqual(migrated["schema_version"], 13)
+        self.assertEqual(migrated["market_data_provider"], "alpaca")
+        self.assertNotIn("yfinance_auto_adjust", migrated)
+        self.assertNotIn("yfinance_repair", migrated)
+        self.assertNotIn("yfinance_timeout", migrated)
+        self.assertNotIn("yfinance_fallback_period", migrated)
 
     @patch(
         "market_cycle_trader_api.services.parameter_bootstrap.ensure_database",

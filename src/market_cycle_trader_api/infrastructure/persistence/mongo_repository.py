@@ -20,7 +20,6 @@ PREDICTIONS_COLLECTION = "backtest_predictions"
 TRADES_COLLECTION = "backtest_trades"
 COMPARISONS_COLLECTION = "backtest_comparisons"
 FAILURES_COLLECTION = "backtest_failures"
-MARKET_BARS_COLLECTION = "market_bars"
 ALPACA_MARKET_BARS_COLLECTION = "alpaca_market_bars"
 INTEGRATIONS_COLLECTION = "integrations"
 ALPACA_INTEGRATION_ID = "alpaca"
@@ -32,7 +31,7 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
-SETTINGS_SCHEMA_VERSION = 11
+SETTINGS_SCHEMA_VERSION = 13
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",

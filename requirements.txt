@@ -10,6 +10,5 @@ scikit-learn==1.9.0
 threadpoolctl==3.6.0
 exchange-calendars>=4.13,<5
 matplotlib
-yfinance
 alpaca-py==0.43.5
 xgboost==3.3.0

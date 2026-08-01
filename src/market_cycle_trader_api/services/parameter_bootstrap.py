@@ -45,9 +45,9 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="xgboost-high-performance-cpu-seed-3042-v1.12.11",
+        configuration_name="xgboost-high-performance-cpu-seed-3042-v1.12.13",
         configuration_note=(
-            "Bundled high-performance XGBoost-only CPU parameterization restored to the promoted seed 3042 runtime."
+            "Bundled high-performance XGBoost-only CPU parameterization using Alpaca for all market data."
         ),
     ),
     ParameterizationDefinition(
@@ -122,14 +122,12 @@ def _strategy_schema_migration(
     *,
     source: str,
 ) -> tuple[dict[str, Any], bool]:
-    """Restore the promoted high-performance execution policy in schema v11.
+    """Apply idempotent strategy migrations required by the current release.
 
-    Version 1.12.10 changed the promoted document from ``xgb_n_jobs=-1``
-    to a single-worker deterministic mode. That was not the configuration
-    that produced the champion result. This migration is intentionally
-    narrow and automatic: it snapshots the existing document, restores only
-    the XGBoost execution-policy fields, and preserves assets, seed, model
-    hyperparameters, dates, costs, and all other strategy choices.
+    Schema v13 removes the retired Yahoo Finance settings and guarantees that
+    historical bootstrap, cache refresh, backtests, diagnostics, and paper
+    planning use Alpaca market data only. Existing strategy hyperparameters,
+    dates, costs, assets, and promoted seeds remain unchanged.
     """
 
     if definition.collection != SETTINGS_COLLECTION:
@@ -137,12 +135,53 @@ def _strategy_schema_migration(
 
     current_schema = int(existing.get("schema_version") or 0)
     operational = _operational_document(existing)
-    migration_required = (
-        current_schema < SETTINGS_SCHEMA_VERSION
-        or "deterministic_execution" not in operational
-        or "numeric_thread_limit" not in operational
+    updates: dict[str, Any] = {}
+    unset_fields: dict[str, str] = {}
+    migration_notes: list[str] = []
+
+    v11_fields_missing = any(
+        field not in operational
+        for field in ("deterministic_execution", "numeric_thread_limit")
     )
-    if not migration_required:
+    if current_schema < 11 or v11_fields_missing:
+        updates.update(
+            {
+                "xgb_n_jobs": -1,
+                "deterministic_execution": False,
+                "numeric_thread_limit": 1,
+            }
+        )
+        migration_notes.append(
+            "restored the promoted high-performance XGBoost execution policy"
+        )
+
+    alpaca_only_defaults = {
+        "market_data_provider": "alpaca",
+        "market_data_history_backfill_enabled": True,
+        "market_data_history_backfill_provider": "alpaca",
+        "market_data_history_start_tolerance_days": 10,
+        "market_data_require_complete_history": True,
+    }
+    for field, value in alpaca_only_defaults.items():
+        if current_schema < 13 or operational.get(field) != value:
+            updates[field] = value
+
+    retired_yahoo_fields = (
+        "yfinance_auto_adjust",
+        "yfinance_repair",
+        "yfinance_timeout",
+        "yfinance_fallback_period",
+    )
+    for field in retired_yahoo_fields:
+        if field in operational:
+            unset_fields[field] = ""
+
+    if current_schema < 13 or updates or unset_fields:
+        migration_notes.append(
+            "removed Yahoo Finance settings and enabled Alpaca-only historical backfill"
+        )
+
+    if not updates and not unset_fields and current_schema >= SETTINGS_SCHEMA_VERSION:
         return existing, False
 
     now = _utc_now()
@@ -151,7 +190,7 @@ def _strategy_schema_migration(
     history.update(
         {
             "captured_at": now,
-            "note": "Automatic v1.12.11 restoration of the promoted high-performance XGBoost execution policy.",
+            "note": "Automatic v1.12.13 Alpaca-only strategy migration before Railway deployment.",
             "source": source,
         }
     )
@@ -159,26 +198,26 @@ def _strategy_schema_migration(
 
     previous_note = str(existing.get("configuration_note") or "").strip()
     migration_note = (
-        "Promoted seed 3042 execution policy restored automatically by v1.12.11 "
-        "after the v1.12.10 single-worker experiment reduced performance."
+        "Automatic v1.12.13 migration: " + "; ".join(migration_notes) + "."
     )
-    configuration_note = (
-        f"{previous_note} {migration_note}".strip()
-        if previous_note
-        else migration_note
+    updates.update(
+        {
+            "schema_version": SETTINGS_SCHEMA_VERSION,
+            "updated_at": now,
+            "configuration_note": (
+                f"{previous_note} {migration_note}".strip()
+                if previous_note
+                else migration_note
+            ),
+            "bootstrap_source": source,
+        }
     )
-    updates = {
-        "xgb_n_jobs": -1,
-        "deterministic_execution": False,
-        "numeric_thread_limit": 1,
-        "schema_version": SETTINGS_SCHEMA_VERSION,
-        "updated_at": now,
-        "configuration_note": configuration_note,
-        "bootstrap_source": source,
-    }
+    mongo_update: dict[str, Any] = {"$set": updates}
+    if unset_fields:
+        mongo_update["$unset"] = unset_fields
     db[SETTINGS_COLLECTION].update_one(
         {"_id": definition.document_id},
-        {"$set": updates},
+        mongo_update,
         upsert=False,
     )
     migrated = db[SETTINGS_COLLECTION].find_one({"_id": definition.document_id})
@@ -186,6 +225,7 @@ def _strategy_schema_migration(
         raise RuntimeError("Strategy configuration disappeared during schema migration.")
     definition.validator.model_validate(_operational_document(migrated))
     return migrated, True
+
 
 def parameterization_status(db: Database) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
@@ -225,9 +265,9 @@ def bootstrap_missing_parameterizations(
 ) -> dict[str, Any]:
     """Insert missing documents and apply versioned, idempotent migrations.
 
-    Existing promoted strategy values are preserved. The v11 migration
-    automatically restores the promoted seed 3042 execution policy and
-    snapshots the previous document before changing the affected fields.
+    Existing promoted strategy values are preserved. Versioned migrations restore
+    the promoted execution policy when needed, enforce Alpaca-only complete-history backfill,
+    and snapshot the previous document before changing affected fields.
     """
 
     ensure_database(db)
@@ -255,7 +295,7 @@ def bootstrap_missing_parameterizations(
                     ),
                     "valid": valid,
                     "message": (
-                        "Existing strategy document was safely migrated to the v11 promoted high-performance execution policy."
+                        "Existing strategy document was safely migrated to schema v13 with Alpaca-only complete-history backfill."
                         if migrated and valid
                         else message
                     ),

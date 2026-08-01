@@ -182,6 +182,9 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "xgb_n_jobs",
         "strategy_configuration_sha256",
         "market_data_signature_sha256",
+        "market_data_history_complete",
+        "market_data_incomplete_assets",
+        "market_data_backfilled_assets",
         "python_version",
         "xgboost_version",
         "scikit_learn_version",
@@ -207,10 +210,30 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         )
         try:
             raw = load_market_bars(symbol, config)
-            bars_by_symbol[symbol] = validate_and_clean_bars(raw, config)
+            cleaned = validate_and_clean_bars(raw, config)
+            bars_by_symbol[symbol] = cleaned
+            provenance = dict(cleaned.attrs.get("market_data_provenance", {}))
+            first_session = pd.Timestamp(cleaned.index.min()).date().isoformat()
+            last_session = pd.Timestamp(cleaned.index.max()).date().isoformat()
+            backfill_rows = int(provenance.get("history_backfill_rows") or 0)
+            source_label = str(
+                provenance.get("effective_provider")
+                or provenance.get("provider")
+                or config.market_data_provider
+            )
+            print(
+                "MARKET_DATA|"
+                f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
+                f"source={source_label}|backfill_rows={backfill_rows}|"
+                f"complete={bool(provenance.get('history_complete', True))}",
+                flush=True,
+            )
             emit_progress(
                 3.0 + 12.0 * (asset_position / total_assets),
-                f"Loaded market data {asset_position}/{total_assets} — {symbol}",
+                (
+                    f"Loaded market data {asset_position}/{total_assets} — {symbol} "
+                    f"({first_session} → {last_session}, {source_label})"
+                ),
             )
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
@@ -237,6 +260,13 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         )
         result.summary += (
             f"Market data SHA-256: {reproducibility['market_data_signature_sha256']}\n"
+        )
+        result.summary += (
+            f"Complete requested history: {reproducibility.get('market_data_history_complete')}\n"
+        )
+        result.summary += (
+            "Backfilled assets: "
+            f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
         )
         result.summary += f"Python: {reproducibility.get('python_version')}\n"
         result.summary += f"XGBoost: {reproducibility.get('xgboost_version')}\n"

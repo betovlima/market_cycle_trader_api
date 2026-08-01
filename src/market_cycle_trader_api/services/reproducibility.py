@@ -89,12 +89,21 @@ def market_data_manifest(
             copy=False,
         )
         digest = hashlib.sha256(row_hashes.tobytes()).hexdigest()
+        provenance = dict(frame.attrs.get("market_data_provenance", {}))
         manifests[symbol] = {
             "sha256": digest,
             "rows": int(len(canonical)),
             "first_timestamp": _series_timestamp(canonical.index.min()) if len(canonical) else None,
             "last_timestamp": _series_timestamp(canonical.index.max()) if len(canonical) else None,
             "columns": columns,
+            "history_complete": bool(provenance.get("history_complete", True)),
+            "provider": provenance.get("provider") or provenance.get("effective_provider"),
+            "effective_provider": provenance.get("effective_provider"),
+            "initial_rows": provenance.get("initial_rows"),
+            "history_backfill_provider": provenance.get("history_backfill_provider"),
+            "history_backfill_rows": provenance.get("history_backfill_rows"),
+            "requested_start": provenance.get("requested_start"),
+            "actual_start": provenance.get("actual_start"),
         }
 
     return _sha256_json(manifests), manifests
@@ -106,10 +115,23 @@ def build_reproducibility_manifest(
 ) -> dict[str, Any]:
     data_hash, data_manifests = market_data_manifest(bars_by_symbol)
     versions = runtime_versions()
+    incomplete_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if not bool(item.get("history_complete", False))
+    ]
+    backfilled_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if int(item.get("history_backfill_rows") or 0) > 0
+    ]
     return {
         "strategy_configuration_sha256": strategy_configuration_fingerprint(config),
         "market_data_signature_sha256": data_hash,
         "market_data_signatures": data_manifests,
+        "market_data_history_complete": not incomplete_assets,
+        "market_data_incomplete_assets": incomplete_assets,
+        "market_data_backfilled_assets": backfilled_assets,
         "runtime_versions": versions,
         "python_version": versions.get("python"),
         "xgboost_version": versions.get("xgboost"),
