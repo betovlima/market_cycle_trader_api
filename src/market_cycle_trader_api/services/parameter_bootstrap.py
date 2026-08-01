@@ -21,6 +21,7 @@ from ..infrastructure.persistence.mongo_repository import (
     ensure_database,
 )
 from ..schemas.paper_trading import PaperTradingSettings
+from ..core.system_rules import IMMUTABLE_STRATEGY_FIELDS
 from ..schemas.requests import BacktestRequest
 
 Validator = type[BaseModel]
@@ -46,7 +47,7 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="xgboost-api-managed-v1.12.15",
+        configuration_name="xgboost-api-managed-v1.12.16",
         configuration_note=(
             "Initial canonical XGBoost configuration. After installation, valid "
             "strategy parameters are managed through the protected administration API."
@@ -58,8 +59,8 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         collection=PAPER_TRADING_SETTINGS_COLLECTION,
         document_id="default",
         validator=PaperTradingSettings,
-        schema_version=1,
-        configuration_name="alpaca-paper-next-session-v1.12.0",
+        schema_version=2,
+        configuration_name="alpaca-paper-continuous-v1.12.16",
         configuration_note=(
             "Bundled paper-market execution settings for the next regular Alpaca session."
         ),
@@ -158,6 +159,73 @@ def _archive_documents(
     return len(audit_documents)
 
 
+
+
+def _migrated_strategy_payload(existing: dict[str, Any]) -> dict[str, Any]:
+    payload = _operational_document(existing)
+    for field in IMMUTABLE_STRATEGY_FIELDS:
+        payload.pop(field, None)
+    repetitions = int(payload.get("rotation_xgb_repetitions") or 1)
+    payload.setdefault("rotation_seed_ensemble_enabled", repetitions >= 3)
+    payload.setdefault("rotation_seed_ensemble_method", "majority_vote")
+    payload.setdefault("rotation_seed_ensemble_min_agreement", 0.4)
+    return payload
+
+
+def _try_migrate_strategy_document(
+    db: Database,
+    definition: ParameterizationDefinition,
+    existing: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    payload = _migrated_strategy_payload(existing)
+    try:
+        validated = BacktestRequest.model_validate(payload)
+    except ValidationError:
+        return None
+
+    previous_payload = _operational_document(existing)
+    next_payload = bson_value(validated.model_dump(mode="python"))
+    if previous_payload == next_payload and int(existing.get("schema_version") or 0) == definition.schema_version:
+        return None
+
+    _archive_documents(
+        db,
+        [existing],
+        source=source,
+        note=(
+            "Automatic schema v16 migration: fixed training/provider/feed rules were "
+            "removed from editable MongoDB parameters and seed-ensemble fields were added."
+        ),
+    )
+    now = _utc_now()
+    document = {
+        "_id": definition.document_id,
+        **next_payload,
+        "created_at": existing.get("created_at") or now,
+        "updated_at": now,
+        "schema_version": definition.schema_version,
+        "revision": int(existing.get("revision") or 1) + 1,
+        "configuration_name": "api-managed-xgboost-ensemble-v1.12.16",
+        "configuration_note": (
+            "Fixed 2016/SIP system rules with API-managed robust XGBoost ensemble parameters."
+        ),
+        "bootstrap_source": source,
+    }
+    db[definition.collection].replace_one({"_id": definition.document_id}, document)
+    return {
+        "key": definition.key,
+        "collection": definition.collection,
+        "document_id": definition.document_id,
+        "status": "migrated_existing",
+        "valid": True,
+        "message": (
+            "Existing strategy was migrated automatically to schema v16. Training starts "
+            "at 2016-01-01 and Alpaca SIP/IEX rules are now immutable system rules."
+        ),
+    }
+
 def _bootstrap_strategy(
     db: Database,
     definition: ParameterizationDefinition,
@@ -200,6 +268,22 @@ def _bootstrap_strategy(
                 "parameter changes are preserved and managed through the administration API."
             ),
         }
+
+    migration_result = _try_migrate_strategy_document(
+        db, definition, default, source=source
+    )
+    if migration_result is not None:
+        default = collection.find_one({"_id": definition.document_id}) or default
+        if extras:
+            _archive_documents(
+                db,
+                extras,
+                source=source,
+                note="Extra strategy documents were archived during the schema v16 migration.",
+            )
+            for document in extras:
+                collection.delete_one({"_id": document.get("_id")})
+        return migration_result
 
     valid, validation_message = _validate_existing(definition, default)
     if not valid:
@@ -291,12 +375,63 @@ def _bootstrap_non_strategy(
     existing = collection.find_one({"_id": definition.document_id})
     if existing is not None:
         valid, message = _validate_existing(definition, existing)
+        if valid:
+            return {
+                "key": definition.key,
+                "collection": definition.collection,
+                "document_id": definition.document_id,
+                "status": "skipped_existing_valid",
+                "valid": True,
+                "message": message,
+            }
+        if definition.collection == PAPER_TRADING_SETTINGS_COLLECTION:
+            payload = _operational_document(existing)
+            payload.setdefault("automatic_continuation_enabled", True)
+            payload.setdefault("scheduler_poll_seconds", 10.0)
+            payload.setdefault("preparation_retry_seconds", 60.0)
+            try:
+                validated = PaperTradingSettings.model_validate(payload)
+            except ValidationError:
+                return {
+                    "key": definition.key,
+                    "collection": definition.collection,
+                    "document_id": definition.document_id,
+                    "status": "skipped_existing_invalid",
+                    "valid": False,
+                    "message": message,
+                }
+            now = _utc_now()
+            collection.replace_one(
+                {"_id": definition.document_id},
+                {
+                    "_id": definition.document_id,
+                    **bson_value(validated.model_dump(mode="python")),
+                    "created_at": existing.get("created_at") or now,
+                    "updated_at": now,
+                    "schema_version": definition.schema_version,
+                    "revision": int(existing.get("revision") or 1) + 1,
+                    "configuration_name": definition.configuration_name,
+                    "configuration_note": definition.configuration_note,
+                    "bootstrap_source": source,
+                },
+            )
+            return {
+                "key": definition.key,
+                "collection": definition.collection,
+                "document_id": definition.document_id,
+                "status": "migrated_existing",
+                "valid": True,
+                "message": (
+                    "Paper settings were migrated automatically; completed runs will "
+                    "continue by arming the next Alpaca regular session."
+                ),
+            }
         return {
             "key": definition.key,
             "collection": definition.collection,
             "document_id": definition.document_id,
-            "status": "skipped_existing_valid" if valid else "skipped_existing_invalid",
-            "valid": valid,
+            "status": "skipped_existing_invalid",
+            "valid": False,
             "message": message,
         }
 

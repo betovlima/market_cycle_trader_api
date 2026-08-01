@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.system_rules import system_rules_payload
 from ..schemas.requests import BacktestRequest
 
 
@@ -32,8 +33,11 @@ def _sha256_json(payload: Any) -> str:
 
 def locked_configuration_payload(config: Any) -> dict[str, Any]:
     return {
-        field_name: getattr(config, field_name)
-        for field_name in BacktestRequest.model_fields
+        "system_rules": system_rules_payload(),
+        "strategy_parameters": {
+            field_name: getattr(config, field_name)
+            for field_name in BacktestRequest.model_fields
+        },
     }
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 import uuid
 from datetime import timedelta
@@ -15,6 +14,8 @@ from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
+    get_paper_trading_settings,
+    get_settings,
     bson_value,
     update_paper_trade_plan,
     utc_now,
@@ -24,6 +25,8 @@ from ..infrastructure.trading.alpaca_paper import (
     create_paper_trading_client,
 )
 from ..schemas.paper_trading import PaperTradingSettings
+from ..schemas.requests import BacktestRequest
+from .reproducibility import strategy_configuration_fingerprint
 from .paper_trading import (
     execute_prepared_paper_plan,
     paper_market_readiness,
@@ -33,29 +36,14 @@ from .paper_trading import (
 EASTERN = ZoneInfo("America/New_York")
 ACTIVE_KEY = "alpaca-paper-next-session"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
-def _positive_float_env(name: str, default: float, *, minimum: float) -> float:
-    raw = str(os.getenv(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be numeric.") from exc
-    if value < minimum:
-        raise RuntimeError(f"{name} must be at least {minimum}.")
-    return value
+def scheduler_poll_seconds(db: Any) -> float:
+    settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
+    return float(settings.scheduler_poll_seconds)
 
 
-def scheduler_poll_seconds() -> float:
-    return _positive_float_env("PAPER_MARKET_POLL_SECONDS", 10.0, minimum=1.0)
-
-
-def preparation_retry_seconds() -> float:
-    return _positive_float_env(
-        "PAPER_MARKET_PREPARE_RETRY_SECONDS",
-        60.0,
-        minimum=10.0,
-    )
+def preparation_retry_seconds(db: Any) -> float:
+    settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
+    return float(settings.preparation_retry_seconds)
 
 
 def _utc_stamp(value: Any) -> pd.Timestamp:
@@ -356,6 +344,17 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
     )
 
 
+def _active_strategy_hash(db: Any) -> str:
+    strategy = BacktestRequest.model_validate(get_settings(db))
+    return strategy_configuration_fingerprint(strategy)
+
+
+def _plan_matches_active_strategy(db: Any, plan: dict[str, Any] | None) -> bool:
+    if not plan:
+        return False
+    return str(plan.get("strategy_configuration_sha256") or "") == _active_strategy_hash(db)
+
+
 def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     run_id = str(run["run_id"])
     expected_open = _utc_stamp(run["expected_market_open"])
@@ -410,13 +409,26 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             {"execution_session": str(run["execution_session"])},
             sort=[("created_at", -1)],
         )
-        if existing is not None and str(existing.get("status") or "") in {
-            "prepared",
-            "executing",
-            "executed",
-        }:
+        if (
+            existing is not None
+            and str(existing.get("status") or "") in {"prepared", "executing", "executed"}
+            and _plan_matches_active_strategy(db, existing)
+        ):
             plan = existing
         else:
+            if existing is not None:
+                update_paper_trade_plan(
+                    db,
+                    str(existing["plan_id"]),
+                    {
+                        "status": "cancelled",
+                        "cancelled_at": utc_now(),
+                        "cancel_reason": (
+                            "Replaced because the active strategy configuration or fixed "
+                            "system rules changed before execution."
+                        ),
+                    },
+                )
             plan = prepare_next_paper_plan(db, replace=existing is not None)
 
         if str(plan.get("execution_session")) != str(run["execution_session"]):
@@ -484,7 +496,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     except Exception as exc:
         now_utc = utc_now()
         if _utc_stamp(now_utc) < expected_open:
-            retry_at = now_utc + timedelta(seconds=preparation_retry_seconds())
+            retry_at = now_utc + timedelta(seconds=preparation_retry_seconds(db))
             db[PAPER_MARKET_RUNS_COLLECTION].update_one(
                 {"run_id": run_id, "status": "preparing", "worker_id": worker_id},
                 {
@@ -543,6 +555,45 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             run_id,
             status="failed",
             message="Prepared paper-market run has no plan_id.",
+        )
+        return
+
+    plan_document = db[PAPER_TRADE_PLANS_COLLECTION].find_one({"plan_id": plan_id}) or {}
+    if not _plan_matches_active_strategy(db, plan_document):
+        now_utc = utc_now()
+        update_paper_trade_plan(
+            db,
+            plan_id,
+            {
+                "status": "cancelled",
+                "cancelled_at": now_utc,
+                "cancel_reason": (
+                    "Active strategy configuration changed after this plan was prepared."
+                ),
+            },
+        )
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "prepared"},
+            {
+                "$set": {
+                    "status": "armed",
+                    "phase": "reprepare_after_strategy_change",
+                    "plan_id": None,
+                    "updated_at": now_utc,
+                    "last_message": (
+                        "Prepared plan was invalidated because the strategy changed. "
+                        "A fresh ensemble decision will be prepared before market open."
+                    ),
+                },
+                "$push": {
+                    "logs": {
+                        "$each": [
+                            f"{now_utc.isoformat()} — Prepared plan invalidated after strategy change."
+                        ],
+                        "$slice": -100,
+                    }
+                },
+            },
         )
         return
 
@@ -626,9 +677,28 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             )
 
 
+def _maybe_auto_arm_next_session(db: Any) -> None:
+    settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
+    if not settings.enabled or not settings.automatic_continuation_enabled:
+        return
+
+    latest = db[PAPER_MARKET_RUNS_COLLECTION].find_one({}, sort=[("created_at", -1)])
+    if latest is None or str(latest.get("status") or "") != "completed":
+        return
+    finished_at = latest.get("finished_at")
+    if finished_at is None:
+        return
+    finished = _utc_stamp(finished_at)
+    if pd.Timestamp.now(tz="UTC") - finished > pd.Timedelta(days=7):
+        return
+
+    arm_next_session(db)
+
+
 def _advance_one(db: Any, worker_id: str) -> None:
     run = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
     if run is None:
+        _maybe_auto_arm_next_session(db)
         return
     status = str(run.get("status") or "")
     if status == "armed":
@@ -665,16 +735,18 @@ class PaperMarketScheduler:
         self._thread = None
 
     def _run(self) -> None:
+        delay_seconds = 10.0
         while not self._stop.is_set():
             try:
                 db = database()
                 _recover_stale_runs(db)
                 _advance_one(db, self._worker_id)
+                delay_seconds = scheduler_poll_seconds(db)
             except Exception:
                 # Run-specific exceptions are persisted by the state machine. A
-                # global dependency failure is retried on the next poll.
-                pass
-            self._stop.wait(scheduler_poll_seconds())
+                # global dependency failure is retried using the safe default delay.
+                delay_seconds = 10.0
+            self._stop.wait(delay_seconds)
 
 
 _SCHEDULER = PaperMarketScheduler()

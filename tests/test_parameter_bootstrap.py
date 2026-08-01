@@ -87,6 +87,13 @@ class _Collection:
         document.update(copy.deepcopy(update.get("$set", {})))
         return _UpdateResult(1)
 
+    def replace_one(self, query: dict, document: dict, upsert: bool = False):
+        document_id = query.get("_id")
+        if document_id not in self.documents and not upsert:
+            return _UpdateResult(0)
+        self.documents[document_id] = copy.deepcopy(document)
+        return _UpdateResult(1)
+
 
 class _Database:
     def __init__(self) -> None:
@@ -123,11 +130,13 @@ class ParameterBootstrapTests(unittest.TestCase):
         paper = db[PAPER_TRADING_SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertIsNotNone(strategy)
         self.assertIsNotNone(paper)
-        self.assertEqual(strategy["random_state"], 3042)
-        self.assertEqual(strategy["schema_version"], 15)
+        self.assertEqual(strategy["random_state"], 42)
+        self.assertEqual(strategy["schema_version"], 16)
         self.assertEqual(strategy["revision"], 1)
-        self.assertEqual(strategy["alpaca_historical_feed"], "sip")
-        self.assertEqual(strategy["alpaca_live_feed"], "iex")
+        self.assertNotIn("start_date", strategy)
+        self.assertNotIn("alpaca_historical_feed", strategy)
+        self.assertTrue(strategy["rotation_seed_ensemble_enabled"])
+        self.assertEqual(strategy["rotation_xgb_repetitions"], 5)
         self.assertTrue(paper["enabled"])
 
         second = bootstrap_missing_parameterizations(db, source="test")
@@ -146,8 +155,7 @@ class ParameterBootstrapTests(unittest.TestCase):
         strategy = db[SETTINGS_COLLECTION].documents["default"]
         strategy["random_state"] = 42
         strategy["rotation_xgb_n_estimators"] = 450
-        strategy["alpaca_historical_feed"] = "iex"
-        strategy["start_date"] = "2020-07-27"
+        strategy["rotation_switch_margin"] = 0.01
         strategy["revision"] = 7
         strategy["configuration_name"] = "api-managed-xgboost-strategy"
 
@@ -157,8 +165,8 @@ class ParameterBootstrapTests(unittest.TestCase):
         preserved = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertEqual(preserved["random_state"], 42)
         self.assertEqual(preserved["rotation_xgb_n_estimators"], 450)
-        self.assertEqual(preserved["alpaca_historical_feed"], "iex")
-        self.assertEqual(preserved["start_date"], "2020-07-27")
+        self.assertEqual(preserved["rotation_switch_margin"], 0.01)
+        self.assertNotIn("start_date", preserved)
         self.assertEqual(preserved["revision"], 7)
 
     @patch(
@@ -180,8 +188,8 @@ class ParameterBootstrapTests(unittest.TestCase):
         self.assertEqual(len(db[SETTINGS_COLLECTION].documents), 1)
 
         repaired = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
-        self.assertEqual(repaired["random_state"], 3042)
-        self.assertEqual(repaired["schema_version"], 15)
+        self.assertEqual(repaired["random_state"], 42)
+        self.assertEqual(repaired["schema_version"], 16)
         self.assertGreaterEqual(repaired["revision"], 2)
 
         history = db[SETTINGS_HISTORY_COLLECTION].audit

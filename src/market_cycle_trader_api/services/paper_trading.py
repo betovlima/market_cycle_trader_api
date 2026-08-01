@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from pymongo import ReturnDocument
 
 from ..engine.live_xgboost_signal import build_live_xgboost_decision
+from ..core.system_rules import MODEL_REFRESH_POLICY, system_rules_payload
 from ..engine.market_data import load_market_bars, validate_and_clean_bars
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_ORDERS_COLLECTION,
@@ -42,6 +43,7 @@ from ..infrastructure.trading.alpaca_paper import (
 )
 from ..schemas.paper_trading import PaperTradePlan, PaperTradingSettings, PaperTradingState
 from ..schemas.requests import BacktestRequest
+from .reproducibility import strategy_configuration_fingerprint
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -351,6 +353,13 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         target_asset=target,
         action=action,
         random_state=decision.random_state,
+        ensemble_enabled=decision.ensemble_enabled,
+        ensemble_method=decision.ensemble_method,
+        ensemble_seeds=decision.ensemble_seeds,
+        ensemble_agreement=decision.ensemble_agreement,
+        strategy_configuration_sha256=strategy_configuration_fingerprint(strategy),
+        system_rules=system_rules_payload(),
+        model_refresh_policy=MODEL_REFRESH_POLICY,
         effective_switch_margin=decision.effective_switch_margin,
         calibrated_candidate_margin=decision.calibrated_candidate_margin,
         calibration_score=decision.calibration_score,

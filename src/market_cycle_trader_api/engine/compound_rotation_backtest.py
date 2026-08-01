@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from ..core.environment import load_project_environment
+from ..core.system_rules import system_rules_payload
 
 # The backtest engine runs in a separate Python process. Load the API .env in
 # this process as well instead of relying only on environment inheritance from
@@ -126,6 +127,10 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "random_seed",
         "repetition_index",
         "repetition_count",
+        "seed_ensemble",
+        "ensemble_method",
+        "ensemble_seeds",
+        "ensemble_min_agreement",
         "strategy_mode",
         "strategy_label",
         "assets",
@@ -145,6 +150,13 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "buy_hold_cagr",
         "compound_log_growth",
         "risk_adjusted_compound_score",
+        "robust_score",
+        "positive_fold_ratio",
+        "folds_above_benchmark_ratio",
+        "worst_fold_return",
+        "median_fold_return",
+        "median_fold_excess_return",
+        "fold_return_standard_deviation",
         "walk_forward_fold_count",
         "walk_forward_purge_days",
         "downside_penalty",
@@ -310,7 +322,9 @@ def main() -> None:
         print(f"Models: {', '.join(config.rotation_models)}", flush=True)
         print(
             "XGBoost execution: "
-            f"seed={config.random_state}, "
+            f"base_seed={config.random_state}, "
+            f"seeds={list(config.ensemble_seeds)}, "
+            f"ensemble={config.rotation_seed_ensemble_enabled}, "
             f"workers={config.xgb_n_jobs}, "
             f"deterministic={config.deterministic_execution}",
             flush=True,
@@ -337,7 +351,14 @@ def main() -> None:
             job_id=args.job_id,
             comparison=comparisons,
             failures=failures,
-            effective_config=bson_value(config.model_dump(mode="python")),
+            effective_config=bson_value(
+                {
+                    "system_rules": system_rules_payload(),
+                    "strategy_parameters": config.model_dump(mode="python"),
+                    "analysis_start_date": config.analysis_start_date,
+                    "analysis_end_date": config.analysis_end_date,
+                }
+            ),
         )
         if not comparisons:
             raise SystemExit(1)

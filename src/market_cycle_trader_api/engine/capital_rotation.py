@@ -2,6 +2,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 import math
+from collections import Counter
 import subprocess
 from typing import Any, Callable
 import numpy as np
@@ -685,23 +686,121 @@ def _fold_performance(predictions: pd.DataFrame, folds: list[dict[str, Any]], in
         })
     return output
 
-def run_rotation_models(bars_by_symbol: dict[str, pd.DataFrame], config: Any, fee_calculator: Callable, slippage: Callable, progress_callback: Callable[[float, str, int], None] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None) -> list[RotationRunResult]:
-    """Run the locked XGBoost walk-forward strategy.
+def _fold_robustness_metrics(folds: list[dict[str, Any]]) -> dict[str, float]:
+    if not folds:
+        return {
+            'robust_score': float('-inf'),
+            'positive_fold_ratio': 0.0,
+            'folds_above_benchmark_ratio': 0.0,
+            'worst_fold_return': float('nan'),
+            'median_fold_return': float('nan'),
+            'median_fold_excess_return': float('nan'),
+            'fold_return_standard_deviation': float('nan'),
+        }
+    returns = np.asarray([float(item['strategy_return']) for item in folds], dtype=float)
+    excess = np.asarray([float(item['excess_return']) for item in folds], dtype=float)
+    drawdowns = np.asarray([abs(float(item['maximum_drawdown'])) for item in folds], dtype=float)
+    positive_ratio = float(np.mean(returns > 0))
+    above_ratio = float(np.mean(excess > 0))
+    worst_return = float(np.min(returns))
+    median_return = float(np.median(returns))
+    median_excess = float(np.median(excess))
+    dispersion = float(np.std(returns))
+    median_drawdown = float(np.median(drawdowns))
+    robust_score = (
+        median_excess
+        + 0.35 * median_return
+        + 0.20 * positive_ratio
+        + 0.20 * above_ratio
+        + 0.25 * min(0.0, worst_return)
+        - 0.35 * dispersion
+        - 0.20 * median_drawdown
+    )
+    return {
+        'robust_score': float(robust_score),
+        'positive_fold_ratio': positive_ratio,
+        'folds_above_benchmark_ratio': above_ratio,
+        'worst_fold_return': worst_return,
+        'median_fold_return': median_return,
+        'median_fold_excess_return': median_excess,
+        'fold_return_standard_deviation': dispersion,
+    }
 
-    This version intentionally supports the validated XGBoost model family only.
-    """
+
+def _majority_vote_policy(
+    policies: list[Callable],
+    *,
+    minimum_agreement: float,
+) -> Callable:
+    """Combine seed policies without selecting the best seed after observing returns."""
+
+    if not policies:
+        raise ValueError('At least one seed policy is required for the ensemble.')
+
+    def policy(date: pd.Timestamp, current_position: int, holding_days: int) -> tuple[int, float]:
+        decisions = [
+            candidate(date, current_position, holding_days)
+            for candidate in policies
+        ]
+        positions = [int(item[0]) for item in decisions]
+        scores = [float(item[1]) for item in decisions]
+        counts = Counter(positions)
+        highest = max(counts.values())
+        agreement = highest / len(decisions)
+        leaders = sorted(position for position, count in counts.items() if count == highest)
+
+        if agreement < float(minimum_agreement):
+            selected_position = int(current_position)
+        elif int(current_position) in leaders:
+            selected_position = int(current_position)
+        elif len(leaders) == 1:
+            selected_position = leaders[0]
+        else:
+            selected_position = max(
+                leaders,
+                key=lambda position: float(np.median([
+                    score
+                    for (candidate_position, score) in decisions
+                    if int(candidate_position) == position
+                ])),
+            )
+
+        selected_scores = [
+            score
+            for candidate_position, score in decisions
+            if int(candidate_position) == selected_position
+        ]
+        selected_score = float(np.median(selected_scores or scores))
+        return selected_position, selected_score
+
+    return policy
+
+
+def run_rotation_models(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    config: Any,
+    fee_calculator: Callable,
+    slippage: Callable,
+    progress_callback: Callable[[float, str, int], None] | None = None,
+    trade_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[RotationRunResult]:
+    """Run seed studies and a production ensemble on the same walk-forward folds."""
+
     if config.strategy_mode != 'COMPOUND_ROTATION_SWING_XGBOOST':
         raise ValueError('This version supports only COMPOUND_ROTATION_SWING_XGBOOST.')
     if list(config.rotation_models) != ['xgboost_utility']:
         raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
+
     frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
     symbols = sorted(frames)
     folds = _build_walk_forward_folds(common_dates, config)
     xgb_plan = resolve_xgboost_compute_plan(config)
     repetitions = int(config.rotation_xgb_repetitions)
     seed_step = int(config.rotation_seed_step)
+    ensemble_enabled = bool(config.rotation_seed_ensemble_enabled and repetitions > 1)
     if repetitions <= 0:
         raise ValueError('At least one XGBoost repetition is required.')
+
     all_decision_dates = _analysis_decision_dates(common_dates, folds, config)
     decision_to_fold: dict[pd.Timestamp, int] = {}
     decision_metadata: dict[pd.Timestamp, dict[str, Any]] = {}
@@ -709,19 +808,34 @@ def run_rotation_models(bars_by_symbol: dict[str, pd.DataFrame], config: Any, fe
         for timestamp in fold['decision_dates'][:-1]:
             key = pd.Timestamp(timestamp)
             decision_to_fold[key] = int(fold['fold_id'])
-            decision_metadata[key] = {'fold_id': int(fold['fold_id']), 'test_start': fold['test_start'], 'test_end': fold['test_end']}
+            decision_metadata[key] = {
+                'fold_id': int(fold['fold_id']),
+                'test_start': fold['test_start'],
+                'test_end': fold['test_end'],
+            }
+
     device_label = f'CUDA — {xgb_plan.gpu_name}' if xgb_plan.selected == 'cuda' else 'CPU'
+    total_outputs = repetitions + (1 if ensemble_enabled else 0)
     if progress_callback is not None:
-        progress_callback(18.0, f'Prepared {len(symbols)} assets and {len(folds)} folds — XGBoost={device_label}', 0)
+        progress_callback(
+            18.0,
+            f'Prepared {len(symbols)} assets and {len(folds)} folds — '
+            f'XGBoost={device_label}; seeds={repetitions}; ensemble={ensemble_enabled}',
+            0,
+        )
 
     def report(fraction: float, stage: str, completed: int) -> None:
         if progress_callback is not None:
-            progress_callback(20.0 + 72.0 * max(0.0, min(1.0, float(fraction))), stage, completed)
+            progress_callback(
+                20.0 + 72.0 * max(0.0, min(1.0, float(fraction))),
+                stage,
+                completed,
+            )
 
     def backend_id(seed: int) -> str:
         return 'xgboost_utility' if repetitions <= 1 else f'xgboost_utility_seed_{seed}'
 
-    def trade_wrapper(seed: int, repetition_index: int) -> Callable[[dict[str, Any]], None] | None:
+    def trade_wrapper(seed: int | None, repetition_index: int, label: str) -> Callable[[dict[str, Any]], None] | None:
         if trade_callback is None:
             return None
 
@@ -730,44 +844,101 @@ def run_rotation_models(bars_by_symbol: dict[str, pd.DataFrame], config: Any, fe
             payload['model_family'] = 'xgboost_utility'
             payload['random_seed'] = seed
             payload['repetition_index'] = repetition_index
-            payload['model'] = 'XGBoost Utility' + (f' · seed {seed}' if repetitions > 1 else '')
+            payload['model'] = label
             trade_callback(payload)
+
         return emit
+
     results: list[RotationRunResult] = []
     effective_device = xgb_plan.selected
+    policies_by_fold: dict[int, list[Callable]] = {int(fold['fold_id']): [] for fold in folds}
+    all_margin_details: list[list[dict[str, Any]]] = []
+    seed_values: list[int] = []
+
     for repetition in range(repetitions):
         seed = int(config.random_state) + repetition * seed_step
+        seed_values.append(seed)
         rep_config = config.model_copy(update={'random_state': seed})
         policies: dict[int, Callable] = {}
         margin_details: list[dict[str, Any]] = []
         fallback_reasons: list[str] = []
+
         for fold_position, fold in enumerate(folds, start=1):
-            overall = (repetition + (fold_position - 1) / max(1, len(folds))) / repetitions
-            report(overall, f'XGBoost Utility run {repetition + 1}/{repetitions} — fold {fold_position}/{len(folds)} — {effective_device.upper()}', repetition)
+            overall = (repetition + (fold_position - 1) / max(1, len(folds))) / total_outputs
+            report(
+                overall,
+                f'XGBoost seed run {repetition + 1}/{repetitions} — '
+                f'fold {fold_position}/{len(folds)} — {effective_device.upper()}',
+                repetition,
+            )
             fold_id = int(fold['fold_id'])
             train_dates = common_dates[:int(fold['train_end_index'])]
-            calibration_dates = common_dates[int(fold['calibration_start_index']):int(fold['calibration_end_index'])]
+            calibration_dates = common_dates[
+                int(fold['calibration_start_index']):int(fold['calibration_end_index'])
+            ]
             final_fit_dates = common_dates[:int(fold['final_fit_end_index'])]
-            calibration_models, effective_device, fallback_reason = _fit_xgb_models(frames, symbols, train_dates, rep_config, effective_device)
+
+            calibration_models, effective_device, fallback_reason = _fit_xgb_models(
+                frames, symbols, train_dates, rep_config, effective_device
+            )
             if fallback_reason:
                 fallback_reasons.append(fallback_reason)
-            candidate_margins = tuple((float(value) for value in rep_config.rotation_switch_margin_candidates))
+
+            candidate_margins = tuple(
+                float(value) for value in rep_config.rotation_switch_margin_candidates
+            )
             best_candidate = candidate_margins[0]
             best_score = float('-inf')
             for candidate in candidate_margins:
-                calibration_policy = _xgb_policy(calibration_models, frames, symbols, rep_config, candidate)
-                score = _simple_policy_growth(calibration_policy, frames, symbols, calibration_dates, rep_config)
+                calibration_policy = _xgb_policy(
+                    calibration_models, frames, symbols, rep_config, candidate
+                )
+                score = _simple_policy_growth(
+                    calibration_policy, frames, symbols, calibration_dates, rep_config
+                )
                 if score > best_score:
-                    best_score = score
-                    best_candidate = candidate
-            final_models, effective_device, fallback_reason = _fit_xgb_models(frames, symbols, final_fit_dates, rep_config, effective_device)
+                    best_score = float(score)
+                    best_candidate = float(candidate)
+
+            final_models, effective_device, fallback_reason = _fit_xgb_models(
+                frames, symbols, final_fit_dates, rep_config, effective_device
+            )
             if fallback_reason:
                 fallback_reasons.append(fallback_reason)
-            effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
-            policies[fold_id] = _xgb_policy(final_models, frames, symbols, rep_config, effective_margin)
-            margin_details.append({'fold_id': fold_id, 'calibrated_candidate_margin': float(best_candidate), 'effective_switch_margin': float(effective_margin), 'calibration_risk_adjusted_score': float(best_score)})
+
+            effective_margin = max(
+                float(rep_config.rotation_switch_margin),
+                float(best_candidate),
+            )
+            fold_policy = _xgb_policy(
+                final_models, frames, symbols, rep_config, effective_margin
+            )
+            policies[fold_id] = fold_policy
+            policies_by_fold[fold_id].append(fold_policy)
+            margin_details.append(
+                {
+                    'fold_id': fold_id,
+                    'calibrated_candidate_margin': float(best_candidate),
+                    'effective_switch_margin': float(effective_margin),
+                    'calibration_risk_adjusted_score': float(best_score),
+                }
+            )
+
+        all_margin_details.append(margin_details)
         scheduled = _scheduled_policy(policies, decision_to_fold)
-        result = _simulate_exact('xgboost_utility', scheduled, frames, symbols, all_decision_dates, rep_config, fee_calculator, slippage, decision_metadata=decision_metadata, trade_callback=trade_wrapper(seed, repetition + 1))
+        label = 'XGBoost Utility' + (f' · seed {seed}' if repetitions > 1 else '')
+        result = _simulate_exact(
+            'xgboost_utility',
+            scheduled,
+            frames,
+            symbols,
+            all_decision_dates,
+            rep_config,
+            fee_calculator,
+            slippage,
+            decision_metadata=decision_metadata,
+            trade_callback=trade_wrapper(seed, repetition + 1, label),
+        )
         unique_backend = backend_id(seed)
         result.backend = unique_backend
         result.metrics['backend'] = unique_backend
@@ -779,14 +950,41 @@ def run_rotation_models(bars_by_symbol: dict[str, pd.DataFrame], config: Any, fe
         result.metrics['random_seed'] = seed
         result.metrics['repetition_index'] = repetition + 1
         result.metrics['repetition_count'] = repetitions
-        result.metrics['strategy_label'] = 'XGBoost Utility' + (f' · seed {seed}' if repetitions > 1 else '')
-        fold_metrics = _fold_performance(result.predictions, folds, float(rep_config.initial_capital))
+        result.metrics['seed_ensemble'] = False
+        result.metrics['strategy_label'] = label
+
+        fold_metrics = _fold_performance(
+            result.predictions, folds, float(rep_config.initial_capital)
+        )
         margin_by_fold = {item['fold_id']: item for item in margin_details}
         for item in fold_metrics:
             item.update(margin_by_fold.get(item['fold_id'], {}))
+        result.metrics.update(_fold_robustness_metrics(fold_metrics))
         effective_values = [item['effective_switch_margin'] for item in margin_details]
         candidate_values = [item['calibrated_candidate_margin'] for item in margin_details]
-        result.metrics.update({'walk_forward_fold_count': len(folds), 'walk_forward_folds': fold_metrics, 'calibrated_candidate_margin_mean': float(np.mean(candidate_values)), 'effective_switch_margin_mean': float(np.mean(effective_values)), 'effective_switch_margin_min': float(np.min(effective_values)), 'effective_switch_margin_max': float(np.max(effective_values)), 'calibrated_switch_margin': float(np.mean(candidate_values)), 'effective_switch_margin': float(np.mean(effective_values)), 'requested_accelerator': xgb_plan.requested, 'effective_compute_device': effective_device, 'cuda_available': xgb_plan.cuda_available, 'gpu_name': xgb_plan.gpu_name, 'framework_version': xgb_plan.framework_version, 'cuda_build': xgb_plan.cuda_build, 'cpu_fallback_used': bool(xgb_plan.fallback_used or fallback_reasons), 'compute_fallback_reason': fallback_reasons[-1] if fallback_reasons else xgb_plan.fallback_reason, 'deterministic_execution': bool(rep_config.deterministic_execution), 'numeric_thread_limit': int(rep_config.numeric_thread_limit), 'xgb_n_jobs': int(rep_config.xgb_n_jobs)})
+        result.metrics.update(
+            {
+                'walk_forward_fold_count': len(folds),
+                'walk_forward_folds': fold_metrics,
+                'calibrated_candidate_margin_mean': float(np.mean(candidate_values)),
+                'effective_switch_margin_mean': float(np.mean(effective_values)),
+                'effective_switch_margin_min': float(np.min(effective_values)),
+                'effective_switch_margin_max': float(np.max(effective_values)),
+                'calibrated_switch_margin': float(np.mean(candidate_values)),
+                'effective_switch_margin': float(np.mean(effective_values)),
+                'requested_accelerator': xgb_plan.requested,
+                'effective_compute_device': effective_device,
+                'cuda_available': xgb_plan.cuda_available,
+                'gpu_name': xgb_plan.gpu_name,
+                'framework_version': xgb_plan.framework_version,
+                'cuda_build': xgb_plan.cuda_build,
+                'cpu_fallback_used': bool(xgb_plan.fallback_used or fallback_reasons),
+                'compute_fallback_reason': fallback_reasons[-1] if fallback_reasons else xgb_plan.fallback_reason,
+                'deterministic_execution': bool(rep_config.deterministic_execution),
+                'numeric_thread_limit': int(rep_config.numeric_thread_limit),
+                'xgb_n_jobs': int(rep_config.xgb_n_jobs),
+            }
+        )
         result.summary += '\n\nROBUSTNESS / COMPUTE\n'
         result.summary += f'Seed: {seed}\n'
         result.summary += f'Repetition: {repetition + 1}/{repetitions}\n'
@@ -797,6 +995,78 @@ def run_rotation_models(bars_by_symbol: dict[str, pd.DataFrame], config: Any, fe
         if fallback_reasons:
             result.summary += f'Fallback: {fallback_reasons[-1]}\n'
         results.append(result)
-        report((repetition + 1) / repetitions, f'XGBoost Utility run {repetition + 1}/{repetitions} completed', repetition + 1)
+        report(
+            (repetition + 1) / total_outputs,
+            f'XGBoost seed run {repetition + 1}/{repetitions} completed',
+            repetition + 1,
+        )
+
+    if ensemble_enabled:
+        ensemble_policies: dict[int, Callable] = {}
+        for fold in folds:
+            fold_id = int(fold['fold_id'])
+            ensemble_policies[fold_id] = _majority_vote_policy(
+                policies_by_fold[fold_id],
+                minimum_agreement=float(config.rotation_seed_ensemble_min_agreement),
+            )
+        ensemble_scheduled = _scheduled_policy(ensemble_policies, decision_to_fold)
+        ensemble_label = 'XGBoost Seed Ensemble'
+        ensemble_result = _simulate_exact(
+            'xgboost_utility_ensemble',
+            ensemble_scheduled,
+            frames,
+            symbols,
+            all_decision_dates,
+            config,
+            fee_calculator,
+            slippage,
+            decision_metadata=decision_metadata,
+            trade_callback=trade_wrapper(None, repetitions + 1, ensemble_label),
+        )
+        ensemble_result.backend = 'xgboost_utility_ensemble'
+        ensemble_result.metrics['backend'] = ensemble_result.backend
+        ensemble_result.metrics['model_family'] = 'xgboost_utility'
+        ensemble_result.metrics['strategy_label'] = ensemble_label
+        ensemble_result.metrics['seed_ensemble'] = True
+        ensemble_result.metrics['ensemble_method'] = str(config.rotation_seed_ensemble_method)
+        ensemble_result.metrics['ensemble_seeds'] = seed_values
+        ensemble_result.metrics['ensemble_min_agreement'] = float(
+            config.rotation_seed_ensemble_min_agreement
+        )
+        ensemble_result.metrics['random_seed'] = None
+        ensemble_result.metrics['repetition_index'] = repetitions + 1
+        ensemble_result.metrics['repetition_count'] = repetitions
+        ensemble_result.metrics['champion_fold_schedule_locked'] = True
+        ensemble_result.metrics['champion_oos_start'] = folds[0]['test_start']
+        ensemble_result.metrics['requested_analysis_start'] = pd.Timestamp(all_decision_dates[1])
+        ensemble_result.metrics['requested_analysis_end'] = pd.Timestamp(all_decision_dates[-1])
+        ensemble_result.metrics['walk_forward_fold_count'] = len(folds)
+        ensemble_fold_metrics = _fold_performance(
+            ensemble_result.predictions, folds, float(config.initial_capital)
+        )
+        ensemble_result.metrics['walk_forward_folds'] = ensemble_fold_metrics
+        ensemble_result.metrics.update(_fold_robustness_metrics(ensemble_fold_metrics))
+        ensemble_result.metrics['requested_accelerator'] = xgb_plan.requested
+        ensemble_result.metrics['effective_compute_device'] = effective_device
+        ensemble_result.metrics['cuda_available'] = xgb_plan.cuda_available
+        ensemble_result.metrics['gpu_name'] = xgb_plan.gpu_name
+        ensemble_result.metrics['framework_version'] = xgb_plan.framework_version
+        ensemble_result.metrics['cuda_build'] = xgb_plan.cuda_build
+        ensemble_result.metrics['deterministic_execution'] = bool(config.deterministic_execution)
+        ensemble_result.metrics['numeric_thread_limit'] = int(config.numeric_thread_limit)
+        ensemble_result.metrics['xgb_n_jobs'] = int(config.xgb_n_jobs)
+        ensemble_result.summary += '\n\nPRODUCTION SEED ENSEMBLE\n'
+        ensemble_result.summary += f'Method: {config.rotation_seed_ensemble_method}\n'
+        ensemble_result.summary += f'Seeds: {", ".join(str(seed) for seed in seed_values)}\n'
+        ensemble_result.summary += (
+            f'Minimum agreement: {float(config.rotation_seed_ensemble_min_agreement):.0%}\n'
+        )
+        ensemble_result.summary += (
+            'The production decision combines seed policies instead of selecting the '
+            'best seed after observing test returns.\n'
+        )
+        results.append(ensemble_result)
+        report(1.0, 'XGBoost production seed ensemble completed', total_outputs)
+
     results.sort(key=lambda result: int(result.metrics.get('repetition_index', 1)))
     return results

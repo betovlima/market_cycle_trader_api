@@ -8,6 +8,7 @@ import pandas as pd
 
 from .capital_rotation import (
     _fit_xgb_models,
+    _majority_vote_policy,
     _simple_policy_growth,
     _xgb_policy,
     _xgb_utilities,
@@ -34,6 +35,10 @@ class LiveXGBoostDecision:
     effective_compute_device: str
     compute_fallback_reason: str | None
     random_state: int
+    ensemble_enabled: bool
+    ensemble_method: str | None
+    ensemble_seeds: list[int]
+    ensemble_agreement: float | None
 
 
 def build_live_xgboost_decision(
@@ -43,15 +48,12 @@ def build_live_xgboost_decision(
     current_asset: str | None,
     holding_sessions: int,
 ) -> LiveXGBoostDecision:
-    """Train the validated live fold and decide the next-open target.
+    """Retrain on every completed session and decide the next-open target.
 
-    This mirrors the backtest's expanding walk-forward convention for a decision
-    made after the latest completed daily close:
-
-    * a purge separates training labels from calibration;
-    * a second purge separates final fitting from the live decision;
-    * the model reads features from the latest completed session;
-    * any position change is intended for the next regular-session open.
+    The live plan uses the same fixed historical protocol and seed ensemble as
+    the backtest. Each paper plan is rebuilt after the latest regular-session
+    daily candle is complete, so newly available information is incorporated
+    without allowing future bars into the decision.
     """
 
     if config.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
@@ -66,15 +68,10 @@ def build_live_xgboost_decision(
     if len(common_dates) < 2:
         raise ValueError("At least two aligned completed sessions are required.")
 
-    purge = max(
-        int(config.rotation_purge_days),
-        int(config.rotation_horizon_days),
-    )
+    purge = max(int(config.rotation_purge_days), int(config.rotation_horizon_days))
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     minimum_training_rows = int(config.rotation_minimum_training_rows)
 
-    # A live decision occurs after common_dates[-1], so the unseen execution
-    # session would start at index len(common_dates).
     live_test_start = len(common_dates)
     calibration_end_index = live_test_start - purge
     calibration_start_index = calibration_end_index - calibration_days
@@ -97,60 +94,6 @@ def build_live_xgboost_decision(
     final_fit_dates = common_dates[:final_fit_end_index]
     decision_date = pd.Timestamp(common_dates[-1])
 
-    compute_plan = resolve_xgboost_compute_plan(config)
-    effective_device = compute_plan.selected
-    fallback_reasons: list[str] = []
-
-    calibration_models, effective_device, fallback_reason = _fit_xgb_models(
-        frames,
-        symbols,
-        train_dates,
-        config,
-        effective_device,
-    )
-    if fallback_reason:
-        fallback_reasons.append(fallback_reason)
-
-    candidates = tuple(float(value) for value in config.rotation_switch_margin_candidates)
-    if not candidates:
-        raise ValueError("rotation_switch_margin_candidates cannot be empty.")
-
-    best_candidate = candidates[0]
-    best_score = float("-inf")
-    for candidate in candidates:
-        calibration_policy = _xgb_policy(
-            calibration_models,
-            frames,
-            symbols,
-            config,
-            candidate,
-        )
-        score = _simple_policy_growth(
-            calibration_policy,
-            frames,
-            symbols,
-            calibration_dates,
-            config,
-        )
-        if score > best_score:
-            best_score = float(score)
-            best_candidate = float(candidate)
-
-    final_models, effective_device, fallback_reason = _fit_xgb_models(
-        frames,
-        symbols,
-        final_fit_dates,
-        config,
-        effective_device,
-    )
-    if fallback_reason:
-        fallback_reasons.append(fallback_reason)
-
-    effective_margin = max(
-        float(config.rotation_switch_margin),
-        float(best_candidate),
-    )
-
     current_label = str(current_asset or "CASH").strip().upper()
     labels = ["CASH", *symbols]
     if current_label not in labels:
@@ -159,30 +102,120 @@ def build_live_xgboost_decision(
         )
     current_position = labels.index(current_label)
 
-    utilities_array = _xgb_utilities(
-        final_models,
-        frames,
-        symbols,
-        decision_date,
-        config,
-    )
-    if not np.isfinite(utilities_array).all():
-        raise ValueError("The live XGBoost utilities contain non-finite values.")
+    compute_plan = resolve_xgboost_compute_plan(config)
+    effective_device = compute_plan.selected
+    fallback_reasons: list[str] = []
+    policies = []
+    seed_utilities: list[np.ndarray] = []
+    seed_targets: list[int] = []
+    seed_selected_scores: list[float] = []
+    candidate_margins: list[float] = []
+    calibration_scores: list[float] = []
+    effective_margins: list[float] = []
+    seeds = list(config.ensemble_seeds)
 
-    policy = _xgb_policy(
-        final_models,
-        frames,
-        symbols,
-        config,
-        effective_margin,
-    )
-    target_position, selected_utility = policy(
-        decision_date,
-        current_position,
-        int(holding_sessions),
-    )
+    for seed in seeds:
+        rep_config = config.model_copy(update={"random_state": int(seed)})
+        calibration_models, effective_device, fallback_reason = _fit_xgb_models(
+            frames,
+            symbols,
+            train_dates,
+            rep_config,
+            effective_device,
+        )
+        if fallback_reason:
+            fallback_reasons.append(fallback_reason)
+
+        candidates = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
+        if not candidates:
+            raise ValueError("rotation_switch_margin_candidates cannot be empty.")
+
+        best_candidate = candidates[0]
+        best_score = float("-inf")
+        for candidate in candidates:
+            calibration_policy = _xgb_policy(
+                calibration_models,
+                frames,
+                symbols,
+                rep_config,
+                candidate,
+            )
+            score = _simple_policy_growth(
+                calibration_policy,
+                frames,
+                symbols,
+                calibration_dates,
+                rep_config,
+            )
+            if score > best_score:
+                best_score = float(score)
+                best_candidate = float(candidate)
+
+        final_models, effective_device, fallback_reason = _fit_xgb_models(
+            frames,
+            symbols,
+            final_fit_dates,
+            rep_config,
+            effective_device,
+        )
+        if fallback_reason:
+            fallback_reasons.append(fallback_reason)
+
+        effective_margin = max(
+            float(rep_config.rotation_switch_margin),
+            float(best_candidate),
+        )
+        policy = _xgb_policy(
+            final_models,
+            frames,
+            symbols,
+            rep_config,
+            effective_margin,
+        )
+        utilities_array = _xgb_utilities(
+            final_models,
+            frames,
+            symbols,
+            decision_date,
+            rep_config,
+        )
+        if not np.isfinite(utilities_array).all():
+            raise ValueError("The live XGBoost utilities contain non-finite values.")
+
+        target_position, selected_utility = policy(
+            decision_date,
+            current_position,
+            int(holding_sessions),
+        )
+        policies.append(policy)
+        seed_utilities.append(utilities_array.astype(float))
+        seed_targets.append(int(target_position))
+        seed_selected_scores.append(float(selected_utility))
+        candidate_margins.append(float(best_candidate))
+        calibration_scores.append(float(best_score))
+        effective_margins.append(float(effective_margin))
+
+    ensemble_enabled = bool(config.rotation_seed_ensemble_enabled and len(policies) > 1)
+    if ensemble_enabled:
+        combined_policy = _majority_vote_policy(
+            policies,
+            minimum_agreement=float(config.rotation_seed_ensemble_min_agreement),
+        )
+        target_position, selected_utility = combined_policy(
+            decision_date,
+            current_position,
+            int(holding_sessions),
+        )
+        vote_count = sum(position == int(target_position) for position in seed_targets)
+        agreement = vote_count / len(seed_targets)
+        utilities_array = np.median(np.vstack(seed_utilities), axis=0)
+    else:
+        target_position = seed_targets[0]
+        selected_utility = seed_selected_scores[0]
+        agreement = 1.0
+        utilities_array = seed_utilities[0]
+
     raw_best_position = int(np.nanargmax(utilities_array))
-
     utilities = {
         label: float(utilities_array[index])
         for index, label in enumerate(labels)
@@ -195,9 +228,9 @@ def build_live_xgboost_decision(
         raw_best_asset=labels[raw_best_position],
         selected_utility=float(selected_utility),
         utilities=utilities,
-        effective_switch_margin=float(effective_margin),
-        calibrated_candidate_margin=float(best_candidate),
-        calibration_score=float(best_score),
+        effective_switch_margin=float(np.median(effective_margins)),
+        calibrated_candidate_margin=float(np.median(candidate_margins)),
+        calibration_score=float(np.median(calibration_scores)),
         training_end=pd.Timestamp(train_dates[-1]),
         calibration_start=pd.Timestamp(calibration_dates[0]),
         calibration_end=pd.Timestamp(calibration_dates[-1]),
@@ -209,4 +242,12 @@ def build_live_xgboost_decision(
             else compute_plan.fallback_reason
         ),
         random_state=int(config.random_state),
+        ensemble_enabled=ensemble_enabled,
+        ensemble_method=(
+            str(config.rotation_seed_ensemble_method)
+            if ensemble_enabled
+            else None
+        ),
+        ensemble_seeds=[int(seed) for seed in seeds],
+        ensemble_agreement=float(agreement),
     )

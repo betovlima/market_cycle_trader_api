@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..core.system_rules import IMMUTABLE_STRATEGY_FIELDS
 from .requests import BacktestRequest
 
 
@@ -22,6 +23,12 @@ class StrategyConfigurationPatchRequest(BaseModel):
     def validate_changes(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not value:
             raise ValueError("At least one strategy parameter must be supplied.")
+        immutable = sorted(set(value) & set(IMMUTABLE_STRATEGY_FIELDS))
+        if immutable:
+            raise ValueError(
+                "These values are fixed system rules and cannot be changed: "
+                + ", ".join(immutable)
+            )
         allowed = set(BacktestRequest.model_fields)
         unknown = sorted(set(value) - allowed)
         if unknown:

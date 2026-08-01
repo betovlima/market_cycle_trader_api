@@ -21,6 +21,7 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     utc_now,
 )
+from ..core.system_rules import IMMUTABLE_STRATEGY_FIELDS, system_rules_payload
 from ..schemas.requests import BacktestRequest
 
 CANONICAL_PARAMETERIZATION = "001_xgboost_high_performance_seed_3042.json"
@@ -46,6 +47,17 @@ def _operational_document(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalized_operational_payload(document: dict[str, Any]) -> dict[str, Any]:
+    payload = _operational_document(document)
+    for field in IMMUTABLE_STRATEGY_FIELDS:
+        payload.pop(field, None)
+    repetitions = int(payload.get("rotation_xgb_repetitions") or 1)
+    payload.setdefault("rotation_seed_ensemble_enabled", repetitions >= 3)
+    payload.setdefault("rotation_seed_ensemble_method", "majority_vote")
+    payload.setdefault("rotation_seed_ensemble_min_agreement", 0.4)
+    return payload
+
+
 def _configuration_hash(configuration: dict[str, Any]) -> str:
     encoded = json.dumps(
         bson_value(configuration),
@@ -69,9 +81,10 @@ def _metadata(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_configuration(document: dict[str, Any]) -> dict[str, Any]:
-    validated = BacktestRequest.model_validate(_operational_document(document))
+    validated = BacktestRequest.model_validate(_normalized_operational_payload(document))
     configuration = validated.model_dump(mode="json")
     return {
+        "system_rules": system_rules_payload(),
         "configuration": configuration,
         "configuration_hash": _configuration_hash(configuration),
         "metadata": _metadata(document),
@@ -138,7 +151,7 @@ def _changed_fields(
     previous: dict[str, Any],
     next_configuration: dict[str, Any],
 ) -> list[str]:
-    previous_configuration = _operational_document(previous)
+    previous_configuration = _normalized_operational_payload(previous)
     return sorted(
         key
         for key in set(previous_configuration) | set(next_configuration)
@@ -225,7 +238,7 @@ def _replace_configuration(
         raise StrategyConfigurationError(
             "The updated strategy configuration could not be read from MongoDB."
         )
-    BacktestRequest.model_validate(_operational_document(stored))
+    BacktestRequest.model_validate(_normalized_operational_payload(stored))
 
     response = _public_configuration(stored)
     response.update(
@@ -255,7 +268,7 @@ def patch_strategy_configuration(
         raise StrategyConfigurationNotFound(
             "The active strategy configuration does not exist."
         )
-    merged = {**_operational_document(current), **changes}
+    merged = {**_normalized_operational_payload(current), **changes}
     validated = BacktestRequest.model_validate(merged)
     return _replace_configuration(
         db,
@@ -315,12 +328,12 @@ def list_strategy_configuration_history(
         stored_document = dict(record.get("document") or {})
         try:
             operational = BacktestRequest.model_validate(
-                _operational_document(stored_document)
+                _normalized_operational_payload(stored_document)
             ).model_dump(mode="json")
             valid = True
             validation_error = None
         except ValidationError as exc:
-            operational = bson_value(_operational_document(stored_document))
+            operational = bson_value(_normalized_operational_payload(stored_document))
             valid = False
             validation_error = str(exc)
 
@@ -362,7 +375,7 @@ def restore_strategy_configuration(
             "The requested strategy history entry does not exist."
         )
     configuration = BacktestRequest.model_validate(
-        _operational_document(dict(record.get("document") or {}))
+        _normalized_operational_payload(dict(record.get("document") or {}))
     )
     return _replace_configuration(
         db,
