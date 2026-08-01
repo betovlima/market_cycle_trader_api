@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class BootstrapParametersRequest(BaseModel):
-    """Explicit confirmation for bootstrap plus versioned safe schema migrations."""
+    """Explicit confirmation for canonical strategy reset and missing-document bootstrap."""
 
     model_config = ConfigDict(extra="forbid")
 

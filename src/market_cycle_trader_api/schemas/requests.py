@@ -10,7 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST"]
 Timeframe = Literal["1Day"]
 MarketDataProvider = Literal["alpaca"]
-AlpacaFeed = Literal["iex", "sip"]
+AlpacaHistoricalFeed = Literal["sip"]
+AlpacaLiveFeed = Literal["iex"]
 AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
 HistoryBackfillProvider = Literal["alpaca"]
 RotationModel = Literal["xgboost_utility"]
@@ -75,7 +76,8 @@ class BacktestRequest(BaseModel):
     end_date: str | None
     timeframe: Timeframe
     market_data_provider: MarketDataProvider
-    alpaca_feed: AlpacaFeed
+    alpaca_historical_feed: AlpacaHistoricalFeed
+    alpaca_live_feed: AlpacaLiveFeed
     alpaca_adjustment: AlpacaAdjustment
     market_data_history_backfill_enabled: bool
     market_data_history_backfill_provider: HistoryBackfillProvider

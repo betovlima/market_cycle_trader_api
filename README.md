@@ -1,25 +1,30 @@
-# Market Cycle Trader API v1.12.13
+# Market Cycle Trader API v1.12.14
 
 FastAPI backend for the XGBoost-only Compound Capital Rotation strategy.
 
 ## Market data
 
-All historical, backtest, diagnostic, and paper-trading market data is obtained through the Alpaca API. The application does not use Yahoo Finance.
+The application uses the Alpaca API exclusively:
 
-The Alpaca cache is stored in MongoDB collection `alpaca_market_bars` using the configured feed and adjustment policy.
+- `sip` for historical training, backtests, diagnostics, and daily signal preparation;
+- `iex` for recent/live market-data connectivity;
+- Alpaca Paper for order execution.
+
+The historical cache is stored in MongoDB collection `alpaca_market_bars`. Its unique key includes symbol, timeframe, feed, adjustment, and timestamp, so SIP and IEX records cannot be mixed.
 
 ## Automatic Railway deployment
 
-The Railway pre-deploy phase automatically performs these steps:
+The Railway pre-deploy phase automatically:
 
-1. creates missing database indexes and parameter documents;
-2. migrates `backtest_settings/default` to the current schema;
-3. removes retired provider settings from the active document;
-4. downloads missing historical bars from Alpaca in bounded date ranges;
-5. validates that every configured asset reaches the locked historical start;
-6. starts the API only after the database and market history are ready.
+1. validates the canonical strategy bundled with the release;
+2. archives every existing document from `backtest_settings`;
+3. clears that collection and inserts one canonical `_id="default"` document;
+4. preserves valid paper-trading settings or inserts them when missing;
+5. downloads missing historical bars from Alpaca SIP in bounded date ranges;
+6. validates that every configured asset reaches the locked historical start;
+7. starts the API only after the database and historical cache are ready.
 
-No manual MongoDB migration is required for this release.
+No manual MongoDB migration is required.
 
 ## Runtime modules
 

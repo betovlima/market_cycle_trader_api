@@ -99,6 +99,9 @@ def market_data_manifest(
             "history_complete": bool(provenance.get("history_complete", True)),
             "provider": provenance.get("provider") or provenance.get("effective_provider"),
             "effective_provider": provenance.get("effective_provider"),
+            "historical_feed": provenance.get("historical_feed"),
+            "live_feed": provenance.get("live_feed"),
+            "adjustment": provenance.get("adjustment"),
             "initial_rows": provenance.get("initial_rows"),
             "history_backfill_provider": provenance.get("history_backfill_provider"),
             "history_backfill_rows": provenance.get("history_backfill_rows"),
@@ -143,4 +146,7 @@ def build_reproducibility_manifest(
         "deterministic_execution": bool(config.deterministic_execution),
         "numeric_thread_limit": int(config.numeric_thread_limit),
         "xgb_n_jobs": int(config.xgb_n_jobs),
+        "alpaca_historical_feed": str(config.alpaca_historical_feed),
+        "alpaca_live_feed": str(config.alpaca_live_feed),
+        "alpaca_adjustment": str(config.alpaca_adjustment),
     }

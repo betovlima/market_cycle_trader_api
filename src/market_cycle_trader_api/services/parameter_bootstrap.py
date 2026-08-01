@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import resources
-from typing import Any, Callable
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 from pymongo.database import Database
@@ -45,9 +45,10 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="xgboost-high-performance-cpu-seed-3042-v1.12.13",
+        configuration_name="xgboost-high-performance-seed-3042-alpaca-sip-v1.12.14",
         configuration_note=(
-            "Bundled high-performance XGBoost-only CPU parameterization using Alpaca for all market data."
+            "Canonical locked XGBoost strategy. Alpaca SIP is used for historical "
+            "training/backtests and Alpaca IEX is reserved for recent/live market data."
         ),
     ),
     ParameterizationDefinition(
@@ -114,122 +115,200 @@ def _validate_existing(
     return True, "Existing document is valid and was preserved unchanged."
 
 
-
-def _strategy_schema_migration(
-    db: Database,
+def _canonical_document(
     definition: ParameterizationDefinition,
-    existing: dict[str, Any],
     *,
     source: str,
-) -> tuple[dict[str, Any], bool]:
-    """Apply idempotent strategy migrations required by the current release.
+    created_at: datetime | None = None,
+) -> dict[str, Any]:
+    now = _utc_now()
+    return {
+        "_id": definition.document_id,
+        **_validated_payload(definition),
+        "created_at": created_at or now,
+        "updated_at": now,
+        "schema_version": definition.schema_version,
+        "configuration_name": definition.configuration_name,
+        "configuration_note": definition.configuration_note,
+        "bootstrap_source": source,
+    }
 
-    Schema v13 removes the retired Yahoo Finance settings and guarantees that
-    historical bootstrap, cache refresh, backtests, diagnostics, and paper
-    planning use Alpaca market data only. Existing strategy hyperparameters,
-    dates, costs, assets, and promoted seeds remain unchanged.
-    """
 
-    if definition.collection != SETTINGS_COLLECTION:
-        return existing, False
+def _strategy_is_canonical(
+    definition: ParameterizationDefinition,
+    existing_documents: list[dict[str, Any]],
+) -> bool:
+    if len(existing_documents) != 1:
+        return False
+    existing = existing_documents[0]
+    if existing.get("_id") != definition.document_id:
+        return False
+    if int(existing.get("schema_version") or 0) != definition.schema_version:
+        return False
+    if str(existing.get("configuration_name") or "") != definition.configuration_name:
+        return False
+    try:
+        validated_existing = definition.validator.model_validate(
+            _operational_document(existing)
+        )
+    except ValidationError:
+        return False
+    existing_payload = bson_value(validated_existing.model_dump(mode="python"))
+    return existing_payload == _validated_payload(definition)
 
-    current_schema = int(existing.get("schema_version") or 0)
-    operational = _operational_document(existing)
-    updates: dict[str, Any] = {}
-    unset_fields: dict[str, str] = {}
-    migration_notes: list[str] = []
 
-    v11_fields_missing = any(
-        field not in operational
-        for field in ("deterministic_execution", "numeric_thread_limit")
-    )
-    if current_schema < 11 or v11_fields_missing:
-        updates.update(
+def _archive_strategy_documents(
+    db: Database,
+    documents: list[dict[str, Any]],
+    *,
+    source: str,
+) -> int:
+    if not documents:
+        return 0
+    captured_at = _utc_now()
+    audit_documents: list[dict[str, Any]] = []
+    for existing in documents:
+        copy = deepcopy(existing)
+        original_id = copy.pop("_id", None)
+        audit_documents.append(
             {
-                "xgb_n_jobs": -1,
-                "deterministic_execution": False,
-                "numeric_thread_limit": 1,
+                "captured_at": captured_at,
+                "source": source,
+                "note": (
+                    "Automatic v1.12.14 canonical reset before Railway deployment. "
+                    "The previous strategy document was archived before replacement."
+                ),
+                "original_document_id": str(original_id),
+                "target_schema_version": SETTINGS_SCHEMA_VERSION,
+                "document": bson_value(copy),
             }
         )
-        migration_notes.append(
-            "restored the promoted high-performance XGBoost execution policy"
-        )
+    db[SETTINGS_HISTORY_COLLECTION].insert_many(audit_documents, ordered=True)
+    return len(audit_documents)
 
-    alpaca_only_defaults = {
-        "market_data_provider": "alpaca",
-        "market_data_history_backfill_enabled": True,
-        "market_data_history_backfill_provider": "alpaca",
-        "market_data_history_start_tolerance_days": 10,
-        "market_data_require_complete_history": True,
-    }
-    for field, value in alpaca_only_defaults.items():
-        if current_schema < 13 or operational.get(field) != value:
-            updates[field] = value
 
-    retired_yahoo_fields = (
-        "yfinance_auto_adjust",
-        "yfinance_repair",
-        "yfinance_timeout",
-        "yfinance_fallback_period",
-    )
-    for field in retired_yahoo_fields:
-        if field in operational:
-            unset_fields[field] = ""
+def _reset_strategy_parameterization(
+    db: Database,
+    definition: ParameterizationDefinition,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    collection = db[definition.collection]
+    existing_documents = list(collection.find({}))
 
-    if current_schema < 13 or updates or unset_fields:
-        migration_notes.append(
-            "removed Yahoo Finance settings and enabled Alpaca-only historical backfill"
-        )
-
-    if not updates and not unset_fields and current_schema >= SETTINGS_SCHEMA_VERSION:
-        return existing, False
-
-    now = _utc_now()
-    history = deepcopy(existing)
-    history.pop("_id", None)
-    history.update(
-        {
-            "captured_at": now,
-            "note": "Automatic v1.12.13 Alpaca-only strategy migration before Railway deployment.",
-            "source": source,
-        }
-    )
-    db[SETTINGS_HISTORY_COLLECTION].insert_one(history)
-
-    previous_note = str(existing.get("configuration_note") or "").strip()
-    migration_note = (
-        "Automatic v1.12.13 migration: " + "; ".join(migration_notes) + "."
-    )
-    updates.update(
-        {
-            "schema_version": SETTINGS_SCHEMA_VERSION,
-            "updated_at": now,
-            "configuration_note": (
-                f"{previous_note} {migration_note}".strip()
-                if previous_note
-                else migration_note
+    if _strategy_is_canonical(definition, existing_documents):
+        return {
+            "key": definition.key,
+            "collection": definition.collection,
+            "document_id": definition.document_id,
+            "status": "skipped_existing_valid",
+            "valid": True,
+            "message": (
+                "The single stored strategy document already matches the canonical "
+                "v1.12.14 Alpaca SIP/IEX configuration."
             ),
-            "bootstrap_source": source,
         }
+
+    archived = _archive_strategy_documents(db, existing_documents, source=source)
+    original_created_at = None
+    for document in existing_documents:
+        if document.get("_id") == definition.document_id:
+            original_created_at = document.get("created_at")
+            break
+
+    canonical = _canonical_document(
+        definition,
+        source=source,
+        created_at=original_created_at,
     )
-    mongo_update: dict[str, Any] = {"$set": updates}
-    if unset_fields:
-        mongo_update["$unset"] = unset_fields
-    db[SETTINGS_COLLECTION].update_one(
-        {"_id": definition.document_id},
-        mongo_update,
-        upsert=False,
-    )
-    migrated = db[SETTINGS_COLLECTION].find_one({"_id": definition.document_id})
-    if migrated is None:
-        raise RuntimeError("Strategy configuration disappeared during schema migration.")
-    definition.validator.model_validate(_operational_document(migrated))
-    return migrated, True
+
+    # This collection contains exactly one locked operational strategy. A full
+    # reset prevents old schema fields and extra strategy documents from being
+    # accumulated across releases.
+    collection.delete_many({})
+    collection.insert_one(canonical)
+
+    stored = collection.find_one({"_id": definition.document_id})
+    if stored is None:
+        raise RuntimeError("Canonical strategy configuration was not inserted.")
+    definition.validator.model_validate(_operational_document(stored))
+
+    return {
+        "key": definition.key,
+        "collection": definition.collection,
+        "document_id": definition.document_id,
+        "status": "migrated_existing" if existing_documents else "inserted",
+        "valid": True,
+        "message": (
+            "Canonical strategy reset completed: archived "
+            f"{archived} previous document(s), removed all old strategy documents, "
+            "and inserted one validated schema v14 configuration using Alpaca SIP "
+            "for historical data and IEX for live/recent data."
+        ),
+    }
+
+
+def _insert_or_preserve_non_strategy_parameterization(
+    db: Database,
+    definition: ParameterizationDefinition,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    collection = db[definition.collection]
+    existing = collection.find_one({"_id": definition.document_id})
+    if existing is not None:
+        valid, message = _validate_existing(definition, existing)
+        return {
+            "key": definition.key,
+            "collection": definition.collection,
+            "document_id": definition.document_id,
+            "status": "skipped_existing_valid" if valid else "skipped_existing_invalid",
+            "valid": valid,
+            "message": message,
+        }
+
+    document = _canonical_document(definition, source=source)
+    collection.insert_one(document)
+    return {
+        "key": definition.key,
+        "collection": definition.collection,
+        "document_id": definition.document_id,
+        "status": "inserted",
+        "valid": True,
+        "message": "Bundled validated document was inserted.",
+    }
 
 
 def parameterization_status(db: Database) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for definition in DEFINITIONS:
+        if definition.collection == SETTINGS_COLLECTION:
+            existing_documents = list(db[definition.collection].find({}))
+            canonical = _strategy_is_canonical(definition, existing_documents)
+            results.append(
+                {
+                    "key": definition.key,
+                    "collection": definition.collection,
+                    "document_id": definition.document_id,
+                    "status": (
+                        "skipped_existing_valid"
+                        if canonical
+                        else "skipped_existing_invalid"
+                        if existing_documents
+                        else "missing"
+                    ),
+                    "valid": canonical,
+                    "message": (
+                        "The canonical locked strategy is installed."
+                        if canonical
+                        else "The strategy collection does not match the canonical release configuration."
+                        if existing_documents
+                        else "The strategy collection is empty."
+                    ),
+                }
+            )
+            continue
+
         existing = db[definition.collection].find_one({"_id": definition.document_id})
         if existing is None:
             results.append(
@@ -239,11 +318,10 @@ def parameterization_status(db: Database) -> list[dict[str, Any]]:
                     "document_id": definition.document_id,
                     "status": "missing",
                     "valid": False,
-                    "message": "Document does not exist and can be inserted by the bootstrap API.",
+                    "message": "Document does not exist and can be inserted by bootstrap.",
                 }
             )
             continue
-
         valid, message = _validate_existing(definition, existing)
         results.append(
             {
@@ -263,11 +341,11 @@ def bootstrap_missing_parameterizations(
     *,
     source: str,
 ) -> dict[str, Any]:
-    """Insert missing documents and apply versioned, idempotent migrations.
+    """Install the canonical strategy and preserve valid paper settings.
 
-    Existing promoted strategy values are preserved. Versioned migrations restore
-    the promoted execution policy when needed, enforce Alpaca-only complete-history backfill,
-    and snapshot the previous document before changing affected fields.
+    The strategy collection is intentionally reset to one validated document on
+    every release that changes the canonical configuration. The operation is
+    idempotent: later deploys skip the reset when the document already matches.
     """
 
     ensure_database(db)
@@ -275,82 +353,19 @@ def bootstrap_missing_parameterizations(
     results: list[dict[str, Any]] = []
 
     for definition in DEFINITIONS:
-        existing = db[definition.collection].find_one({"_id": definition.document_id})
-        if existing is not None:
-            migrated_existing, migrated = _strategy_schema_migration(
-                db, definition, existing, source=source
+        if definition.collection == SETTINGS_COLLECTION:
+            result = _reset_strategy_parameterization(
+                db,
+                definition,
+                source=source,
             )
-            valid, message = _validate_existing(definition, migrated_existing)
-            results.append(
-                {
-                    "key": definition.key,
-                    "collection": definition.collection,
-                    "document_id": definition.document_id,
-                    "status": (
-                        "migrated_existing"
-                        if migrated and valid
-                        else "skipped_existing_valid"
-                        if valid
-                        else "skipped_existing_invalid"
-                    ),
-                    "valid": valid,
-                    "message": (
-                        "Existing strategy document was safely migrated to schema v13 with Alpaca-only complete-history backfill."
-                        if migrated and valid
-                        else message
-                    ),
-                }
-            )
-            continue
-
-        payload = _validated_payload(definition)
-        now = _utc_now()
-        document = {
-            "_id": definition.document_id,
-            **payload,
-            "created_at": now,
-            "updated_at": now,
-            "schema_version": definition.schema_version,
-            "configuration_name": definition.configuration_name,
-            "configuration_note": definition.configuration_note,
-            "bootstrap_source": source,
-        }
-
-        # $setOnInsert keeps the operation atomic and idempotent if two callers
-        # reach the endpoint at the same time.
-        write = db[definition.collection].update_one(
-            {"_id": definition.document_id},
-            {"$setOnInsert": document},
-            upsert=True,
-        )
-        inserted = write.upserted_id is not None
-        if inserted:
-            status = "inserted"
-            valid = True
-            message = "Bundled validated document was inserted."
         else:
-            raced = db[definition.collection].find_one({"_id": definition.document_id})
-            if raced is None:
-                status = "missing"
-                valid = False
-                message = "Document was not inserted and could not be read after the write."
-            else:
-                valid, validation_message = _validate_existing(definition, raced)
-                status = "skipped_existing_valid" if valid else "skipped_existing_invalid"
-                message = (
-                    "Another caller created the document first. " + validation_message
-                )
-
-        results.append(
-            {
-                "key": definition.key,
-                "collection": definition.collection,
-                "document_id": definition.document_id,
-                "status": status,
-                "valid": valid,
-                "message": message,
-            }
-        )
+            result = _insert_or_preserve_non_strategy_parameterization(
+                db,
+                definition,
+                source=source,
+            )
+        results.append(result)
 
     finished_at = _utc_now()
     summary = {
@@ -366,18 +381,19 @@ def bootstrap_missing_parameterizations(
         ),
         "missing": sum(item["status"] == "missing" for item in results),
     }
+    mode = "canonical_strategy_reset_and_insert_missing"
     db[PARAMETER_BOOTSTRAP_RUNS_COLLECTION].insert_one(
         {
             "started_at": started_at,
             "finished_at": finished_at,
             "source": source,
-            "mode": "insert_missing_and_safe_schema_migrations",
+            "mode": mode,
             "summary": summary,
             "results": results,
         }
     )
     return {
-        "mode": "insert_missing_and_safe_schema_migrations",
+        "mode": mode,
         "started_at": started_at,
         "finished_at": finished_at,
         "summary": summary,

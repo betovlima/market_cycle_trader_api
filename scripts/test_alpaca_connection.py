@@ -36,7 +36,7 @@ def main() -> int:
     result = verify_alpaca_connection(
         api_key_id=credentials["api_key_id"],
         secret_key=credentials["secret_key"],
-        feed=config.alpaca_feed,
+        feed=config.alpaca_live_feed,
     )
     print(json.dumps(result, indent=2, default=str))
     return 0

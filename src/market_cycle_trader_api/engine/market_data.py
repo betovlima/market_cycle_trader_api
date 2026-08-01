@@ -237,6 +237,9 @@ def _market_data_provenance(
         "history_complete": _history_is_complete(frame, config),
         "provider": provider,
         "effective_provider": provider,
+        "historical_feed": str(config.alpaca_historical_feed),
+        "live_feed": str(config.alpaca_live_feed),
+        "adjustment": str(config.alpaca_adjustment),
         "initial_rows": int(initial_rows),
         "history_backfill_provider": provider if history_backfill_rows > 0 else None,
         "history_backfill_rows": int(history_backfill_rows),
@@ -288,7 +291,7 @@ def complete_market_history(
             f"Incomplete Alpaca market history for {symbol}: requested "
             f"{config.start_date}, but the earliest available session is "
             f"{provenance['actual_start'] or 'unavailable'}. "
-            f"Feed={config.alpaca_feed}; adjustment={config.alpaca_adjustment}. "
+            f"Historical feed={config.alpaca_historical_feed}; adjustment={config.alpaca_adjustment}. "
             "The backtest was stopped instead of silently changing the promoted strategy result."
         )
     return effective_frame
@@ -334,7 +337,7 @@ def _download_alpaca_bars(
             timeframe=config.timeframe,
             start=cursor.to_pydatetime(),
             end=chunk_end.to_pydatetime(),
-            feed=config.alpaca_feed,
+            feed=config.alpaca_historical_feed,
             adjustment=config.alpaca_adjustment,
         )
         if frame is not None and not frame.empty:
@@ -394,7 +397,7 @@ def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
         identity = {
             "symbol": symbol,
             "interval": config.timeframe,
-            "feed": config.alpaca_feed,
+            "feed": config.alpaca_historical_feed,
             "adjustment": config.alpaca_adjustment,
         }
         first = collection.find_one(

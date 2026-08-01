@@ -103,6 +103,6 @@ def test_long_alpaca_history_is_downloaded_in_date_chunks() -> None:
     assert downloader.call_count > 1
     assert not result.empty
     for call in downloader.call_args_list:
-        assert call.kwargs["feed"] == config.alpaca_feed
+        assert call.kwargs["feed"] == config.alpaca_historical_feed
         assert call.kwargs["adjustment"] == config.alpaca_adjustment
         assert call.kwargs["symbol"] == "NVDA"
