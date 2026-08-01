@@ -13,7 +13,6 @@ from .core.runtime import close_mongo, initialize_mongo
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Own infrastructure startup and shutdown in one explicit lifecycle."""
     initialize_mongo()
     try:
         yield
@@ -22,7 +21,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    """Build the HTTP application and compose feature routers."""
     application = FastAPI(
         title="Market Cycle Trader API",
         version=API_VERSION,
