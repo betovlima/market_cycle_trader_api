@@ -1,0 +1,112 @@
+[
+  {
+    "path": "README_RECUPERACAO.md",
+    "sha256": "9877634ed1b5160f530822d94909997fba8a2d4f477d14db58b86c6d41e32583",
+    "size": 3369
+  },
+  {
+    "path": "scripts/apply_locked_config.py",
+    "sha256": "112688a35e2b32ef05e6bc8809960d97e90b4653218c91fc59a90555b4b6a2cf",
+    "size": 3765
+  },
+  {
+    "path": "scripts/apply_paper_trading_config.py",
+    "sha256": "77515c8183683a510a4a632121f0f5cbc805de47c868ecb4133329c1e3b6783a",
+    "size": 2554
+  },
+  {
+    "path": "scripts/bootstrap_market_history.py",
+    "sha256": "f70d5fd904de877269cfdb3637020f562f4c1e187f9d5d95af699b1e0ae72182",
+    "size": 3393
+  },
+  {
+    "path": "scripts/bootstrap_parameters.py",
+    "sha256": "f53996265b1e50297a01b82b0cd4850579505ad3e83b052e149b2ab74a17e0ee",
+    "size": 2036
+  },
+  {
+    "path": "scripts/export_locked_config.py",
+    "sha256": "73d1baa8c3e1cc0c5148bad03a9938935921d056cd6c1beac72529bce867062c",
+    "size": 1241
+  },
+  {
+    "path": "scripts/migrate_xgboost_only_v1_12_0.py",
+    "sha256": "d8e4b35887e9409d94c4deebe3dce099e45a9cc99b27ac9c95ea9c1392a907b1",
+    "size": 672
+  },
+  {
+    "path": "src/market_cycle_trader_api/api/routers/admin_setup.py",
+    "sha256": "5f77d5f1aefc40e401518e6c723cf72a03c520cd5841a15b8f2b86469b1306a3",
+    "size": 1404
+  },
+  {
+    "path": "src/market_cycle_trader_api/api/routers/parameter_bootstrap.py",
+    "sha256": "163131be82cf350dda7f693417c733d4b4c1caae7d5ff87b08f8efaadbf2bb63",
+    "size": 2184
+  },
+  {
+    "path": "src/market_cycle_trader_api/api/routers/strategy_configuration.py",
+    "sha256": "f8aba6f8102e199bf435da059fff87a284268b946132932e549ea8e058944d70",
+    "size": 5070
+  },
+  {
+    "path": "src/market_cycle_trader_api/core/environment.py",
+    "sha256": "16272452354ad98da9c08fd3449e499372d6f05cab0332644fb661472045166e",
+    "size": 1060
+  },
+  {
+    "path": "src/market_cycle_trader_api/core/runtime.py",
+    "sha256": "8cf0c610aa990299ced486186d52625d2b8072932fd5c35bb50d1f0e77f0563b",
+    "size": 3848
+  },
+  {
+    "path": "src/market_cycle_trader_api/infrastructure/persistence/mongo_repository.py",
+    "sha256": "041cfc9c90618dd30a2e84a43d9e9dd0b4de93e6b42fa675e47e7c13a5df99a8",
+    "size": 13780
+  },
+  {
+    "path": "src/market_cycle_trader_api/main.py",
+    "sha256": "42595a448137249936a451b48de25285adc493d74124e8bbd1937bd89cbbf7ac",
+    "size": 2021
+  },
+  {
+    "path": "src/market_cycle_trader_api/schemas/admin_setup.py",
+    "sha256": "532a88f620f8b2bab34055555e50b892a561b8d3c9064bc00bdb692382642c4c",
+    "size": 174
+  },
+  {
+    "path": "src/market_cycle_trader_api/schemas/parameter_bootstrap.py",
+    "sha256": "6e9ffa961510e540936b33d5186aaf966e4b559b90534066c51491cbe1e827ef",
+    "size": 889
+  },
+  {
+    "path": "src/market_cycle_trader_api/schemas/strategy_configuration.py",
+    "sha256": "d37cd8ba801b4b3b1964ab01c21aae11c25860dc45771aaad3c19c5870caa174",
+    "size": 2668
+  },
+  {
+    "path": "src/market_cycle_trader_api/services/admin_setup.py",
+    "sha256": "d6cdbdbe7c907c3fba079ee7d99b5e3f520cd2c94eb8321f50ba07f45215ac37",
+    "size": 4987
+  },
+  {
+    "path": "src/market_cycle_trader_api/services/parameter_bootstrap.py",
+    "sha256": "8f35cc63c2523c232b527dc3a01ad1f8f4a6fd75e45c184023cdac6e2f4e1b27",
+    "size": 13314
+  },
+  {
+    "path": "src/market_cycle_trader_api/services/strategy_configuration.py",
+    "sha256": "a49a63722daffc715f0449eb72392071c45f2d80aa9a345337cf5e2b4049123f",
+    "size": 11452
+  },
+  {
+    "path": "tests/test_parameter_bootstrap.py",
+    "sha256": "19e0d221123f5a10d41e07da95632097b5b9fe26e5375e44a7d3da9d8899fe59",
+    "size": 7749
+  },
+  {
+    "path": "tests/test_reproducibility_manifest.py",
+    "sha256": "19f3e2930c24b86e7123e9e448f763add18d7dfbbb868ac7805acf3ac8b5d1c7",
+    "size": 1978
+  }
+]

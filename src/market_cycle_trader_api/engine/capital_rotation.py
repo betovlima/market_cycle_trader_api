@@ -3149,7 +3149,7 @@ def run_rotation_models(
                     "qrdqn_best_step_min": int(min(best_steps)),
                     "qrdqn_best_step_max": int(max(best_steps)),
                     "qrdqn_early_stopped_folds": int(early_count),
-                    "diagnostics_version": "1.12.18",
+                    "diagnostics_version": "1.12.20",
                     "q_value_diagnostics_enabled": False,
                     "policy_modified_by_diagnostics": False,
                     "rotation_counterfactual_horizons_bars": [],

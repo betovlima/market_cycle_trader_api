@@ -10,33 +10,41 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from market_cycle_trader_api.core.environment import load_project_environment  # noqa: E402
+from market_cycle_trader_api.core.environment import load_project_environment
 
 load_project_environment()
 
-from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (  # noqa: E402
+from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
     create_client,
+    ensure_database,
     get_database,
+    mongo_database_name,
 )
-from market_cycle_trader_api.services.parameter_bootstrap import (  # noqa: E402
-    bootstrap_missing_parameterizations,
-    parameterization_status,
+from market_cycle_trader_api.schemas.paper_trading import PaperTradingSettings
+from market_cycle_trader_api.schemas.requests import BacktestRequest
+from market_cycle_trader_api.services.parameter_bootstrap import (
+    apply_parameter_documents,
+    parameter_status,
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Insert missing parameter documents, repair invalid strategy schemas, "
-            "and preserve valid API-managed strategy parameters."
-        )
-    )
-    parser.add_argument(
-        "--status",
-        action="store_true",
-        help="Show existence and validation status without writing MongoDB.",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--strategy-config", type=Path)
+    parser.add_argument("--paper-config", type=Path)
+    parser.add_argument("--replace", action="store_true")
+    parser.add_argument("--note", default="private parameter bootstrap")
     return parser.parse_args()
+
+
+def load_json(path: Path | None) -> dict | None:
+    if path is None:
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise SystemExit(f"{path} must contain one JSON object.")
+    return value
 
 
 def main() -> int:
@@ -44,25 +52,36 @@ def main() -> int:
     client = create_client()
     try:
         db = get_database(client)
+        ensure_database(db)
         if args.status:
-            result = {
-                "mode": "status_only",
-                "items": parameterization_status(db),
-            }
-        else:
-            result = bootstrap_missing_parameterizations(
-                db,
-                source="bootstrap_parameters.py",
+            print(f"MongoDB database: {mongo_database_name()}")
+            print(json.dumps(parameter_status(db), indent=2, default=str))
+            return 0
+
+        strategy_raw = load_json(args.strategy_config)
+        paper_raw = load_json(args.paper_config)
+        if strategy_raw is None and paper_raw is None:
+            raise SystemExit(
+                "Use --status or supply --strategy-config and/or --paper-config."
             )
+
+        result = apply_parameter_documents(
+            db,
+            strategy_configuration=(
+                BacktestRequest.model_validate(strategy_raw)
+                if strategy_raw is not None
+                else None
+            ),
+            paper_trading_configuration=(
+                PaperTradingSettings.model_validate(paper_raw)
+                if paper_raw is not None
+                else None
+            ),
+            replace_existing=args.replace,
+            note=args.note,
+            source="bootstrap_parameters.py",
+        )
         print(json.dumps(result, indent=2, default=str))
-        if not args.status:
-            invalid = [item for item in result.get("results", []) if not item.get("valid")]
-            if invalid:
-                print(
-                    "Parameter bootstrap failed because one or more non-strategy documents are invalid.",
-                    file=sys.stderr,
-                )
-                return 1
     finally:
         client.close()
     return 0

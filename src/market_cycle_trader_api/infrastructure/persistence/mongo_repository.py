@@ -10,8 +10,9 @@ import pandas as pd
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.database import Database
 
-MONGO_URI = str(os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "").strip()
-MONGO_DATABASE = str(os.getenv("MONGO_DATABASE") or "").strip()
+from ...core.environment import load_project_environment
+
+DEFAULT_MONGO_DATABASE = "extrema_backtest"
 SETTINGS_COLLECTION = "backtest_settings"
 SETTINGS_HISTORY_COLLECTION = "backtest_settings_history"
 JOBS_COLLECTION = "backtest_jobs"
@@ -31,8 +32,19 @@ PAPER_TRADE_PLANS_COLLECTION = "paper_trade_plans"
 PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
+PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
 SETTINGS_SCHEMA_VERSION = 18
 SETTINGS_METADATA_FIELDS = frozenset({
+    "_id",
+    "created_at",
+    "updated_at",
+    "schema_version",
+    "configuration_name",
+    "configuration_note",
+    "bootstrap_source",
+    "revision",
+})
+PAPER_SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",
     "updated_at",
@@ -48,13 +60,40 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _environment_value(*names: str) -> str:
+    load_project_environment()
+    for name in names:
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def mongo_url(*, required: bool = True) -> str:
+    value = _environment_value("MONGO_URL", "MONGO_URI")
+    if required and not value:
+        raise RuntimeError("MONGO_URL is required in the API server environment.")
+    return value
+
+
+def mongo_database_name() -> str:
+    # Preserve the deployment contract used by the validated versions: Railway
+    # needs only MONGO_URL. MONGO_DATABASE remains an optional override.
+    return _environment_value("MONGO_DATABASE") or DEFAULT_MONGO_DATABASE
+
+
+def mongo_connection_status() -> dict[str, Any]:
+    return {
+        "configured": bool(mongo_url(required=False)),
+        "database": mongo_database_name(),
+    }
+
+
 def create_client() -> MongoClient:
-    if not MONGO_URI:
-        raise RuntimeError("MONGO_URL is required in the server environment.")
     return MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=2000,
-        connectTimeoutMS=2000,
+        mongo_url(),
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
         maxPoolSize=30,
         minPoolSize=1,
         retryWrites=True,
@@ -62,11 +101,9 @@ def create_client() -> MongoClient:
 
 
 def get_database(client: MongoClient | None = None) -> Database:
-    if not MONGO_DATABASE:
-        raise RuntimeError("MONGO_DATABASE is required in the server environment.")
     active_client = client or create_client()
     active_client.admin.command("ping")
-    return active_client[MONGO_DATABASE]
+    return active_client[mongo_database_name()]
 
 
 def bson_value(value: Any) -> Any:
@@ -181,13 +218,6 @@ def ensure_database(db: Database) -> None:
     )
 
 
-
-def _environment_value(*names: str) -> str:
-    for name in names:
-        value = str(os.getenv(name) or "").strip()
-        if value:
-            return value
-    return ""
 
 def get_alpaca_credentials() -> dict[str, str]:
     api_key_id = _environment_value("ALPACA_API_KEY_ID", "APCA_API_KEY_ID")

@@ -1,0 +1,17 @@
+Market Cycle Trader API v1.12.20 validation
+
+PASS - Python compileall for src and scripts.
+PASS - MONGO_URL works without MONGO_DATABASE.
+PASS - Default database resolves to extrema_backtest.
+PASS - Optional MONGO_DATABASE override works.
+PASS - MONGO_URI compatibility alias works.
+PASS - Missing MONGO_URL raises a clear server configuration error.
+PASS - Current private 74-field configuration validates against BacktestRequest.
+PASS - Protected administration routes are registered.
+PASS - Protected administration routes are excluded from public OpenAPI.
+PASS - No .env.example included.
+PASS - No .gitignore included.
+PASS - No private parameterization JSON included.
+
+Environment limitation:
+- No real MongoDB, Railway, or Alpaca connection was executed in the packaging environment.
