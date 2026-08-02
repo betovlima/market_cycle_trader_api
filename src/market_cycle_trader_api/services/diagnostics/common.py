@@ -6,7 +6,10 @@ from typing import Any
 import pandas as pd
 from pymongo.database import Database
 
-from ...infrastructure.persistence.mongo_repository import ALPACA_MARKET_BARS_COLLECTION
+from ...infrastructure.persistence.mongo_repository import (
+    ALPACA_MARKET_BARS_COLLECTION,
+    MARKET_BARS_COLLECTION,
+)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -86,19 +89,45 @@ def _market_close_series(
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.Series:
-    query = {
-        "symbol": symbol,
-        "interval": "1Day",
-        "timestamp": {
-            "$gte": start.to_pydatetime(),
-            "$lte": end.to_pydatetime(),
-        },
+    timestamp_filter = {
+        "$gte": start.to_pydatetime(),
+        "$lte": end.to_pydatetime(),
     }
-    rows = list(
-        db[ALPACA_MARKET_BARS_COLLECTION]
-        .find(query, {"_id": 0, "timestamp": 1, "close": 1})
-        .sort("timestamp", 1)
+    projection = {
+        "_id": 0,
+        "timestamp": 1,
+        "close": 1,
+        "updated_at": 1,
+    }
+    sources = (
+        (
+            ALPACA_MARKET_BARS_COLLECTION,
+            {
+                "symbol": symbol,
+                "interval": "1Day",
+                "timestamp": timestamp_filter,
+            },
+        ),
+        (
+            MARKET_BARS_COLLECTION,
+            {
+                "symbol": symbol,
+                "interval": "1d",
+                "timestamp": timestamp_filter,
+            },
+        ),
     )
+
+    rows: list[dict[str, Any]] = []
+    for collection_name, query in sources:
+        rows = list(
+            db[collection_name]
+            .find(query, projection)
+            .sort([("timestamp", 1), ("updated_at", 1)])
+        )
+        if rows:
+            break
+
     if not rows:
         return _empty_market_series()
 
@@ -109,19 +138,17 @@ def _market_close_series(
         errors="coerce",
     )
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp", "close"]).sort_values(
-        "timestamp"
-    )
+    frame = frame.dropna(subset=["timestamp", "close"])
     if frame.empty:
         return _empty_market_series()
 
     series = pd.Series(
         frame["close"].astype(float).to_numpy(),
-        index=pd.DatetimeIndex(frame["timestamp"]),
+        index=pd.DatetimeIndex(frame["timestamp"], name="timestamp"),
         dtype=float,
+        name="close",
     )
-    series = series.loc[~series.index.duplicated(keep="last")]
-    return series.sort_index()
+    return series.loc[~series.index.duplicated(keep="last")].sort_index()
 
 
 def _future_market_prices(

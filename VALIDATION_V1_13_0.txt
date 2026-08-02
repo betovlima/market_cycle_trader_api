@@ -1,6 +1,0 @@
-Market Cycle Trader API v1.13.0 validation
-
-- Python compileall: passed.
-- Bundled parameterization BacktestRequest validation: passed.
-- Synthetic multi-horizon feature/target generation: passed.
-- Full pytest was not executed because pymongo is not installed in this build environment.

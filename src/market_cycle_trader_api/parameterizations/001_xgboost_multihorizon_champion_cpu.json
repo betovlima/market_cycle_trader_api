@@ -48,7 +48,7 @@
   "rotation_xgb_n_estimators": 300,
   "rotation_xgb_learning_rate": 0.035,
   "rotation_xgb_max_depth": 3,
-  "rotation_accelerator": "auto",
+  "rotation_accelerator": "cpu",
   "rotation_allow_cpu_fallback": true,
   "rotation_xgb_repetitions": 1,
   "rotation_seed_step": 1000,

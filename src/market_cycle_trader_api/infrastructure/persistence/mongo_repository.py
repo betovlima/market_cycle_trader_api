@@ -10,6 +10,8 @@ import pandas as pd
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.database import Database
 
+from ...core.environment import load_project_environment
+
 MONGO_URI = str(os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "").strip()
 MONGO_DATABASE = str(os.getenv("MONGO_DATABASE") or "").strip()
 SETTINGS_COLLECTION = "backtest_settings"
@@ -21,6 +23,7 @@ TRADES_COLLECTION = "backtest_trades"
 COMPARISONS_COLLECTION = "backtest_comparisons"
 FAILURES_COLLECTION = "backtest_failures"
 ALPACA_MARKET_BARS_COLLECTION = "alpaca_market_bars"
+MARKET_BARS_COLLECTION = "market_bars"
 INTEGRATIONS_COLLECTION = "integrations"
 ALPACA_INTEGRATION_ID = "alpaca"
 PAPER_TRADING_SETTINGS_COLLECTION = "paper_trading_settings"
@@ -31,7 +34,7 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
-SETTINGS_SCHEMA_VERSION = 15
+SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",
@@ -177,13 +180,45 @@ def ensure_database(db: Database) -> None:
 
 
 def _environment_value(*names: str) -> str:
+    load_project_environment()
     for name in names:
         value = str(os.getenv(name) or "").strip()
         if value:
             return value
     return ""
 
-def get_alpaca_credentials() -> dict[str, str]:
+
+def mask_api_key(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) <= 8:
+        return "*" * len(text)
+    return f"{text[:4]}{'*' * max(4, len(text) - 8)}{text[-4:]}"
+
+
+def get_alpaca_integration_status(db: Database | None = None) -> dict[str, Any]:
+    """Return non-secret Alpaca status from environment variables only."""
+
+    del db
+    api_key_id = _environment_value("ALPACA_API_KEY_ID", "APCA_API_KEY_ID")
+    secret_key = _environment_value(
+        "ALPACA_SECRET_KEY",
+        "ALPACA_API_SECRET_KEY",
+        "APCA_API_SECRET_KEY",
+    )
+    return {
+        "configured": bool(api_key_id and secret_key),
+        "api_key_id_masked": mask_api_key(api_key_id),
+        "source": "environment",
+        "updated_at": None,
+    }
+
+
+def get_alpaca_credentials(db: Database | None = None) -> dict[str, str]:
+    """Read Alpaca credentials exclusively from the process environment."""
+
+    del db
     api_key_id = _environment_value("ALPACA_API_KEY_ID", "APCA_API_KEY_ID")
     secret_key = _environment_value(
         "ALPACA_SECRET_KEY",
@@ -196,6 +231,25 @@ def get_alpaca_credentials() -> dict[str, str]:
             "Set ALPACA_API_KEY_ID and ALPACA_SECRET_KEY."
         )
     return {"api_key_id": api_key_id, "secret_key": secret_key}
+
+
+def save_alpaca_credentials(
+    db: Database,
+    *,
+    api_key_id: str,
+    secret_key: str,
+) -> dict[str, Any]:
+    del db, api_key_id, secret_key
+    raise RuntimeError(
+        "Alpaca credentials are managed exclusively through server environment variables."
+    )
+
+
+def delete_alpaca_credentials(db: Database) -> None:
+    del db
+    raise RuntimeError(
+        "Alpaca credentials are managed exclusively through server environment variables."
+    )
 
 
 def get_settings(db: Database) -> dict[str, Any]:

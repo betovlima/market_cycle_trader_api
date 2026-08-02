@@ -23,7 +23,7 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from ..schemas.requests import BacktestRequest
 
-CANONICAL_PARAMETERIZATION = "001_xgboost_high_performance_seed_3042.json"
+CANONICAL_PARAMETERIZATION = "001_xgboost_multihorizon_champion_cpu.json"
 
 
 class StrategyConfigurationError(RuntimeError):

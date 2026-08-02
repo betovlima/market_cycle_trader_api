@@ -123,11 +123,13 @@ class ParameterBootstrapTests(unittest.TestCase):
         paper = db[PAPER_TRADING_SETTINGS_COLLECTION].find_one({"_id": "default"})
         self.assertIsNotNone(strategy)
         self.assertIsNotNone(paper)
-        self.assertEqual(strategy["random_state"], 3042)
-        self.assertEqual(strategy["schema_version"], 15)
+        self.assertEqual(strategy["random_state"], 42)
+        self.assertEqual(strategy["schema_version"], 16)
         self.assertEqual(strategy["revision"], 1)
         self.assertEqual(strategy["alpaca_historical_feed"], "sip")
         self.assertEqual(strategy["alpaca_live_feed"], "iex")
+        self.assertEqual(strategy["rotation_accelerator"], "cpu")
+        self.assertEqual(strategy["rotation_target_horizons"], [5, 10, 20, 40, 60])
         self.assertTrue(paper["enabled"])
 
         second = bootstrap_missing_parameterizations(db, source="test")
@@ -180,8 +182,8 @@ class ParameterBootstrapTests(unittest.TestCase):
         self.assertEqual(len(db[SETTINGS_COLLECTION].documents), 1)
 
         repaired = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
-        self.assertEqual(repaired["random_state"], 3042)
-        self.assertEqual(repaired["schema_version"], 15)
+        self.assertEqual(repaired["random_state"], 42)
+        self.assertEqual(repaired["schema_version"], 16)
         self.assertGreaterEqual(repaired["revision"], 2)
 
         history = db[SETTINGS_HISTORY_COLLECTION].audit

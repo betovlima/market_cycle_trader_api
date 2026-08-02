@@ -23,6 +23,7 @@ class ChampionAnalysisWindowTest(unittest.TestCase):
         self.base = {
             "rotation_purge_days": 60,
             "rotation_horizon_days": 40,
+            "rotation_target_horizons": [5, 10, 20, 40, 60],
             "rotation_walk_forward_calibration_days": 126,
             "rotation_walk_forward_test_days": 504,
             "rotation_walk_forward_min_test_days": 126,
