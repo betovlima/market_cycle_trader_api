@@ -180,7 +180,7 @@ class BacktestConfig:
     asset_overrides: dict[str, dict[str, Any]] = field(
         default_factory=dict
     )
-    strategy_mode: str = "COMPOUND_ROTATION_SWING_1W"
+    strategy_mode: str = "COMPOUND_ROTATION_SWING_XGBOOST"
 
     # Label definition.
     future_horizon: int = 5
@@ -789,6 +789,8 @@ def validate_config(config: BacktestConfig) -> None:
         "BOTTOM_ENTRY_MTF_TOP_EXIT",
         "BOTTOM_ENTRY_EXIT_RISK_V1",
         "BOTTOM_ENTRY_EXIT_RISK_SWING_1D",
+        "COMPOUND_ROTATION_SWING_XGBOOST",
+        "COMPOUND_ROTATION_SWING_QRDQN",
         "COMPOUND_ROTATION_SWING_1W",
         "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE",
         "STRUCTURAL_TREND",
@@ -876,9 +878,18 @@ def validate_config(config: BacktestConfig) -> None:
         raise ValueError("EXIT_RISK_MINIMUM_TRAINING_ROWS must be >= 100.")
     if config.exit_risk_reentry_cooldown_days < 0:
         raise ValueError("EXIT_RISK_REENTRY_COOLDOWN_DAYS must be >= 0.")
-    if config.strategy_mode == "COMPOUND_ROTATION_SWING_1W":
+    if config.strategy_mode in {"COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_QRDQN", "COMPOUND_ROTATION_SWING_1W"}:
+        expected_rotation_models = (
+            ("qrdqn",)
+            if config.strategy_mode == "COMPOUND_ROTATION_SWING_QRDQN"
+            else ("xgboost_utility",)
+        )
+        if tuple(config.rotation_models) != expected_rotation_models:
+            raise ValueError(
+                f"{config.strategy_mode} requires ROTATION_MODELS={list(expected_rotation_models)}."
+            )
         if config.market_data_provider not in {"alpaca", "yahoo"}:
-            raise ValueError("COMPOUND_ROTATION_SWING_1W supports MARKET_DATA_PROVIDER=alpaca or yahoo.")
+            raise ValueError("Swing Compound Capital Rotation supports MARKET_DATA_PROVIDER=alpaca or yahoo.")
         if config.market_data_provider == "alpaca":
             if config.alpaca_feed not in {"iex", "sip"}:
                 raise ValueError("ALPACA_FEED must be iex or sip.")
@@ -886,7 +897,7 @@ def validate_config(config: BacktestConfig) -> None:
                 raise ValueError("ALPACA_ADJUSTMENT must be raw, split, dividend or all.")
         if config.timeframe != "1Day":
             raise ValueError(
-                "COMPOUND_ROTATION_SWING_1W requires TIMEFRAME=1Day."
+                "Swing Compound Capital Rotation requires TIMEFRAME=1Day."
             )
         valid_rotation_models = {"xgboost_utility", "qrdqn"}
         if not config.rotation_models:
@@ -6530,6 +6541,8 @@ def main() -> None:
         print("Storage: MongoDB only. No runtime result files will be created.")
 
         if config.strategy_mode in {
+            "COMPOUND_ROTATION_SWING_XGBOOST",
+            "COMPOUND_ROTATION_SWING_QRDQN",
             "COMPOUND_ROTATION_SWING_1W",
             "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE",
         }:

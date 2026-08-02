@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .requests import BacktestRequest
+
+
+class StrategyConfigurationPatchRequest(BaseModel):
+    """Apply a validated partial update to the active strategy configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_update: Literal[True]
+    changes: dict[str, Any]
+    note: str = Field(min_length=3, max_length=500)
+    expected_revision: int | None = Field(default=None, ge=1)
+
+    @field_validator("changes")
+    @classmethod
+    def validate_changes(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not value:
+            raise ValueError("At least one strategy parameter must be supplied.")
+        allowed = set(BacktestRequest.model_fields)
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(
+                "Unknown or non-operational strategy fields: " + ", ".join(unknown)
+            )
+        return value
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str) -> str:
+        return " ".join(str(value).split())
+
+
+class StrategyConfigurationReplaceRequest(BaseModel):
+    """Replace the complete active strategy configuration after validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_replace: Literal[True]
+    configuration: BacktestRequest
+    note: str = Field(min_length=3, max_length=500)
+    expected_revision: int | None = Field(default=None, ge=1)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str) -> str:
+        return " ".join(str(value).split())
+
+
+class StrategyConfigurationResetRequest(BaseModel):
+    """Restore the bundled canonical configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_reset: Literal[True]
+    note: str = Field(
+        default="Restore the bundled canonical strategy configuration.",
+        min_length=3,
+        max_length=500,
+    )
+    expected_revision: int | None = Field(default=None, ge=1)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str) -> str:
+        return " ".join(str(value).split())
+
+
+class StrategyConfigurationRestoreRequest(BaseModel):
+    """Restore a previously archived strategy configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_restore: Literal[True]
+    note: str = Field(min_length=3, max_length=500)
+    expected_revision: int | None = Field(default=None, ge=1)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str) -> str:
+        return " ".join(str(value).split())

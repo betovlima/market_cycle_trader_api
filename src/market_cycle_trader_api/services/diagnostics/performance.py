@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from pymongo.database import Database
 
 from .common import (
     _classify_relative_episode,
     _diagnostic_trade_frame,
+    _future_market_prices,
     _market_close_series,
     _safe_float,
 )
@@ -61,9 +61,9 @@ def build_performance_diagnostics(
     is_day_trade = str((metrics or {}).get("strategy_mode", "")).startswith("COMPOUND_ROTATION_DAY_TRADE")
     day_trade_diagnostics = {}
 
-    # Relative-performance drawdown episodes. A new relative high closes the
-    # previous episode. This identifies periods where the strategy loses ground
-    # versus buy-and-hold, not absolute strategy drawdowns.
+
+
+
     episodes: list[dict[str, Any]] = []
     peak_idx = 0
     in_episode = False
@@ -270,8 +270,8 @@ def build_performance_diagnostics(
         key=lambda item: float(item["relative_drawdown"]),
     )[:10]
 
-    # Post-exit counterfactuals are diagnostic only. Future prices are NEVER
-    # fed back into training or into the policy.
+
+
     exit_diagnostics: list[dict[str, Any]] = []
     if (not is_day_trade) and (not trade_frame.empty) and "action" in trade_frame:
         sells = trade_frame.loc[
@@ -307,8 +307,8 @@ def build_performance_diagnostics(
                 if not asset or sale_price is None or sale_price <= 0:
                     continue
 
-                prices = asset_series.get(asset, pd.Series(dtype=float))
-                future = prices.loc[prices.index > sold_at]
+                prices = asset_series.get(asset)
+                future = _future_market_prices(prices, sold_at)
                 if future.empty:
                     continue
 

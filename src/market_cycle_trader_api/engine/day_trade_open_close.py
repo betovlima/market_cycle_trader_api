@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 from typing import Any, Callable
 
@@ -108,14 +108,6 @@ def _session_path_drawdown(group: pd.DataFrame) -> float:
 
 
 def _expected_session_bar_starts(session_date: Any) -> pd.DatetimeIndex:
-    """Return the official NYSE regular-session 15-minute bar starts for a date.
-
-    The exchange calendar handles holidays, daylight-saving changes, and official
-    shortened sessions. These boundaries are used to guarantee that Open→Close
-    always has the official opening bar and final regular-session bar. Internal
-    IEX gaps are tracked as data-quality metadata instead of discarding the whole
-    trading session.
-    """
     label = pd.Timestamp(session_date).normalize()
     if not _NYSE_CALENDAR.is_session(label):
         return pd.DatetimeIndex([], tz="UTC")
@@ -136,15 +128,6 @@ def _regular_session_quality(
     *,
     now_utc: pd.Timestamp | None = None,
 ) -> dict[str, Any]:
-    """Validate Open→Close boundaries and describe internal source-bar quality.
-
-    A session is usable only after its official NYSE close and only when both the
-    official 09:30 opening bar and the final regular-session source bar are
-    present. Missing *internal* 15-minute bars do not invalidate a historical
-    session; they are surfaced through quality metadata because the audit showed
-    that strict 26/26 completeness unnecessarily removed many otherwise usable
-    IEX sessions from the common portfolio panel.
-    """
     expected = _expected_session_bar_starts(session_date)
     if expected.empty:
         return {
@@ -203,29 +186,16 @@ def _regular_session_quality(
 
 
 def _training_round_trip_cost_rate(open_price: pd.Series, config: Any) -> pd.Series:
-    """Approximate proportional open-to-close execution cost for model labels.
-
-    Exact cent-rounded regulatory fees remain in the financial simulator. The
-    training target uses a smooth proportional estimate so the model does not
-    learn discontinuities caused by per-trade cent rounding.
-    """
-    slip = 2.0 * max(0.0, float(getattr(config, "slippage_bps", 0.0))) / 10_000.0
-    commission = 2.0 * max(0.0, float(getattr(config, "commission_rate", 0.0)))
-    sec = max(0.0, float(getattr(config, "sec_fee_rate", 0.0)))
-    taf_per_share = max(0.0, float(getattr(config, "taf_fee_per_share", 0.0)))
-    cat_per_share = max(0.0, float(getattr(config, "cat_fee_per_share", 0.0)))
+    slip = 2.0 * max(0.0, float(config.slippage_bps)) / 10_000.0
+    commission = 2.0 * max(0.0, float(config.commission_rate))
+    sec = max(0.0, float(config.sec_fee_rate))
+    taf_per_share = max(0.0, float(config.taf_fee_per_share))
+    cat_per_share = max(0.0, float(config.cat_fee_per_share))
     share_based = (taf_per_share + 2.0 * cat_per_share) / open_price.clip(lower=1e-9)
     return (slip + commission + sec + share_based).clip(lower=0.0, upper=0.25)
 
 
 def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
-    """Aggregate 15-minute source bars into one leak-free decision row/session.
-
-    The position for each session is selected before the regular-session open.
-    Therefore every price/volume feature is based only on completed prior
-    sessions. This permits a clean historical simulation that executes at the
-    official session open without using the same opening print as an input.
-    """
     data = bars.copy().sort_index()
     data.index = pd.to_datetime(data.index, utc=True)
     local_index = data.index.tz_convert(MARKET_TIMEZONE)
@@ -249,8 +219,8 @@ def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
 
         quality = _regular_session_quality(group, session_date)
         if not bool(quality["usable"]):
-            # The current in-progress session and historical sessions without an
-            # official opening/final bar are never valid Open→Close observations.
+
+
             continue
 
         expected_starts = _expected_session_bar_starts(session_date)
@@ -313,8 +283,8 @@ def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     volume_std = volume.rolling(20).std()
     raw_features["volume_zscore_20"] = _safe_divide(volume - volume_mean, volume_std)
 
-    # Leak-free historical indicators: today's position is selected before the
-    # regular-session open, so only completed prior sessions may be inputs.
+
+
     shifted = raw_features.shift(1)
     for column in shifted.columns:
         daily[column] = shifted[column]
@@ -345,7 +315,6 @@ def build_open_close_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
         - float(config.rotation_downside_penalty) * daily["forward_downside"]
         - float(config.rotation_drawdown_penalty) * daily["forward_max_drawdown"]
     )
-    daily["forward_log_utility"] = daily["forward_risk_adjusted_utility"]
     daily["open_to_close_return"] = intraday_return
 
     required = OPEN_CLOSE_FEATURES + [
@@ -394,7 +363,6 @@ def _panel_session_quality_summary(
     frames: dict[str, pd.DataFrame],
     common_dates: pd.DatetimeIndex,
 ) -> dict[str, Any]:
-    """Summarize retained internal IEX gaps for auditability."""
     counts: dict[str, int] = {
         "COMPLETE": 0,
         "INTERNAL_GAP": 0,
@@ -434,12 +402,30 @@ def _build_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, 
     min_test = int(config.rotation_walk_forward_min_test_days)
     min_train = int(config.rotation_minimum_training_rows)
 
-    first_test = min_train + purge + calibration + purge
-    if first_test >= len(common_dates) - min_test:
+    minimum_first_test = min_train + purge + calibration + purge
+    requested_start = pd.Timestamp(
+        getattr(config, "analysis_start_date", config.start_date)
+    )
+    requested_start = (
+        requested_start.tz_localize("UTC")
+        if requested_start.tzinfo is None
+        else requested_start.tz_convert("UTC")
+    )
+    requested_test_start = int(common_dates.searchsorted(requested_start, side="left"))
+    first_test = max(minimum_first_test, requested_test_start)
+
+    if requested_test_start >= len(common_dates):
         raise ValueError(
-            "Not enough Open-Close sessions for expanding walk-forward: "
-            f"sessions={len(common_dates)}, minimum_train={min_train}, "
-            f"calibration={calibration}, purge={purge}, minimum_test={min_test}."
+            "The requested analysis start is after the last available common session: "
+            f"requested={requested_start.date()}, last={common_dates[-1].date()}."
+        )
+    if first_test >= len(common_dates) - min_test:
+        available_test_rows = max(0, len(common_dates) - first_test)
+        raise ValueError(
+            "Not enough Open-Close out-of-sample sessions for the requested analysis window: "
+            f"available_test_rows={available_test_rows}, minimum_test={min_test}, "
+            f"requested_start={requested_start.date()}, sessions={len(common_dates)}, "
+            f"minimum_train={min_train}, calibration={calibration}, purge={purge}."
         )
 
     folds: list[dict[str, Any]] = []
@@ -530,8 +516,8 @@ def _utility_matrix(
 
 
 def _resolve_qrdqn_plan(config: Any) -> ComputePlan:
-    requested = str(getattr(config, "rotation_accelerator", "auto")).lower()
-    allow_fallback = bool(getattr(config, "rotation_allow_cpu_fallback", True))
+    requested = str(config.rotation_accelerator).lower()
+    allow_fallback = bool(config.rotation_allow_cpu_fallback)
     version = None
     cuda_available = False
     gpu_name = None
@@ -560,8 +546,8 @@ def _resolve_qrdqn_plan(config: Any) -> ComputePlan:
 
 
 def _resolve_xgb_plan(config: Any) -> ComputePlan:
-    requested = str(getattr(config, "rotation_accelerator", "auto")).lower()
-    allow_fallback = bool(getattr(config, "rotation_allow_cpu_fallback", True))
+    requested = str(config.rotation_accelerator).lower()
+    allow_fallback = bool(config.rotation_allow_cpu_fallback)
     version = None
     cuda_available = False
     gpu_name = None
@@ -805,7 +791,7 @@ def _fit_xgb_models(
     except ImportError as exc:
         raise RuntimeError("XGBoost Utility requires xgboost.") from exc
 
-    allow_fallback = bool(getattr(config, "rotation_allow_cpu_fallback", True))
+    allow_fallback = bool(config.rotation_allow_cpu_fallback)
 
     def fit(effective: str) -> dict[str, Any]:
         models: dict[str, Any] = {}
@@ -1214,7 +1200,7 @@ def _simulate(
         "initial_capital": initial,
         "strategy_ending_capital": ending,
         "strategy_return": ending / initial - 1,
-        # Legacy keys point at the fair same-session benchmark so existing UI/API remains compatible.
+
         "buy_hold_ending_capital": benchmark_ending,
         "buy_hold_return": benchmark_ending / initial - 1,
         "excess_return": ending / initial - benchmark_ending / initial,
@@ -1259,7 +1245,7 @@ def _simulate(
             "",
             f"Model: {metrics['strategy_label']}",
             f"Assets: {', '.join(symbols)}",
-            f"Market-data source: {str(getattr(config, 'market_data_provider', 'alpaca')).upper()} 15-minute bars aggregated into one session decision row",
+            f"Market-data source: {str(config.market_data_provider).upper()} 15-minute bars aggregated into one session decision row",
             "Decision timing: once per session before the regular-session open",
             "Execution rule: at most one BUY at the regular-session open and one SELL at the same-session close",
             "Intraday rotations: prohibited",

@@ -1,39 +1,20 @@
-# market_cycle_trader_api
+# Market Cycle Trader API v1.13.0
 
-FastAPI backend for Market Cycle Trader v1.9.20.
+Complete MongoDB-backed backtest and Alpaca Paper API.
 
-## Local
+## Main routes
 
-```powershell
-python -m pip install -r requirements.txt
-.\run_local.ps1
-```
+- `/api/jobs` — complete backtest execution and results.
+- `/api/paper-market` — Alpaca Paper portfolio and next-session execution.
+- `/api/admin/parameters` — protected initial parameter installation and status.
+- `/api/admin/setup` — protected account binding and paper-state initialization.
+- `/api/admin/strategy-configuration` — protected strategy configuration and history.
+- `/api/health/live` and `/api/health/ready` — liveness and readiness.
 
-or:
+## Administration contract
 
-```powershell
-python -m uvicorn market_cycle_trader_api.main:app --app-dir src --host 127.0.0.1 --port 8000 --reload
-```
+MongoDB configuration is changed only through protected administrative endpoints. Railway starts the API directly and has no database pre-deploy command. Infrastructure credentials and administrative tokens remain server environment variables.
 
-Swagger: `http://127.0.0.1:8000/docs`
+## v1.12.26 hotfix
 
-## Package responsibilities
-
-- `api/routers`: HTTP transport only.
-- `schemas`: Pydantic contracts and validation.
-- `services`: application use-cases/orchestration.
-- `core`: runtime and application configuration.
-- `infrastructure`: MongoDB and market-data adapters.
-- `engine`: isolated quantitative/ML core.
-
-## Railway
-
-Use root directory `/market_cycle_trader_api` and config path `/market_cycle_trader_api/railway.toml`.
-
-Required production variables:
-
-```text
-MONGO_URL
-MONGO_DATABASE
-CORS_ORIGINS
-```
+The paper-settings repository now strips all administrative metadata, including `revision`, before Pydantic validation. This fixes `POST /api/admin/setup/initialize` after a clean endpoint-driven bootstrap. No strategy parameter was changed.
