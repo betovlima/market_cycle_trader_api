@@ -24,6 +24,9 @@ class PaperTradingSettings(BaseModel):
     order_fill_timeout_seconds: int = Field(ge=10, le=900)
     order_poll_interval_seconds: float = Field(ge=0.5, le=30)
     cash_reserve_dollars: float = Field(ge=0, le=1_000)
+    automatic_continuation_enabled: bool
+    scheduler_poll_seconds: float = Field(ge=1, le=300)
+    preparation_retry_seconds: float = Field(ge=10, le=3_600)
 
     @field_validator("client_order_id_prefix")
     @classmethod
@@ -97,6 +100,13 @@ class PaperTradePlan(BaseModel):
     target_asset: str
     action: Literal["hold", "buy", "sell_to_cash", "rotate", "stay_in_cash"]
     random_state: int
+    ensemble_enabled: bool = False
+    ensemble_method: str | None = None
+    ensemble_seeds: list[int] = Field(default_factory=list)
+    ensemble_agreement: float | None = Field(default=None, ge=0, le=1)
+    strategy_configuration_sha256: str
+    system_rules: dict
+    model_refresh_policy: str
     effective_switch_margin: float
     calibrated_candidate_margin: float
     calibration_score: float

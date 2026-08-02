@@ -7,15 +7,20 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..core.system_rules import (
+    ALPACA_HISTORICAL_FEED,
+    ALPACA_LIVE_FEED,
+    MARKET_DATA_PROVIDER,
+    TRAINING_HISTORY_END,
+    TRAINING_HISTORY_START,
+)
+
 StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST"]
 Timeframe = Literal["1Day"]
-MarketDataProvider = Literal["alpaca"]
-AlpacaHistoricalFeed = Literal["sip"]
-AlpacaLiveFeed = Literal["iex"]
-AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
 HistoryBackfillProvider = Literal["alpaca"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
+SeedEnsembleMethod = Literal["majority_vote"]
 
 
 def normalize_assets(value: list[str]) -> list[str]:
@@ -41,7 +46,12 @@ def normalize_iso_date(value: str, *, field_name: str) -> str:
 
 
 class PublicBacktestRequest(BaseModel):
-    """Only the historical date range may be supplied by the public client."""
+    """Public analysis window.
+
+    ``start_date`` and ``end_date`` preserve the existing frontend contract, but
+    they select only the simulated account/report interval. They never change
+    the fixed model-training history that begins on 2016-01-01.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -51,6 +61,11 @@ class PublicBacktestRequest(BaseModel):
     @model_validator(mode="after")
     def validate_date_range(self) -> "PublicBacktestRequest":
         market_today = datetime.now(ZoneInfo("America/New_York")).date()
+        training_start = date.fromisoformat(TRAINING_HISTORY_START)
+        if self.start_date < training_start:
+            raise ValueError(
+                f"Analysis start date cannot be earlier than {TRAINING_HISTORY_START}."
+            )
         if self.start_date > market_today:
             raise ValueError("Start date cannot be later than today.")
         if self.end_date is not None:
@@ -62,23 +77,19 @@ class PublicBacktestRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    """Complete XGBoost-only configuration loaded from MongoDB.
+    """Editable XGBoost strategy parameters loaded from MongoDB.
 
-    Operational values intentionally have no Python defaults. Missing or unknown
-    MongoDB fields are configuration errors instead of being silently replaced.
+    Training start, provider and feeds are system rules and intentionally do not
+    belong to this model. This prevents the browser and administration API from
+    changing the production research protocol.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     assets: list[str]
     strategy_mode: StrategyMode
-    start_date: str
-    end_date: str | None
     timeframe: Timeframe
-    market_data_provider: MarketDataProvider
-    alpaca_historical_feed: AlpacaHistoricalFeed
-    alpaca_live_feed: AlpacaLiveFeed
-    alpaca_adjustment: AlpacaAdjustment
+    alpaca_adjustment: Literal["raw", "split", "dividend", "all"]
     market_data_history_backfill_enabled: bool
     market_data_history_backfill_provider: HistoryBackfillProvider
     market_data_history_start_tolerance_days: int = Field(ge=0, le=365)
@@ -106,6 +117,9 @@ class BacktestRequest(BaseModel):
     rotation_allow_cpu_fallback: bool
     rotation_xgb_repetitions: int = Field(ge=1, le=100)
     rotation_seed_step: int = Field(ge=1, le=10_000_000)
+    rotation_seed_ensemble_enabled: bool
+    rotation_seed_ensemble_method: SeedEnsembleMethod
+    rotation_seed_ensemble_min_agreement: float = Field(gt=0, le=1)
 
     initial_capital: float = Field(gt=0)
     whole_shares: bool
@@ -131,25 +145,40 @@ class BacktestRequest(BaseModel):
     random_state: int
 
     @property
+    def start_date(self) -> str:
+        return TRAINING_HISTORY_START
+
+    @property
+    def end_date(self) -> str | None:
+        return TRAINING_HISTORY_END
+
+    @property
+    def market_data_provider(self) -> str:
+        return MARKET_DATA_PROVIDER
+
+    @property
+    def alpaca_historical_feed(self) -> str:
+        return ALPACA_HISTORICAL_FEED
+
+    @property
+    def alpaca_live_feed(self) -> str:
+        return ALPACA_LIVE_FEED
+
+    @property
     def fractional_shares(self) -> bool:
         return not self.whole_shares
+
+    @property
+    def ensemble_seeds(self) -> tuple[int, ...]:
+        return tuple(
+            int(self.random_state) + index * int(self.rotation_seed_step)
+            for index in range(int(self.rotation_xgb_repetitions))
+        )
 
     @field_validator("assets")
     @classmethod
     def validate_assets(cls, value: list[str]) -> list[str]:
         return normalize_assets(value)
-
-    @field_validator("start_date")
-    @classmethod
-    def validate_start_date(cls, value: str) -> str:
-        return normalize_iso_date(value, field_name="start_date")
-
-    @field_validator("end_date")
-    @classmethod
-    def validate_end_date(cls, value: str | None) -> str | None:
-        if value is None or not str(value).strip():
-            return None
-        return normalize_iso_date(value, field_name="end_date")
 
     @field_validator("rotation_models")
     @classmethod
@@ -169,39 +198,26 @@ class BacktestRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_relationships(self) -> "BacktestRequest":
-        market_today = datetime.now(ZoneInfo("America/New_York")).date()
-        start = date.fromisoformat(self.start_date)
-        end = date.fromisoformat(self.end_date) if self.end_date else None
-        if start > market_today:
-            raise ValueError("Start date cannot be later than today.")
-        if end is not None:
-            if end > market_today:
-                raise ValueError("End date cannot be later than today.")
-            if end < start:
-                raise ValueError("End date cannot be earlier than start date.")
-
         if self.xgb_n_jobs == 0:
             raise ValueError("xgb_n_jobs must be -1 or a positive integer.")
         if self.deterministic_execution:
             if self.xgb_n_jobs != 1:
-                raise ValueError(
-                    "Deterministic execution requires xgb_n_jobs=1 in MongoDB."
-                )
+                raise ValueError("Deterministic execution requires xgb_n_jobs=1 in MongoDB.")
             if self.numeric_thread_limit != 1:
-                raise ValueError(
-                    "Deterministic execution requires numeric_thread_limit=1 in MongoDB."
-                )
+                raise ValueError("Deterministic execution requires numeric_thread_limit=1 in MongoDB.")
         if not self.rotation_walk_forward_enabled:
             raise ValueError("Compound Capital Rotation requires expanding walk-forward validation.")
         if self.rotation_walk_forward_min_test_days > self.rotation_walk_forward_test_days:
             raise ValueError("Minimum test sessions cannot exceed the configured test window.")
         if self.rotation_purge_days < self.rotation_horizon_days:
             raise ValueError("Swing rotation purge must be at least the decision horizon.")
+        if self.rotation_seed_ensemble_enabled and self.rotation_xgb_repetitions < 3:
+            raise ValueError("The production seed ensemble requires at least three repetitions.")
         return self
 
 
 class BacktestExecutionRequest(BacktestRequest):
-    """Locked XGBoost configuration plus the public out-of-sample window."""
+    """Editable strategy settings plus a public out-of-sample report window."""
 
     analysis_start_date: str
     analysis_end_date: str | None
@@ -221,15 +237,14 @@ class BacktestExecutionRequest(BacktestRequest):
     @model_validator(mode="after")
     def validate_analysis_window(self) -> "BacktestExecutionRequest":
         market_today = datetime.now(ZoneInfo("America/New_York")).date()
-        history_start = date.fromisoformat(self.start_date)
-        history_end = date.fromisoformat(self.end_date) if self.end_date else None
+        history_start = date.fromisoformat(TRAINING_HISTORY_START)
         analysis_start = date.fromisoformat(self.analysis_start_date)
         analysis_end = date.fromisoformat(self.analysis_end_date) if self.analysis_end_date else None
 
         if analysis_start < history_start:
             raise ValueError(
-                "Analysis start date cannot be earlier than the locked historical data start "
-                f"({self.start_date})."
+                "Analysis start date cannot be earlier than the fixed training-history start "
+                f"({TRAINING_HISTORY_START})."
             )
         if analysis_start > market_today:
             raise ValueError("Analysis start date cannot be later than today.")
@@ -238,22 +253,11 @@ class BacktestExecutionRequest(BacktestRequest):
                 raise ValueError("Analysis end date cannot be later than today.")
             if analysis_end < analysis_start:
                 raise ValueError("Analysis end date cannot be earlier than analysis start date.")
-        if history_end is not None:
-            if analysis_start > history_end:
-                raise ValueError(
-                    "Analysis start date cannot be later than the locked historical data end "
-                    f"({self.end_date})."
-                )
-            if analysis_end is not None and analysis_end > history_end:
-                raise ValueError(
-                    "Analysis end date cannot be later than the locked historical data end "
-                    f"({self.end_date})."
-                )
         return self
 
     @property
     def effective_analysis_end_date(self) -> str | None:
-        return self.analysis_end_date or self.end_date
+        return self.analysis_end_date
 
 
 LOCKED_CONFIGURATION_FIELDS = frozenset(BacktestRequest.model_fields)

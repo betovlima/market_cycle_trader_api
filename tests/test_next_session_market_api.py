@@ -53,6 +53,9 @@ class NextSessionMarketApiTests(unittest.TestCase):
                 "order_fill_timeout_seconds": 180,
                 "order_poll_interval_seconds": 2.0,
                 "cash_reserve_dollars": 0.0,
+                "automatic_continuation_enabled": True,
+                "scheduler_poll_seconds": 10.0,
+                "preparation_retry_seconds": 60.0,
             }
         )
         self.assertEqual(settings.market_execution_window_seconds, 900)
