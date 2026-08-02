@@ -9,9 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST"]
 Timeframe = Literal["1Day"]
-MarketDataProvider = Literal["yahoo", "alpaca"]
-AlpacaFeed = Literal["iex", "sip"]
+MarketDataProvider = Literal["alpaca"]
+AlpacaHistoricalFeed = Literal["sip", "iex"]
+AlpacaLiveFeed = Literal["iex", "sip"]
 AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
+HistoryBackfillProvider = Literal["alpaca"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
 
@@ -74,8 +76,13 @@ class BacktestRequest(BaseModel):
     end_date: str | None
     timeframe: Timeframe
     market_data_provider: MarketDataProvider
-    alpaca_feed: AlpacaFeed
+    alpaca_historical_feed: AlpacaHistoricalFeed
+    alpaca_live_feed: AlpacaLiveFeed
     alpaca_adjustment: AlpacaAdjustment
+    market_data_history_backfill_enabled: bool
+    market_data_history_backfill_provider: HistoryBackfillProvider
+    market_data_history_start_tolerance_days: int = Field(ge=0, le=365)
+    market_data_require_complete_history: bool
 
     rotation_models: list[RotationModel]
     rotation_horizon_days: int = Field(ge=1, le=260)
@@ -115,11 +122,9 @@ class BacktestRequest(BaseModel):
     xgb_reg_alpha: float = Field(ge=0)
     xgb_reg_lambda: float = Field(ge=0)
     xgb_n_jobs: int = Field(ge=-1)
+    deterministic_execution: bool
+    numeric_thread_limit: int = Field(ge=1, le=128)
 
-    yfinance_auto_adjust: bool
-    yfinance_repair: bool
-    yfinance_timeout: int = Field(ge=1, le=600)
-    yfinance_fallback_period: str = Field(min_length=1, max_length=50)
     mongo_cache_enabled: bool
     mongo_refresh_overlap_days: int = Field(ge=0, le=365)
     mongo_write_batch_size: int = Field(ge=1, le=100_000)
@@ -177,6 +182,15 @@ class BacktestRequest(BaseModel):
 
         if self.xgb_n_jobs == 0:
             raise ValueError("xgb_n_jobs must be -1 or a positive integer.")
+        if self.deterministic_execution:
+            if self.xgb_n_jobs != 1:
+                raise ValueError(
+                    "Deterministic execution requires xgb_n_jobs=1 in MongoDB."
+                )
+            if self.numeric_thread_limit != 1:
+                raise ValueError(
+                    "Deterministic execution requires numeric_thread_limit=1 in MongoDB."
+                )
         if not self.rotation_walk_forward_enabled:
             raise ValueError("Compound Capital Rotation requires expanding walk-forward validation.")
         if self.rotation_walk_forward_min_test_days > self.rotation_walk_forward_test_days:

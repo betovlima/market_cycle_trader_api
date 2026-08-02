@@ -27,8 +27,8 @@ from market_cycle_trader_api.services.parameter_bootstrap import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Insert every bundled parameterization whose _id is missing. "
-            "Existing documents are never modified."
+            "Insert missing parameter documents, repair invalid strategy schemas, "
+            "and preserve valid API-managed strategy parameters."
         )
     )
     parser.add_argument(
@@ -55,6 +55,14 @@ def main() -> int:
                 source="bootstrap_parameters.py",
             )
         print(json.dumps(result, indent=2, default=str))
+        if not args.status:
+            invalid = [item for item in result.get("results", []) if not item.get("valid")]
+            if invalid:
+                print(
+                    "Parameter bootstrap failed because one or more non-strategy documents are invalid.",
+                    file=sys.stderr,
+                )
+                return 1
     finally:
         client.close()
     return 0

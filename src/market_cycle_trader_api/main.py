@@ -12,7 +12,15 @@ load_project_environment()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api.routers import admin_setup, exports, health, jobs, paper_market, parameter_bootstrap
+from .api.routers import (
+    admin_setup,
+    exports,
+    health,
+    jobs,
+    paper_market,
+    parameter_bootstrap,
+    strategy_configuration,
+)
 from .core.config import API_VERSION, cors_origins
 from .core.runtime import close_mongo, initialize_mongo
 from .services.paper_market_scheduler import (
@@ -48,6 +56,7 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["Content-Disposition", "Content-Length"],
     )
 
     application.include_router(health.router)
@@ -55,6 +64,7 @@ def create_app() -> FastAPI:
     application.include_router(exports.router)
     application.include_router(paper_market.router)
     application.include_router(parameter_bootstrap.router)
+    application.include_router(strategy_configuration.router)
     application.include_router(admin_setup.router)
     return application
 

@@ -27,6 +27,7 @@ from ..infrastructure.persistence.mongo_repository import (
     replace_run_result,
 )
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
+from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
 from .market_data import load_market_bars, validate_and_clean_bars
 
@@ -176,6 +177,21 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "turnover_ratio",
         "effective_compute_device",
         "gpu_name",
+        "deterministic_execution",
+        "numeric_thread_limit",
+        "xgb_n_jobs",
+        "strategy_configuration_sha256",
+        "market_data_signature_sha256",
+        "market_data_history_complete",
+        "market_data_incomplete_assets",
+        "market_data_backfilled_assets",
+        "python_version",
+        "xgboost_version",
+        "scikit_learn_version",
+        "numpy_version",
+        "pandas_version",
+        "scipy_version",
+        "threadpoolctl_version",
     )
     row = {key: metrics.get(key) for key in keys}
     row.update({"symbol": "PORTFOLIO", "portfolio_rotation": True})
@@ -194,16 +210,37 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         )
         try:
             raw = load_market_bars(symbol, config)
-            bars_by_symbol[symbol] = validate_and_clean_bars(raw, config)
+            cleaned = validate_and_clean_bars(raw, config)
+            bars_by_symbol[symbol] = cleaned
+            provenance = dict(cleaned.attrs.get("market_data_provenance", {}))
+            first_session = pd.Timestamp(cleaned.index.min()).date().isoformat()
+            last_session = pd.Timestamp(cleaned.index.max()).date().isoformat()
+            backfill_rows = int(provenance.get("history_backfill_rows") or 0)
+            source_label = str(
+                provenance.get("effective_provider")
+                or provenance.get("provider")
+                or config.market_data_provider
+            )
+            print(
+                "MARKET_DATA|"
+                f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
+                f"source={source_label}|backfill_rows={backfill_rows}|"
+                f"complete={bool(provenance.get('history_complete', True))}",
+                flush=True,
+            )
             emit_progress(
                 3.0 + 12.0 * (asset_position / total_assets),
-                f"Loaded market data {asset_position}/{total_assets} — {symbol}",
+                (
+                    f"Loaded market data {asset_position}/{total_assets} — {symbol} "
+                    f"({first_session} → {last_session}, {source_label})"
+                ),
             )
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
+    reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
     emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
     results = run_rotation_models(
         bars_by_symbol,
@@ -216,6 +253,23 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
+        result.metrics.update(reproducibility)
+        result.summary += "\n\nREPRODUCIBILITY\n"
+        result.summary += (
+            f"Configuration SHA-256: {reproducibility['strategy_configuration_sha256']}\n"
+        )
+        result.summary += (
+            f"Market data SHA-256: {reproducibility['market_data_signature_sha256']}\n"
+        )
+        result.summary += (
+            f"Complete requested history: {reproducibility.get('market_data_history_complete')}\n"
+        )
+        result.summary += (
+            "Backfilled assets: "
+            f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
+        )
+        result.summary += f"Python: {reproducibility.get('python_version')}\n"
+        result.summary += f"XGBoost: {reproducibility.get('xgboost_version')}\n"
         emit_progress(
             92.0 + 6.0 * ((result_position - 1) / total_results),
             f"Saving {result.metrics.get('strategy_label', result.backend)} results to MongoDB",
@@ -254,6 +308,13 @@ def main() -> None:
         print(f"Assets: {', '.join(config.assets)}", flush=True)
         print(f"Strategy: {config.strategy_mode}", flush=True)
         print(f"Models: {', '.join(config.rotation_models)}", flush=True)
+        print(
+            "XGBoost execution: "
+            f"seed={config.random_state}, "
+            f"workers={config.xgb_n_jobs}, "
+            f"deterministic={config.deterministic_execution}",
+            flush=True,
+        )
         print(
             f"Training history: {config.start_date} → "
             f"{config.effective_analysis_end_date or 'latest available session'}",

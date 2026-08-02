@@ -8,7 +8,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import pandas as pd
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 
 from ...core.runtime import database
 from ...infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, PREDICTIONS_COLLECTION, RUNS_COLLECTION, TRADES_COLLECTION
@@ -20,7 +20,7 @@ from ...services.serialization import iso_value
 router = APIRouter(tags=["exports"])
 
 @router.get("/api/jobs/{job_id}/comparison.csv")
-def export_comparison(job_id: str) -> StreamingResponse:
+def export_comparison(job_id: str) -> Response:
     require_job(job_id)
     document = database()[COMPARISONS_COLLECTION].find_one(
         {"job_id": job_id},
@@ -39,7 +39,7 @@ def export_predictions(
     job_id: str,
     symbol: str,
     backend: str,
-) -> StreamingResponse:
+) -> Response:
     require_run(job_id, symbol, backend)
     rows = list(
         database()[PREDICTIONS_COLLECTION]
@@ -65,7 +65,7 @@ def export_trades(
     job_id: str,
     symbol: str,
     backend: str,
-) -> StreamingResponse:
+) -> Response:
     require_run(job_id, symbol, backend)
     rows = list(
         database()[TRADES_COLLECTION]
@@ -91,7 +91,7 @@ def get_run_diagnostics_csv(
     job_id: str,
     symbol: str,
     backend: str,
-) -> StreamingResponse:
+) -> Response:
     require_job(job_id)
     db = database()
     run_filter = {
@@ -220,7 +220,7 @@ def export_comparison_chart(job_id: str) -> Response:
 
 
 @router.get("/api/jobs/{job_id}/export.zip")
-def export_zip(job_id: str) -> StreamingResponse:
+def export_zip(job_id: str) -> Response:
     require_job(job_id)
     db = database()
 
@@ -251,6 +251,37 @@ def export_zip(job_id: str) -> StreamingResponse:
             "failures.csv",
             csv_bytes(comparison.get("failures", [])),
         )
+        archive.writestr(
+            "effective_config.json",
+            json.dumps(
+                iso_value(comparison.get("effective_config", {})),
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+        if runs:
+            first_metrics = runs[0].get("metrics", {})
+            reproducibility = {
+                key: first_metrics.get(key)
+                for key in (
+                    "strategy_configuration_sha256",
+                    "market_data_signature_sha256",
+                    "market_data_signatures",
+                    "runtime_versions",
+                    "deterministic_execution",
+                    "numeric_thread_limit",
+                    "xgb_n_jobs",
+                )
+                if key in first_metrics
+            }
+            archive.writestr(
+                "reproducibility.json",
+                json.dumps(
+                    iso_value(reproducibility),
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
         for run in runs:
             symbol = str(run["symbol"])
             backend = str(run["backend"])
@@ -272,12 +303,17 @@ def export_zip(job_id: str) -> StreamingResponse:
                 .sort([("timestamp", 1), ("sequence", 1)])
             )
             metrics = run.get("metrics", {})
-            diagnostics = build_performance_diagnostics(
-                db,
-                predictions,
-                trades,
-                metrics,
-            )
+            diagnostics_error: str | None = None
+            try:
+                diagnostics = build_performance_diagnostics(
+                    db,
+                    predictions,
+                    trades,
+                    metrics,
+                )
+            except Exception as exc:  # Export must remain available even if an optional diagnostic fails.
+                diagnostics = {}
+                diagnostics_error = f"{type(exc).__name__}: {exc}"
 
             archive.writestr(
                 f"{folder}/{symbol}_{backend}_metrics.json",
@@ -323,6 +359,11 @@ def export_zip(job_id: str) -> StreamingResponse:
                     ensure_ascii=False,
                 ),
             )
+            if diagnostics_error:
+                archive.writestr(
+                    f"{folder}/{symbol}_{backend}_diagnostics_error.txt",
+                    diagnostics_error,
+                )
 
             if str(metrics.get("strategy_mode", "")) == "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE":
                 decision_rows: list[dict[str, Any]] = []
@@ -374,13 +415,15 @@ def export_zip(job_id: str) -> StreamingResponse:
                     csv_bytes(value_rows),
                 )
 
-    archive_buffer.seek(0)
-    return StreamingResponse(
-        archive_buffer,
+    payload = archive_buffer.getvalue()
+    return Response(
+        content=payload,
         media_type="application/zip",
         headers={
             "Content-Disposition": (
                 f'attachment; filename="market_cycle_trader_{job_id}.zip"'
-            )
+            ),
+            "Content-Length": str(len(payload)),
+            "Cache-Control": "no-store",
         },
     )

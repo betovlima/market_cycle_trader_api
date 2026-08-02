@@ -6,7 +6,7 @@ from typing import Any
 import pandas as pd
 from pymongo.database import Database
 
-from ...infrastructure.persistence.mongo_repository import MARKET_BARS_COLLECTION
+from ...infrastructure.persistence.mongo_repository import ALPACA_MARKET_BARS_COLLECTION
 
 
 def _safe_float(value: Any) -> float | None:
@@ -88,14 +88,14 @@ def _market_close_series(
 ) -> pd.Series:
     query = {
         "symbol": symbol,
-        "interval": "1d",
+        "interval": "1Day",
         "timestamp": {
             "$gte": start.to_pydatetime(),
             "$lte": end.to_pydatetime(),
         },
     }
     rows = list(
-        db[MARKET_BARS_COLLECTION]
+        db[ALPACA_MARKET_BARS_COLLECTION]
         .find(query, {"_id": 0, "timestamp": 1, "close": 1})
         .sort("timestamp", 1)
     )

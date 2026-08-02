@@ -3,11 +3,12 @@ uvicorn[standard]
 pydantic
 python-dotenv>=1.0,<2
 pymongo
-numpy
-pandas
+numpy==2.5.1
+pandas==3.0.5
+scipy==1.18.0
+scikit-learn==1.9.0
+threadpoolctl==3.6.0
 exchange-calendars>=4.13,<5
 matplotlib
-yfinance
 alpaca-py==0.43.5
-xgboost>=3.0
-scikit-learn
+xgboost==3.3.0

@@ -7,7 +7,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import pandas as pd
 from fastapi import HTTPException
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import (
@@ -137,12 +137,29 @@ def build_results(job_id: str) -> dict[str, Any]:
         .sort([("symbol", 1), ("backend", 1)])
     )
     comparison_rows = comparison.get("results", [])
+    run_payloads = [build_run_payload(run) for run in runs]
+    first_metrics = run_payloads[0].get("metrics", {}) if run_payloads else {}
+    reproducibility = {
+        key: first_metrics.get(key)
+        for key in (
+            "strategy_configuration_sha256",
+            "market_data_signature_sha256",
+            "market_data_signatures",
+            "runtime_versions",
+            "deterministic_execution",
+            "numeric_thread_limit",
+            "xgb_n_jobs",
+        )
+        if key in first_metrics
+    }
     return {
         "jobId": job_id,
         "comparison": iso_value(comparison_rows),
         "robustnessSummary": iso_value(build_robustness_summary(comparison_rows)),
-        "runs": [build_run_payload(run) for run in runs],
+        "runs": run_payloads,
         "failures": iso_value(comparison.get("failures", [])),
+        "effectiveConfig": iso_value(comparison.get("effective_config", {})),
+        "reproducibility": iso_value(reproducibility),
         "downloads": {
             "zip": f"/api/jobs/{job_id}/export.zip",
             "comparison": f"/api/jobs/{job_id}/comparison.csv",
@@ -175,11 +192,16 @@ def csv_response(
     rows: list[dict[str, Any]],
     filename: str,
     excluded_fields: set[str] | None = None,
-) -> StreamingResponse:
-    return StreamingResponse(
-        io.BytesIO(csv_bytes(rows, excluded_fields=excluded_fields)),
+) -> Response:
+    payload = csv_bytes(rows, excluded_fields=excluded_fields)
+    return Response(
+        content=payload,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+            "Cache-Control": "no-store",
+        },
     )
 
 

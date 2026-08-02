@@ -1,56 +1,20 @@
-# Market Cycle Trader API v1.12.9
+# Market Cycle Trader API v1.12.26
 
-FastAPI backend for the XGBoost-only Compound Capital Rotation strategy.
+Complete MongoDB-backed backtest and Alpaca Paper API.
 
-## Runtime modules
+## Main routes
 
-- `engine/capital_rotation.py`: XGBoost walk-forward training and simulation.
-- `engine/live_xgboost_signal.py`: next-session paper-trading decision.
-- `engine/market_data.py`: historical market-data loading and MongoDB cache.
-- `services/paper_trading.py`: isolated Alpaca Paper portfolio workflow.
+- `/api/jobs` — complete backtest execution and results.
+- `/api/paper-market` — Alpaca Paper portfolio and next-session execution.
+- `/api/admin/parameters` — protected initial parameter installation and status.
+- `/api/admin/setup` — protected account binding and paper-state initialization.
+- `/api/admin/strategy-configuration` — protected strategy configuration and history.
+- `/api/health/live` and `/api/health/ready` — liveness and readiness.
 
-The API does not include a QR-DQN execution path and does not require PyTorch.
+## Administration contract
 
-## Active configuration
+MongoDB configuration is changed only through protected administrative endpoints. Railway starts the API directly and has no database pre-deploy command. Infrastructure credentials and administrative tokens remain server environment variables.
 
-MongoDB collection: `backtest_settings`
+## v1.12.26 hotfix
 
-Active document: `_id = "default"`
-
-Use `scripts/apply_locked_config.py` with the complete JSON from `configs/`.
-
-## Next-session Alpaca Paper API
-
-The API can arm one locked XGBoost execution for the next regular Alpaca paper session.
-It uses the Alpaca clock instead of assuming weekdays and persists its state in
-`paper_market_runs`.
-
-```bash
-curl -X POST "http://127.0.0.1:8000/api/paper-market/start-next-session" \
-  -H "X-Paper-Market-Token: $PAPER_MARKET_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"confirm_paper":true}'
-```
-
-See `NEXT_SESSION_MARKET_API_V1_12_0.md` at the project root.
-
-## Idempotent parameter bootstrap
-
-Set `PARAMETER_BOOTSTRAP_API_TOKEN`, then inspect or insert missing parameter documents:
-
-```bash
-curl "http://127.0.0.1:8000/api/admin/parameters/status" \
-  -H "X-Parameter-Bootstrap-Token: YOUR_TOKEN"
-
-curl -X POST "http://127.0.0.1:8000/api/admin/parameters/bootstrap" \
-  -H "X-Parameter-Bootstrap-Token: YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"confirm_insert_missing_only":true}'
-```
-
-Existing `_id=default` documents are never overwritten. The equivalent CLI is:
-
-```bash
-python scripts/bootstrap_parameters.py --status
-python scripts/bootstrap_parameters.py
-```
+The paper-settings repository now strips all administrative metadata, including `revision`, before Pydantic validation. This fixes `POST /api/admin/setup/initialize` after a clean endpoint-driven bootstrap. No strategy parameter was changed.

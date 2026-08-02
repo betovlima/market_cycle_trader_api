@@ -20,7 +20,6 @@ PREDICTIONS_COLLECTION = "backtest_predictions"
 TRADES_COLLECTION = "backtest_trades"
 COMPARISONS_COLLECTION = "backtest_comparisons"
 FAILURES_COLLECTION = "backtest_failures"
-MARKET_BARS_COLLECTION = "market_bars"
 ALPACA_MARKET_BARS_COLLECTION = "alpaca_market_bars"
 INTEGRATIONS_COLLECTION = "integrations"
 ALPACA_INTEGRATION_ID = "alpaca"
@@ -32,7 +31,7 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 15
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",
@@ -41,6 +40,7 @@ SETTINGS_METADATA_FIELDS = frozenset({
     "configuration_name",
     "configuration_note",
     "bootstrap_source",
+    "revision",
 })
 
 
@@ -205,7 +205,7 @@ def get_settings(db: Database) -> dict[str, Any]:
     if document is None:
         raise RuntimeError(
             "Locked strategy configuration was not found in MongoDB. "
-            "Run scripts/apply_locked_config.py with a complete JSON configuration."
+            "Call POST /api/admin/parameters/bootstrap."
         )
     return {
         key: bson_value(value)
@@ -282,7 +282,7 @@ def get_paper_trading_settings(db: Database) -> dict[str, Any]:
     return {
         key: bson_value(value)
         for key, value in document.items()
-        if key not in {"_id", "created_at", "updated_at", "schema_version", "configuration_name", "configuration_note", "bootstrap_source"}
+        if key not in SETTINGS_METADATA_FIELDS
     }
 
 
@@ -296,7 +296,7 @@ def get_paper_trading_state(db: Database) -> dict[str, Any]:
     return {
         key: bson_value(value)
         for key, value in document.items()
-        if key not in {"_id", "created_at", "updated_at", "schema_version", "configuration_name", "configuration_note", "bootstrap_source"}
+        if key not in SETTINGS_METADATA_FIELDS
     }
 
 
