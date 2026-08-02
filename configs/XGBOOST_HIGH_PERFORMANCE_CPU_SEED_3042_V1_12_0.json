@@ -12,7 +12,12 @@
     "SPY"
   ],
   "strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST",
+  "start_date": "2016-01-01",
+  "end_date": null,
   "timeframe": "1Day",
+  "market_data_provider": "alpaca",
+  "alpaca_historical_feed": "sip",
+  "alpaca_live_feed": "iex",
   "alpaca_adjustment": "all",
   "market_data_history_backfill_enabled": true,
   "market_data_history_backfill_provider": "alpaca",
@@ -45,7 +50,7 @@
   "rotation_xgb_max_depth": 3,
   "rotation_accelerator": "cpu",
   "rotation_allow_cpu_fallback": true,
-  "rotation_xgb_repetitions": 5,
+  "rotation_xgb_repetitions": 1,
   "rotation_seed_step": 1000,
   "initial_capital": 10000.0,
   "whole_shares": false,
@@ -66,8 +71,5 @@
   "mongo_cache_enabled": true,
   "mongo_refresh_overlap_days": 7,
   "mongo_write_batch_size": 1000,
-  "random_state": 42,
-  "rotation_seed_ensemble_enabled": true,
-  "rotation_seed_ensemble_method": "majority_vote",
-  "rotation_seed_ensemble_min_agreement": 0.4
+  "random_state": 3042
 }

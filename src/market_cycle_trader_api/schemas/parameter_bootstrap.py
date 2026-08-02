@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class BootstrapParametersRequest(BaseModel):
-    """Explicit confirmation for automatic parameter bootstrap and schema repair."""
+    """Explicit confirmation for canonical strategy reset and missing-document bootstrap."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -22,7 +22,6 @@ class ParameterizationItemResult(BaseModel):
     status: Literal[
         "inserted",
         "migrated_existing",
-        "repaired_invalid",
         "skipped_existing_valid",
         "skipped_existing_invalid",
         "missing",

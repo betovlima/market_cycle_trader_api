@@ -37,23 +37,25 @@ def database() -> Database:
     return _MONGO_DB
 
 
-def _validate_configuration(db: Database) -> None:
-    BacktestRequest.model_validate(get_settings(db))
-
-
 def refresh_locked_configuration_status() -> bool:
+    """Revalidate the active locked configuration without restarting the API."""
+
     if _MONGO_DB is None:
         MONGO_STATUS["configuration_available"] = False
         MONGO_STATUS["configuration_message"] = "MongoDB is unavailable."
         return False
+
     try:
-        _validate_configuration(_MONGO_DB)
+        BacktestRequest.model_validate(get_settings(_MONGO_DB))
     except (RuntimeError, ValidationError) as exc:
         MONGO_STATUS["configuration_available"] = False
-        MONGO_STATUS["configuration_message"] = f"Configuration is unavailable or invalid: {exc}"
+        MONGO_STATUS["configuration_message"] = (
+            f"Locked configuration is unavailable or invalid: {exc}"
+        )
         return False
+
     MONGO_STATUS["configuration_available"] = True
-    MONGO_STATUS["configuration_message"] = "Configuration is valid."
+    MONGO_STATUS["configuration_message"] = "Locked configuration is valid."
     return True
 
 
@@ -75,13 +77,15 @@ def initialize_mongo() -> None:
                 "$unset": {"process_id": ""},
             },
         )
-        available = True
-        message = "Configuration is valid."
+
+        configuration_available = True
+        configuration_message = "Locked configuration is valid."
         try:
-            _validate_configuration(db)
+            BacktestRequest.model_validate(get_settings(db))
         except (RuntimeError, ValidationError) as exc:
-            available = False
-            message = f"Configuration is unavailable or invalid: {exc}"
+            configuration_available = False
+            configuration_message = f"Locked configuration is unavailable or invalid: {exc}"
+
         _MONGO_CLIENT = client
         _MONGO_DB = db
         MONGO_STATUS.clear()
@@ -90,8 +94,8 @@ def initialize_mongo() -> None:
                 "available": True,
                 "configured": True,
                 "database": MONGO_DATABASE,
-                "configuration_available": available,
-                "configuration_message": message,
+                "configuration_available": configuration_available,
+                "configuration_message": configuration_message,
                 "message": "MongoDB is available.",
             }
         )

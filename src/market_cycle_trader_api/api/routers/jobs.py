@@ -74,8 +74,6 @@ def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
     payload = bson_value(request_payload)
     lifecycle = strategy_lifecycle(payload["strategy_mode"])
     total_runs = int(payload["rotation_xgb_repetitions"])
-    if bool(payload.get("rotation_seed_ensemble_enabled")) and total_runs > 1:
-        total_runs += 1
     job = {
         "id": job_id,
         "status": "queued",

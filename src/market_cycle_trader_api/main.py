@@ -5,14 +5,14 @@ from typing import AsyncIterator
 
 from .core.environment import load_project_environment
 
-
-
+# Load market_cycle_trader_api/.env before importing modules that read
+# environment variables at import time, such as the MongoDB repository.
 load_project_environment()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api.routers import health, paper_market
+from .api.routers import admin_setup, exports, health, jobs, paper_market, parameter_bootstrap
 from .core.config import API_VERSION, cors_origins
 from .core.runtime import close_mongo, initialize_mongo
 from .services.paper_market_scheduler import (
@@ -36,7 +36,10 @@ def create_app() -> FastAPI:
     application = FastAPI(
         title="Market Cycle Trader API",
         version=API_VERSION,
-        description="Private market execution API.",
+        description=(
+            "MongoDB-backed market-cycle research and backtest API. "
+            "Trading engines are isolated from HTTP orchestration."
+        ),
         lifespan=lifespan,
     )
     application.add_middleware(
@@ -49,7 +52,11 @@ def create_app() -> FastAPI:
     )
 
     application.include_router(health.router)
+    application.include_router(jobs.router)
+    application.include_router(exports.router)
     application.include_router(paper_market.router)
+    application.include_router(parameter_bootstrap.router)
+    application.include_router(admin_setup.router)
     return application
 
 

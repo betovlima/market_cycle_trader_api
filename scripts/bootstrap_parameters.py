@@ -27,8 +27,8 @@ from market_cycle_trader_api.services.parameter_bootstrap import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Insert missing parameter documents, repair invalid strategy schemas, "
-            "and preserve valid API-managed strategy parameters."
+            "Reset the strategy collection to the canonical release configuration "
+            "and insert other missing parameter documents."
         )
     )
     parser.add_argument(

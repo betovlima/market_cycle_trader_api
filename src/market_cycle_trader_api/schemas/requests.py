@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..core.config import SWING_STRATEGY_MODES
-
-StrategyMode = Literal[
-    "COMPOUND_ROTATION_SWING_XGBOOST",
-    "COMPOUND_ROTATION_SWING_QRDQN",
-    "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE",
-]
-Timeframe = Literal["1Day", "15Min"]
-MarketDataProvider = Literal["yahoo", "alpaca"]
-AlpacaFeed = Literal["iex", "sip"]
+StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST"]
+Timeframe = Literal["1Day"]
+MarketDataProvider = Literal["alpaca"]
+AlpacaHistoricalFeed = Literal["sip"]
+AlpacaLiveFeed = Literal["iex"]
 AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
-RotationModel = Literal["xgboost_utility", "qrdqn"]
+HistoryBackfillProvider = Literal["alpaca"]
+RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
 
 
@@ -66,11 +62,10 @@ class PublicBacktestRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    """Complete locked execution configuration loaded from MongoDB.
+    """Complete XGBoost-only configuration loaded from MongoDB.
 
-    Operational values intentionally have no Python defaults. A missing MongoDB
-    field is therefore a configuration error instead of being silently replaced
-    by a value embedded in the application binary.
+    Operational values intentionally have no Python defaults. Missing or unknown
+    MongoDB fields are configuration errors instead of being silently replaced.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -81,8 +76,13 @@ class BacktestRequest(BaseModel):
     end_date: str | None
     timeframe: Timeframe
     market_data_provider: MarketDataProvider
-    alpaca_feed: AlpacaFeed
+    alpaca_historical_feed: AlpacaHistoricalFeed
+    alpaca_live_feed: AlpacaLiveFeed
     alpaca_adjustment: AlpacaAdjustment
+    market_data_history_backfill_enabled: bool
+    market_data_history_backfill_provider: HistoryBackfillProvider
+    market_data_history_start_tolerance_days: int = Field(ge=0, le=365)
+    market_data_require_complete_history: bool
 
     rotation_models: list[RotationModel]
     rotation_horizon_days: int = Field(ge=1, le=260)
@@ -104,31 +104,8 @@ class BacktestRequest(BaseModel):
     rotation_xgb_max_depth: int = Field(ge=1, le=20)
     rotation_accelerator: RotationAccelerator
     rotation_allow_cpu_fallback: bool
-    rotation_parallel_models: bool
     rotation_xgb_repetitions: int = Field(ge=1, le=100)
-    rotation_qrdqn_repetitions: int = Field(ge=1, le=100)
     rotation_seed_step: int = Field(ge=1, le=10_000_000)
-
-    qrdqn_training_steps: int = Field(ge=500, le=2_000_000)
-    qrdqn_parallel_folds: int = Field(ge=1, le=32)
-    qrdqn_parallel_repetitions: int = Field(ge=1, le=16)
-    qrdqn_torch_num_threads: int = Field(ge=0, le=64)
-    qrdqn_early_stopping_enabled: bool
-    qrdqn_early_stopping_patience: int = Field(ge=1, le=100)
-    qrdqn_min_training_steps: int = Field(ge=500, le=2_000_000)
-    qrdqn_episode_days: int = Field(ge=20, le=2_000)
-    qrdqn_replay_size: int = Field(ge=1_000, le=2_000_000)
-    qrdqn_learning_starts: int = Field(ge=100, le=100_000)
-    qrdqn_batch_size: int = Field(ge=16, le=4_096)
-    qrdqn_learning_rate: float = Field(gt=0, le=1)
-    qrdqn_gamma: float = Field(ge=0, le=1)
-    qrdqn_n_step: int = Field(ge=1, le=60)
-    qrdqn_n_quantiles: int = Field(ge=5, le=200)
-    qrdqn_hidden_dim: int = Field(ge=16, le=2_048)
-    qrdqn_target_update_steps: int = Field(ge=10, le=100_000)
-    qrdqn_eval_every_steps: int = Field(ge=100, le=100_000)
-    qrdqn_epsilon_start: float = Field(ge=0, le=1)
-    qrdqn_epsilon_end: float = Field(ge=0, le=1)
 
     initial_capital: float = Field(gt=0)
     whole_shares: bool
@@ -145,11 +122,9 @@ class BacktestRequest(BaseModel):
     xgb_reg_alpha: float = Field(ge=0)
     xgb_reg_lambda: float = Field(ge=0)
     xgb_n_jobs: int = Field(ge=-1)
+    deterministic_execution: bool
+    numeric_thread_limit: int = Field(ge=1, le=128)
 
-    yfinance_auto_adjust: bool
-    yfinance_repair: bool
-    yfinance_timeout: int = Field(ge=1, le=600)
-    yfinance_fallback_period: str = Field(min_length=1, max_length=50)
     mongo_cache_enabled: bool
     mongo_refresh_overlap_days: int = Field(ge=0, le=365)
     mongo_write_batch_size: int = Field(ge=1, le=100_000)
@@ -180,11 +155,8 @@ class BacktestRequest(BaseModel):
     @classmethod
     def validate_rotation_models(cls, value: list[str]) -> list[str]:
         cleaned = list(dict.fromkeys(str(item).strip().lower() for item in value if str(item).strip()))
-        invalid = sorted(set(cleaned) - {"xgboost_utility", "qrdqn"})
-        if invalid:
-            raise ValueError(f"Unsupported rotation models: {invalid}")
-        if not cleaned:
-            raise ValueError("Select at least one capital-rotation model.")
+        if cleaned != ["xgboost_utility"]:
+            raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
         return cleaned
 
     @field_validator("rotation_switch_margin_candidates")
@@ -208,49 +180,80 @@ class BacktestRequest(BaseModel):
             if end < start:
                 raise ValueError("End date cannot be earlier than start date.")
 
-        if self.qrdqn_min_training_steps > self.qrdqn_training_steps:
-            raise ValueError("QR-DQN minimum training steps cannot exceed total training steps.")
-        if self.qrdqn_learning_starts >= self.qrdqn_replay_size:
-            raise ValueError("QR-DQN learning starts must be smaller than replay size.")
-        if self.qrdqn_batch_size > self.qrdqn_replay_size:
-            raise ValueError("QR-DQN batch size cannot exceed replay size.")
-        if self.qrdqn_epsilon_end > self.qrdqn_epsilon_start:
-            raise ValueError("QR-DQN epsilon end cannot exceed epsilon start.")
         if self.xgb_n_jobs == 0:
             raise ValueError("xgb_n_jobs must be -1 or a positive integer.")
-
+        if self.deterministic_execution:
+            if self.xgb_n_jobs != 1:
+                raise ValueError(
+                    "Deterministic execution requires xgb_n_jobs=1 in MongoDB."
+                )
+            if self.numeric_thread_limit != 1:
+                raise ValueError(
+                    "Deterministic execution requires numeric_thread_limit=1 in MongoDB."
+                )
         if not self.rotation_walk_forward_enabled:
             raise ValueError("Compound Capital Rotation requires expanding walk-forward validation.")
         if self.rotation_walk_forward_min_test_days > self.rotation_walk_forward_test_days:
             raise ValueError("Minimum test sessions cannot exceed the configured test window.")
-
-        if self.strategy_mode in SWING_STRATEGY_MODES:
-            if self.timeframe != "1Day":
-                raise ValueError("Swing rotation strategies require timeframe=1Day.")
-            if self.rotation_purge_days < self.rotation_horizon_days:
-                raise ValueError("Swing rotation purge must be at least the decision horizon.")
-            expected_models = (
-                ["qrdqn"]
-                if self.strategy_mode == "COMPOUND_ROTATION_SWING_QRDQN"
-                else ["xgboost_utility"]
-            )
-            if self.rotation_models != expected_models:
-                raise ValueError(
-                    f"{self.strategy_mode} requires rotation_models={expected_models}."
-                )
-        else:
-            if self.timeframe != "15Min":
-                raise ValueError("Day Trade Open→Close requires timeframe=15Min.")
-            if self.rotation_horizon_days != 1:
-                raise ValueError("Day Trade Open→Close requires a one-session decision horizon.")
-            if self.market_data_provider == "yahoo":
-                start_timestamp = datetime.fromisoformat(self.start_date).replace(tzinfo=timezone.utc)
-                if start_timestamp < datetime.now(timezone.utc) - timedelta(days=60):
-                    raise ValueError(
-                        "Yahoo Finance 15-minute history is limited to roughly the last 60 days. "
-                        "Use Alpaca for longer Day Trade windows."
-                    )
+        if self.rotation_purge_days < self.rotation_horizon_days:
+            raise ValueError("Swing rotation purge must be at least the decision horizon.")
         return self
+
+
+class BacktestExecutionRequest(BacktestRequest):
+    """Locked XGBoost configuration plus the public out-of-sample window."""
+
+    analysis_start_date: str
+    analysis_end_date: str | None
+
+    @field_validator("analysis_start_date")
+    @classmethod
+    def validate_analysis_start_date(cls, value: str) -> str:
+        return normalize_iso_date(value, field_name="analysis_start_date")
+
+    @field_validator("analysis_end_date")
+    @classmethod
+    def validate_analysis_end_date(cls, value: str | None) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        return normalize_iso_date(value, field_name="analysis_end_date")
+
+    @model_validator(mode="after")
+    def validate_analysis_window(self) -> "BacktestExecutionRequest":
+        market_today = datetime.now(ZoneInfo("America/New_York")).date()
+        history_start = date.fromisoformat(self.start_date)
+        history_end = date.fromisoformat(self.end_date) if self.end_date else None
+        analysis_start = date.fromisoformat(self.analysis_start_date)
+        analysis_end = date.fromisoformat(self.analysis_end_date) if self.analysis_end_date else None
+
+        if analysis_start < history_start:
+            raise ValueError(
+                "Analysis start date cannot be earlier than the locked historical data start "
+                f"({self.start_date})."
+            )
+        if analysis_start > market_today:
+            raise ValueError("Analysis start date cannot be later than today.")
+        if analysis_end is not None:
+            if analysis_end > market_today:
+                raise ValueError("Analysis end date cannot be later than today.")
+            if analysis_end < analysis_start:
+                raise ValueError("Analysis end date cannot be earlier than analysis start date.")
+        if history_end is not None:
+            if analysis_start > history_end:
+                raise ValueError(
+                    "Analysis start date cannot be later than the locked historical data end "
+                    f"({self.end_date})."
+                )
+            if analysis_end is not None and analysis_end > history_end:
+                raise ValueError(
+                    "Analysis end date cannot be later than the locked historical data end "
+                    f"({self.end_date})."
+                )
+        return self
+
+    @property
+    def effective_analysis_end_date(self) -> str | None:
+        return self.analysis_end_date or self.end_date
 
 
 LOCKED_CONFIGURATION_FIELDS = frozenset(BacktestRequest.model_fields)

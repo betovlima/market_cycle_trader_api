@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from copy import deepcopy
@@ -13,11 +12,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from market_cycle_trader_api.core.environment import load_project_environment              
+from market_cycle_trader_api.core.environment import load_project_environment  # noqa: E402
 
 load_project_environment()
 
-from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (              
+from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (  # noqa: E402
     MONGO_DATABASE,
     SETTINGS_COLLECTION,
     SETTINGS_HISTORY_COLLECTION,
@@ -27,7 +26,7 @@ from market_cycle_trader_api.infrastructure.persistence.mongo_repository import 
     ensure_database,
     get_database,
 )
-from market_cycle_trader_api.schemas.requests import (              
+from market_cycle_trader_api.schemas.requests import (  # noqa: E402
     BacktestRequest,
     LOCKED_CONFIGURATION_FIELDS,
 )
@@ -64,11 +63,9 @@ def main() -> int:
     validated = BacktestRequest.model_validate(raw).model_dump(mode="json")
     effective = {key: bson_value(value) for key, value in validated.items()}
 
-    canonical = json.dumps(validated, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    fingerprint = hashlib.sha256(canonical).hexdigest()
+    print(json.dumps(validated, indent=2, default=str))
     if args.dry_run:
-        print(f"Configuration is valid. SHA-256: {fingerprint}")
-        print("MongoDB was not changed.")
+        print("\nDRY RUN: configuration is valid; MongoDB was not changed.")
         return 0
 
     client = create_client()

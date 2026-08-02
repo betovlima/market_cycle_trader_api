@@ -10,6 +10,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.environment import load_project_environment
+
+# The backtest engine runs in a separate Python process. Load the API .env in
+# this process as well instead of relying only on environment inheritance from
+# Uvicorn. Real system/Railway variables keep priority because override=False.
+load_project_environment()
+
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     bson_value,
@@ -19,9 +26,9 @@ from ..infrastructure.persistence.mongo_repository import (
     replace_comparison,
     replace_run_result,
 )
-from ..schemas.requests import BacktestRequest
+from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
+from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
-from .day_trade_open_close import run_open_close_models
 from .market_data import load_market_bars, validate_and_clean_bars
 
 
@@ -87,11 +94,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(db: Any, job_id: str) -> BacktestRequest:
+def load_config(db: Any, job_id: str) -> BacktestExecutionRequest:
     job = db[JOBS_COLLECTION].find_one({"id": job_id}, {"_id": 0, "request": 1})
     if job is None:
         raise ValueError(f"Backtest job not found: {job_id}")
-    return BacktestRequest.model_validate(job.get("request") or {})
+    return BacktestExecutionRequest.model_validate(job.get("request") or {})
 
 
 def emit_progress(percent: float, stage: str, completed_runs: int = 0) -> None:
@@ -170,19 +177,30 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "turnover_ratio",
         "effective_compute_device",
         "gpu_name",
-        "qrdqn_parallel_folds_effective",
-        "qrdqn_training_steps_mean_used",
-        "qrdqn_early_stopped_folds",
+        "deterministic_execution",
+        "numeric_thread_limit",
+        "xgb_n_jobs",
+        "strategy_configuration_sha256",
+        "market_data_signature_sha256",
+        "market_data_history_complete",
+        "market_data_incomplete_assets",
+        "market_data_backfilled_assets",
+        "python_version",
+        "xgboost_version",
+        "scikit_learn_version",
+        "numpy_version",
+        "pandas_version",
+        "scipy_version",
+        "threadpoolctl_version",
     )
     row = {key: metrics.get(key) for key in keys}
     row.update({"symbol": "PORTFOLIO", "portfolio_rotation": True})
     return row
 
 
-def run_job(job_id: str, config: BacktestRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
-    is_day_trade = config.strategy_mode == "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE"
     emit_progress(2.0, "Preparing shared-capital rotation")
     total_assets = max(1, len(config.assets))
     for asset_position, symbol in enumerate(config.assets, start=1):
@@ -192,24 +210,39 @@ def run_job(job_id: str, config: BacktestRequest, db: Any) -> tuple[list[dict[st
         )
         try:
             raw = load_market_bars(symbol, config)
-            bars_by_symbol[symbol] = validate_and_clean_bars(raw, config)
+            cleaned = validate_and_clean_bars(raw, config)
+            bars_by_symbol[symbol] = cleaned
+            provenance = dict(cleaned.attrs.get("market_data_provenance", {}))
+            first_session = pd.Timestamp(cleaned.index.min()).date().isoformat()
+            last_session = pd.Timestamp(cleaned.index.max()).date().isoformat()
+            backfill_rows = int(provenance.get("history_backfill_rows") or 0)
+            source_label = str(
+                provenance.get("effective_provider")
+                or provenance.get("provider")
+                or config.market_data_provider
+            )
+            print(
+                "MARKET_DATA|"
+                f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
+                f"source={source_label}|backfill_rows={backfill_rows}|"
+                f"complete={bool(provenance.get('history_complete', True))}",
+                flush=True,
+            )
             emit_progress(
                 3.0 + 12.0 * (asset_position / total_assets),
-                f"Loaded market data {asset_position}/{total_assets} — {symbol}",
+                (
+                    f"Loaded market data {asset_position}/{total_assets} — {symbol} "
+                    f"({first_session} → {last_session}, {source_label})"
+                ),
             )
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
-    emit_progress(
-        17.0,
-        "Building aligned Open→Close session panel and walk-forward folds"
-        if is_day_trade
-        else "Building aligned daily panel and walk-forward folds",
-    )
-    runner = run_open_close_models if is_day_trade else run_rotation_models
-    results = runner(
+    reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
+    emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
+    results = run_rotation_models(
         bars_by_symbol,
         config,
         calculate_reference_fees,
@@ -220,6 +253,23 @@ def run_job(job_id: str, config: BacktestRequest, db: Any) -> tuple[list[dict[st
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
+        result.metrics.update(reproducibility)
+        result.summary += "\n\nREPRODUCIBILITY\n"
+        result.summary += (
+            f"Configuration SHA-256: {reproducibility['strategy_configuration_sha256']}\n"
+        )
+        result.summary += (
+            f"Market data SHA-256: {reproducibility['market_data_signature_sha256']}\n"
+        )
+        result.summary += (
+            f"Complete requested history: {reproducibility.get('market_data_history_complete')}\n"
+        )
+        result.summary += (
+            "Backfilled assets: "
+            f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
+        )
+        result.summary += f"Python: {reproducibility.get('python_version')}\n"
+        result.summary += f"XGBoost: {reproducibility.get('xgboost_version')}\n"
         emit_progress(
             92.0 + 6.0 * ((result_position - 1) / total_results),
             f"Saving {result.metrics.get('strategy_label', result.backend)} results to MongoDB",
@@ -258,6 +308,28 @@ def main() -> None:
         print(f"Assets: {', '.join(config.assets)}", flush=True)
         print(f"Strategy: {config.strategy_mode}", flush=True)
         print(f"Models: {', '.join(config.rotation_models)}", flush=True)
+        print(
+            "XGBoost execution: "
+            f"seed={config.random_state}, "
+            f"workers={config.xgb_n_jobs}, "
+            f"deterministic={config.deterministic_execution}",
+            flush=True,
+        )
+        print(
+            f"Training history: {config.start_date} → "
+            f"{config.effective_analysis_end_date or 'latest available session'}",
+            flush=True,
+        )
+        print(
+            f"Requested analysis window: {config.analysis_start_date} → "
+            f"{config.analysis_end_date or 'latest available session'}",
+            flush=True,
+        )
+        print(
+            "Champion walk-forward schedule locked; the public date range "
+            "changes only the simulated account window.",
+            flush=True,
+        )
         comparisons, failures = run_job(args.job_id, config, db)
         comparisons.sort(key=lambda item: str(item.get("backend", "")))
         replace_comparison(

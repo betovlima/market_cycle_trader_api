@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -20,7 +20,6 @@ PREDICTIONS_COLLECTION = "backtest_predictions"
 TRADES_COLLECTION = "backtest_trades"
 COMPARISONS_COLLECTION = "backtest_comparisons"
 FAILURES_COLLECTION = "backtest_failures"
-MARKET_BARS_COLLECTION = "market_bars"
 ALPACA_MARKET_BARS_COLLECTION = "alpaca_market_bars"
 INTEGRATIONS_COLLECTION = "integrations"
 ALPACA_INTEGRATION_ID = "alpaca"
@@ -31,7 +30,8 @@ PAPER_TRADE_PLANS_COLLECTION = "paper_trade_plans"
 PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
-SETTINGS_SCHEMA_VERSION = 18
+PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
+SETTINGS_SCHEMA_VERSION = 14
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
     "created_at",
@@ -40,7 +40,6 @@ SETTINGS_METADATA_FIELDS = frozenset({
     "configuration_name",
     "configuration_note",
     "bootstrap_source",
-    "revision",
 })
 
 
@@ -82,8 +81,6 @@ def bson_value(value: Any) -> Any:
         return stamp.to_pydatetime()
     if isinstance(value, datetime):
         return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-    if isinstance(value, date):
-        return value.isoformat()
     if isinstance(value, np.generic):
         return bson_value(value.item())
     if isinstance(value, float):
@@ -96,6 +93,8 @@ def bson_value(value: Any) -> Any:
 
 
 def ensure_database(db: Database) -> None:
+    """Create storage indexes without mutating the locked strategy document."""
+
     db[JOBS_COLLECTION].create_index(
         [("status", ASCENDING), ("created_at", DESCENDING)],
         name="ix_jobs_status_created",
@@ -124,16 +123,6 @@ def ensure_database(db: Database) -> None:
         [("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING)],
         unique=True,
         name="uq_backtest_failure",
-    )
-    db[MARKET_BARS_COLLECTION].create_index(
-        [("symbol", ASCENDING), ("timeframe", ASCENDING), ("timestamp", ASCENDING)],
-        unique=True,
-        name="uq_market_bar",
-    )
-    db[ALPACA_MARKET_BARS_COLLECTION].create_index(
-        [("symbol", ASCENDING), ("timeframe", ASCENDING), ("feed", ASCENDING), ("adjustment", ASCENDING), ("timestamp", ASCENDING)],
-        unique=True,
-        name="uq_alpaca_market_bar",
     )
     db[SETTINGS_HISTORY_COLLECTION].create_index(
         [("captured_at", DESCENDING)],
@@ -179,6 +168,10 @@ def ensure_database(db: Database) -> None:
         [("recorded_at", DESCENDING)],
         name="ix_paper_portfolio_recorded",
     )
+    db[PARAMETER_BOOTSTRAP_RUNS_COLLECTION].create_index(
+        [("finished_at", DESCENDING)],
+        name="ix_parameter_bootstrap_finished",
+    )
 
 
 
@@ -205,15 +198,19 @@ def get_alpaca_credentials() -> dict[str, str]:
 
 
 def get_settings(db: Database) -> dict[str, Any]:
+    """Return the complete locked document without applying code defaults."""
+
     document = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
     if document is None:
-        raise RuntimeError("The active configuration was not found in MongoDB.")
+        raise RuntimeError(
+            "Locked strategy configuration was not found in MongoDB. "
+            "Run scripts/apply_locked_config.py with a complete JSON configuration."
+        )
     return {
         key: bson_value(value)
         for key, value in document.items()
         if key not in SETTINGS_METADATA_FIELDS
     }
-
 
 
 def dataframe_documents(frame: pd.DataFrame, *, job_id: str, symbol: str, backend: str) -> list[dict[str, Any]]:
