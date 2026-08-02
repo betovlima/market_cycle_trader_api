@@ -1,5 +1,17 @@
 # Releases
 
+## 1.13.2 — Protected winner-file installation
+
+- Adds `POST /api/admin/strategy-configuration/winner/install`.
+- Reads the packaged `winner-v1.13.1.json` file as the single source of truth.
+- Validates the file with `BacktestRequest` before any MongoDB write.
+- Enforces the validated configuration SHA-256 `22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953`.
+- Replaces the active strategy document, deletes extra strategy documents, and clears strategy-configuration history.
+- Resets the installed winner to revision 1 and records its source file and validated hash in metadata.
+- Blocks installation while a backtest is queued/running or an Alpaca Paper run is active.
+- Does not delete backtest jobs/results, market bars, Paper settings, Paper plans, Paper orders, or portfolio snapshots.
+- Renames the bundled strategy parameterization to `winner-v1.13.1.json`; bootstrap and reset now read the same file.
+
 ## 1.13.1 — Multi-horizon migration hardening
 
 - Preserves the multi-horizon XGBoost strategy and the dedicated `compound_rotation_backtest` engine.

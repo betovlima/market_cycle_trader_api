@@ -17,7 +17,7 @@ def _config() -> BacktestRequest:
         / "src"
         / "market_cycle_trader_api"
         / "parameterizations"
-        / "001_xgboost_multihorizon_champion_cpu.json"
+        / "winner-v1.13.1.json"
     )
     return BacktestRequest.model_validate(json.loads(path.read_text(encoding="utf-8")))
 

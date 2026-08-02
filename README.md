@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.1
+# Market Cycle Trader API v1.13.2
 
 MongoDB-backed multi-horizon XGBoost rotation backtest and Alpaca Paper API.
 
@@ -17,7 +17,7 @@ MongoDB-backed multi-horizon XGBoost rotation backtest and Alpaca Paper API.
 - `/api/paper-market` — inspect the paper portfolio and arm/cancel next-session runs.
 - `/api/admin/parameters` — inspect and install the initial MongoDB parameter documents.
 - `/api/admin/setup` — bind the Alpaca Paper account and initialize paper state.
-- `/api/admin/strategy-configuration` — read, patch, replace, reset, and restore strategy revisions.
+- `/api/admin/strategy-configuration` — read, patch, replace, reset, restore, and install the protected winner file.
 - `/api/health/live` and `/api/health/ready` — liveness and strict readiness.
 
 ## Required server variables
@@ -38,10 +38,11 @@ The MongoDB connection string, database name, Alpaca credentials, and API tokens
 
 A new or cleared database is intentionally empty. Install the canonical parameter documents through the protected API before starting a backtest:
 
-1. `GET /api/admin/parameters/status`
-2. `POST /api/admin/parameters/bootstrap`
-3. `GET /api/admin/strategy-configuration`
-4. `POST /api/admin/setup/initialize`
-5. `POST /api/jobs`
+1. `POST /api/admin/strategy-configuration/winner/install`
+2. `GET /api/admin/parameters/status`
+3. `POST /api/admin/parameters/bootstrap` when non-strategy documents are missing
+4. `GET /api/admin/strategy-configuration`
+5. `POST /api/admin/setup/initialize`
+6. `POST /api/jobs`
 
 The exact order and payload file names are documented in `script/EXECUTION.md`.
