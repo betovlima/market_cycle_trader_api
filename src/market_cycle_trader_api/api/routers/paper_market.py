@@ -51,19 +51,11 @@ def start_next_session(
     _: StartNextSessionRequest,
     __: Annotated[None, Depends(require_paper_market_token)],
 ) -> dict[str, Any]:
-    """Arm one XGBoost/Alpaca paper run for the next regular equity session.
-
-    The endpoint never executes in the current session. It persists the request,
-    prepares the decision after a completed daily candle, and submits paper
-    orders only after the next regular open plus the configured safety delay.
-    """
-
     try:
         return arm_next_session(database())
     except RuntimeError as exc:
-        detail = str(exc)
-        code = status.HTTP_409_CONFLICT if "already active" in detail else status.HTTP_503_SERVICE_UNAVAILABLE
-        raise HTTPException(status_code=code, detail=detail) from exc
+        code = status.HTTP_409_CONFLICT if "already active" in str(exc) else status.HTTP_503_SERVICE_UNAVAILABLE
+        raise HTTPException(status_code=code, detail="Unable to start paper execution.") from exc
 
 
 @router.get("/status")
@@ -80,11 +72,25 @@ def paper_market_portfolio(
     _: Annotated[None, Depends(require_paper_market_token)],
 ) -> dict[str, Any]:
     try:
-        return paper_portfolio_snapshot(database())
+        snapshot = paper_portfolio_snapshot(database())
+        clock = snapshot.get("market_clock") or {}
+        run = snapshot.get("next_session_run") or {}
+        return {
+            "status": str(snapshot.get("status") or "ready"),
+            "portfolio_value": snapshot.get("portfolio_value"),
+            "available_cash": snapshot.get("available_cash"),
+            "market_value": snapshot.get("market_value"),
+            "realized_pnl": snapshot.get("realized_pnl"),
+            "unrealized_pnl": snapshot.get("unrealized_pnl"),
+            "total_pnl": snapshot.get("total_pnl"),
+            "total_return": snapshot.get("total_return"),
+            "market_open": bool(clock.get("is_open")),
+            "execution_status": str(run.get("status") or "idle"),
+        }
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
+            detail="Portfolio data is temporarily unavailable.",
         ) from exc
 
 
@@ -97,6 +103,5 @@ def cancel_next_session(
     try:
         return cancel_paper_market_run(database(), run_id)
     except RuntimeError as exc:
-        detail = str(exc)
-        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_409_CONFLICT
-        raise HTTPException(status_code=code, detail=detail) from exc
+        code = status.HTTP_404_NOT_FOUND if "not found" in str(exc) else status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=code, detail="Unable to cancel paper execution.") from exc

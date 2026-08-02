@@ -11,7 +11,6 @@ from pydantic import ValidationError
 from pymongo import ReturnDocument
 
 from ..engine.live_xgboost_signal import build_live_xgboost_decision
-from ..core.system_rules import MODEL_REFRESH_POLICY, system_rules_payload
 from ..engine.market_data import load_market_bars, validate_and_clean_bars
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_ORDERS_COLLECTION,
@@ -64,38 +63,26 @@ def _validated_context(db: Any) -> tuple[BacktestRequest, PaperTradingSettings, 
         settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
         state = PaperTradingState.model_validate(get_paper_trading_state(db))
     except (RuntimeError, ValidationError) as exc:
-        raise RuntimeError(f"Paper-trading configuration is unavailable or invalid: {exc}") from exc
+        raise RuntimeError("Paper-trading configuration is unavailable or invalid.") from exc
 
     if not settings.enabled:
-        raise RuntimeError("Paper trading is disabled in MongoDB.")
-    if strategy.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise RuntimeError("Paper trading requires the locked XGBoost swing strategy.")
-    if strategy.rotation_models != ["xgboost_utility"]:
-        raise RuntimeError("Paper trading requires rotation_models=['xgboost_utility'].")
-    if strategy.market_data_provider != "alpaca":
-        raise RuntimeError("Paper trading requires market_data_provider='alpaca'.")
+        raise RuntimeError("Paper trading is disabled.")
     if strategy.end_date is not None:
-        raise RuntimeError(
-            "Paper trading requires the locked historical end_date to be empty so the latest completed session is loaded."
-        )
+        raise RuntimeError("The active configuration must be open-ended.")
     if strategy.whole_shares:
-        raise RuntimeError("Paper trading requires fractional shares for the isolated strategy sleeve.")
+        raise RuntimeError("Fractional execution is required.")
     if not math.isclose(
         float(state.initial_capital),
         float(strategy.initial_capital),
         rel_tol=0,
         abs_tol=0.01,
     ):
-        raise RuntimeError(
-            "Paper state initial capital differs from the locked strategy capital: "
-            f"state={state.initial_capital:.2f}, locked={strategy.initial_capital:.2f}."
-        )
+        raise RuntimeError("The paper state and active configuration are inconsistent.")
     return strategy, settings, state
 
 
-
 def paper_market_readiness(db: Any) -> dict[str, Any]:
-    """Validate every dependency required to arm next-session paper execution."""
+
 
     strategy, settings, state = _validated_context(db)
     client = create_paper_trading_client(db)
@@ -131,8 +118,7 @@ def _trim_incomplete_daily_session(
     next_open = pd.Timestamp(clock["next_open"])
     next_open = next_open.tz_localize("UTC") if next_open.tzinfo is None else next_open.tz_convert("UTC")
 
-    # During regular hours, and before today's open, today's daily candle is not
-    # a completed decision candle and must never be used by the model.
+    
     incomplete_session: str | None = None
     if bool(clock["is_open"]) or timestamp.tz_convert(EASTERN).date() == next_open.tz_convert(EASTERN).date():
         incomplete_session = timestamp.tz_convert(EASTERN).date().isoformat()
@@ -213,9 +199,6 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
     settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
     if not settings.enabled:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
-    if strategy.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise RuntimeError("The locked strategy is not the XGBoost swing strategy.")
-
     existing = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"})
     if existing is not None and not replace:
         raise RuntimeError(
@@ -352,31 +335,12 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         current_asset=current,
         target_asset=target,
         action=action,
-        random_state=decision.random_state,
-        ensemble_enabled=decision.ensemble_enabled,
-        ensemble_method=decision.ensemble_method,
-        ensemble_seeds=decision.ensemble_seeds,
-        ensemble_agreement=decision.ensemble_agreement,
-        strategy_configuration_sha256=strategy_configuration_fingerprint(strategy),
-        system_rules=system_rules_payload(),
-        model_refresh_policy=MODEL_REFRESH_POLICY,
-        effective_switch_margin=decision.effective_switch_margin,
-        calibrated_candidate_margin=decision.calibrated_candidate_margin,
-        calibration_score=decision.calibration_score,
-        selected_utility=decision.selected_utility,
-        utilities=decision.utilities,
-        training_end=_et_date(decision.training_end),
-        calibration_start=_et_date(decision.calibration_start),
-        calibration_end=_et_date(decision.calibration_end),
-        final_fit_end=_et_date(decision.final_fit_end),
+        strategy_configuration_sha256=strategy_configuration_fingerprint(get_settings(db)),
         state_snapshot=state.model_dump(mode="python"),
         created_at=utc_now().isoformat(),
     )
     document = {
         **plan.model_dump(mode="python"),
-        "raw_best_asset": decision.raw_best_asset,
-        "effective_compute_device": decision.effective_compute_device,
-        "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
     }
     insert_paper_trade_plan(db, document, replace=replace)

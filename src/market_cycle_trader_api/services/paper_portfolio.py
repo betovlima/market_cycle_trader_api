@@ -69,7 +69,7 @@ def _record_snapshot(db: Any, snapshot: dict[str, Any]) -> None:
         {
             "recorded_at": now,
             "portfolio_value": snapshot["portfolio_value"],
-            "strategy_cash": snapshot["strategy_cash"],
+            "available_cash": snapshot["available_cash"],
             "market_value": snapshot["market_value"],
             "total_pnl": snapshot["total_pnl"],
             "total_return": snapshot["total_return"],
@@ -121,7 +121,7 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
         "status": "ready",
         "recorded_at": utc_now(),
         "initial_capital": _round_money(state.initial_capital),
-        "strategy_cash": _round_money(strategy_cash),
+        "available_cash": _round_money(strategy_cash),
         "market_value": _round_money(market_value),
         "portfolio_value": _round_money(portfolio_value),
         "realized_pnl": _round_money(state.realized_pnl),
@@ -146,6 +146,12 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
     orders = list(
         db[PAPER_TRADE_ORDERS_COLLECTION].find({}).sort("created_at", -1).limit(20)
     )
-    snapshot["history"] = [bson_value(item) for item in history]
+    public_history = []
+    for item in history:
+        clean = bson_value(item)
+        if "strategy_cash" in clean and "available_cash" not in clean:
+            clean["available_cash"] = clean.pop("strategy_cash")
+        public_history.append(clean)
+    snapshot["history"] = public_history
     snapshot["recent_orders"] = [_public_order(item) for item in orders]
     return snapshot
