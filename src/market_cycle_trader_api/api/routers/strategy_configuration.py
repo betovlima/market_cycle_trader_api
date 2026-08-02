@@ -11,12 +11,14 @@ from ...schemas.strategy_configuration import (
     StrategyConfigurationReplaceRequest,
     StrategyConfigurationResetRequest,
     StrategyConfigurationRestoreRequest,
+    StrategyWinnerInstallRequest,
 )
 from ...services.strategy_configuration import (
     StrategyConfigurationConflict,
     StrategyConfigurationError,
     StrategyConfigurationNotFound,
     get_strategy_configuration,
+    install_winner_strategy_configuration,
     list_strategy_configuration_history,
     patch_strategy_configuration,
     replace_strategy_configuration,
@@ -93,6 +95,23 @@ def replace_active_strategy_configuration(
             note=request.note,
             source="strategy-configuration-api",
             expected_revision=request.expected_revision,
+        )
+        refresh_locked_configuration_status()
+        return result
+    except (StrategyConfigurationError, ValidationError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/winner/install")
+def install_winner_strategy(
+    request: StrategyWinnerInstallRequest,
+    _: Annotated[None, Depends(require_parameter_bootstrap_token)],
+) -> dict[str, Any]:
+    try:
+        result = install_winner_strategy_configuration(
+            database(),
+            note=request.note,
+            source="winner-v1.13.1-install-api",
         )
         refresh_locked_configuration_status()
         return result

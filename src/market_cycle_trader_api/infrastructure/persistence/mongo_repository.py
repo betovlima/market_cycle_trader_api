@@ -44,6 +44,8 @@ SETTINGS_METADATA_FIELDS = frozenset({
     "configuration_note",
     "bootstrap_source",
     "revision",
+    "winner_source_file",
+    "winner_configuration_hash",
 })
 
 

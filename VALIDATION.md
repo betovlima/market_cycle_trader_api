@@ -1,5 +1,26 @@
 # Validation
 
+## 1.13.2
+
+Validated in the packaging environment:
+
+- Python source compilation with `compileall`.
+- Full pytest suite: 35 tests passed using temporary import stubs for unavailable `pymongo`/`bson`; service behavior was exercised with an in-memory fake database.
+- Bundled winner file validation against `BacktestRequest`.
+- Exact winner configuration SHA-256 verification.
+- Replacement of an old default strategy document.
+- Deletion of extra strategy documents and all strategy history documents.
+- Revision reset to 1 and winner source/hash metadata persistence.
+- Rejection while a backtest is active.
+- Rejection while an Alpaca Paper run is active.
+- Source contract and generated OpenAPI validation for `POST /api/admin/strategy-configuration/winner/install` and the packaged winner file.
+- JSON syntax validation for all bundled parameterizations and `script/` payloads.
+
+Deletion scope of the new endpoint:
+
+- Deleted or overwritten: `backtest_settings` strategy documents and `backtest_settings_history`.
+- Preserved: jobs, runs, predictions, trades, comparisons, failures, market bars, Paper settings, Paper runs, Paper plans, Paper orders, and portfolio snapshots.
+
 ## 1.13.1
 
 Validated in the packaging environment:

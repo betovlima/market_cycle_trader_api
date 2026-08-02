@@ -1,4 +1,4 @@
-# Fresh-database execution sequence
+# Winner installation and execution sequence
 
 All commands are HTTP operations through Swagger or another API client. Do not write strategy documents directly in MongoDB.
 
@@ -22,23 +22,62 @@ X-Paper-Market-Token: <PAPER_MARKET_API_TOKEN>
 GET /api/health/live
 ```
 
-Expected API version: `1.13.1`.
+Expected API version: `1.13.2`.
 
 ```http
 GET /api/health/ready
 ```
 
-With an empty database, strict readiness can report that the locked configuration is unavailable. This is expected until bootstrap finishes.
+With an empty database, strict readiness can report that the locked configuration is unavailable. This is expected until the winner installation finishes.
 
-## 2. Inspect the empty database
+## 2. Install winner-v1.13.1 from the packaged file
+
+```http
+POST /api/admin/strategy-configuration/winner/install
+```
+
+Payload file:
+
+```text
+script/post_api_admin_strategy-configuration_winner_install.json
+```
+
+The endpoint reads only the packaged file:
+
+```text
+src/market_cycle_trader_api/parameterizations/winner-v1.13.1.json
+```
+
+It performs these strategy-only changes:
+
+1. Validates the JSON against `BacktestRequest`.
+2. Verifies configuration SHA-256 `22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953`.
+3. Replaces or creates `backtest_settings/default`.
+4. Deletes every extra document from `backtest_settings`.
+5. Deletes every document from `backtest_settings_history`.
+6. Stores the winner as revision 1.
+
+It does not delete backtest results, Alpaca market bars, or Paper execution data.
+
+The operation is rejected when a backtest is queued/running or a Paper run is active.
+
+Expected response values:
+
+```text
+status: winner_installed
+source_file: winner-v1.13.1.json
+configuration_hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
+metadata.revision: 1
+metadata.configuration_name: winner-v1.13.1
+```
+
+## 3. Install missing non-strategy parameter documents
 
 ```http
 GET /api/admin/parameters/status
 ```
 
-No payload. A cleared database should report missing parameter documents.
-
-## 3. Install canonical documents
+When Paper settings are missing:
 
 ```http
 POST /api/admin/parameters/bootstrap
@@ -50,20 +89,15 @@ Payload file:
 script/post_api_admin_parameters_bootstrap.json
 ```
 
-Run the status endpoint again. Required result:
+Bootstrap preserves the valid winner strategy and inserts missing non-strategy documents.
 
-```text
-all_present: true
-all_valid: true
-```
-
-## 4. Confirm the champion strategy
+## 4. Confirm the winner strategy
 
 ```http
 GET /api/admin/strategy-configuration
 ```
 
-No payload. A fresh bootstrap should return revision 1 with:
+Required values:
 
 ```text
 strategy_mode: COMPOUND_ROTATION_SWING_XGBOOST
@@ -73,15 +107,10 @@ rotation_target_horizons: [5, 10, 20, 40, 60]
 rotation_target_horizon_weights: [0.1, 0.15, 0.2, 0.3, 0.25]
 rotation_movement_capture_weight: 0.35
 rotation_trend_persistence_weight: 0.2
+configuration_hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
+metadata.revision: 1
+metadata.winner_source_file: winner-v1.13.1.json
 ```
-
-The complete replacement payload is available at:
-
-```text
-script/put_api_admin_strategy-configuration_champion.json
-```
-
-Use it only when the active configuration differs. Before using it, replace `expected_revision` with the revision returned by the latest GET.
 
 ## 5. Inspect and initialize Paper state
 

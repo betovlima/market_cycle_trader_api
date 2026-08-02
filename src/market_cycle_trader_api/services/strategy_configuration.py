@@ -14,6 +14,7 @@ from pymongo.database import Database
 
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
+    PAPER_MARKET_RUNS_COLLECTION,
     SETTINGS_COLLECTION,
     SETTINGS_HISTORY_COLLECTION,
     SETTINGS_METADATA_FIELDS,
@@ -23,7 +24,11 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from ..schemas.requests import BacktestRequest
 
-CANONICAL_PARAMETERIZATION = "001_xgboost_multihorizon_champion_cpu.json"
+WINNER_PARAMETERIZATION = "winner-v1.13.1.json"
+WINNER_CONFIGURATION_SHA256 = (
+    "22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953"
+)
+WINNER_ACTIVE_PAPER_KEY = "alpaca-paper-next-session"
 
 
 class StrategyConfigurationError(RuntimeError):
@@ -56,6 +61,27 @@ def _configuration_hash(configuration: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _winner_configuration() -> tuple[BacktestRequest, str]:
+    package = resources.files("market_cycle_trader_api.parameterizations")
+    raw = json.loads(
+        package.joinpath(WINNER_PARAMETERIZATION).read_text(encoding="utf-8")
+    )
+    if not isinstance(raw, dict):
+        raise StrategyConfigurationError(
+            f"Bundled winner file {WINNER_PARAMETERIZATION} must contain one JSON object."
+        )
+
+    validated = BacktestRequest.model_validate(raw)
+    actual_hash = _configuration_hash(validated.model_dump(mode="json"))
+    if actual_hash != WINNER_CONFIGURATION_SHA256:
+        raise StrategyConfigurationError(
+            "The bundled winner strategy does not match the validated winner-v1.13.1 "
+            f"configuration hash. Expected {WINNER_CONFIGURATION_SHA256}, "
+            f"received {actual_hash}."
+        )
+    return validated, actual_hash
+
+
 def _metadata(document: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": int(document.get("schema_version") or 0),
@@ -63,6 +89,10 @@ def _metadata(document: dict[str, Any]) -> dict[str, Any]:
         "configuration_name": str(document.get("configuration_name") or ""),
         "configuration_note": str(document.get("configuration_note") or ""),
         "bootstrap_source": str(document.get("bootstrap_source") or ""),
+        "winner_source_file": str(document.get("winner_source_file") or ""),
+        "winner_configuration_hash": str(
+            document.get("winner_configuration_hash") or ""
+        ),
         "created_at": document.get("created_at"),
         "updated_at": document.get("updated_at"),
     }
@@ -99,12 +129,23 @@ def _assert_no_active_backtest(db: Database) -> None:
         )
 
 
-def _canonical_configuration() -> BacktestRequest:
-    package = resources.files("market_cycle_trader_api.parameterizations")
-    raw = json.loads(
-        package.joinpath(CANONICAL_PARAMETERIZATION).read_text(encoding="utf-8")
+def _assert_no_active_strategy_execution(db: Database) -> None:
+    _assert_no_active_backtest(db)
+    active_paper = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
+        {"active_key": WINNER_ACTIVE_PAPER_KEY},
+        {"_id": 0, "run_id": 1, "status": 1},
     )
-    return BacktestRequest.model_validate(raw)
+    if active_paper is not None:
+        raise StrategyConfigurationConflict(
+            "The winner strategy cannot be installed while a Paper run is active. "
+            f"Active run: {active_paper.get('run_id', 'unknown')} "
+            f"({active_paper.get('status', 'unknown')})."
+        )
+
+
+def _canonical_configuration() -> BacktestRequest:
+    configuration, _ = _winner_configuration()
+    return configuration
 
 
 def _archive_previous(
@@ -300,6 +341,75 @@ def reset_strategy_configuration(
         change_type="canonical_reset",
         expected_revision=expected_revision,
     )
+
+
+def install_winner_strategy_configuration(
+    db: Database,
+    *,
+    note: str,
+    source: str,
+) -> dict[str, Any]:
+    """Replace all stored strategy configuration data with winner-v1.13.1."""
+
+    _assert_no_active_strategy_execution(db)
+    configuration, winner_hash = _winner_configuration()
+    payload = bson_value(configuration.model_dump(mode="python"))
+    collection = db[SETTINGS_COLLECTION]
+    history_collection = db[SETTINGS_HISTORY_COLLECTION]
+    previous_default = collection.find_one({"_id": "default"})
+    now = utc_now()
+    document = {
+        "_id": "default",
+        **payload,
+        "created_at": now,
+        "updated_at": now,
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "revision": 1,
+        "configuration_name": "winner-v1.13.1",
+        "configuration_note": note,
+        "bootstrap_source": source,
+        "winner_source_file": WINNER_PARAMETERIZATION,
+        "winner_configuration_hash": winner_hash,
+    }
+
+    result = collection.replace_one({"_id": "default"}, document, upsert=True)
+    if previous_default is not None and result.matched_count != 1:
+        raise StrategyConfigurationConflict(
+            "The active strategy configuration changed while winner-v1.13.1 was being installed."
+        )
+
+    extras = collection.delete_many({"_id": {"$ne": "default"}})
+    history = history_collection.delete_many({})
+
+    stored = collection.find_one({"_id": "default"})
+    if stored is None:
+        raise StrategyConfigurationError(
+            "winner-v1.13.1 was written but could not be read back from MongoDB."
+        )
+    validated = BacktestRequest.model_validate(_operational_document(stored))
+    stored_hash = _configuration_hash(validated.model_dump(mode="json"))
+    if stored_hash != WINNER_CONFIGURATION_SHA256:
+        raise StrategyConfigurationError(
+            "The stored strategy does not match the validated winner-v1.13.1 hash."
+        )
+
+    response = _public_configuration(stored)
+    response.update(
+        {
+            "status": "winner_installed",
+            "source_file": WINNER_PARAMETERIZATION,
+            "expected_configuration_hash": WINNER_CONFIGURATION_SHA256,
+            "replaced_previous_default": previous_default is not None,
+            "deleted_extra_strategy_documents": int(extras.deleted_count),
+            "deleted_strategy_history_documents": int(history.deleted_count),
+            "message": (
+                "Old strategy configuration data was removed and winner-v1.13.1 "
+                "was installed as revision 1. Backtest results, market bars, and Paper "
+                "execution data were not deleted."
+            ),
+        }
+    )
+    return response
 
 
 def list_strategy_configuration_history(
