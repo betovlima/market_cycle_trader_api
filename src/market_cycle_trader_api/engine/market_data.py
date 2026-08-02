@@ -511,7 +511,7 @@ def validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
 
     minimum = (
         int(config.rotation_minimum_training_rows)
-        + int(config.rotation_horizon_days)
+        + max(int(item) for item in config.rotation_target_horizons)
         + int(config.rotation_purge_days)
     )
     if len(result) < minimum:

@@ -86,6 +86,10 @@ class BacktestRequest(BaseModel):
 
     rotation_models: list[RotationModel]
     rotation_horizon_days: int = Field(ge=1, le=260)
+    rotation_target_horizons: list[int]
+    rotation_target_horizon_weights: list[float]
+    rotation_movement_capture_weight: float = Field(ge=0, le=10)
+    rotation_trend_persistence_weight: float = Field(ge=0, le=10)
     rotation_minimum_training_rows: int = Field(ge=300, le=100_000)
     rotation_walk_forward_enabled: bool
     rotation_walk_forward_calibration_days: int = Field(ge=40, le=5_000)
@@ -159,6 +163,23 @@ class BacktestRequest(BaseModel):
             raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
         return cleaned
 
+
+    @field_validator("rotation_target_horizons")
+    @classmethod
+    def validate_target_horizons(cls, value: list[int]) -> list[int]:
+        cleaned = sorted(dict.fromkeys(int(item) for item in value))
+        if not cleaned or any(item < 2 or item > 260 for item in cleaned):
+            raise ValueError("Target horizons must contain unique values between 2 and 260 sessions.")
+        return cleaned
+
+    @field_validator("rotation_target_horizon_weights")
+    @classmethod
+    def validate_target_weights(cls, value: list[float]) -> list[float]:
+        cleaned = [float(item) for item in value]
+        if not cleaned or any(item < 0 for item in cleaned) or sum(cleaned) <= 0:
+            raise ValueError("Target-horizon weights must be non-negative and have a positive sum.")
+        return cleaned
+
     @field_validator("rotation_switch_margin_candidates")
     @classmethod
     def validate_switch_margins(cls, value: list[float]) -> list[float]:
@@ -195,8 +216,12 @@ class BacktestRequest(BaseModel):
             raise ValueError("Compound Capital Rotation requires expanding walk-forward validation.")
         if self.rotation_walk_forward_min_test_days > self.rotation_walk_forward_test_days:
             raise ValueError("Minimum test sessions cannot exceed the configured test window.")
-        if self.rotation_purge_days < self.rotation_horizon_days:
-            raise ValueError("Swing rotation purge must be at least the decision horizon.")
+        if len(self.rotation_target_horizons) != len(self.rotation_target_horizon_weights):
+            raise ValueError("Target horizons and target-horizon weights must have the same length.")
+        if self.rotation_horizon_days not in self.rotation_target_horizons:
+            raise ValueError("rotation_horizon_days must be included in rotation_target_horizons.")
+        if self.rotation_purge_days < max(self.rotation_target_horizons):
+            raise ValueError("Swing rotation purge must be at least the maximum target horizon.")
         return self
 
 

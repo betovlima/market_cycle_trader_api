@@ -9,8 +9,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from ..core.config import ENGINE_MODULE, SOURCE_ROOT
-from ..core.environment import load_project_environment
+from ..core.config import ENGINE_MODULE, ENGINE_PATH, SOURCE_ROOT
+from ..core.environment import build_subprocess_environment, load_project_environment
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, JOBS_COLLECTION, RUNS_COLLECTION, utc_now
 from .serialization import iso_value
@@ -143,9 +143,43 @@ def run_job(job_id: str) -> None:
     if existing_python_path:
         python_path = python_path + os.pathsep + existing_python_path
     command = [sys.executable, "-u", "-m", ENGINE_MODULE, "--job-id", job_id]
+    child_environment = build_subprocess_environment({"PYTHONPATH": python_path})
+    engine_identity = {
+        "engine_module": ENGINE_MODULE,
+        "engine_path": str(ENGINE_PATH),
+        "python_executable": sys.executable,
+    }
+    db[JOBS_COLLECTION].update_one(
+        {"id": job_id},
+        {
+            "$set": {
+                **engine_identity,
+                "updated_at": utc_now(),
+            },
+            "$push": {
+                "logs": {
+                    "$each": [f"Backtest engine: {ENGINE_MODULE}"],
+                    "$slice": -400,
+                }
+            },
+        },
+    )
     try:
-        process = subprocess.Popen(command, cwd=str(SOURCE_ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env={**os.environ, "PYTHONPATH": python_path, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"})
-        db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"process_id": process.pid, "updated_at": utc_now()}})
+        process = subprocess.Popen(
+            command,
+            cwd=str(SOURCE_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=child_environment,
+        )
+        db[JOBS_COLLECTION].update_one(
+            {"id": job_id},
+            {"$set": {"process_id": process.pid, "updated_at": utc_now()}},
+        )
         assert process.stdout is not None
         for line in process.stdout:
             append_log(job_id, line)

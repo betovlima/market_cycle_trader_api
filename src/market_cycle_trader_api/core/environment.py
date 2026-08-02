@@ -1,34 +1,88 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Mapping
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-API_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+ENV_FILE_VARIABLE = "MARKET_CYCLE_TRADER_ENV_FILE"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
 
-def load_project_environment() -> tuple[Path, ...]:
-    """Load local .env files without overriding real system variables.
+def _candidate_environment_files(
+    explicit_path: str | os.PathLike[str] | None = None,
+) -> list[Path]:
+    candidates: list[Path] = []
 
-    Railway injects variables directly into the process environment, so those
-    values always win. During local development, both the current working
-    directory and the API project directory are checked so the application can
-    be started either from the repository root or from market_cycle_trader_api.
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+
+    configured_path = str(os.getenv(ENV_FILE_VARIABLE) or "").strip()
+    if configured_path:
+        candidates.append(Path(configured_path).expanduser())
+
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(DEFAULT_ENV_FILE)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(resolved)
+    return unique
+
+
+def load_project_environment(
+    explicit_path: str | os.PathLike[str] | None = None,
+) -> tuple[Path, ...]:
+    """Load the first project .env while preserving real non-empty variables.
+
+    Windows launchers can create empty variables. Empty or missing values are
+    therefore filled from the local file, while non-empty system and Railway
+    values remain authoritative.
     """
 
-    candidates = (
-        Path.cwd() / ".env",
-        API_PROJECT_ROOT / ".env",
-    )
     loaded: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved in seen:
+    for candidate in _candidate_environment_files(explicit_path):
+        if not candidate.is_file():
             continue
-        seen.add(resolved)
-        if not resolved.is_file():
-            continue
-        load_dotenv(dotenv_path=resolved, override=False)
-        loaded.append(resolved)
+
+        values = dotenv_values(candidate)
+        for key, raw_value in values.items():
+            if not key or raw_value is None:
+                continue
+            current = os.getenv(key)
+            if current is None or not str(current).strip():
+                os.environ[key] = str(raw_value).strip()
+
+        os.environ[ENV_FILE_VARIABLE] = str(candidate)
+        loaded.append(candidate)
+        break
+
     return tuple(loaded)
+
+
+def build_subprocess_environment(
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a child-process environment after refreshing the project .env."""
+
+    load_project_environment()
+    child_environment = dict(os.environ)
+    child_environment.update(
+        {
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+        }
+    )
+    if extra:
+        child_environment.update(
+            {str(key): str(value) for key, value in extra.items()}
+        )
+    return child_environment

@@ -40,15 +40,15 @@ class ParameterizationDefinition:
 
 DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
     ParameterizationDefinition(
-        key="xgboost_high_performance_seed_3042",
-        filename="001_xgboost_high_performance_seed_3042.json",
+        key="xgboost_multihorizon_champion_cpu",
+        filename="001_xgboost_multihorizon_champion_cpu.json",
         collection=SETTINGS_COLLECTION,
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="xgboost-api-managed-v1.12.15",
+        configuration_name="xgboost-multihorizon-champion-cpu-v1.13.1",
         configuration_note=(
-            "Initial canonical XGBoost configuration. After installation, valid "
+            "Validated multi-horizon XGBoost CPU configuration. After installation, valid "
             "strategy parameters are managed through the protected administration API."
         ),
     ),

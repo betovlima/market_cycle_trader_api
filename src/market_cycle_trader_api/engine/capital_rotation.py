@@ -8,7 +8,25 @@ import numpy as np
 import pandas as pd
 from threadpoolctl import threadpool_limits
 
-ROTATION_FEATURES = ['return_1', 'return_3', 'return_5', 'return_10', 'return_20', 'vol_5', 'vol_20', 'ema_distance_5', 'ema_distance_10', 'ema_distance_20', 'ema_distance_50', 'ema_5_vs_20', 'ema_20_vs_50', 'rsi_14', 'atr_pct_14', 'distance_from_high_20', 'distance_from_low_20', 'volume_zscore_20']
+ROTATION_FEATURES = [
+    'return_1', 'return_2', 'return_3', 'return_5', 'return_10', 'return_20',
+    'return_40', 'return_60', 'return_120',
+    'vol_5', 'vol_10', 'vol_20', 'vol_40', 'vol_60',
+    'vol_ratio_5_20', 'vol_ratio_10_40', 'vol_ratio_20_60',
+    'ema_distance_5', 'ema_distance_10', 'ema_distance_20', 'ema_distance_50',
+    'ema_distance_100', 'ema_5_vs_20', 'ema_20_vs_50', 'ema_50_vs_100',
+    'ema_slope_20_5', 'ema_slope_50_10', 'ema_slope_100_20',
+    'rsi_14', 'atr_pct_14',
+    'distance_from_high_20', 'distance_from_low_20',
+    'distance_from_high_50', 'distance_from_low_50',
+    'distance_from_high_100', 'distance_from_low_100',
+    'distance_from_high_200', 'distance_from_low_200',
+    'channel_position_20', 'channel_position_50', 'channel_position_100', 'channel_position_200',
+    'trend_efficiency_10', 'trend_efficiency_20', 'trend_efficiency_40', 'trend_efficiency_60',
+    'momentum_acceleration_5_20', 'momentum_acceleration_20_60',
+    'range_expansion_5_20', 'volume_zscore_20', 'volume_zscore_60', 'volume_ratio_5_20',
+]
+
 
 @dataclass
 class RotationRunResult:
@@ -105,7 +123,11 @@ def _true_range(frame: pd.DataFrame) -> pd.Series:
     return pd.concat([frame['high'] - frame['low'], (frame['high'] - previous_close).abs(), (frame['low'] - previous_close).abs()], axis=1).max(axis=1)
 
 def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
-    horizon_days = int(config.rotation_horizon_days)
+    horizons = [int(item) for item in config.rotation_target_horizons]
+    weights = np.asarray(config.rotation_target_horizon_weights, dtype=float)
+    weights = weights / weights.sum()
+    max_horizon = max(horizons)
+
     data = bars.copy().sort_index()
     data.index = pd.to_datetime(data.index, utc=True)
     close = data['close'].astype(float)
@@ -114,54 +136,117 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     low = data['low'].astype(float)
     volume = data['volume'].astype(float)
     daily_return = close.pct_change()
-    for period in [1, 3, 5, 10, 20]:
+    daily_range = _safe_divide(high - low, close)
+
+    for period in [1, 2, 3, 5, 10, 20, 40, 60, 120]:
         data[f'return_{period}'] = close.pct_change(period)
-    for period in [5, 20]:
+    for period in [5, 10, 20, 40, 60]:
         data[f'vol_{period}'] = daily_return.rolling(period).std()
-    ema = {}
-    for period in [5, 10, 20, 50]:
+    data['vol_ratio_5_20'] = _safe_divide(data['vol_5'], data['vol_20'])
+    data['vol_ratio_10_40'] = _safe_divide(data['vol_10'], data['vol_40'])
+    data['vol_ratio_20_60'] = _safe_divide(data['vol_20'], data['vol_60'])
+
+    ema: dict[int, pd.Series] = {}
+    for period in [5, 10, 20, 50, 100]:
         ema[period] = close.ewm(span=period, adjust=False).mean()
         data[f'ema_distance_{period}'] = _safe_divide(close, ema[period]) - 1
     data['ema_5_vs_20'] = _safe_divide(ema[5], ema[20]) - 1
     data['ema_20_vs_50'] = _safe_divide(ema[20], ema[50]) - 1
+    data['ema_50_vs_100'] = _safe_divide(ema[50], ema[100]) - 1
+    data['ema_slope_20_5'] = ema[20].pct_change(5)
+    data['ema_slope_50_10'] = ema[50].pct_change(10)
+    data['ema_slope_100_20'] = ema[100].pct_change(20)
+
     data['rsi_14'] = _rsi(close) / 100.0
     atr = _true_range(data).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
     data['atr_pct_14'] = _safe_divide(atr, close)
-    rolling_high = high.rolling(20).max()
-    rolling_low = low.rolling(20).min()
-    data['distance_from_high_20'] = _safe_divide(close, rolling_high) - 1
-    data['distance_from_low_20'] = _safe_divide(close, rolling_low) - 1
-    volume_mean = volume.rolling(20).mean()
-    volume_std = volume.rolling(20).std()
-    data['volume_zscore_20'] = _safe_divide(volume - volume_mean, volume_std)
-    entry_open = open_price.shift(-1)
-    exit_close = close.shift(-horizon_days)
-    gross_log_return = np.log(_safe_divide(exit_close, entry_open))
-    round_trip_cost = min(0.25, 2.0 * (max(0.0, float(config.slippage_bps)) / 10000.0 + max(0.0, float(config.commission_rate))))
+
+    for period in [20, 50, 100, 200]:
+        rolling_high = high.rolling(period).max()
+        rolling_low = low.rolling(period).min()
+        data[f'distance_from_high_{period}'] = _safe_divide(close, rolling_high) - 1
+        data[f'distance_from_low_{period}'] = _safe_divide(close, rolling_low) - 1
+        data[f'channel_position_{period}'] = _safe_divide(close - rolling_low, rolling_high - rolling_low)
+
+    absolute_change = close.pct_change().abs()
+    for period in [10, 20, 40, 60]:
+        net_move = close.pct_change(period).abs()
+        traveled = absolute_change.rolling(period).sum()
+        data[f'trend_efficiency_{period}'] = _safe_divide(net_move, traveled)
+
+    data['momentum_acceleration_5_20'] = data['return_5'] - data['return_20'] * (5.0 / 20.0)
+    data['momentum_acceleration_20_60'] = data['return_20'] - data['return_60'] * (20.0 / 60.0)
+    data['range_expansion_5_20'] = _safe_divide(daily_range.rolling(5).mean(), daily_range.rolling(20).mean())
+
+    for period in [20, 60]:
+        volume_mean = volume.rolling(period).mean()
+        volume_std = volume.rolling(period).std()
+        data[f'volume_zscore_{period}'] = _safe_divide(volume - volume_mean, volume_std)
+    data['volume_ratio_5_20'] = _safe_divide(volume.rolling(5).mean(), volume.rolling(20).mean())
+
+    round_trip_cost = min(
+        0.25,
+        2.0 * (
+            max(0.0, float(config.slippage_bps)) / 10000.0
+            + max(0.0, float(config.commission_rate))
+        ),
+    )
     net_cost_log = math.log(max(1e-12, 1.0 - round_trip_cost))
+
     lows = low.to_numpy(dtype=float)
+    highs = high.to_numpy(dtype=float)
     closes = close.to_numpy(dtype=float)
     opens = open_price.to_numpy(dtype=float)
-    downside = np.full(len(data), np.nan, dtype=float)
-    path_drawdown = np.full(len(data), np.nan, dtype=float)
-    for idx in range(0, max(0, len(data) - horizon_days)):
+    utility_components = np.full((len(data), len(horizons)), np.nan, dtype=float)
+    movement_capture = np.full(len(data), np.nan, dtype=float)
+    trend_persistence = np.full(len(data), np.nan, dtype=float)
+
+    for idx in range(0, max(0, len(data) - max_horizon)):
         entry = opens[idx + 1]
         if not np.isfinite(entry) or entry <= 0:
             continue
-        future_lows = lows[idx + 1:idx + horizon_days + 1]
-        future_closes = closes[idx + 1:idx + horizon_days + 1]
-        if len(future_closes) != horizon_days:
+        full_closes = closes[idx + 1:idx + max_horizon + 1]
+        full_highs = highs[idx + 1:idx + max_horizon + 1]
+        if len(full_closes) != max_horizon:
             continue
-        minimum_low = float(np.nanmin(future_lows))
-        downside[idx] = max(0.0, 1.0 - minimum_low / entry)
-        path = np.concatenate(([entry], future_closes))
-        running_peak = np.maximum.accumulate(path)
-        drawdowns = 1.0 - np.divide(path, running_peak, out=np.ones_like(path), where=running_peak > 0)
-        path_drawdown[idx] = max(0.0, float(np.nanmax(drawdowns)))
-    data['forward_net_log_return'] = gross_log_return + net_cost_log
-    data['forward_downside'] = downside
-    data['forward_max_drawdown'] = path_drawdown
-    data['forward_risk_adjusted_utility'] = data['forward_net_log_return'] - float(config.rotation_downside_penalty) * data['forward_downside'] - float(config.rotation_drawdown_penalty) * data['forward_max_drawdown']
+
+        max_upside = max(0.0, float(np.nanmax(full_highs) / entry - 1.0))
+        positive_share = float(np.mean(full_closes > entry))
+        directional_changes = np.diff(full_closes)
+        positive_steps = float(np.mean(directional_changes > 0)) if len(directional_changes) else 0.0
+        movement_capture[idx] = math.log1p(max_upside)
+        trend_persistence[idx] = 0.5 * positive_share + 0.5 * positive_steps
+
+        for component_idx, horizon in enumerate(horizons):
+            future_lows = lows[idx + 1:idx + horizon + 1]
+            future_closes = closes[idx + 1:idx + horizon + 1]
+            if len(future_closes) != horizon:
+                continue
+            gross_log_return = math.log(max(float(future_closes[-1]) / entry, 1e-12))
+            minimum_low = float(np.nanmin(future_lows))
+            downside = max(0.0, 1.0 - minimum_low / entry)
+            path = np.concatenate(([entry], future_closes))
+            running_peak = np.maximum.accumulate(path)
+            drawdowns = 1.0 - np.divide(path, running_peak, out=np.ones_like(path), where=running_peak > 0)
+            path_drawdown = max(0.0, float(np.nanmax(drawdowns)))
+            utility_components[idx, component_idx] = (
+                gross_log_return
+                + net_cost_log
+                - float(config.rotation_downside_penalty) * downside
+                - float(config.rotation_drawdown_penalty) * path_drawdown
+            )
+
+    weighted_utility = np.nansum(utility_components * weights.reshape(1, -1), axis=1)
+    invalid_rows = np.isnan(utility_components).any(axis=1)
+    weighted_utility[invalid_rows] = np.nan
+    data['forward_movement_capture'] = movement_capture
+    data['forward_trend_persistence'] = trend_persistence
+    data['forward_risk_adjusted_utility'] = (
+        weighted_utility
+        + float(config.rotation_movement_capture_weight) * data['forward_movement_capture']
+        + float(config.rotation_trend_persistence_weight) * data['forward_trend_persistence']
+    )
+
     required = ROTATION_FEATURES + ['open', 'high', 'low', 'close', 'volume']
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna(subset=required)
@@ -544,7 +629,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     years = max(days / 365.25, 1 / 365.25)
     periods_per_year = 252.0
     metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': 'XGBoost Utility', 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
-    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f'Utility horizon: {config.rotation_horizon_days} trading sessions', 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across the same available assets.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', f'- XGBoost Utility predicts {config.rotation_horizon_days}-session risk-adjusted capital utility.', '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
+    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across the same available assets.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}.", '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
@@ -556,7 +641,7 @@ def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> li
     with the validated champion run.
     """
 
-    purge = max(int(config.rotation_purge_days), int(config.rotation_horizon_days))
+    purge = max(int(config.rotation_purge_days), max(int(item) for item in config.rotation_target_horizons))
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     test_days = int(config.rotation_walk_forward_test_days)
     min_test_days = int(config.rotation_walk_forward_min_test_days)

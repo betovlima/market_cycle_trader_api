@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -18,6 +19,8 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from .diagnostics.performance import build_performance_diagnostics
 from .serialization import clean_mongo_rows, downsample_documents, iso_value
+
+LOGGER = logging.getLogger(__name__)
 
 
 def diagnostic_csv_rows(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
@@ -58,12 +61,25 @@ def build_run_payload(run: dict[str, Any]) -> dict[str, Any]:
         .find(run_filter, {"_id": 0})
         .sort([("timestamp", 1), ("sequence", 1)])
     )
-    diagnostics = build_performance_diagnostics(
-        db,
-        raw_predictions,
-        trades,
-        run.get("metrics", {}),
-    )
+    try:
+        diagnostics = build_performance_diagnostics(
+            db,
+            raw_predictions,
+            trades,
+            run.get("metrics", {}),
+        )
+    except Exception as exc:  # Diagnostics must never hide a completed backtest.
+        LOGGER.exception(
+            "Performance diagnostics failed for %s/%s/%s",
+            job_id,
+            symbol,
+            backend,
+        )
+        diagnostics = {
+            "status": "unavailable",
+            "message": "Optional performance diagnostics could not be generated.",
+            "error_type": type(exc).__name__,
+        }
     series = [
         {
             "timestamp": iso_value(row.get("timestamp")),

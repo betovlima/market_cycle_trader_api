@@ -68,7 +68,7 @@ def build_live_xgboost_decision(
 
     purge = max(
         int(config.rotation_purge_days),
-        int(config.rotation_horizon_days),
+        max(int(item) for item in config.rotation_target_horizons),
     )
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     minimum_training_rows = int(config.rotation_minimum_training_rows)
