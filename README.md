@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.4
+# Market Cycle Trader API v1.13.5
 
 MongoDB-backed multi-horizon XGBoost rotation backtest and Alpaca Paper API.
 
@@ -61,3 +61,8 @@ GET /api/dashboard/jobs/{job_id}
 ```
 
 They expose only strategy-neutral operational metrics. Existing API endpoints and engine behavior remain unchanged.
+
+
+## v1.13.5
+
+Adds a sanitized read-only Paper portfolio endpoint. Existing protected Paper endpoints and trading behavior remain unchanged.

@@ -19,6 +19,7 @@ from .api.routers import (
     health,
     jobs,
     paper_market,
+    public_paper_portfolio,
     parameter_bootstrap,
     strategy_configuration,
 )
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
     application.include_router(jobs.router)
     application.include_router(exports.router)
     application.include_router(paper_market.router)
+    application.include_router(public_paper_portfolio.router)
     application.include_router(parameter_bootstrap.router)
     application.include_router(strategy_configuration.router)
     application.include_router(admin_setup.router)
