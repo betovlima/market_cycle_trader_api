@@ -24,7 +24,7 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from ..schemas.requests import BacktestRequest
 
-WINNER_PARAMETERIZATION = "winner-v1.13.1.json"
+WINNER_PARAMETERIZATION = "winner-v1.13.2.json"
 WINNER_CONFIGURATION_SHA256 = (
     "22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953"
 )
@@ -75,7 +75,7 @@ def _winner_configuration() -> tuple[BacktestRequest, str]:
     actual_hash = _configuration_hash(validated.model_dump(mode="json"))
     if actual_hash != WINNER_CONFIGURATION_SHA256:
         raise StrategyConfigurationError(
-            "The bundled winner strategy does not match the validated winner-v1.13.1 "
+            "The bundled winner strategy does not match the validated winner-v1.13.2 "
             f"configuration hash. Expected {WINNER_CONFIGURATION_SHA256}, "
             f"received {actual_hash}."
         )
@@ -349,7 +349,7 @@ def install_winner_strategy_configuration(
     note: str,
     source: str,
 ) -> dict[str, Any]:
-    """Replace all stored strategy configuration data with winner-v1.13.1."""
+    """Replace all stored strategy configuration data with winner-v1.13.2."""
 
     _assert_no_active_strategy_execution(db)
     configuration, winner_hash = _winner_configuration()
@@ -365,7 +365,7 @@ def install_winner_strategy_configuration(
         "updated_at": now,
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "revision": 1,
-        "configuration_name": "winner-v1.13.1",
+        "configuration_name": "winner-v1.13.2",
         "configuration_note": note,
         "bootstrap_source": source,
         "winner_source_file": WINNER_PARAMETERIZATION,
@@ -375,7 +375,7 @@ def install_winner_strategy_configuration(
     result = collection.replace_one({"_id": "default"}, document, upsert=True)
     if previous_default is not None and result.matched_count != 1:
         raise StrategyConfigurationConflict(
-            "The active strategy configuration changed while winner-v1.13.1 was being installed."
+            "The active strategy configuration changed while winner-v1.13.2 was being installed."
         )
 
     extras = collection.delete_many({"_id": {"$ne": "default"}})
@@ -384,13 +384,13 @@ def install_winner_strategy_configuration(
     stored = collection.find_one({"_id": "default"})
     if stored is None:
         raise StrategyConfigurationError(
-            "winner-v1.13.1 was written but could not be read back from MongoDB."
+            "winner-v1.13.2 was written but could not be read back from MongoDB."
         )
     validated = BacktestRequest.model_validate(_operational_document(stored))
     stored_hash = _configuration_hash(validated.model_dump(mode="json"))
     if stored_hash != WINNER_CONFIGURATION_SHA256:
         raise StrategyConfigurationError(
-            "The stored strategy does not match the validated winner-v1.13.1 hash."
+            "The stored strategy does not match the validated winner-v1.13.2 hash."
         )
 
     response = _public_configuration(stored)
@@ -403,7 +403,7 @@ def install_winner_strategy_configuration(
             "deleted_extra_strategy_documents": int(extras.deleted_count),
             "deleted_strategy_history_documents": int(history.deleted_count),
             "message": (
-                "Old strategy configuration data was removed and winner-v1.13.1 "
+                "Old strategy configuration data was removed and winner-v1.13.2 "
                 "was installed as revision 1. Backtest results, market bars, and Paper "
                 "execution data were not deleted."
             ),

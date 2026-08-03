@@ -633,9 +633,9 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
-    """Build the validated champion folds independently of the public report window.
+    """Build the validated champion folds independently of the locked execution window.
 
-    The public ``analysis_start_date`` chooses where the simulated account starts.
+    The internal ``analysis_start_date`` is derived from the locked winner configuration.
     It must never move the train/calibration/purge boundaries, because doing so
     creates a different model and makes an overlapping date range incomparable
     with the validated champion run.
@@ -687,9 +687,9 @@ def _analysis_decision_dates(
     folds: list[dict[str, Any]],
     config: Any,
 ) -> pd.DatetimeIndex:
-    """Return decision/execution dates for the requested public window.
+    """Return decision/execution dates for the locked winner window.
 
-    Fold policies are trained on the fixed champion schedule. The requested
+    Fold policies are trained on the fixed champion schedule. The locked
     analysis start only selects the first execution session and resets the
     simulated account to ``initial_capital`` in cash.
     """

@@ -111,7 +111,7 @@ def install_winner_strategy(
         result = install_winner_strategy_configuration(
             database(),
             note=request.note,
-            source="winner-v1.13.1-install-api",
+            source="winner-v1.13.2-install-api",
         )
         refresh_locked_configuration_status()
         return result

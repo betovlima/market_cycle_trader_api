@@ -40,13 +40,13 @@ class ParameterizationDefinition:
 
 DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
     ParameterizationDefinition(
-        key="winner_v1_13_1",
-        filename="winner-v1.13.1.json",
+        key="winner_v1_13_2",
+        filename="winner-v1.13.2.json",
         collection=SETTINGS_COLLECTION,
         document_id="default",
         validator=BacktestRequest,
         schema_version=SETTINGS_SCHEMA_VERSION,
-        configuration_name="winner-v1.13.1",
+        configuration_name="winner-v1.13.2",
         configuration_note=(
             "Validated multi-horizon XGBoost CPU configuration. After installation, valid "
             "strategy parameters are managed through the protected administration API."

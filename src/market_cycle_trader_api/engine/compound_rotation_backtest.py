@@ -326,8 +326,7 @@ def main() -> None:
             flush=True,
         )
         print(
-            "Champion walk-forward schedule locked; the public date range "
-            "changes only the simulated account window.",
+            "Champion walk-forward schedule and execution period are locked in MongoDB.",
             flush=True,
         )
         comparisons, failures = run_job(args.job_id, config, db)

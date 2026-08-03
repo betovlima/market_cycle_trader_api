@@ -1,5 +1,5 @@
 {
   "confirm_delete_existing_strategy_data": true,
-  "confirm_install_winner_v1_13_1": true,
-  "note": "Delete old strategy configuration data and install winner-v1.13.1.json."
+  "note": "Delete old strategy configuration data and install winner-v1.13.2.json.",
+  "confirm_install_winner_v1_13_2": true
 }

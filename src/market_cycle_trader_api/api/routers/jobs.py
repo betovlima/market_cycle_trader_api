@@ -17,7 +17,7 @@ from ...infrastructure.persistence.mongo_repository import (
     get_settings,
     utc_now,
 )
-from ...schemas.requests import BacktestExecutionRequest, BacktestRequest, PublicBacktestRequest
+from ...schemas.requests import BacktestExecutionRequest, BacktestRequest
 from ...services.jobs import public_job, require_job, run_job
 from ...services.results import build_results
 
@@ -25,11 +25,12 @@ router = APIRouter(tags=["jobs"])
 
 
 @router.post("/api/jobs", status_code=202)
-def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
-    """Queue a job using locked strategy settings and a public date range.
+def create_job() -> dict[str, Any]:
+    """Queue a job using only the protected configuration stored in MongoDB.
 
-    The browser may choose only ``start_date`` and ``end_date``. Every strategy,
-    model, execution, fee, and market-data setting remains controlled by MongoDB.
+    The public client supplies no historical dates or strategy parameters. The
+    complete execution period and every operational setting come from the
+    installed winner configuration.
     """
     db = database()
     if db[JOBS_COLLECTION].find_one({"status": {"$in": ["queued", "running"]}}, {"_id": 1}) is not None:
@@ -57,16 +58,14 @@ def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
         request = BacktestExecutionRequest.model_validate(
             {
                 **locked_configuration.model_dump(mode="python"),
-                "analysis_start_date": date_range.start_date.isoformat(),
-                "analysis_end_date": (
-                    date_range.end_date.isoformat() if date_range.end_date else None
-                ),
+                "analysis_start_date": locked_configuration.start_date,
+                "analysis_end_date": locked_configuration.end_date,
             }
         )
     except ValidationError as exc:
         raise HTTPException(
-            status_code=422,
-            detail=f"Requested date range is invalid: {exc}",
+            status_code=500,
+            detail=f"Locked execution period is invalid: {exc}",
         ) from exc
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
@@ -87,11 +86,8 @@ def create_job(date_range: PublicBacktestRequest) -> dict[str, Any]:
         "strategy_lifecycle": lifecycle,
         "total_runs": total_runs,
         "request": payload,
-        "public_date_range": {
-            "start_date": payload["analysis_start_date"],
-            "end_date": payload["analysis_end_date"],
-        },
         "configuration_locked": True,
+        "execution_period_locked": True,
         "live_trades": [],
         "live_trade_count": 0,
         "logs": ["Backtest queued."],

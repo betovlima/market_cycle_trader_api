@@ -251,37 +251,6 @@ def export_zip(job_id: str) -> Response:
             "failures.csv",
             csv_bytes(comparison.get("failures", [])),
         )
-        archive.writestr(
-            "effective_config.json",
-            json.dumps(
-                iso_value(comparison.get("effective_config", {})),
-                indent=2,
-                ensure_ascii=False,
-            ),
-        )
-        if runs:
-            first_metrics = runs[0].get("metrics", {})
-            reproducibility = {
-                key: first_metrics.get(key)
-                for key in (
-                    "strategy_configuration_sha256",
-                    "market_data_signature_sha256",
-                    "market_data_signatures",
-                    "runtime_versions",
-                    "deterministic_execution",
-                    "numeric_thread_limit",
-                    "xgb_n_jobs",
-                )
-                if key in first_metrics
-            }
-            archive.writestr(
-                "reproducibility.json",
-                json.dumps(
-                    iso_value(reproducibility),
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-            )
         for run in runs:
             symbol = str(run["symbol"])
             backend = str(run["backend"])

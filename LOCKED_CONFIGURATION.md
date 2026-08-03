@@ -10,7 +10,7 @@ Administrative authentication uses the `X-Parameter-Bootstrap-Token` header and 
 The validated strategy source is packaged as:
 
 ```text
-src/market_cycle_trader_api/parameterizations/winner-v1.13.1.json
+src/market_cycle_trader_api/parameterizations/winner-v1.13.2.json
 ```
 
 Install it through:

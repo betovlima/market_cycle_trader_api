@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "1.13.2"' in config
+    assert 'API_VERSION = "1.13.4"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -18,6 +18,7 @@ def test_admin_strategy_routes_are_composed() -> None:
     assert "parameter_bootstrap" in main
     assert "admin_setup" in main
     assert "paper_market" in main
+    assert "dashboard" in main
 
 
 def test_legacy_public_mutation_routers_are_not_packaged() -> None:
@@ -29,9 +30,9 @@ def test_legacy_public_mutation_routers_are_not_packaged() -> None:
 def test_winner_install_endpoint_and_file_are_packaged() -> None:
     router = (SRC / "api" / "routers" / "strategy_configuration.py").read_text(encoding="utf-8")
     service = (SRC / "services" / "strategy_configuration.py").read_text(encoding="utf-8")
-    winner = SRC / "parameterizations" / "winner-v1.13.1.json"
+    winner = SRC / "parameterizations" / "winner-v1.13.2.json"
 
     assert '@router.post("/winner/install")' in router
-    assert 'WINNER_PARAMETERIZATION = "winner-v1.13.1.json"' in service
+    assert 'WINNER_PARAMETERIZATION = "winner-v1.13.2.json"' in service
     assert winner.exists()
     assert not (SRC / "parameterizations" / "001_xgboost_multihorizon_champion_cpu.json").exists()

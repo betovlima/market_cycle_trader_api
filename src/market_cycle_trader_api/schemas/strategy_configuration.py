@@ -53,15 +53,15 @@ class StrategyConfigurationReplaceRequest(BaseModel):
 
 
 class StrategyWinnerInstallRequest(BaseModel):
-    """Delete old strategy configuration data and install winner-v1.13.1."""
+    """Delete old strategy configuration data and install winner-v1.13.2."""
 
     model_config = ConfigDict(extra="forbid")
 
     confirm_delete_existing_strategy_data: Literal[True]
-    confirm_install_winner_v1_13_1: Literal[True]
+    confirm_install_winner_v1_13_2: Literal[True]
     note: str = Field(
         default=(
-            "Delete old strategy configuration data and install winner-v1.13.1.json."
+            "Delete old strategy configuration data and install winner-v1.13.2.json."
         ),
         min_length=3,
         max_length=500,

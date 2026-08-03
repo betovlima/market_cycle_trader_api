@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.2
+# Market Cycle Trader API v1.13.4
 
 MongoDB-backed multi-horizon XGBoost rotation backtest and Alpaca Paper API.
 
@@ -46,3 +46,18 @@ A new or cleared database is intentionally empty. Install the canonical paramete
 6. `POST /api/jobs`
 
 The exact order and payload file names are documented in `script/EXECUTION.md`.
+
+## Locked execution period
+
+`POST /api/jobs` accepts no body. The active `winner-v1.13.2.json` document stored in MongoDB supplies the historical start and end dates.
+
+## Additive dashboard API
+
+The redesigned frontend uses two read-only endpoints:
+
+```http
+GET /api/dashboard/summary?limit=12
+GET /api/dashboard/jobs/{job_id}
+```
+
+They expose only strategy-neutral operational metrics. Existing API endpoints and engine behavior remain unchanged.

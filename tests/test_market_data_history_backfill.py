@@ -20,7 +20,7 @@ def _config() -> BacktestRequest:
         / "src"
         / "market_cycle_trader_api"
         / "parameterizations"
-        / "winner-v1.13.1.json"
+        / "winner-v1.13.2.json"
     )
     return BacktestRequest.model_validate(json.loads(path.read_text(encoding="utf-8")))
 

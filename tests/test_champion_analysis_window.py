@@ -37,7 +37,7 @@ class ChampionAnalysisWindowTest(unittest.TestCase):
             analysis_start_date=analysis_start_date,
         )
 
-    def test_public_start_does_not_move_champion_fold_boundaries(self) -> None:
+    def test_locked_start_does_not_move_champion_fold_boundaries(self) -> None:
         early = _build_walk_forward_folds(
             self.common_dates,
             self.config("2024-01-01"),
@@ -59,7 +59,7 @@ class ChampionAnalysisWindowTest(unittest.TestCase):
 
         self.assertEqual(early_boundaries, late_boundaries)
 
-    def test_public_start_only_selects_execution_window(self) -> None:
+    def test_locked_start_only_selects_execution_window(self) -> None:
         folds = _build_walk_forward_folds(
             self.common_dates,
             self.config("2024-01-01"),

@@ -22,7 +22,7 @@ X-Paper-Market-Token: <PAPER_MARKET_API_TOKEN>
 GET /api/health/live
 ```
 
-Expected API version: `1.13.2`.
+Expected API version: `1.13.4`.
 
 ```http
 GET /api/health/ready
@@ -30,7 +30,7 @@ GET /api/health/ready
 
 With an empty database, strict readiness can report that the locked configuration is unavailable. This is expected until the winner installation finishes.
 
-## 2. Install winner-v1.13.1 from the packaged file
+## 2. Install winner-v1.13.2 from the packaged file
 
 ```http
 POST /api/admin/strategy-configuration/winner/install
@@ -45,7 +45,7 @@ script/post_api_admin_strategy-configuration_winner_install.json
 The endpoint reads only the packaged file:
 
 ```text
-src/market_cycle_trader_api/parameterizations/winner-v1.13.1.json
+src/market_cycle_trader_api/parameterizations/winner-v1.13.2.json
 ```
 
 It performs these strategy-only changes:
@@ -65,10 +65,10 @@ Expected response values:
 
 ```text
 status: winner_installed
-source_file: winner-v1.13.1.json
+source_file: winner-v1.13.2.json
 configuration_hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
 metadata.revision: 1
-metadata.configuration_name: winner-v1.13.1
+metadata.configuration_name: winner-v1.13.2
 ```
 
 ## 3. Install missing non-strategy parameter documents
@@ -109,7 +109,7 @@ rotation_movement_capture_weight: 0.35
 rotation_trend_persistence_weight: 0.2
 configuration_hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
 metadata.revision: 1
-metadata.winner_source_file: winner-v1.13.1.json
+metadata.winner_source_file: winner-v1.13.2.json
 ```
 
 ## 5. Inspect and initialize Paper state
@@ -136,11 +136,7 @@ script/post_api_admin_setup_initialize.json
 POST /api/jobs
 ```
 
-Payload file:
-
-```text
-script/post_api_jobs_full_history.json
-```
+Request body: none. The execution period is loaded from the installed winner configuration.
 
 Read the returned job id, then poll:
 

@@ -99,7 +99,7 @@ class _Database:
 def test_bundled_winner_file_has_the_validated_configuration_hash() -> None:
     configuration, configuration_hash = _winner_configuration()
 
-    assert WINNER_PARAMETERIZATION == "winner-v1.13.1.json"
+    assert WINNER_PARAMETERIZATION == "winner-v1.13.2.json"
     assert configuration_hash == WINNER_CONFIGURATION_SHA256
     assert configuration.strategy_mode == "COMPOUND_ROTATION_SWING_XGBOOST"
     assert configuration.rotation_accelerator == "cpu"
@@ -135,7 +135,7 @@ def test_install_winner_removes_old_strategy_data_and_resets_revision() -> None:
     )
 
     assert result["status"] == "winner_installed"
-    assert result["source_file"] == "winner-v1.13.1.json"
+    assert result["source_file"] == "winner-v1.13.2.json"
     assert result["configuration_hash"] == WINNER_CONFIGURATION_SHA256
     assert result["replaced_previous_default"] is True
     assert result["deleted_extra_strategy_documents"] == 1
@@ -145,8 +145,8 @@ def test_install_winner_removes_old_strategy_data_and_resets_revision() -> None:
 
     stored = db[SETTINGS_COLLECTION].documents["default"]
     assert stored["revision"] == 1
-    assert stored["configuration_name"] == "winner-v1.13.1"
-    assert stored["winner_source_file"] == "winner-v1.13.1.json"
+    assert stored["configuration_name"] == "winner-v1.13.2"
+    assert stored["winner_source_file"] == "winner-v1.13.2.json"
     assert stored["winner_configuration_hash"] == WINNER_CONFIGURATION_SHA256
     assert stored["rotation_xgb_n_estimators"] == 300
     assert stored["rotation_target_horizons"] == [5, 10, 20, 40, 60]

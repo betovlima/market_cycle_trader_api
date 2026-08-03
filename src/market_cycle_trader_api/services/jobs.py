@@ -28,13 +28,8 @@ PUBLIC_JOB_FIELDS = frozenset({
     "completed_runs",
     "total_runs",
     "return_code",
-    "error",
-    "public_date_range",
 })
 
-_PRIVATE_LOG_PREFIXES = (
-    "Locked execution snapshot queued from MongoDB:",
-)
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)\b(ALPACA_API_KEY_ID|ALPACA_SECRET_KEY|MONGO_URL)\b\s*[:=]\s*([^\s,;]+)"
 )
@@ -44,14 +39,58 @@ _MONGODB_CREDENTIAL_PATTERN = re.compile(
 )
 
 
+def _public_stage(raw_stage: Any) -> str:
+    stage = str(raw_stage or "").strip()
+    lowered = stage.lower()
+    if not lowered:
+        return "Queued"
+    if "interrupt" in lowered or "cancel" in lowered:
+        return "Interrupted"
+    if "fail" in lowered or "error" in lowered:
+        return "Backtest failed"
+    if "complete" in lowered:
+        return "Completed"
+    if "final" in lowered or "report" in lowered:
+        return "Finalizing results"
+    if "load" in lowered or "market data" in lowered:
+        return "Loading market data"
+    if "prepare" in lowered or "build" in lowered or "align" in lowered:
+        return "Preparing analysis"
+    if "run" in lowered or "train" in lowered or "fold" in lowered:
+        return "Running analysis"
+    if "start" in lowered:
+        return "Starting backtest"
+    if "queue" in lowered:
+        return "Queued"
+    return "Running analysis"
+
+
 def _public_log_line(raw_line: Any) -> str | None:
     line = str(raw_line).strip()
-    if not line or line.startswith(_PRIVATE_LOG_PREFIXES):
+    if not line:
         return None
 
     line = _SECRET_ASSIGNMENT_PATTERN.sub(r"\1=***", line)
     line = _MONGODB_CREDENTIAL_PATTERN.sub(r"\1***@", line)
-    return line
+    lowered = line.lower()
+
+    if lowered == "backtest queued.":
+        return "Backtest queued."
+    if lowered.startswith("error"):
+        return "Backtest failed. Check the protected server logs."
+    if lowered.startswith("loading "):
+        return "Loading market data."
+    if lowered.startswith("preparing ") or lowered.startswith("building "):
+        return "Preparing analysis."
+    if lowered.startswith("running ") or lowered.startswith("training "):
+        return "Running analysis."
+    if lowered.startswith("finalizing "):
+        return "Finalizing results."
+    if lowered.startswith("portfolio/"):
+        return "Analysis run completed."
+    if "local simulation only" in lowered:
+        return "Simulation environment ready."
+    return None
 
 
 def public_job(document: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -63,6 +102,7 @@ def public_job(document: dict[str, Any] | None) -> dict[str, Any] | None:
         for key, value in document.items()
         if key in PUBLIC_JOB_FIELDS
     }
+    payload["stage"] = _public_stage(document.get("stage"))
 
     raw_logs = document.get("logs")
     if isinstance(raw_logs, list):
@@ -71,7 +111,11 @@ def public_job(document: dict[str, Any] | None) -> dict[str, Any] | None:
             for raw_line in raw_logs
             if (line := _public_log_line(raw_line)) is not None
         ]
-        payload["logs"] = public_logs[-120:]
+        deduplicated: list[str] = []
+        for line in public_logs:
+            if not deduplicated or deduplicated[-1] != line:
+                deduplicated.append(line)
+        payload["logs"] = deduplicated[-120:]
     else:
         payload["logs"] = []
 

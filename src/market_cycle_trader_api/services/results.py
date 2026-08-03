@@ -154,28 +154,12 @@ def build_results(job_id: str) -> dict[str, Any]:
     )
     comparison_rows = comparison.get("results", [])
     run_payloads = [build_run_payload(run) for run in runs]
-    first_metrics = run_payloads[0].get("metrics", {}) if run_payloads else {}
-    reproducibility = {
-        key: first_metrics.get(key)
-        for key in (
-            "strategy_configuration_sha256",
-            "market_data_signature_sha256",
-            "market_data_signatures",
-            "runtime_versions",
-            "deterministic_execution",
-            "numeric_thread_limit",
-            "xgb_n_jobs",
-        )
-        if key in first_metrics
-    }
     return {
         "jobId": job_id,
         "comparison": iso_value(comparison_rows),
         "robustnessSummary": iso_value(build_robustness_summary(comparison_rows)),
         "runs": run_payloads,
         "failures": iso_value(comparison.get("failures", [])),
-        "effectiveConfig": iso_value(comparison.get("effective_config", {})),
-        "reproducibility": iso_value(reproducibility),
         "downloads": {
             "zip": f"/api/jobs/{job_id}/export.zip",
             "comparison": f"/api/jobs/{job_id}/comparison.csv",

@@ -40,27 +40,6 @@ def normalize_iso_date(value: str, *, field_name: str) -> str:
         raise ValueError(f"{field_name} must use YYYY-MM-DD format.") from exc
 
 
-class PublicBacktestRequest(BaseModel):
-    """Only the historical date range may be supplied by the public client."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    start_date: date
-    end_date: date | None = None
-
-    @model_validator(mode="after")
-    def validate_date_range(self) -> "PublicBacktestRequest":
-        market_today = datetime.now(ZoneInfo("America/New_York")).date()
-        if self.start_date > market_today:
-            raise ValueError("Start date cannot be later than today.")
-        if self.end_date is not None:
-            if self.end_date > market_today:
-                raise ValueError("End date cannot be later than today.")
-            if self.end_date < self.start_date:
-                raise ValueError("End date cannot be earlier than start date.")
-        return self
-
-
 class BacktestRequest(BaseModel):
     """Complete XGBoost-only configuration loaded from MongoDB.
 
@@ -226,7 +205,7 @@ class BacktestRequest(BaseModel):
 
 
 class BacktestExecutionRequest(BacktestRequest):
-    """Locked XGBoost configuration plus the public out-of-sample window."""
+    """Immutable execution snapshot derived entirely from the locked MongoDB configuration."""
 
     analysis_start_date: str
     analysis_end_date: str | None
