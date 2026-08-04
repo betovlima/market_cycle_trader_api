@@ -33,3 +33,14 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - Temporary role selection for Viewer or Trader invitations.
 - Strategy-neutral analytics payload enforcement.
 - No MongoDB migration and no new environment variables.
+
+
+## v1.13.11 — Continuous regular-session Paper robot
+
+- Converts the protected next-session activation into a persistent continuous controller.
+- Automatically schedules the following Alpaca regular session after every completed or failed run.
+- Preserves the enabled state across API restarts.
+- Adopts an existing active v1.13.10 run without replacing its prepared plan.
+- Adds protected robot heartbeat/status and stop endpoints.
+- Adds a sanitized robot-status endpoint for Trader and Administrator Portfolio screens.
+- Stops automatic scheduling when an execution enters `review_required`.

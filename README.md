@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.10
+# Market Cycle Trader API v1.13.11
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -71,7 +71,7 @@ TRADER_COOKIE_SECURE
 TRADER_COOKIE_SAMESITE
 ```
 
-## v1.13.10
+## v1.13.11
 
 - Adds the `trader` temporary-access role while preserving existing Viewer sessions.
 - Adds Backtest Analytics for Viewer, Trader and Administrator sessions.
@@ -80,3 +80,14 @@ TRADER_COOKIE_SAMESITE
 - Keeps Paper operations, setup, strategy configuration and access administration Administrator-only.
 - Keeps the legacy administrator rotation endpoint for compatibility while exposing the same sanitized rotation data through Backtest Analytics.
 - Returns historical Portfolio analytics even when a live Alpaca refresh is temporarily unavailable.
+
+
+## v1.13.11 — continuous regular-session Paper robot
+
+- `POST /api/paper-market/start-next-session` now enables a persistent continuous robot.
+- The controller automatically arms the following Alpaca regular session after each terminal execution.
+- The enabled state survives API restarts and adopts an already active v1.13.10 run during upgrade.
+- `GET /api/paper-market/robot/status` exposes administrator diagnostics and scheduler heartbeat.
+- `POST /api/paper-market/robot/stop` disables future sessions and safely cancels a pending run.
+- `GET /api/paper-market/public-robot-status` exposes only sanitized status to Trader and Administrator portfolios.
+- Execution remains restricted to the regular market open returned by Alpaca, plus the configured safety delay.

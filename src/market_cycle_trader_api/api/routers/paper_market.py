@@ -7,12 +7,18 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from ...core.runtime import database
-from ...schemas.paper_market import CancelPaperMarketRequest, StartNextSessionRequest
+from ...schemas.paper_market import (
+    CancelPaperMarketRequest,
+    StartNextSessionRequest,
+    StopPaperRobotRequest,
+)
 from ...services.paper_portfolio import paper_portfolio_snapshot
 from ...services.paper_market_scheduler import (
     arm_next_session,
     cancel_paper_market_run,
     latest_paper_market_run,
+    paper_market_robot_status,
+    stop_continuous_robot,
 )
 
 router = APIRouter(prefix="/api/paper-market", tags=["paper-market"])
@@ -51,11 +57,10 @@ def start_next_session(
     _: StartNextSessionRequest,
     __: Annotated[None, Depends(require_paper_market_token)],
 ) -> dict[str, Any]:
-    """Arm one XGBoost/Alpaca paper run for the next regular equity session.
+    """Enable the continuous Paper robot and ensure the next session is armed.
 
-    The endpoint never executes in the current session. It persists the request,
-    prepares the decision after a completed daily candle, and submits paper
-    orders only after the next regular open plus the configured safety delay.
+    The robot remains enabled across API restarts and automatically schedules a
+    new run for every regular Alpaca session until an administrator stops it.
     """
 
     try:
@@ -71,6 +76,24 @@ def paper_market_status(
     _: Annotated[None, Depends(require_paper_market_token)],
 ) -> dict[str, Any] | None:
     return latest_paper_market_run(database())
+
+
+@router.get("/robot/status")
+def robot_status(
+    _: Annotated[None, Depends(require_paper_market_token)],
+) -> dict[str, Any]:
+    return paper_market_robot_status(database())
+
+
+@router.post("/robot/stop")
+def stop_robot(
+    request: StopPaperRobotRequest,
+    _: Annotated[None, Depends(require_paper_market_token)],
+) -> dict[str, Any]:
+    return stop_continuous_robot(
+        database(),
+        cancel_pending_run=request.cancel_pending_run,
+    )
 
 
 

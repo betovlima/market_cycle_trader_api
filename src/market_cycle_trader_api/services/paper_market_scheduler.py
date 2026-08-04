@@ -13,6 +13,7 @@ from pymongo.errors import DuplicateKeyError
 
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import (
+    PAPER_MARKET_AUTOMATION_COLLECTION,
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
     bson_value,
@@ -33,6 +34,8 @@ from .paper_trading import (
 EASTERN = ZoneInfo("America/New_York")
 ACTIVE_KEY = "alpaca-paper-next-session"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+AUTOMATION_ID = "default"
+AUTOMATION_MODE = "continuous_regular_sessions"
 def _positive_float_env(name: str, default: float, *, minimum: float) -> float:
     raw = str(os.getenv(name) or "").strip()
     if not raw:
@@ -156,6 +159,46 @@ def _mark_review_required(
     )
 
 
+def _automation_document(db: Any) -> dict[str, Any] | None:
+    return db[PAPER_MARKET_AUTOMATION_COLLECTION].find_one({"_id": AUTOMATION_ID})
+
+
+def _update_automation(db: Any, changes: dict[str, Any], *, unset: tuple[str, ...] = ()) -> None:
+    now = utc_now()
+    update: dict[str, Any] = {
+        "$set": bson_value({
+            "mode": AUTOMATION_MODE,
+            "updated_at": now,
+            **changes,
+        }),
+        "$setOnInsert": {"created_at": now},
+    }
+    if unset:
+        update["$unset"] = {field: "" for field in unset}
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].update_one(
+        {"_id": AUTOMATION_ID},
+        update,
+        upsert=True,
+    )
+
+
+def _public_robot_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
+    if document is None:
+        return None
+    allowed = (
+        "run_id",
+        "status",
+        "phase",
+        "created_at",
+        "updated_at",
+        "expected_market_open",
+        "execution_session",
+        "preparation_attempts",
+        "finished_at",
+    )
+    return {key: bson_value(document.get(key)) for key in allowed if document.get(key) is not None}
+
+
 def latest_paper_market_run(db: Any) -> dict[str, Any] | None:
     document = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
         {},
@@ -164,7 +207,7 @@ def latest_paper_market_run(db: Any) -> dict[str, Any] | None:
     return _public_run(document)
 
 
-def arm_next_session(db: Any) -> dict[str, Any]:
+def _create_next_session_run(db: Any) -> dict[str, Any]:
     readiness = paper_market_readiness(db)
     clock = readiness["clock"]
     expected_open = _utc_stamp(clock["next_open"])
@@ -208,6 +251,69 @@ def arm_next_session(db: Any) -> dict[str, Any]:
             f"Another paper-market run is already active: {active_id}."
         ) from exc
     return _public_run(document) or {}
+
+
+def arm_next_session(db: Any) -> dict[str, Any]:
+    """Enable the continuous Paper robot and ensure the next session is armed."""
+
+    active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
+    now = utc_now()
+    _update_automation(
+        db,
+        {
+            "enabled": True,
+            "status": "active",
+            "phase": "ensuring_next_regular_session",
+            "activated_at": now,
+            "stopped_at": None,
+            "last_error": None,
+        },
+    )
+    if active is None:
+        run = _create_next_session_run(db)
+        active_run_id = run.get("run_id")
+    else:
+        run = _public_run(active) or {}
+        active_run_id = run.get("run_id")
+    _update_automation(
+        db,
+        {
+            "enabled": True,
+            "status": "active",
+            "phase": str(run.get("phase") or "armed"),
+            "active_run_id": active_run_id,
+            "next_market_open": run.get("expected_market_open"),
+            "next_execution_session": run.get("execution_session"),
+        },
+        unset=("last_error",),
+    )
+    return {
+        **run,
+        "automation_enabled": True,
+        "automation_mode": AUTOMATION_MODE,
+    }
+
+
+def stop_continuous_robot(db: Any, *, cancel_pending_run: bool = True) -> dict[str, Any]:
+    """Disable future sessions and safely cancel a non-executing active run."""
+
+    now = utc_now()
+    _update_automation(
+        db,
+        {
+            "enabled": False,
+            "status": "stopped",
+            "phase": "stopped_by_administrator",
+            "stopped_at": now,
+        },
+    )
+    active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
+    if active is not None and cancel_pending_run:
+        status = str(active.get("status") or "")
+        if status not in {"executing", "review_required"}:
+            cancel_paper_market_run(db, str(active["run_id"]))
+            active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"run_id": active["run_id"]})
+    return paper_market_robot_status(db)
 
 
 def cancel_paper_market_run(db: Any, run_id: str) -> dict[str, Any]:
@@ -626,8 +732,98 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             )
 
 
+def _ensure_continuous_run(db: Any) -> dict[str, Any] | None:
+    controller = _automation_document(db)
+    active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
+
+    # Upgrade an already armed one-shot run to the continuous controller on first
+    # startup after this release, preserving the currently prepared plan.
+    if controller is None and active is not None:
+        _update_automation(
+            db,
+            {
+                "enabled": True,
+                "status": "active",
+                "phase": str(active.get("phase") or active.get("status") or "armed"),
+                "activated_at": active.get("requested_at") or utc_now(),
+                "active_run_id": active.get("run_id"),
+                "next_market_open": active.get("expected_market_open"),
+                "next_execution_session": active.get("execution_session"),
+                "adopted_existing_run": True,
+            },
+        )
+        controller = _automation_document(db)
+
+    if not bool((controller or {}).get("enabled")):
+        return active
+
+    if active is not None:
+        _update_automation(
+            db,
+            {
+                "status": "active",
+                "phase": str(active.get("phase") or active.get("status") or "active"),
+                "active_run_id": active.get("run_id"),
+                "next_market_open": active.get("expected_market_open"),
+                "next_execution_session": active.get("execution_session"),
+            },
+        )
+        return active
+
+    latest = db[PAPER_MARKET_RUNS_COLLECTION].find_one({}, sort=[("created_at", -1)])
+    if latest is not None and str(latest.get("status") or "") == "review_required":
+        _update_automation(
+            db,
+            {
+                "enabled": False,
+                "status": "blocked",
+                "phase": "manual_review_required",
+                "last_error": "The previous execution requires manual review.",
+                "last_terminal_run_id": latest.get("run_id"),
+                "last_terminal_status": latest.get("status"),
+            },
+        )
+        return None
+
+    retry_at = (controller or {}).get("next_retry_at")
+    if retry_at is not None and _utc_stamp(retry_at) > pd.Timestamp.now(tz="UTC"):
+        return None
+
+    try:
+        created = _create_next_session_run(db)
+        active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"run_id": created.get("run_id")})
+        _update_automation(
+            db,
+            {
+                "enabled": True,
+                "status": "active",
+                "phase": str(created.get("phase") or "armed"),
+                "active_run_id": created.get("run_id"),
+                "next_market_open": created.get("expected_market_open"),
+                "next_execution_session": created.get("execution_session"),
+                "last_terminal_run_id": (latest or {}).get("run_id"),
+                "last_terminal_status": (latest or {}).get("status"),
+            },
+            unset=("last_error", "next_retry_at"),
+        )
+        return active
+    except Exception as exc:
+        retry = utc_now() + timedelta(seconds=preparation_retry_seconds())
+        _update_automation(
+            db,
+            {
+                "enabled": True,
+                "status": "degraded",
+                "phase": "waiting_to_retry_next_session_scheduling",
+                "last_error": str(exc),
+                "next_retry_at": retry,
+            },
+        )
+        return None
+
+
 def _advance_one(db: Any, worker_id: str) -> None:
-    run = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
+    run = _ensure_continuous_run(db)
     if run is None:
         return
     status = str(run.get("status") or "")
@@ -642,15 +838,21 @@ class PaperMarketScheduler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._worker_id = f"paper-market-worker-{uuid.uuid4().hex[:10]}"
+        self._lock = threading.Lock()
+        self._started_at = None
+        self._last_tick_at = None
+        self._last_successful_tick_at = None
+        self._last_error = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
+        self._started_at = utc_now()
         try:
             _recover_stale_runs(database())
-        except Exception:
-            # The loop will retry after MongoDB becomes available.
-            pass
+        except Exception as exc:
+            self._last_error = str(exc)
         self._thread = threading.Thread(
             target=self._run,
             name="alpaca-paper-market-scheduler",
@@ -664,20 +866,70 @@ class PaperMarketScheduler:
             self._thread.join(timeout=5)
         self._thread = None
 
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "scheduler_alive": bool(self._thread is not None and self._thread.is_alive()),
+                "scheduler_worker_id": self._worker_id,
+                "scheduler_started_at": bson_value(self._started_at),
+                "last_scheduler_tick_at": bson_value(self._last_tick_at),
+                "last_successful_scheduler_tick_at": bson_value(self._last_successful_tick_at),
+                "scheduler_last_error": self._last_error,
+                "poll_seconds": scheduler_poll_seconds(),
+            }
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            tick = utc_now()
+            with self._lock:
+                self._last_tick_at = tick
             try:
                 db = database()
                 _recover_stale_runs(db)
                 _advance_one(db, self._worker_id)
-            except Exception:
-                # Run-specific exceptions are persisted by the state machine. A
-                # global dependency failure is retried on the next poll.
-                pass
+                with self._lock:
+                    self._last_successful_tick_at = utc_now()
+                    self._last_error = None
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = str(exc)
             self._stop.wait(scheduler_poll_seconds())
 
 
 _SCHEDULER = PaperMarketScheduler()
+
+
+def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any]:
+    controller = _automation_document(db) or {}
+    active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
+    latest = active or db[PAPER_MARKET_RUNS_COLLECTION].find_one({}, sort=[("created_at", -1)])
+    runtime = _SCHEDULER.snapshot()
+    enabled = bool(controller.get("enabled"))
+    status = str(controller.get("status") or ("active" if enabled else "stopped"))
+    output: dict[str, Any] = {
+        "enabled": enabled,
+        "mode": str(controller.get("mode") or AUTOMATION_MODE),
+        "status": status,
+        "phase": str(controller.get("phase") or (latest or {}).get("phase") or status),
+        "scheduler_alive": bool(runtime.get("scheduler_alive")),
+        "scheduler_started_at": runtime.get("scheduler_started_at"),
+        "last_scheduler_tick_at": runtime.get("last_scheduler_tick_at"),
+        "last_successful_scheduler_tick_at": runtime.get("last_successful_scheduler_tick_at"),
+        "next_market_open": bson_value((active or {}).get("expected_market_open") or controller.get("next_market_open")),
+        "next_execution_session": (active or {}).get("execution_session") or controller.get("next_execution_session"),
+        "active_run": _public_robot_run(active),
+        "latest_run": _public_robot_run(latest),
+        "updated_at": bson_value(controller.get("updated_at")),
+    }
+    if not public:
+        output.update({
+            "scheduler_worker_id": runtime.get("scheduler_worker_id"),
+            "scheduler_last_error": runtime.get("scheduler_last_error"),
+            "poll_seconds": runtime.get("poll_seconds"),
+            "last_error": controller.get("last_error"),
+            "next_retry_at": bson_value(controller.get("next_retry_at")),
+        })
+    return output
 
 
 def start_paper_market_scheduler() -> None:
