@@ -4,9 +4,13 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from market_cycle_trader_api.schemas.paper_market import StartNextSessionRequest
+from market_cycle_trader_api.schemas.paper_market import StartNextSessionRequest, StopPaperRobotRequest
 from market_cycle_trader_api.schemas.paper_trading import PaperTradingSettings
-from market_cycle_trader_api.services.paper_market_scheduler import arm_next_session
+from market_cycle_trader_api.services.paper_market_scheduler import (
+    _ensure_continuous_run,
+    arm_next_session,
+    paper_market_robot_status,
+)
 
 
 class _InsertResult:
@@ -26,6 +30,22 @@ class _Collection:
             if all(document.get(key) == value for key, value in query.items()):
                 return dict(document)
         return None
+
+    def update_one(self, query: dict, update: dict, upsert: bool = False):
+        target = None
+        for document in self.documents:
+            if all(document.get(key) == value for key, value in query.items()):
+                target = document
+                break
+        if target is None and upsert:
+            target = dict(query)
+            target.update(update.get("$setOnInsert", {}))
+            self.documents.append(target)
+        if target is not None:
+            target.update(update.get("$set", {}))
+            for key in update.get("$unset", {}):
+                target.pop(key, None)
+        return _InsertResult()
 
 
 class _Database:
@@ -86,6 +106,79 @@ class NextSessionMarketApiTests(unittest.TestCase):
         self.assertEqual(run["execution_session"], "2026-08-03")
         self.assertEqual(run["strategy_cash"], 10_000.0)
         self.assertEqual(len(db["paper_market_runs"].documents), 1)
+        self.assertTrue(run["automation_enabled"])
+        controller = db["paper_market_automation"].find_one({"_id": "default"})
+        self.assertTrue(controller["enabled"])
+
+    def test_stop_request_requires_confirmation(self) -> None:
+        self.assertTrue(StopPaperRobotRequest(confirm_stop=True).confirm_stop)
+        with self.assertRaises(ValueError):
+            StopPaperRobotRequest(confirm_stop=False)
+
+    def test_robot_status_reports_continuous_mode(self) -> None:
+        db = _Database()
+        db["paper_market_automation"].documents.append({
+            "_id": "default",
+            "enabled": True,
+            "status": "active",
+            "phase": "waiting_for_next_market_open",
+        })
+        status = paper_market_robot_status(db, public=True)
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["mode"], "continuous_regular_sessions")
+
+    def test_continuous_controller_arms_following_session_after_terminal_run(self) -> None:
+        db = _Database()
+        db["paper_market_automation"].documents.append({
+            "_id": "default",
+            "enabled": True,
+            "status": "active",
+            "phase": "completed",
+        })
+        db["paper_market_runs"].documents.append({
+            "run_id": "previous",
+            "status": "completed",
+            "phase": "completed",
+            "created_at": datetime(2026, 8, 4, 13, 31, tzinfo=timezone.utc),
+        })
+        readiness = {
+            "clock": {
+                "timestamp": datetime(2026, 8, 4, 13, 32, tzinfo=timezone.utc),
+                "is_open": True,
+                "next_open": datetime(2026, 8, 5, 13, 30, tzinfo=timezone.utc),
+                "next_close": datetime(2026, 8, 4, 20, 0, tzinfo=timezone.utc),
+            },
+            "settings": {},
+            "strategy_cash": 10_000.0,
+            "managed_symbol": None,
+        }
+        with patch(
+            "market_cycle_trader_api.services.paper_market_scheduler.paper_market_readiness",
+            return_value=readiness,
+        ):
+            active = _ensure_continuous_run(db)
+
+        self.assertIsNotNone(active)
+        self.assertEqual(active["status"], "armed")
+        self.assertEqual(active["execution_session"], "2026-08-05")
+
+    def test_upgrade_adopts_existing_prepared_run_as_continuous(self) -> None:
+        db = _Database()
+        db["paper_market_runs"].documents.append({
+            "run_id": "prepared-run",
+            "active_key": "alpaca-paper-next-session",
+            "status": "prepared",
+            "phase": "waiting_for_next_market_open",
+            "requested_at": datetime(2026, 8, 3, 13, 36, tzinfo=timezone.utc),
+            "expected_market_open": datetime(2026, 8, 4, 13, 30, tzinfo=timezone.utc),
+            "execution_session": "2026-08-04",
+        })
+        active = _ensure_continuous_run(db)
+        controller = db["paper_market_automation"].find_one({"_id": "default"})
+
+        self.assertEqual(active["run_id"], "prepared-run")
+        self.assertTrue(controller["enabled"])
+        self.assertTrue(controller["adopted_existing_run"])
 
 
 if __name__ == "__main__":

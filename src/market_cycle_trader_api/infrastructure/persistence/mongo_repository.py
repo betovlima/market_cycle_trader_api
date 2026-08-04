@@ -32,6 +32,7 @@ PAPER_TRADING_STATE_COLLECTION = "paper_trading_state"
 PAPER_TRADE_PLANS_COLLECTION = "paper_trade_plans"
 PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
+PAPER_MARKET_AUTOMATION_COLLECTION = "paper_market_automation"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
 SETTINGS_SCHEMA_VERSION = 16

@@ -31,3 +31,19 @@ class CancelPaperMarketRequest(BaseModel):
         if value is not True:
             raise ValueError("confirm_cancel must be true.")
         return value
+
+
+class StopPaperRobotRequest(BaseModel):
+    """Explicit confirmation required before stopping continuous Paper automation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_stop: bool
+    cancel_pending_run: bool = True
+
+    @field_validator("confirm_stop")
+    @classmethod
+    def require_stop_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("confirm_stop must be true.")
+        return value
