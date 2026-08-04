@@ -31,3 +31,6 @@ After installation:
 
 Other strategy changes continue to use the protected `/api/admin/strategy-configuration` endpoints.
 No MongoDB configuration script or Railway pre-deploy database command is required.
+
+
+Paper automation v1.13.12 uses `premarket_analysis_minutes` from `paper_trading_settings/_id=default` (default: 90).

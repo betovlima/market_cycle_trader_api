@@ -7,10 +7,26 @@ from unittest.mock import patch
 from market_cycle_trader_api.schemas.paper_market import StartNextSessionRequest, StopPaperRobotRequest
 from market_cycle_trader_api.schemas.paper_trading import PaperTradingSettings
 from market_cycle_trader_api.services.paper_market_scheduler import (
+    PREMARKET_ANALYSIS_POLICY,
     _ensure_continuous_run,
+    _prepared_run_has_valid_premarket_analysis,
+    _rearm_prepared_run_for_premarket_analysis,
     arm_next_session,
     paper_market_robot_status,
 )
+
+
+def _paper_settings() -> dict:
+    return {
+        "enabled": True,
+        "client_order_id_prefix": "mct-xgb-paper",
+        "premarket_analysis_minutes": 90,
+        "market_open_delay_seconds": 60,
+        "market_execution_window_seconds": 900,
+        "order_fill_timeout_seconds": 180,
+        "order_poll_interval_seconds": 2.0,
+        "cash_reserve_dollars": 0.0,
+    }
 
 
 class _InsertResult:
@@ -64,18 +80,9 @@ class NextSessionMarketApiTests(unittest.TestCase):
             StartNextSessionRequest(confirm_paper=False)
 
     def test_paper_settings_require_safe_execution_window(self) -> None:
-        settings = PaperTradingSettings.model_validate(
-            {
-                "enabled": True,
-                "client_order_id_prefix": "mct-xgb-paper",
-                "market_open_delay_seconds": 60,
-                "market_execution_window_seconds": 900,
-                "order_fill_timeout_seconds": 180,
-                "order_poll_interval_seconds": 2.0,
-                "cash_reserve_dollars": 0.0,
-            }
-        )
+        settings = PaperTradingSettings.model_validate(_paper_settings())
         self.assertEqual(settings.market_execution_window_seconds, 900)
+        self.assertEqual(settings.premarket_analysis_minutes, 90)
 
         invalid = settings.model_dump()
         invalid["market_execution_window_seconds"] = 60
@@ -92,7 +99,7 @@ class NextSessionMarketApiTests(unittest.TestCase):
                 "next_open": next_open,
                 "next_close": datetime(2026, 8, 3, 20, 0, tzinfo=timezone.utc),
             },
-            "settings": {},
+            "settings": _paper_settings(),
             "strategy_cash": 10_000.0,
             "managed_symbol": None,
         }
@@ -103,6 +110,9 @@ class NextSessionMarketApiTests(unittest.TestCase):
             run = arm_next_session(db)
 
         self.assertEqual(run["status"], "armed")
+        self.assertEqual(run["phase"], "waiting_for_premarket_analysis")
+        self.assertEqual(run["analysis_policy"], PREMARKET_ANALYSIS_POLICY)
+        self.assertEqual(run["premarket_analysis_at"], datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
         self.assertEqual(run["execution_session"], "2026-08-03")
         self.assertEqual(run["strategy_cash"], 10_000.0)
         self.assertEqual(len(db["paper_market_runs"].documents), 1)
@@ -148,7 +158,7 @@ class NextSessionMarketApiTests(unittest.TestCase):
                 "next_open": datetime(2026, 8, 5, 13, 30, tzinfo=timezone.utc),
                 "next_close": datetime(2026, 8, 4, 20, 0, tzinfo=timezone.utc),
             },
-            "settings": {},
+            "settings": _paper_settings(),
             "strategy_cash": 10_000.0,
             "managed_symbol": None,
         }
@@ -179,6 +189,48 @@ class NextSessionMarketApiTests(unittest.TestCase):
         self.assertEqual(active["run_id"], "prepared-run")
         self.assertTrue(controller["enabled"])
         self.assertTrue(controller["adopted_existing_run"])
+
+    def test_valid_premarket_analysis_must_complete_inside_window(self) -> None:
+        run = {
+            "analysis_policy": PREMARKET_ANALYSIS_POLICY,
+            "premarket_analysis_at": datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc),
+            "premarket_analysis_completed_at": datetime(2026, 8, 5, 12, 15, tzinfo=timezone.utc),
+            "expected_market_open": datetime(2026, 8, 5, 13, 30, tzinfo=timezone.utc),
+        }
+        self.assertTrue(_prepared_run_has_valid_premarket_analysis(run))
+        run["premarket_analysis_completed_at"] = datetime(2026, 8, 5, 11, 59, tzinfo=timezone.utc)
+        self.assertFalse(_prepared_run_has_valid_premarket_analysis(run))
+
+    def test_legacy_prepared_plan_is_rearmed_without_touching_position_state(self) -> None:
+        db = _Database()
+        db["paper_market_runs"].documents.append({
+            "run_id": "legacy-plan-run",
+            "active_key": "alpaca-paper-next-session",
+            "status": "prepared",
+            "phase": "waiting_for_next_market_open",
+            "plan_id": "legacy-plan",
+            "action": "hold",
+            "target_asset": "AMZN",
+            "managed_symbol": "AMZN",
+            "expected_market_open": datetime(2026, 8, 5, 13, 30, tzinfo=timezone.utc),
+            "execution_session": "2026-08-05",
+        })
+        db["paper_trade_plans"].documents.append({
+            "plan_id": "legacy-plan",
+            "status": "prepared",
+        })
+
+        refreshed = _rearm_prepared_run_for_premarket_analysis(
+            db,
+            db["paper_market_runs"].find_one({"run_id": "legacy-plan-run"}),
+        )
+
+        self.assertEqual(refreshed["status"], "armed")
+        self.assertEqual(refreshed["phase"], "waiting_for_premarket_analysis")
+        self.assertEqual(refreshed["managed_symbol"], "AMZN")
+        self.assertNotIn("plan_id", refreshed)
+        plan = db["paper_trade_plans"].find_one({"plan_id": "legacy-plan"})
+        self.assertEqual(plan["status"], "cancelled")
 
 
 if __name__ == "__main__":

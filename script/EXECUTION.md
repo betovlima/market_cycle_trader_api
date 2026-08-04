@@ -183,3 +183,6 @@ Payload file:
 ```text
 script/post_api_paper-market_start-next-session.json
 ```
+
+
+Paper automation v1.13.12 uses `premarket_analysis_minutes` from `paper_trading_settings/_id=default` (default: 90).

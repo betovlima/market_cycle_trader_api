@@ -2,6 +2,7 @@
   "enabled": true,
   "paper_account_id": null,
   "client_order_id_prefix": "mct-xgb-paper",
+  "premarket_analysis_minutes": 90,
   "market_open_delay_seconds": 60,
   "market_execution_window_seconds": 900,
   "order_fill_timeout_seconds": 180,

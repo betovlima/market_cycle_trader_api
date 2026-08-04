@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.11
+# Market Cycle Trader API v1.13.12
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -71,7 +71,7 @@ TRADER_COOKIE_SECURE
 TRADER_COOKIE_SAMESITE
 ```
 
-## v1.13.11
+## v1.13.12
 
 - Adds the `trader` temporary-access role while preserving existing Viewer sessions.
 - Adds Backtest Analytics for Viewer, Trader and Administrator sessions.
@@ -82,7 +82,7 @@ TRADER_COOKIE_SAMESITE
 - Returns historical Portfolio analytics even when a live Alpaca refresh is temporarily unavailable.
 
 
-## v1.13.11 — continuous regular-session Paper robot
+## v1.13.12 — continuous regular-session Paper robot
 
 - `POST /api/paper-market/start-next-session` now enables a persistent continuous robot.
 - The controller automatically arms the following Alpaca regular session after each terminal execution.
@@ -91,3 +91,13 @@ TRADER_COOKIE_SAMESITE
 - `POST /api/paper-market/robot/stop` disables future sessions and safely cancels a pending run.
 - `GET /api/paper-market/public-robot-status` exposes only sanitized status to Trader and Administrator portfolios.
 - Execution remains restricted to the regular market open returned by Alpaca, plus the configured safety delay.
+
+
+## v1.13.12 — mandatory pre-market refresh
+
+- Arms the following regular session immediately after the previous run completes.
+- Waits until the configured pre-market window instead of training immediately after the close.
+- Refreshes completed Alpaca daily bars, reconciles account state and retrains XGBoost before every open.
+- Defaults to 90 minutes before Alpaca `next_open` through `premarket_analysis_minutes` in MongoDB.
+- Rejects or replaces a legacy prepared plan that did not complete the mandatory pre-market validation.
+- Preserves open Alpaca Paper positions and continuous-controller state across API deployments.

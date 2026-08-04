@@ -10,6 +10,9 @@ def test_continuous_robot_routes_and_controller_are_present() -> None:
     assert "continuous_regular_sessions" in scheduler
     assert "_ensure_continuous_run" in scheduler
     assert "adopted_existing_run" in scheduler
+    assert "mandatory_premarket_refresh_v1" in scheduler
+    assert "waiting_for_premarket_analysis" in scheduler
+    assert "_rearm_prepared_run_for_premarket_analysis" in scheduler
     assert '@router.get("/robot/status")' in router
     assert '@router.post("/robot/stop")' in router
     assert '@router.get("/public-robot-status")' in public_router

@@ -35,7 +35,7 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - No MongoDB migration and no new environment variables.
 
 
-## v1.13.11 — Continuous regular-session Paper robot
+## v1.13.12 — Continuous regular-session Paper robot
 
 - Converts the protected next-session activation into a persistent continuous controller.
 - Automatically schedules the following Alpaca regular session after every completed or failed run.
@@ -44,3 +44,12 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - Adds protected robot heartbeat/status and stop endpoints.
 - Adds a sanitized robot-status endpoint for Trader and Administrator Portfolio screens.
 - Stops automatic scheduling when an execution enters `review_required`.
+
+
+## v1.13.12 — Mandatory pre-market analysis
+
+- Moves the definitive daily data refresh, reconciliation, calibration and XGBoost training to the pre-market window.
+- Uses Alpaca `next_open` minus the MongoDB setting `premarket_analysis_minutes` (default 90).
+- Keeps the API restart-safe and backward-compatible with active v1.13.11 runs.
+- Discards pre-v1.13.12 prepared plans before execution and rebuilds them during the mandatory pre-market window.
+- Does not liquidate or modify an existing Alpaca Paper position during deployment.

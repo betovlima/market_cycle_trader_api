@@ -24,3 +24,6 @@ Validated contracts:
 - `POST /api/jobs` is available to Viewer sessions and still loads all strategy configuration exclusively from MongoDB.
 - The Portfolio snapshot and all Paper Market, setup, strategy and access administration routes remain Administrator-only.
 - Focused route-composition and source-contract tests pass without changing the trading engine.
+
+
+Paper automation v1.13.12 uses `premarket_analysis_minutes` from `paper_trading_settings/_id=default` (default: 90).

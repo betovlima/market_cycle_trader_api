@@ -55,6 +55,7 @@ class PaperSettingsMetadataTests(unittest.TestCase):
         self.assertNotIn("schema_version", settings)
         validated = PaperTradingSettings.model_validate(settings)
         self.assertTrue(validated.enabled)
+        self.assertEqual(validated.premarket_analysis_minutes, 90)
 
 
 if __name__ == "__main__":

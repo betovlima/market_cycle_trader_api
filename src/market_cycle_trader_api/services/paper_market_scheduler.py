@@ -17,6 +17,7 @@ from ..infrastructure.persistence.mongo_repository import (
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
     bson_value,
+    get_paper_trading_settings,
     update_paper_trade_plan,
     utc_now,
 )
@@ -36,6 +37,9 @@ ACTIVE_KEY = "alpaca-paper-next-session"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 AUTOMATION_ID = "default"
 AUTOMATION_MODE = "continuous_regular_sessions"
+PREMARKET_ANALYSIS_POLICY = "mandatory_premarket_refresh_v1"
+
+
 def _positive_float_env(name: str, default: float, *, minimum: float) -> float:
     raw = str(os.getenv(name) or "").strip()
     if not raw:
@@ -58,6 +62,20 @@ def preparation_retry_seconds() -> float:
         "PAPER_MARKET_PREPARE_RETRY_SECONDS",
         60.0,
         minimum=10.0,
+    )
+
+
+def _paper_settings(db: Any) -> PaperTradingSettings:
+    return PaperTradingSettings.model_validate(get_paper_trading_settings(db))
+
+
+def _premarket_analysis_at(
+    expected_open: Any,
+    settings: PaperTradingSettings,
+) -> pd.Timestamp:
+    return _utc_stamp(expected_open) - pd.Timedelta(
+        int(settings.premarket_analysis_minutes),
+        unit="m",
     )
 
 
@@ -194,6 +212,11 @@ def _public_robot_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
         "expected_market_open",
         "execution_session",
         "preparation_attempts",
+        "analysis_policy",
+        "premarket_analysis_minutes",
+        "premarket_analysis_at",
+        "premarket_analysis_started_at",
+        "premarket_analysis_completed_at",
         "finished_at",
     )
     return {key: bson_value(document.get(key)) for key in allowed if document.get(key) is not None}
@@ -210,14 +233,22 @@ def latest_paper_market_run(db: Any) -> dict[str, Any] | None:
 def _create_next_session_run(db: Any) -> dict[str, Any]:
     readiness = paper_market_readiness(db)
     clock = readiness["clock"]
+    settings = PaperTradingSettings.model_validate(readiness["settings"])
     expected_open = _utc_stamp(clock["next_open"])
+    analysis_at = _premarket_analysis_at(expected_open, settings)
     execution_session = expected_open.tz_convert(EASTERN).date().isoformat()
     run_id = f"paper-market-{execution_session}-{uuid.uuid4().hex[:8]}"
     now = utc_now()
-    phase = "waiting_for_market_close" if bool(clock["is_open"]) else "ready_to_prepare"
+    market_timestamp = _utc_stamp(clock["timestamp"])
+    phase = (
+        "ready_for_premarket_analysis"
+        if market_timestamp >= analysis_at and not bool(clock["is_open"])
+        else "waiting_for_premarket_analysis"
+    )
     first_message = (
-        "Paper market run armed for the next Alpaca regular session. "
-        f"Expected open: {expected_open.isoformat()}."
+        "Paper market run armed for mandatory pre-market analysis. "
+        f"Analysis begins at or after {analysis_at.isoformat()}; "
+        f"expected open: {expected_open.isoformat()}."
     )
     document = {
         "run_id": run_id,
@@ -230,6 +261,9 @@ def _create_next_session_run(db: Any) -> dict[str, Any]:
         "expected_market_open": expected_open.to_pydatetime(),
         "execution_session": execution_session,
         "requested_market_was_open": bool(clock["is_open"]),
+        "analysis_policy": PREMARKET_ANALYSIS_POLICY,
+        "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+        "premarket_analysis_at": analysis_at.to_pydatetime(),
         "plan_id": None,
         "action": None,
         "target_asset": None,
@@ -451,7 +485,7 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
         {
             "$set": {
                 "status": "preparing",
-                "phase": "training_xgboost_and_preparing_plan",
+                "phase": "refreshing_market_data_and_preparing_premarket_plan",
                 "worker_id": worker_id,
                 "lease_expires_at": now + timedelta(hours=6),
                 "updated_at": now,
@@ -465,6 +499,8 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
 def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     run_id = str(run["run_id"])
     expected_open = _utc_stamp(run["expected_market_open"])
+    settings = _paper_settings(db)
+    analysis_at = _premarket_analysis_at(expected_open, settings)
     next_retry = run.get("next_retry_at")
     if next_retry is not None and _utc_stamp(next_retry) > pd.Timestamp.now(tz="UTC"):
         return
@@ -479,22 +515,40 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             db,
             run_id,
             status="failed",
-            message="The expected market open arrived before a valid XGBoost plan was prepared.",
+            message="The expected market open arrived before mandatory pre-market analysis completed.",
         )
         return
 
+    if now < analysis_at:
+        if (
+            str(run.get("phase") or "") != "waiting_for_premarket_analysis"
+            or str(run.get("analysis_policy") or "") != PREMARKET_ANALYSIS_POLICY
+            or run.get("premarket_analysis_at") is None
+            or int(run.get("premarket_analysis_minutes") or 0) != int(settings.premarket_analysis_minutes)
+        ):
+            db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+                {"run_id": run_id, "status": "armed"},
+                {
+                    "$set": {
+                        "phase": "waiting_for_premarket_analysis",
+                        "analysis_policy": PREMARKET_ANALYSIS_POLICY,
+                        "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+                        "premarket_analysis_at": analysis_at.to_pydatetime(),
+                        "updated_at": utc_now(),
+                        "last_message": (
+                            "Waiting for the mandatory pre-market analysis window before refreshing data and retraining XGBoost."
+                        ),
+                    }
+                },
+            )
+        return
+
     if bool(clock["is_open"]):
-        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-            {"run_id": run_id, "status": "armed"},
-            {
-                "$set": {
-                    "phase": "waiting_for_market_close",
-                    "updated_at": utc_now(),
-                    "last_message": (
-                        "Current regular session is open; the model will be trained after the daily candle completes."
-                    ),
-                }
-            },
+        _finish_run(
+            db,
+            run_id,
+            status="failed",
+            message="The regular market opened before mandatory pre-market analysis completed.",
         )
         return
 
@@ -510,20 +564,33 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     claimed = _claim_for_preparation(db, run_id, worker_id)
     if claimed is None:
         return
-    _append_log(db, run_id, "Preparing the locked XGBoost decision for the next regular session.")
+    started_at = utc_now()
+    db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+        {"run_id": run_id, "status": "preparing", "worker_id": worker_id},
+        {
+            "$set": {
+                "analysis_policy": PREMARKET_ANALYSIS_POLICY,
+                "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+                "premarket_analysis_at": analysis_at.to_pydatetime(),
+                "premarket_analysis_started_at": started_at,
+            }
+        },
+    )
+    _append_log(
+        db,
+        run_id,
+        "Refreshing completed daily data and training the locked XGBoost decision during the mandatory pre-market window.",
+    )
     try:
         existing = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
             {"execution_session": str(run["execution_session"])},
             sort=[("created_at", -1)],
         )
-        if existing is not None and str(existing.get("status") or "") in {
-            "prepared",
-            "executing",
-            "executed",
-        }:
-            plan = existing
-        else:
-            plan = prepare_next_paper_plan(db, replace=existing is not None)
+        if existing is not None and str(existing.get("status") or "") in {"executing", "executed"}:
+            raise RuntimeError(
+                "A paper plan for this execution session has already entered execution and cannot be replaced safely."
+            )
+        plan = prepare_next_paper_plan(db, replace=existing is not None)
 
         if str(plan.get("execution_session")) != str(run["execution_session"]):
             raise RuntimeError(
@@ -544,31 +611,35 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 {
                     "status": "cancelled",
                     "cancelled_at": utc_now(),
-                    "cancel_reason": "Cancellation requested while the XGBoost plan was being prepared.",
+                    "cancel_reason": "Cancellation requested during mandatory pre-market analysis.",
                 },
             )
             _finish_run(
                 db,
                 run_id,
                 status="cancelled",
-                message="Paper-market run cancelled after plan preparation and before execution.",
+                message="Paper-market run cancelled after pre-market analysis and before execution.",
             )
             return
 
-        now_utc = utc_now()
+        completed_at = utc_now()
         db[PAPER_MARKET_RUNS_COLLECTION].update_one(
             {"run_id": run_id, "status": "preparing", "worker_id": worker_id},
             {
                 "$set": {
                     "status": "prepared",
                     "phase": "waiting_for_next_market_open",
+                    "analysis_policy": PREMARKET_ANALYSIS_POLICY,
+                    "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+                    "premarket_analysis_at": analysis_at.to_pydatetime(),
+                    "premarket_analysis_completed_at": completed_at,
                     "plan_id": str(plan["plan_id"]),
                     "action": str(plan["action"]),
                     "target_asset": str(plan["target_asset"]),
                     "decision_date": str(plan["decision_date"]),
-                    "updated_at": now_utc,
+                    "updated_at": completed_at,
                     "last_message": (
-                        f"XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
+                        f"Mandatory pre-market XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
                     ),
                 },
                 "$unset": {
@@ -580,7 +651,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 "$push": {
                     "logs": {
                         "$each": [
-                            f"{now_utc.isoformat()} — XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
+                            f"{completed_at.isoformat()} — Mandatory pre-market XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
                         ],
                         "$slice": -100,
                     }
@@ -596,17 +667,17 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 {
                     "$set": {
                         "status": "armed",
-                        "phase": "waiting_to_retry_plan_preparation",
+                        "phase": "waiting_to_retry_premarket_analysis",
                         "updated_at": now_utc,
                         "next_retry_at": retry_at,
                         "last_error": str(exc),
-                        "last_message": f"Plan preparation failed and will be retried: {exc}",
+                        "last_message": f"Pre-market analysis failed and will be retried: {exc}",
                     },
                     "$unset": {"worker_id": "", "lease_expires_at": ""},
                     "$push": {
                         "logs": {
                             "$each": [
-                                f"{now_utc.isoformat()} — Plan preparation failed and will be retried: {exc}"
+                                f"{now_utc.isoformat()} — Pre-market analysis failed and will be retried: {exc}"
                             ],
                             "$slice": -100,
                         }
@@ -618,7 +689,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 db,
                 run_id,
                 status="failed",
-                message=f"Could not prepare the plan before market open: {exc}",
+                message=f"Could not complete mandatory pre-market analysis before market open: {exc}",
             )
 
 
@@ -732,12 +803,79 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             )
 
 
+def _prepared_run_has_valid_premarket_analysis(run: dict[str, Any]) -> bool:
+    if str(run.get("analysis_policy") or "") != PREMARKET_ANALYSIS_POLICY:
+        return False
+    completed = run.get("premarket_analysis_completed_at")
+    analysis_at = run.get("premarket_analysis_at")
+    expected_open = run.get("expected_market_open")
+    if completed is None or analysis_at is None or expected_open is None:
+        return False
+    completed_at = _utc_stamp(completed)
+    return _utc_stamp(analysis_at) <= completed_at < _utc_stamp(expected_open)
+
+
+def _rearm_prepared_run_for_premarket_analysis(
+    db: Any,
+    run: dict[str, Any],
+) -> dict[str, Any]:
+    if _prepared_run_has_valid_premarket_analysis(run):
+        return run
+    run_id = str(run["run_id"])
+    plan_id = str(run.get("plan_id") or "").strip()
+    if plan_id:
+        update_paper_trade_plan(
+            db,
+            plan_id,
+            {
+                "status": "cancelled",
+                "cancelled_at": utc_now(),
+                "cancel_reason": "Superseded by mandatory pre-market reanalysis before execution.",
+            },
+        )
+    now = utc_now()
+    db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+        {"run_id": run_id, "status": "prepared"},
+        {
+            "$set": {
+                "status": "armed",
+                "phase": "waiting_for_premarket_analysis",
+                "analysis_policy": PREMARKET_ANALYSIS_POLICY,
+                "updated_at": now,
+                "next_retry_at": now,
+                "last_message": (
+                    "A plan created before the mandatory pre-market policy was discarded; current data will be refreshed and XGBoost retrained before the next open."
+                ),
+            },
+            "$unset": {
+                "plan_id": "",
+                "action": "",
+                "target_asset": "",
+                "decision_date": "",
+                "premarket_analysis_started_at": "",
+                "premarket_analysis_completed_at": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+            },
+            "$push": {
+                "logs": {
+                    "$each": [
+                        f"{now.isoformat()} — Legacy prepared plan discarded for mandatory pre-market reanalysis."
+                    ],
+                    "$slice": -100,
+                }
+            },
+        },
+    )
+    return db[PAPER_MARKET_RUNS_COLLECTION].find_one({"run_id": run_id}) or run
+
+
 def _ensure_continuous_run(db: Any) -> dict[str, Any] | None:
     controller = _automation_document(db)
     active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
 
-    # Upgrade an already armed one-shot run to the continuous controller on first
-    # startup after this release, preserving the currently prepared plan.
+    # Upgrade an already active one-shot run to the continuous controller on first
+    # startup. Legacy prepared plans are revalidated by the mandatory pre-market policy.
     if controller is None and active is not None:
         _update_automation(
             db,
@@ -827,6 +965,9 @@ def _advance_one(db: Any, worker_id: str) -> None:
     if run is None:
         return
     status = str(run.get("status") or "")
+    if status == "prepared" and not _prepared_run_has_valid_premarket_analysis(run):
+        run = _rearm_prepared_run_for_premarket_analysis(db, run)
+        status = str(run.get("status") or "")
     if status == "armed":
         _prepare_run(db, run, worker_id)
     elif status == "prepared":
@@ -917,6 +1058,8 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "last_successful_scheduler_tick_at": runtime.get("last_successful_scheduler_tick_at"),
         "next_market_open": bson_value((active or {}).get("expected_market_open") or controller.get("next_market_open")),
         "next_execution_session": (active or {}).get("execution_session") or controller.get("next_execution_session"),
+        "next_premarket_analysis_at": bson_value((active or {}).get("premarket_analysis_at")),
+        "premarket_analysis_minutes": (active or {}).get("premarket_analysis_minutes"),
         "active_run": _public_robot_run(active),
         "latest_run": _public_robot_run(latest),
         "updated_at": bson_value(controller.get("updated_at")),
