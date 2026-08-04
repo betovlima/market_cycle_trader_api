@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from market_cycle_trader_api.services.admin_rotations import admin_job_rotations
+
+
+class FakeCollection:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    @staticmethod
+    def _matches(row: dict[str, Any], query: dict[str, Any]) -> bool:
+        return all(row.get(key) == value for key, value in query.items())
+
+    @staticmethod
+    def _project(row: dict[str, Any], projection: dict[str, int] | None) -> dict[str, Any]:
+        if not projection:
+            return dict(row)
+        included = {key for key, enabled in projection.items() if enabled and key != "_id"}
+        if included:
+            return {key: row.get(key) for key in included if key in row}
+        excluded = {key for key, enabled in projection.items() if not enabled}
+        return {key: value for key, value in row.items() if key not in excluded}
+
+    def find(self, query: dict[str, Any], projection: dict[str, int] | None = None):
+        return [
+            self._project(row, projection)
+            for row in self.rows
+            if self._matches(row, query)
+        ]
+
+    def find_one(self, query: dict[str, Any], projection: dict[str, int] | None = None):
+        rows = self.find(query, projection)
+        return rows[0] if rows else None
+
+
+class FakeDatabase(dict[str, FakeCollection]):
+    def __getitem__(self, key: str) -> FakeCollection:
+        return super().__getitem__(key)
+
+
+def _database() -> FakeDatabase:
+    at = datetime(2026, 8, 3, 15, 30, tzinfo=timezone.utc)
+    job_id = "job-1"
+    backend = "private-seed-backend"
+    return FakeDatabase({
+        "backtest_jobs": FakeCollection([
+            {"id": job_id, "status": "completed"},
+        ]),
+        "backtest_comparisons": FakeCollection([
+            {
+                "job_id": job_id,
+                "results": [
+                    {
+                        "portfolio_rotation": True,
+                        "backend": backend,
+                        "strategy_return": 0.20,
+                    }
+                ],
+            }
+        ]),
+        "backtest_runs": FakeCollection([
+            {"job_id": job_id, "symbol": "PORTFOLIO", "backend": backend},
+        ]),
+        "backtest_trades": FakeCollection([
+            {
+                "job_id": job_id,
+                "symbol": "PORTFOLIO",
+                "backend": backend,
+                "timestamp": at,
+                "sequence": 1,
+                "action": "SELL",
+                "asset": "AAPL",
+                "rotation_id": "rotation-1",
+                "rotation_from_asset": "AAPL",
+                "rotation_to_asset": "NVDA",
+                "holding_bars": 8,
+                "position_return": 0.12,
+                "realized_pnl": 120.0,
+                "total_fee": 1.25,
+                "q_delta_final_vs_current": 99,
+                "random_seed": 42,
+            },
+            {
+                "job_id": job_id,
+                "symbol": "PORTFOLIO",
+                "backend": backend,
+                "timestamp": at,
+                "sequence": 2,
+                "action": "BUY",
+                "asset": "NVDA",
+                "rotation_id": "rotation-1",
+                "rotation_from_asset": "AAPL",
+                "rotation_to_asset": "NVDA",
+                "holding_bars": 0,
+                "position_return": 0,
+                "realized_pnl": 0,
+                "total_fee": 1.75,
+                "q_delta_final_vs_current": 100,
+                "random_seed": 43,
+            },
+        ]),
+    })
+
+
+def _all_keys(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | set().union(*(_all_keys(item) for item in value.values()), set())
+    if isinstance(value, list):
+        return set().union(*(_all_keys(item) for item in value), set())
+    return set()
+
+
+def test_admin_rotation_payload_is_useful_and_strategy_neutral() -> None:
+    payload = admin_job_rotations(_database(), "job-1")
+
+    assert payload["summary"]["total_rotations"] == 1
+    assert payload["summary"]["profitable_rotations"] == 1
+    assert payload["summary"]["total_realized_pnl"] == 120.0
+    assert payload["summary"]["total_transaction_fees"] == 3.0
+    assert payload["rotations"] == [
+        {
+            "executed_at": "2026-08-03T15:30:00+00:00",
+            "from_asset": "AAPL",
+            "to_asset": "NVDA",
+            "holding_days": 8.0,
+            "position_return": 0.12,
+            "realized_pnl": 120.0,
+            "transaction_fees": 3.0,
+        }
+    ]
+
+    forbidden = {
+        "backend",
+        "random_seed",
+        "q_delta_final_vs_current",
+        "q_current_position",
+        "q_final_action",
+        "strategy_configuration_sha256",
+        "effective_config",
+    }
+    assert not (_all_keys(payload) & forbidden)

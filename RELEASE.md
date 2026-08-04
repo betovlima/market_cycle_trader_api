@@ -1,3 +1,9 @@
+## 1.13.9
+
+- Adds sanitized administrator-only capital-rotation reporting for completed backtests.
+- Keeps detailed rotation output behind the administrator session boundary.
+- Does not expose strategy parameters, Q-values, seeds or backend identifiers.
+
 # Market Cycle Trader API
 
 ## 1.13.4 — Additive dashboard read model
@@ -14,3 +20,16 @@ Compatibility guarantees:
 - No backtest, Paper, MongoDB, configuration, export, scheduler, or engine behavior was modified.
 - The new endpoints do not mutate MongoDB.
 - Private configuration, model identifiers, seeds, assets, horizons, hashes, internal backends, and effective configuration are excluded from the new payloads.
+
+
+## 1.13.8
+
+Viewer sessions can now use Dashboard, Backtest, job results and exports, including starting a protected backtest. Portfolio and all administration surfaces remain restricted to Administrator sessions.
+
+## v1.13.10 — Analytical dashboards and Trader access
+
+- Backtest Analytics for all authenticated roles.
+- Portfolio and Portfolio Analytics for Trader and Administrator.
+- Temporary role selection for Viewer or Trader invitations.
+- Strategy-neutral analytics payload enforcement.
+- No MongoDB migration and no new environment variables.

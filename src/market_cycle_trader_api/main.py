@@ -9,11 +9,15 @@ from .core.environment import load_project_environment
 # environment variables at import time, such as the MongoDB repository.
 load_project_environment()
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api.routers import (
+    access_admin,
+    admin_rotations,
+    analytics,
     admin_setup,
+    auth,
     dashboard,
     exports,
     health,
@@ -24,6 +28,9 @@ from .api.routers import (
     strategy_configuration,
 )
 from .core.config import API_VERSION, cors_origins
+from .auth.config import get_auth_settings
+from .auth.security import require_admin_session, require_portfolio_session, require_trader_session
+from .auth.access_service import get_access_service
 from .core.runtime import close_mongo, initialize_mongo
 from .services.paper_market_scheduler import (
     start_paper_market_scheduler,
@@ -34,6 +41,8 @@ from .services.paper_market_scheduler import (
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     initialize_mongo()
+    get_auth_settings().validate_runtime()
+    get_access_service().ensure_storage()
     start_paper_market_scheduler()
     try:
         yield
@@ -62,14 +71,21 @@ def create_app() -> FastAPI:
     )
 
     application.include_router(health.router)
-    application.include_router(dashboard.router)
-    application.include_router(jobs.router)
-    application.include_router(exports.router)
-    application.include_router(paper_market.router)
-    application.include_router(public_paper_portfolio.router)
-    application.include_router(parameter_bootstrap.router)
-    application.include_router(strategy_configuration.router)
-    application.include_router(admin_setup.router)
+    application.include_router(auth.router)
+    application.include_router(access_admin.router)
+    viewer_required = [Depends(require_trader_session)]
+    admin_required = [Depends(require_admin_session)]
+    portfolio_required = [Depends(require_portfolio_session)]
+    application.include_router(dashboard.router, dependencies=viewer_required)
+    application.include_router(jobs.router, dependencies=viewer_required)
+    application.include_router(exports.router, dependencies=viewer_required)
+    application.include_router(analytics.router)
+    application.include_router(paper_market.router, dependencies=admin_required)
+    application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
+    application.include_router(admin_rotations.router, dependencies=admin_required)
+    application.include_router(parameter_bootstrap.router, dependencies=admin_required)
+    application.include_router(strategy_configuration.router, dependencies=admin_required)
+    application.include_router(admin_setup.router, dependencies=admin_required)
     return application
 
 

@@ -12,3 +12,5 @@ exchange-calendars>=4.13,<5
 matplotlib
 alpaca-py==0.43.5
 xgboost==3.3.0
+
+itsdangerous>=2.2,<3
