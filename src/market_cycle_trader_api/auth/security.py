@@ -53,7 +53,7 @@ class SessionManager:
             subject="trader-admin",
             role="admin",
             scope="trader:read portfolio:read admin:manage",
-            expires_at=datetime.now(UTC) + timedelta(seconds=self.settings.session_max_age_seconds),
+            expires_at=datetime.now(UTC) + timedelta(seconds=self.settings.session_max_age_for_role("admin")),
             display_name="Administrator",
             email=None,
         )

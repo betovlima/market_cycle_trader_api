@@ -65,7 +65,7 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - Adds identity mismatch, claim, login and session replacement audit events.
 - Preserves all strategy, backtest, analytics, Portfolio and Paper automation behavior.
 
-## v1.13.14 — Unified Google authentication
+## v1.13.16 — Unified Google authentication
 
 - Adds Google identity-bound Administrator access alongside Viewer and Trader.
 - Adds direct login for previously claimed identities.

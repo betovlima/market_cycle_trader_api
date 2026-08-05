@@ -21,7 +21,7 @@ from market_cycle_trader_api.schemas.auth import (
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 
 
-def _session_response(identity) -> SessionResponse:
+def _session_response(identity, idle_expires_at=None) -> SessionResponse:
     return SessionResponse(
         authenticated=True,
         role=identity.role,
@@ -29,6 +29,7 @@ def _session_response(identity) -> SessionResponse:
             0, int((identity.expires_at - datetime.now(UTC)).total_seconds())
         ),
         expires_at=identity.expires_at,
+        idle_expires_at=idle_expires_at,
         display_name=identity.display_name,
         email=identity.email,
     )
@@ -87,7 +88,7 @@ def verified_access(
     login_attempt_limiter.clear(client_key)
     identity = manager.create_access_identity(session)
     manager.set_cookie(response, identity)
-    return _session_response(identity)
+    return _session_response(identity, session.get("idle_expires_at"))
 
 
 @router.get("/session", response_model=SessionResponse)
@@ -100,7 +101,11 @@ def session(request: Request) -> SessionResponse:
         identity = manager.decode_session_token(token)
     except HTTPException:
         return SessionResponse(authenticated=False, expires_in_seconds=0)
-    return _session_response(identity)
+    idle_expires_at = None
+    if identity.session_id:
+        current = get_access_service().validate_access_session(identity.session_id)
+        idle_expires_at = current.get("idle_expires_at")
+    return _session_response(identity, idle_expires_at)
 
 
 @router.post("/logout", response_model=SessionResponse)

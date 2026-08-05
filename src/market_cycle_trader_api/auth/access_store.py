@@ -190,6 +190,15 @@ class InMemoryAccessStore:
             item = self.sessions.get(session_id)
             return deepcopy(item) if item else None
 
+    def touch_session(self, session_id: str, last_activity_at: datetime, idle_expires_at: datetime) -> dict[str, Any] | None:
+        with self.lock:
+            item = self.sessions.get(session_id)
+            if not item or item.get("revoked"):
+                return None
+            item["last_activity_at"] = last_activity_at
+            item["idle_expires_at"] = idle_expires_at
+            return deepcopy(item)
+
     def terminate_sessions(self, invitation_id: str) -> int:
         count = 0
         with self.lock:
@@ -390,6 +399,15 @@ class MongoAccessStore:
 
     def get_session(self, session_id):
         return self.sessions.find_one({"_id": session_id})
+
+    def touch_session(self, session_id, last_activity_at, idle_expires_at):
+        from pymongo import ReturnDocument
+
+        return self.sessions.find_one_and_update(
+            {"_id": session_id, "revoked": False},
+            {"$set": {"last_activity_at": last_activity_at, "idle_expires_at": idle_expires_at}},
+            return_document=ReturnDocument.AFTER,
+        )
 
     def terminate_sessions(self, invitation_id):
         now = datetime.now(UTC)

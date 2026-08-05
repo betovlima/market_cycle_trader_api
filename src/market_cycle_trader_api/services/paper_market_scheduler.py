@@ -13,6 +13,7 @@ from pymongo.errors import DuplicateKeyError
 
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import (
+    ADMIN_OPERATION_LOGS_COLLECTION,
     PAPER_MARKET_AUTOMATION_COLLECTION,
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
@@ -38,6 +39,8 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 AUTOMATION_ID = "default"
 AUTOMATION_MODE = "continuous_regular_sessions"
 PREMARKET_ANALYSIS_POLICY = "mandatory_premarket_refresh_v1"
+TRADER_CONTROL_MODES = frozenset({"active", "paused", "exit_only", "stopped"})
+EXIT_ONLY_ALLOWED_ACTIONS = frozenset({"sell_to_cash", "stay_in_cash", "hold"})
 
 
 def _positive_float_env(name: str, default: float, *, minimum: float) -> float:
@@ -198,6 +201,95 @@ def _update_automation(db: Any, changes: dict[str, Any], *, unset: tuple[str, ..
         update,
         upsert=True,
     )
+
+
+
+
+def _control_mode(controller: dict[str, Any] | None) -> str:
+    document = controller or {}
+    explicit = str(document.get("control_mode") or "").strip().lower()
+    if explicit in TRADER_CONTROL_MODES:
+        return explicit
+    return "active" if bool(document.get("enabled")) else "stopped"
+
+
+def _record_admin_operation(
+    db: Any,
+    *,
+    action: str,
+    previous_mode: str,
+    new_mode: str,
+    reason: str | None,
+    actor_email: str | None,
+) -> None:
+    db[ADMIN_OPERATION_LOGS_COLLECTION].insert_one(
+        bson_value({
+            "action": action,
+            "previous_mode": previous_mode,
+            "new_mode": new_mode,
+            "reason": (reason or "").strip() or None,
+            "actor_email": (actor_email or "").strip().lower() or None,
+            "created_at": utc_now(),
+            "success": True,
+        })
+    )
+
+
+def set_trader_control_mode(
+    db: Any,
+    *,
+    mode: str,
+    reason: str | None = None,
+    actor_email: str | None = None,
+    cancel_pending_run: bool = False,
+) -> dict[str, Any]:
+    requested = str(mode or "").strip().lower()
+    if requested not in TRADER_CONTROL_MODES:
+        raise RuntimeError(f"Unsupported Trader control mode: {requested}.")
+
+    controller = _automation_document(db) or {}
+    previous = _control_mode(controller)
+
+    if requested == "active":
+        arm_next_session(db)
+        _update_automation(db, {"control_mode": "active", "status": "active", "phase": "active"})
+    elif requested == "stopped":
+        stop_continuous_robot(db, cancel_pending_run=cancel_pending_run)
+        _update_automation(db, {"control_mode": "stopped", "status": "stopped", "phase": "stopped_by_administrator"})
+    else:
+        now = utc_now()
+        _update_automation(
+            db,
+            {
+                "enabled": requested == "exit_only",
+                "control_mode": requested,
+                "status": requested,
+                "phase": "new_entries_paused" if requested == "paused" else "exit_only",
+                "mode_changed_at": now,
+            },
+        )
+        if requested == "paused" and cancel_pending_run:
+            active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
+            if active is not None and str(active.get("status") or "") not in {"executing", "review_required"}:
+                cancel_paper_market_run(db, str(active["run_id"]))
+
+    _record_admin_operation(
+        db,
+        action="trader_control_mode_changed",
+        previous_mode=previous,
+        new_mode=requested,
+        reason=reason,
+        actor_email=actor_email,
+    )
+    return paper_market_robot_status(db)
+
+
+def list_admin_operation_logs(db: Any, *, limit: int = 50) -> list[dict[str, Any]]:
+    cursor = db[ADMIN_OPERATION_LOGS_COLLECTION].find({}).sort("created_at", -1).limit(max(1, min(int(limit), 200)))
+    return [
+        {key: bson_value(value) for key, value in item.items() if key != "_id"}
+        for item in cursor
+    ]
 
 
 def _public_robot_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -762,6 +854,35 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     if current_session != str(run["execution_session"]):
         return
 
+    controller = _automation_document(db) or {}
+    control_mode = _control_mode(controller)
+    if control_mode == "paused":
+        return
+    if control_mode == "stopped":
+        return
+    if control_mode == "exit_only":
+        action = str(run.get("action") or "").strip().lower()
+        if action not in EXIT_ONLY_ALLOWED_ACTIONS:
+            plan_id = str(run.get("plan_id") or "").strip()
+            if plan_id:
+                update_paper_trade_plan(
+                    db,
+                    plan_id,
+                    {
+                        "status": "cancelled",
+                        "cancelled_at": utc_now(),
+                        "cancel_reason": "Blocked by exit-only Trader mode.",
+                    },
+                )
+            _finish_run(
+                db,
+                run_id,
+                status="completed",
+                message="The prepared plan was not executed because exit-only mode blocks new entries and rotations.",
+                extra={"execution_result": {"action": action, "blocked_by_control_mode": "exit_only"}},
+            )
+            return
+
     claimed = _claim_for_execution(db, run_id, worker_id)
     if claimed is None:
         return
@@ -961,6 +1082,9 @@ def _ensure_continuous_run(db: Any) -> dict[str, Any] | None:
 
 
 def _advance_one(db: Any, worker_id: str) -> None:
+    controller = _automation_document(db) or {}
+    if _control_mode(controller) in {"paused", "stopped"}:
+        return
     run = _ensure_continuous_run(db)
     if run is None:
         return
@@ -1046,9 +1170,11 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
     latest = active or db[PAPER_MARKET_RUNS_COLLECTION].find_one({}, sort=[("created_at", -1)])
     runtime = _SCHEDULER.snapshot()
     enabled = bool(controller.get("enabled"))
-    status = str(controller.get("status") or ("active" if enabled else "stopped"))
+    control_mode = _control_mode(controller)
+    status = str(controller.get("status") or control_mode)
     output: dict[str, Any] = {
         "enabled": enabled,
+        "control_mode": control_mode,
         "mode": str(controller.get("mode") or AUTOMATION_MODE),
         "status": status,
         "phase": str(controller.get("phase") or (latest or {}).get("phase") or status),

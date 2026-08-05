@@ -17,6 +17,7 @@ from .api.routers import (
     admin_rotations,
     analytics,
     admin_setup,
+    admin_trader,
     auth,
     dashboard,
     exports,
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     application.include_router(paper_market.router, dependencies=admin_required)
     application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
     application.include_router(admin_rotations.router, dependencies=admin_required)
+    application.include_router(admin_trader.router, dependencies=admin_required)
     application.include_router(parameter_bootstrap.router, dependencies=admin_required)
     application.include_router(strategy_configuration.router, dependencies=admin_required)
     application.include_router(admin_setup.router, dependencies=admin_required)
