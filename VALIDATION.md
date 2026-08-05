@@ -27,3 +27,18 @@ Validated contracts:
 
 
 Paper automation v1.13.12 uses `premarket_analysis_minutes` from `paper_trading_settings/_id=default` (default: 90).
+
+
+## v1.13.13 identity-bound access
+
+Validated contracts:
+
+- A valid invitation token cannot be claimed by a different authorized email.
+- The token digest is invitation-UUID-bound; the first successful Google claim replaces it and stores Google `sub`.
+- A different Google subject is rejected after the invitation is claimed, even with the same email.
+- Returning access works for the original Google subject without reusing the claim token.
+- Trader session limit 1 replaces the older active session.
+- Viewer default session limit 2 preserves only the two newest active sessions.
+- Legacy invitations are marked `legacy_unverified` and cannot create new sessions.
+- OpenAPI requires `credential` for `POST /api/auth/access`.
+- Python compilation, unresolved-global scan and the complete automated API test suite pass.

@@ -2,19 +2,21 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from market_cycle_trader_api.auth.access_service import get_access_service
 from market_cycle_trader_api.auth.security import (
     SESSION_COOKIE_NAME,
     get_session_manager,
     login_attempt_limiter,
 )
 from market_cycle_trader_api.schemas.auth import (
+    AccessPreviewRequest,
+    AccessPreviewResponse,
     AdminLoginRequest,
+    GoogleAccessRequest,
     SessionResponse,
-    ViewerAccessRequest,
 )
-from market_cycle_trader_api.auth.access_service import get_access_service
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 
@@ -28,6 +30,7 @@ def _session_response(identity) -> SessionResponse:
         ),
         expires_at=identity.expires_at,
         display_name=identity.display_name,
+        email=identity.email,
     )
 
 
@@ -50,10 +53,26 @@ def admin_login(
     return _session_response(identity)
 
 
+@router.post("/access/preview", response_model=AccessPreviewResponse)
+def access_preview(
+    payload: AccessPreviewRequest,
+    request: Request,
+) -> AccessPreviewResponse:
+    client_key = request.client.host if request.client else "unknown"
+    login_attempt_limiter.ensure_allowed(client_key)
+    try:
+        result = get_access_service().preview_access(payload, request)
+    except HTTPException:
+        login_attempt_limiter.register_failure(client_key)
+        raise
+    login_attempt_limiter.clear(client_key)
+    return result
+
+
 @router.post("/access", response_model=SessionResponse)
 @router.post("/viewer/access", response_model=SessionResponse, include_in_schema=False)
-def viewer_access(
-    payload: ViewerAccessRequest,
+def verified_access(
+    payload: GoogleAccessRequest,
     request: Request,
     response: Response,
 ) -> SessionResponse:
@@ -61,7 +80,7 @@ def viewer_access(
     client_key = request.client.host if request.client else "unknown"
     login_attempt_limiter.ensure_allowed(client_key)
     try:
-        session = get_access_service().create_viewer_session(payload.token, request)
+        session = get_access_service().create_google_session(payload, request)
     except HTTPException:
         login_attempt_limiter.register_failure(client_key)
         raise
@@ -92,7 +111,7 @@ def logout(request: Request, response: Response) -> SessionResponse:
         try:
             identity = manager.decode_session_token(token)
             if identity.role in {"viewer", "trader"} and identity.session_id:
-                get_access_service().revoke_viewer_session(identity.session_id)
+                get_access_service().revoke_guest_session(identity.session_id)
         except HTTPException:
             pass
     manager.clear_cookie(response)

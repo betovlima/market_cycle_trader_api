@@ -10,9 +10,25 @@ class AdminLoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=512)
 
 
-class ViewerAccessRequest(BaseModel):
+class AccessPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    token: str = Field(min_length=12, max_length=256)
+
+    invitation_id: str = Field(min_length=8, max_length=128)
+    token: str | None = Field(default=None, min_length=12, max_length=256)
+
+
+class GoogleAccessRequest(AccessPreviewRequest):
+    credential: str = Field(min_length=100, max_length=16_384)
+
+
+class AccessPreviewResponse(BaseModel):
+    invitation_id: str
+    guest_name: str
+    role: str
+    masked_email: str
+    status: str
+    expires_at: datetime
+    requires_token: bool
 
 
 class SessionResponse(BaseModel):
@@ -21,3 +37,4 @@ class SessionResponse(BaseModel):
     expires_in_seconds: int
     expires_at: datetime | None = None
     display_name: str | None = None
+    email: str | None = None

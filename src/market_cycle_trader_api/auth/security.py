@@ -23,6 +23,7 @@ class SessionIdentity:
     expires_at: datetime
     session_id: str | None = None
     display_name: str | None = None
+    email: str | None = None
 
     @property
     def is_admin(self) -> bool:
@@ -53,18 +54,21 @@ class SessionManager:
             scope="trader:read admin:manage",
             expires_at=datetime.now(UTC) + timedelta(seconds=self.settings.session_max_age_seconds),
             display_name="Administrator",
+            email=None,
         )
 
     def create_guest_identity(self, session: dict) -> SessionIdentity:
         role = str(session.get("role") or "viewer")
         scope = "trader:read portfolio:read" if role == "trader" else "trader:read"
+        identity_subject = str(session.get("identity_subject") or "")
         return SessionIdentity(
-            subject=f"{role}:{session['invitation_id']}",
+            subject=f"google:{identity_subject}",
             role=role,
             scope=scope,
             expires_at=session["expires_at"],
             session_id=session["_id"],
             display_name=session.get("display_name"),
+            email=session.get("identity_email"),
         )
 
     def create_viewer_identity(self, session: dict) -> SessionIdentity:
@@ -79,6 +83,7 @@ class SessionManager:
                 "expires_at": identity.expires_at.isoformat(),
                 "session_id": identity.session_id,
                 "display_name": identity.display_name,
+                "email": identity.email,
             }
         )
 
@@ -108,6 +113,7 @@ class SessionManager:
             expires_at=expires_at,
             session_id=payload.get("session_id"),
             display_name=payload.get("display_name"),
+            email=payload.get("email"),
         )
         if role in {"viewer", "trader"}:
             if not identity.session_id:

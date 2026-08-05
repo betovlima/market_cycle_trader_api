@@ -10,7 +10,14 @@ from urllib.parse import quote
 
 from fastapi import HTTPException, Request
 
+from market_cycle_trader_api.auth.access_store import get_access_store
 from market_cycle_trader_api.auth.config import get_auth_settings as get_settings
+from market_cycle_trader_api.auth.google_identity import (
+    GoogleIdentityVerifier,
+    ProductionGoogleIdentityVerifier,
+    VerifiedGoogleIdentity,
+    normalize_email,
+)
 from market_cycle_trader_api.schemas.access_admin import (
     AccessLogResponse,
     InvitationCreateRequest,
@@ -19,7 +26,7 @@ from market_cycle_trader_api.schemas.access_admin import (
     InvitationResponse,
     InvitationUpdateRequest,
 )
-from market_cycle_trader_api.auth.access_store import get_access_store
+from market_cycle_trader_api.schemas.auth import AccessPreviewRequest, AccessPreviewResponse, GoogleAccessRequest
 
 
 def utc_now() -> datetime:
@@ -27,13 +34,6 @@ def utc_now() -> datetime:
 
 
 def as_utc(value: datetime | None) -> datetime | None:
-    """Normalize MongoDB datetimes to timezone-aware UTC values.
-
-    PyMongo returns BSON dates as naive UTC datetimes unless the client is
-    configured with ``tz_aware=True``. Authentication code compares stored
-    dates with aware UTC values, so every persisted date is normalized at the
-    service boundary before comparison or serialization.
-    """
     if value is None:
         return None
     if value.tzinfo is None:
@@ -48,61 +48,64 @@ def _new_access_token() -> str:
     )
 
 
-def token_digest(token: str) -> str:
+def token_digest(token: str, invitation_id: str | None = None) -> str:
+    """Return a keyed digest bound to one invitation identifier.
+
+    v1.13.13 invitation digests include the invitation UUID, so a token cannot
+    be moved to another access record and cannot be accepted by the legacy
+    token-only v1.13.12 login after a rollback.
+    """
     settings = get_settings()
-    normalized = token.strip().upper().encode("utf-8")
+    normalized = str(token or "").strip().upper()
+    material = f"{invitation_id}:{normalized}" if invitation_id else normalized
     return hmac.new(
         settings.session_secret.encode("utf-8"),
-        normalized,
+        material.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
 
-def _effective_status(document: dict, now: datetime | None = None) -> str:
+def _authorization_status(document: dict, now: datetime | None = None) -> str:
     current = as_utc(now) or utc_now()
-    if document.get("status") == "revoked":
+    stored = str(document.get("status") or "")
+    if stored == "revoked":
         return "revoked"
+    if stored == "legacy_unverified" or not document.get("authorized_email"):
+        return "legacy_unverified"
     expires_at = as_utc(document.get("expires_at"))
     if expires_at is None or expires_at <= current:
         return "expired"
-    return "active"
+    if stored == "blocked":
+        return "blocked"
+    if stored == "claimed" and document.get("claimed_subject"):
+        return "claimed"
+    return "pending_verification"
 
 
-def invitation_response(document: dict) -> InvitationResponse:
-    created_at = as_utc(document.get("created_at"))
-    expires_at = as_utc(document.get("expires_at"))
-    if created_at is None or expires_at is None:
-        raise RuntimeError("Stored access record is missing required timestamps.")
-    return InvitationResponse(
-        id=document["_id"],
-        guest_name=document.get("guest_name") or "Viewer",
-        role=str(document.get("role") or "viewer"),
-        status=_effective_status(document),
-        created_at=created_at,
-        expires_at=expires_at,
-        last_access_at=as_utc(document.get("last_access_at")),
-        revoked_at=as_utc(document.get("revoked_at")),
-    )
-
-
-def invitation_link_response(document: dict, raw_token: str) -> InvitationLinkResponse:
-    response = invitation_response(document)
-    access_url = (
-        f"{get_settings().frontend_base_url}/access#token={quote(raw_token, safe='')}"
-    )
-    return InvitationLinkResponse(**response.model_dump(), access_url=access_url)
+def _masked_email(email: str) -> str:
+    normalized = normalize_email(email)
+    local, separator, domain = normalized.partition("@")
+    if not separator:
+        return "hidden"
+    if len(local) <= 2:
+        masked_local = local[:1] + "*"
+    else:
+        masked_local = local[:2] + "*" * min(6, len(local) - 2)
+    return f"{masked_local}@{domain}"
 
 
 def _client_metadata(request: Request) -> tuple[str, str]:
-    client_ip = request.client.host if request.client else "unknown"
+    forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    client_ip = forwarded or (request.client.host if request.client else "unknown")
     user_agent = str(request.headers.get("user-agent") or "")[:512]
     return client_ip, user_agent
 
 
 class AccessService:
-    def __init__(self) -> None:
+    def __init__(self, identity_verifier: GoogleIdentityVerifier | None = None) -> None:
         self.settings = get_settings()
         self.store = get_access_store()
+        self.identity_verifier = identity_verifier or ProductionGoogleIdentityVerifier()
 
     def ensure_storage(self) -> None:
         self.store.ensure_indexes()
@@ -114,6 +117,7 @@ class AccessService:
         request: Request,
         invitation_id: str | None = None,
         guest_name: str | None = None,
+        identity_email: str | None = None,
         role: str | None = None,
         success: bool = True,
     ) -> None:
@@ -124,6 +128,7 @@ class AccessService:
                 "event": event,
                 "invitation_id": invitation_id,
                 "guest_name": guest_name,
+                "identity_email": normalize_email(identity_email or "") or None,
                 "role": role,
                 "success": success,
                 "client_ip": client_ip,
@@ -131,6 +136,50 @@ class AccessService:
                 "created_at": utc_now(),
             }
         )
+
+    def _active_session_count(self, invitation_id: str, now: datetime | None = None) -> int:
+        return self.store.count_active_sessions(invitation_id, as_utc(now) or utc_now())
+
+    def _invitation_response(self, document: dict) -> InvitationResponse:
+        created_at = as_utc(document.get("created_at"))
+        expires_at = as_utc(document.get("expires_at"))
+        if created_at is None or expires_at is None:
+            raise RuntimeError("Stored access record is missing required timestamps.")
+        active_sessions = self._active_session_count(document["_id"])
+        status = _authorization_status(document)
+        if status == "claimed" and active_sessions > 0:
+            status = "active"
+        return InvitationResponse(
+            id=document["_id"],
+            guest_name=document.get("guest_name") or "Guest",
+            authorized_email=document.get("authorized_email") or None,
+            role=str(document.get("role") or "viewer"),
+            status=status,
+            created_at=created_at,
+            expires_at=expires_at,
+            last_access_at=as_utc(document.get("last_access_at")),
+            claimed_at=as_utc(document.get("claimed_at")),
+            claimed_email=document.get("claimed_email") or None,
+            max_active_sessions=int(
+                document.get("max_active_sessions")
+                or (1 if document.get("role") == "trader" else 2)
+            ),
+            active_sessions=active_sessions,
+            revoked_at=as_utc(document.get("revoked_at")),
+        )
+
+    def _invitation_link_response(
+        self,
+        document: dict,
+        raw_token: str,
+    ) -> InvitationLinkResponse:
+        response = self._invitation_response(document)
+        access_url = (
+            f"{self.settings.frontend_base_url}/access"
+            f"#invitation={quote(document['_id'], safe='')}"
+            f"&token={quote(raw_token, safe='')}"
+        )
+        return InvitationLinkResponse(**response.model_dump(), access_url=access_url)
 
     def create_invitation(
         self,
@@ -143,27 +192,34 @@ class AccessService:
         document = {
             "_id": invitation_id,
             "guest_name": payload.guest_name.strip(),
+            "authorized_email": normalize_email(str(payload.authorized_email)),
             "role": payload.role,
-            "token_hash": token_digest(raw_token),
-            "status": "active",
+            "max_active_sessions": int(payload.max_active_sessions or 1),
+            "token_hash": token_digest(raw_token, invitation_id),
+            "token_version": 1,
+            "status": "pending_verification",
             "created_at": now,
             "updated_at": now,
             "expires_at": now + timedelta(seconds=payload.duration_seconds),
             "last_access_at": None,
+            "claimed_at": None,
+            "claimed_subject": None,
+            "claimed_email": None,
             "revoked_at": None,
         }
         self.store.create_invitation(document)
         self._record_log(
-            event="access_link_created",
+            event="verified_access_link_created",
             request=request,
             invitation_id=invitation_id,
             guest_name=document["guest_name"],
+            identity_email=document["authorized_email"],
             role=document["role"],
         )
-        return invitation_link_response(document, raw_token)
+        return self._invitation_link_response(document, raw_token)
 
     def list_invitations(self) -> list[InvitationResponse]:
-        return [invitation_response(item) for item in self.store.list_invitations()]
+        return [self._invitation_response(item) for item in self.store.list_invitations()]
 
     def update_invitation(
         self,
@@ -174,30 +230,44 @@ class AccessService:
         document = self.store.get_invitation(invitation_id)
         if not document:
             raise HTTPException(status_code=404, detail="Access record not found.")
-        if document.get("status") == "revoked":
-            raise HTTPException(status_code=409, detail="Revoked access cannot be extended.")
+        state = _authorization_status(document)
+        if state in {"revoked", "legacy_unverified"}:
+            raise HTTPException(status_code=409, detail="This access record cannot be updated.")
+
         now = utc_now()
-        expires_at = (
-            now + timedelta(seconds=payload.duration_seconds)
-            if payload.duration_seconds is not None
-            else as_utc(payload.expires_at)
-        )
-        updated = self.store.update_invitation(
-            invitation_id,
-            {
-                "expires_at": expires_at,
-                "status": "active",
-                "updated_at": now,
-            },
-        )
+        updates: dict = {"updated_at": now}
+        if payload.duration_seconds is not None:
+            updates["expires_at"] = now + timedelta(seconds=payload.duration_seconds)
+        elif payload.expires_at is not None:
+            updates["expires_at"] = as_utc(payload.expires_at)
+        if payload.max_active_sessions is not None:
+            updates["max_active_sessions"] = int(payload.max_active_sessions)
+
+        updated = self.store.update_invitation(invitation_id, updates) or document
+        if payload.max_active_sessions is not None:
+            terminated = self.store.trim_active_sessions(
+                invitation_id,
+                int(payload.max_active_sessions),
+                now,
+            )
+            if terminated:
+                self._record_log(
+                    event="session_limit_enforced",
+                    request=request,
+                    invitation_id=invitation_id,
+                    guest_name=document.get("guest_name"),
+                    identity_email=document.get("authorized_email"),
+                    role=str(document.get("role") or "viewer"),
+                )
         self._record_log(
-            event="access_extended",
+            event="verified_access_updated",
             request=request,
             invitation_id=invitation_id,
             guest_name=document.get("guest_name"),
+            identity_email=document.get("authorized_email"),
             role=str(document.get("role") or "viewer"),
         )
-        return invitation_response(updated or document)
+        return self._invitation_response(updated)
 
     def regenerate_access_link(
         self,
@@ -208,30 +278,42 @@ class AccessService:
         document = self.store.get_invitation(invitation_id)
         if not document:
             raise HTTPException(status_code=404, detail="Access record not found.")
-        if document.get("status") == "revoked":
+        state = _authorization_status(document)
+        if state == "revoked":
+            raise HTTPException(status_code=409, detail="Revoked access cannot generate a new link.")
+        if state == "legacy_unverified":
             raise HTTPException(
                 status_code=409,
-                detail="Revoked access cannot generate a new link.",
+                detail="Create a new identity-verified invitation for this legacy access.",
             )
+
         now = utc_now()
         raw_token = _new_access_token()
+        self.store.terminate_sessions(invitation_id)
         updated = self.store.update_invitation(
             invitation_id,
             {
-                "token_hash": token_digest(raw_token),
+                "token_hash": token_digest(raw_token, invitation_id),
+                "token_version": int(document.get("token_version") or 0) + 1,
                 "expires_at": now + timedelta(seconds=payload.duration_seconds),
-                "status": "active",
+                "status": "pending_verification",
+                "claimed_at": None,
+                "claimed_subject": None,
+                "claimed_email": None,
+                "token_consumed_at": None,
+                "last_access_at": None,
                 "updated_at": now,
             },
         ) or document
         self._record_log(
-            event="access_link_regenerated",
+            event="verified_access_link_regenerated",
             request=request,
             invitation_id=invitation_id,
             guest_name=document.get("guest_name"),
+            identity_email=document.get("authorized_email"),
             role=str(document.get("role") or "viewer"),
         )
-        return invitation_link_response(updated, raw_token)
+        return self._invitation_link_response(updated, raw_token)
 
     def revoke_invitation(self, invitation_id: str, request: Request) -> InvitationResponse:
         document = self.store.get_invitation(invitation_id)
@@ -244,13 +326,14 @@ class AccessService:
         ) or document
         self.store.terminate_sessions(invitation_id)
         self._record_log(
-            event="access_revoked",
+            event="verified_access_revoked",
             request=request,
             invitation_id=invitation_id,
             guest_name=document.get("guest_name"),
+            identity_email=document.get("authorized_email"),
             role=str(document.get("role") or "viewer"),
         )
-        return invitation_response(updated)
+        return self._invitation_response(updated)
 
     def terminate_sessions(self, invitation_id: str, request: Request) -> int:
         document = self.store.get_invitation(invitation_id)
@@ -262,6 +345,7 @@ class AccessService:
             request=request,
             invitation_id=invitation_id,
             guest_name=document.get("guest_name"),
+            identity_email=document.get("authorized_email"),
             role=str(document.get("role") or "viewer"),
         )
         return count
@@ -270,7 +354,8 @@ class AccessService:
         document = self.store.get_invitation(invitation_id)
         if not document:
             raise HTTPException(status_code=404, detail="Access record not found.")
-        if _effective_status(document) == "active":
+        state = self._invitation_response(document).status
+        if state in {"pending_verification", "claimed", "active"}:
             raise HTTPException(
                 status_code=409,
                 detail="Revoke or wait for the access to expire before deleting it.",
@@ -282,54 +367,191 @@ class AccessService:
             request=request,
             invitation_id=invitation_id,
             guest_name=document.get("guest_name"),
+            identity_email=document.get("authorized_email"),
             role=str(document.get("role") or "viewer"),
         )
 
-    def create_viewer_session(self, raw_token: str, request: Request) -> dict:
-        digest = token_digest(raw_token)
-        document = self.store.get_invitation_by_token_hash(digest)
+    def _locate_invitation(self, payload: AccessPreviewRequest) -> dict:
+        document = self.store.get_invitation(payload.invitation_id)
         if not document:
-            self._record_log(event="guest_access_denied", request=request, success=False)
-            raise HTTPException(status_code=401, detail="Invalid or expired access token.")
-        if _effective_status(document) != "active":
+            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
+        return document
+
+    def preview_access(self, payload: AccessPreviewRequest, request: Request) -> AccessPreviewResponse:
+        document = self._locate_invitation(payload)
+        state = _authorization_status(document)
+        if state == "legacy_unverified":
+            raise HTTPException(status_code=410, detail="A new identity-verified invitation is required.")
+        if state in {"revoked", "expired", "blocked"}:
+            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
+        if state == "pending_verification":
+            if not payload.token or not hmac.compare_digest(
+                str(document.get("token_hash") or ""),
+                token_digest(payload.token, document["_id"]),
+            ):
+                self._record_log(
+                    event="invitation_preview_denied",
+                    request=request,
+                    invitation_id=document.get("_id"),
+                    guest_name=document.get("guest_name"),
+                    role=str(document.get("role") or "viewer"),
+                    success=False,
+                )
+                raise HTTPException(status_code=401, detail="The complete invitation link is required.")
+
+        expires_at = as_utc(document.get("expires_at"))
+        if expires_at is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
+        return AccessPreviewResponse(
+            invitation_id=document["_id"],
+            guest_name=document.get("guest_name") or "Guest",
+            role=str(document.get("role") or "viewer"),
+            masked_email=_masked_email(document.get("authorized_email") or ""),
+            status=state,
+            expires_at=expires_at,
+            requires_token=state == "pending_verification",
+        )
+
+    def _verify_invited_identity(
+        self,
+        document: dict,
+        identity: VerifiedGoogleIdentity,
+        request: Request,
+    ) -> None:
+        authorized_email = normalize_email(document.get("authorized_email") or "")
+        if not authorized_email or identity.email != authorized_email:
             self._record_log(
-                event="guest_access_denied",
+                event="google_identity_mismatch",
                 request=request,
-                invitation_id=document["_id"],
+                invitation_id=document.get("_id"),
                 guest_name=document.get("guest_name"),
+                identity_email=identity.email,
                 role=str(document.get("role") or "viewer"),
                 success=False,
             )
-            raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+            raise HTTPException(
+                status_code=403,
+                detail="This Google account is not authorized for this invitation.",
+            )
+
+    def create_google_session(self, payload: GoogleAccessRequest, request: Request) -> dict:
+        document = self._locate_invitation(payload)
+        state = _authorization_status(document)
+        if state == "legacy_unverified":
+            raise HTTPException(status_code=410, detail="A new identity-verified invitation is required.")
+        if state in {"revoked", "expired", "blocked"}:
+            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
+
+        identity = self.identity_verifier.verify(payload.credential)
+        self._verify_invited_identity(document, identity, request)
         now = utc_now()
-        session_id = str(uuid.uuid4())
+
+        if state == "pending_verification":
+            if not payload.token:
+                raise HTTPException(status_code=401, detail="The complete invitation link is required.")
+            expected_digest = token_digest(payload.token, document["_id"])
+            if not hmac.compare_digest(
+                str(document.get("token_hash") or ""),
+                expected_digest,
+            ):
+                raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
+            claimed = self.store.claim_invitation(
+                document["_id"],
+                expected_digest,
+                now,
+                {
+                    "status": "claimed",
+                    "claimed_at": now,
+                    "claimed_subject": identity.subject,
+                    "claimed_email": identity.email,
+                    "google_display_name": identity.display_name,
+                    "google_hosted_domain": identity.hosted_domain,
+                    "token_consumed_at": now,
+                    # Replace the usable token digest atomically without violating
+                    # the existing unique token_hash index.
+                    "token_hash": token_digest(_new_access_token(), document["_id"]),
+                    "updated_at": now,
+                },
+            )
+            if not claimed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This invitation was already claimed or replaced.",
+                )
+            document = claimed
+            self._record_log(
+                event="google_identity_claimed",
+                request=request,
+                invitation_id=document["_id"],
+                guest_name=document.get("guest_name"),
+                identity_email=identity.email,
+                role=str(document.get("role") or "viewer"),
+            )
+        else:
+            claimed_subject = str(document.get("claimed_subject") or "")
+            claimed_email = normalize_email(document.get("claimed_email") or "")
+            if claimed_subject != identity.subject or claimed_email != identity.email:
+                self._record_log(
+                    event="claimed_identity_rejected",
+                    request=request,
+                    invitation_id=document.get("_id"),
+                    guest_name=document.get("guest_name"),
+                    identity_email=identity.email,
+                    role=str(document.get("role") or "viewer"),
+                    success=False,
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="This invitation is already linked to another Google account.",
+                )
+
         invitation_expires_at = as_utc(document.get("expires_at"))
-        if invitation_expires_at is None:
-            raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+        if invitation_expires_at is None or invitation_expires_at <= now:
+            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
+        session_expires_at = min(
+            invitation_expires_at,
+            now + timedelta(seconds=self.settings.session_max_age_seconds),
+        )
         session = {
-            "_id": session_id,
+            "_id": str(uuid.uuid4()),
             "invitation_id": document["_id"],
             "role": str(document.get("role") or "viewer"),
-            "display_name": document.get("guest_name") or "Viewer",
+            "display_name": document.get("guest_name") or identity.display_name or "Guest",
+            "identity_subject": identity.subject,
+            "identity_email": identity.email,
             "created_at": now,
-            "expires_at": invitation_expires_at,
+            "expires_at": session_expires_at,
             "revoked": False,
         }
-        self.store.create_session(session)
+        max_sessions = int(
+            document.get("max_active_sessions")
+            or (1 if document.get("role") == "trader" else 2)
+        )
+        terminated = self.store.create_limited_session(session, max_sessions, now)
         self.store.update_invitation(
             document["_id"],
             {"last_access_at": now, "updated_at": now},
         )
+        if terminated:
+            self._record_log(
+                event="older_session_replaced",
+                request=request,
+                invitation_id=document["_id"],
+                guest_name=document.get("guest_name"),
+                identity_email=identity.email,
+                role=str(document.get("role") or "viewer"),
+            )
         self._record_log(
-            event="guest_access_granted",
+            event="google_access_granted",
             request=request,
             invitation_id=document["_id"],
             guest_name=document.get("guest_name"),
+            identity_email=identity.email,
             role=str(document.get("role") or "viewer"),
         )
         return session
 
-    def validate_viewer_session(self, session_id: str) -> dict:
+    def validate_guest_session(self, session_id: str) -> dict:
         session = self.store.get_session(session_id)
         now = utc_now()
         session_expires_at = as_utc(session.get("expires_at")) if session else None
@@ -341,14 +563,27 @@ class AccessService:
         ):
             raise HTTPException(status_code=401, detail="Guest session expired or revoked.")
         invitation = self.store.get_invitation(session["invitation_id"])
-        if not invitation or _effective_status(invitation, now) != "active":
+        if not invitation or _authorization_status(invitation, now) != "claimed":
             raise HTTPException(status_code=401, detail="Guest access expired or revoked.")
+        if (
+            str(session.get("identity_subject") or "")
+            != str(invitation.get("claimed_subject") or "")
+            or normalize_email(session.get("identity_email") or "")
+            != normalize_email(invitation.get("claimed_email") or "")
+        ):
+            raise HTTPException(status_code=401, detail="Guest identity is no longer valid.")
         session["expires_at"] = session_expires_at
         session["created_at"] = as_utc(session.get("created_at")) or now
         return session
 
-    def revoke_viewer_session(self, session_id: str) -> None:
+    def validate_viewer_session(self, session_id: str) -> dict:
+        return self.validate_guest_session(session_id)
+
+    def revoke_guest_session(self, session_id: str) -> None:
         self.store.revoke_session(session_id)
+
+    def revoke_viewer_session(self, session_id: str) -> None:
+        self.revoke_guest_session(session_id)
 
     def list_logs(self, limit: int) -> list[AccessLogResponse]:
         return [
@@ -357,6 +592,7 @@ class AccessService:
                 event=item["event"],
                 invitation_id=item.get("invitation_id"),
                 guest_name=item.get("guest_name"),
+                identity_email=item.get("identity_email"),
                 role=item.get("role"),
                 success=bool(item.get("success", True)),
                 client_ip=item.get("client_ip", "unknown"),

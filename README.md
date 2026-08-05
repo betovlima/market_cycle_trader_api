@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.12
+# Market Cycle Trader API v1.13.13
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -11,7 +11,7 @@ FastAPI and MongoDB backend for protected historical simulations, sanitized anal
 | Paper Portfolio and Portfolio Analytics | No | Yes | Yes |
 | Access, setup and strategy administration | No | No | Yes |
 
-Existing invitation documents without `role` are interpreted as `viewer`; no MongoDB migration is required.
+At v1.13.13 startup, pre-identity invitation documents are marked `legacy_unverified` and their temporary sessions are revoked. Administrators must create new invitations with an authorized Google email.
 
 ## Analytical routes
 
@@ -50,7 +50,9 @@ The analytics layer rejects protected output keys such as backend identifiers, s
 - `/api/analytics` — sanitized analytical dashboards.
 - `/api/paper-market/public-portfolio` — read-only portfolio for Trader or Administrator.
 - `/api/paper-market` — administrator-only Paper operations.
-- `/api/admin/invitations` — administrator-only temporary access management.
+- `/api/auth/access/preview` — validates an invitation locator without exposing the complete email.
+- `/api/auth/access` — verifies the Google ID token and creates an identity-bound session.
+- `/api/admin/invitations` — administrator-only identity-bound access management.
 - `/api/admin/strategy-configuration` — administrator-only protected configuration administration.
 - `/api/health/live` and `/api/health/ready` — liveness and readiness.
 
@@ -69,6 +71,7 @@ TRADER_AUTH_STORAGE
 TRADER_SESSION_MAX_AGE_SECONDS
 TRADER_COOKIE_SECURE
 TRADER_COOKIE_SAMESITE
+GOOGLE_CLIENT_ID
 ```
 
 ## v1.13.12
@@ -101,3 +104,18 @@ TRADER_COOKIE_SAMESITE
 - Defaults to 90 minutes before Alpaca `next_open` through `premarket_analysis_minutes` in MongoDB.
 - Rejects or replaces a legacy prepared plan that did not complete the mandatory pre-market validation.
 - Preserves open Alpaca Paper positions and continuous-controller state across API deployments.
+
+
+## v1.13.13 — Google identity-bound Viewer and Trader access
+
+- Requires an administrator-approved Google email for every new Viewer or Trader invitation.
+- Verifies Google Identity Services ID tokens server-side against `GOOGLE_CLIENT_ID`.
+- Requires Google `email_verified` and exact normalized-email matching before a first claim.
+- Binds each token digest to its invitation UUID, consumes it atomically and binds the authorization to the Google `sub` identifier.
+- Allows returning access only for the same Google subject and email.
+- Defaults Viewer invitations to two active sessions and Trader invitations to one.
+- Revokes the oldest session when the configured session limit would be exceeded.
+- Regenerating a claim link terminates sessions, rotates the token and requires a new identity claim.
+- Marks legacy token-only invitations as `legacy_unverified` and revokes their sessions at startup.
+- Keeps Administrator password authentication unchanged.
+- Stores no raw invitation token or Google ID token in MongoDB.

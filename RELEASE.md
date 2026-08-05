@@ -53,3 +53,14 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - Keeps the API restart-safe and backward-compatible with active v1.13.11 runs.
 - Discards pre-v1.13.12 prepared plans before execution and rebuilds them during the mandatory pre-market window.
 - Does not liquidate or modify an existing Alpaca Paper position during deployment.
+
+
+## v1.13.13 — Identity-bound temporary access
+
+- Replaces bearer-only Viewer/Trader access with an authorized-email Google identity claim.
+- Adds server-side Google ID-token verification and immutable `sub` binding.
+- Adds invitation-UUID-bound token digests, atomic token consumption and invitation-specific returning login.
+- Adds per-invitation active-session limits, with Viewer default 2 and Trader default 1.
+- Adds idempotent migration of old invitations to `legacy_unverified` and revokes their sessions.
+- Adds identity mismatch, claim, login and session replacement audit events.
+- Preserves all strategy, backtest, analytics, Portfolio and Paper automation behavior.

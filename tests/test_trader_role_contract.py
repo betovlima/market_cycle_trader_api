@@ -18,14 +18,17 @@ def _settings() -> AuthSettings:
         mongo_url="",
         mongo_database="",
         frontend_base_url="http://localhost:5173",
+        google_client_id="google-client-id",
     )
 
 
 def test_invitation_role_defaults_to_viewer_and_accepts_trader() -> None:
-    viewer = InvitationCreateRequest(guest_name="Viewer", duration_seconds=3600)
-    trader = InvitationCreateRequest(guest_name="Trader", role="trader", duration_seconds=3600)
+    viewer = InvitationCreateRequest(guest_name="Viewer", authorized_email="viewer@example.com", duration_seconds=3600)
+    trader = InvitationCreateRequest(guest_name="Trader", authorized_email="trader@example.com", role="trader", duration_seconds=3600)
     assert viewer.role == "viewer"
     assert trader.role == "trader"
+    assert viewer.max_active_sessions == 2
+    assert trader.max_active_sessions == 1
 
 
 def test_trader_session_gets_portfolio_scope() -> None:
@@ -36,6 +39,8 @@ def test_trader_session_gets_portfolio_scope() -> None:
             "invitation_id": "invitation-1",
             "role": "trader",
             "display_name": "Portfolio Trader",
+            "identity_subject": "google-trader",
+            "identity_email": "trader@example.com",
             "expires_at": datetime.now(UTC) + timedelta(hours=1),
         }
     )
@@ -52,6 +57,8 @@ def test_viewer_session_does_not_get_portfolio_scope() -> None:
             "invitation_id": "invitation-2",
             "role": "viewer",
             "display_name": "Backtest Viewer",
+            "identity_subject": "google-viewer",
+            "identity_email": "viewer@example.com",
             "expires_at": datetime.now(UTC) + timedelta(hours=1),
         }
     )

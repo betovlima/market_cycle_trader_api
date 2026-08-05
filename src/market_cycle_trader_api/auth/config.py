@@ -40,6 +40,7 @@ class AuthSettings:
     mongo_url: str
     mongo_database: str
     frontend_base_url: str
+    google_client_id: str = ""
 
     def validate_runtime(self) -> None:
         missing: list[str] = []
@@ -53,6 +54,8 @@ class AuthSettings:
             missing.append("MONGO_DATABASE")
         if not self.frontend_base_url:
             missing.append("TRADER_FRONTEND_BASE_URL")
+        if not self.google_client_id:
+            missing.append("GOOGLE_CLIENT_ID")
         if missing:
             raise RuntimeError("Missing required authentication variables: " + ", ".join(missing))
 
@@ -78,4 +81,5 @@ def get_auth_settings() -> AuthSettings:
         mongo_url=str(os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "").strip(),
         mongo_database=str(os.getenv("MONGO_DATABASE") or "").strip(),
         frontend_base_url=str(os.getenv("TRADER_FRONTEND_BASE_URL") or "").strip().rstrip("/"),
+        google_client_id=str(os.getenv("GOOGLE_CLIENT_ID") or "").strip(),
     )
