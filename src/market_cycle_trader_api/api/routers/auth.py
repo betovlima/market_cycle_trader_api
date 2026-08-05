@@ -85,7 +85,7 @@ def verified_access(
         login_attempt_limiter.register_failure(client_key)
         raise
     login_attempt_limiter.clear(client_key)
-    identity = manager.create_guest_identity(session)
+    identity = manager.create_access_identity(session)
     manager.set_cookie(response, identity)
     return _session_response(identity)
 
@@ -110,8 +110,8 @@ def logout(request: Request, response: Response) -> SessionResponse:
     if token:
         try:
             identity = manager.decode_session_token(token)
-            if identity.role in {"viewer", "trader"} and identity.session_id:
-                get_access_service().revoke_guest_session(identity.session_id)
+            if identity.session_id:
+                get_access_service().revoke_access_session(identity.session_id)
         except HTTPException:
             pass
     manager.clear_cookie(response)

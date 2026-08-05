@@ -42,6 +42,7 @@ def _locator(access_url: str) -> tuple[str, str]:
 @pytest.fixture()
 def service(monkeypatch) -> tuple[AccessService, FakeGoogleVerifier]:
     monkeypatch.setenv("TRADER_ADMIN_PASSWORD", "admin-password")
+    monkeypatch.setenv("TRADER_ADMIN_GOOGLE_EMAIL", "admin@example.com")
     monkeypatch.setenv("TRADER_SESSION_SECRET", "s" * 64)
     monkeypatch.setenv("TRADER_SESSION_MAX_AGE_SECONDS", "3600")
     monkeypatch.setenv("TRADER_COOKIE_SECURE", "false")
@@ -233,3 +234,100 @@ def test_preview_masks_email_and_legacy_access_is_disabled(service) -> None:
     with pytest.raises(HTTPException) as error:
         access_service.preview_access(AccessPreviewRequest(invitation_id=legacy_id), _request())
     assert error.value.status_code == 410
+
+
+def test_claimed_identity_can_sign_in_without_reusing_invitation_link(service) -> None:
+    access_service, verifier = service
+    invitation = access_service.create_invitation(
+        InvitationCreateRequest(
+            guest_name="Direct Trader",
+            authorized_email="user-b@example.com",
+            role="trader",
+            duration_seconds=3600,
+        ),
+        _request(),
+    )
+    invitation_id, token = _locator(invitation.access_url)
+    claimed = access_service.create_google_session(
+        GoogleAccessRequest(
+            invitation_id=invitation_id,
+            token=token,
+            credential="h" * 120,
+        ),
+        _request(),
+    )
+
+    direct = access_service.create_google_session(
+        GoogleAccessRequest(credential="i" * 120),
+        _request(),
+    )
+
+    assert direct["role"] == "trader"
+    assert direct["identity_subject"] == verifier.identity.subject
+    assert access_service.store.get_session(claimed["_id"])["revoked"] is True
+
+
+def test_administrator_invitation_creates_google_admin_access(service) -> None:
+    access_service, verifier = service
+    invitation = access_service.create_invitation(
+        InvitationCreateRequest(
+            guest_name="Invited Administrator",
+            authorized_email="user-b@example.com",
+            role="admin",
+            duration_seconds=3600,
+        ),
+        _request(),
+    )
+    invitation_id, token = _locator(invitation.access_url)
+
+    session = access_service.create_google_session(
+        GoogleAccessRequest(
+            invitation_id=invitation_id,
+            token=token,
+            credential="j" * 120,
+        ),
+        _request(),
+    )
+
+    assert session["role"] == "admin"
+    assert session["identity_subject"] == verifier.identity.subject
+    assert access_service.validate_access_session(session["_id"])["role"] == "admin"
+
+
+def test_configured_google_email_bootstraps_primary_administrator(service) -> None:
+    access_service, verifier = service
+    verifier.identity = VerifiedGoogleIdentity(
+        subject="primary-admin-subject",
+        email="admin@example.com",
+        display_name="Primary Administrator",
+    )
+
+    session = access_service.create_google_session(
+        GoogleAccessRequest(credential="k" * 120),
+        _request(),
+    )
+    document = access_service.store.get_invitation(session["invitation_id"])
+
+    assert session["role"] == "admin"
+    assert document["primary_administrator"] is True
+    assert document["claimed_email"] == "admin@example.com"
+    with pytest.raises(HTTPException) as error:
+        access_service.revoke_invitation(document["_id"], _request())
+    assert error.value.status_code == 409
+
+
+def test_unregistered_google_account_cannot_use_direct_login(service) -> None:
+    access_service, verifier = service
+    verifier.identity = VerifiedGoogleIdentity(
+        subject="unknown-subject",
+        email="unknown@example.com",
+        display_name="Unknown User",
+    )
+
+    with pytest.raises(HTTPException) as error:
+        access_service.create_google_session(
+            GoogleAccessRequest(credential="l" * 120),
+            _request(),
+        )
+
+    assert error.value.status_code == 403

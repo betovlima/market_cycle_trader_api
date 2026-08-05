@@ -29,9 +29,14 @@ def _positive_integer(name: str, default: int, minimum: int = 1) -> int:
     return value
 
 
+def _normalized_email(value: str) -> str:
+    return str(value or "").strip().casefold()
+
+
 @dataclass(frozen=True)
 class AuthSettings:
     admin_password: str
+    admin_google_email: str
     session_secret: str
     session_max_age_seconds: int
     cookie_secure: bool
@@ -46,6 +51,8 @@ class AuthSettings:
         missing: list[str] = []
         if not self.admin_password:
             missing.append("TRADER_ADMIN_PASSWORD")
+        if not self.admin_google_email:
+            missing.append("TRADER_ADMIN_GOOGLE_EMAIL")
         if not self.session_secret:
             missing.append("TRADER_SESSION_SECRET")
         if self.auth_storage == "mongodb" and not self.mongo_url:
@@ -73,6 +80,7 @@ def get_auth_settings() -> AuthSettings:
         raise RuntimeError("TRADER_AUTH_STORAGE must be mongodb or memory.")
     return AuthSettings(
         admin_password=str(os.getenv("TRADER_ADMIN_PASSWORD") or ""),
+        admin_google_email=_normalized_email(os.getenv("TRADER_ADMIN_GOOGLE_EMAIL") or ""),
         session_secret=str(os.getenv("TRADER_SESSION_SECRET") or ""),
         session_max_age_seconds=_positive_integer("TRADER_SESSION_MAX_AGE_SECONDS", 28_800, 300),
         cookie_secure=secure,
