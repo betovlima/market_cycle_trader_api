@@ -558,9 +558,15 @@ class AccessService:
         role = str(document.get("role") or "viewer")
         if role not in {"viewer", "trader", "admin"}:
             raise HTTPException(status_code=401, detail="Invalid access role.")
+        absolute_lifetime = self.settings.session_max_age_for_role(role)
+        idle_lifetime = self.settings.session_idle_for_role(role)
         session_expires_at = min(
             invitation_expires_at,
-            now + timedelta(seconds=self.settings.session_max_age_seconds),
+            now + timedelta(seconds=absolute_lifetime),
+        )
+        idle_expires_at = min(
+            session_expires_at,
+            now + timedelta(seconds=idle_lifetime),
         )
         session = {
             "_id": str(uuid.uuid4()),
@@ -570,7 +576,9 @@ class AccessService:
             "identity_subject": identity.subject,
             "identity_email": identity.email,
             "created_at": now,
+            "last_activity_at": now,
             "expires_at": session_expires_at,
+            "idle_expires_at": idle_expires_at,
             "revoked": False,
         }
         max_sessions = int(
@@ -687,12 +695,23 @@ class AccessService:
         session = self.store.get_session(session_id)
         now = utc_now()
         session_expires_at = as_utc(session.get("expires_at")) if session else None
+        idle_expires_at = as_utc(session.get("idle_expires_at")) if session else None
+        if session and idle_expires_at is None and session_expires_at is not None:
+            last_activity = as_utc(session.get("last_activity_at")) or as_utc(session.get("created_at")) or now
+            idle_expires_at = min(
+                session_expires_at,
+                last_activity + timedelta(seconds=get_settings().session_idle_for_role(str(session.get("role") or "viewer"))),
+            )
         if (
             not session
             or session.get("revoked")
             or session_expires_at is None
             or session_expires_at <= now
+            or idle_expires_at is None
+            or idle_expires_at <= now
         ):
+            if session and not session.get("revoked") and hasattr(self.store, "revoke_session"):
+                self.store.revoke_session(session_id)
             raise HTTPException(status_code=401, detail="Identity-bound session expired or revoked.")
         invitation = self.store.get_invitation(session["invitation_id"])
         if not invitation or _authorization_status(invitation, now) != "claimed":
@@ -706,7 +725,16 @@ class AccessService:
             != str(invitation.get("role") or "viewer")
         ):
             raise HTTPException(status_code=401, detail="Google identity access is no longer valid.")
+        next_idle_expiration = min(
+            session_expires_at,
+            now + timedelta(seconds=get_settings().session_idle_for_role(str(session.get("role") or "viewer"))),
+        )
+        touched = self.store.touch_session(session_id, now, next_idle_expiration) if hasattr(self.store, "touch_session") else None
+        if touched:
+            session = touched
         session["expires_at"] = session_expires_at
+        session["idle_expires_at"] = next_idle_expiration
+        session["last_activity_at"] = now
         session["created_at"] = as_utc(session.get("created_at")) or now
         return session
 

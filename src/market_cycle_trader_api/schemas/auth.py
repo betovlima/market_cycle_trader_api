@@ -40,5 +40,6 @@ class SessionResponse(BaseModel):
     role: str | None = None
     expires_in_seconds: int
     expires_at: datetime | None = None
+    idle_expires_at: datetime | None = None
     display_name: str | None = None
     email: str | None = None

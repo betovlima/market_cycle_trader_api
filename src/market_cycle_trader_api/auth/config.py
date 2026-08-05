@@ -39,6 +39,12 @@ class AuthSettings:
     admin_google_email: str
     session_secret: str
     session_max_age_seconds: int
+    viewer_session_max_age_seconds: int
+    viewer_session_idle_seconds: int
+    trader_session_max_age_seconds: int
+    trader_session_idle_seconds: int
+    admin_session_max_age_seconds: int
+    admin_session_idle_seconds: int
     cookie_secure: bool
     cookie_samesite: str
     auth_storage: str
@@ -46,6 +52,20 @@ class AuthSettings:
     mongo_database: str
     frontend_base_url: str
     google_client_id: str = ""
+
+    def session_max_age_for_role(self, role: str) -> int:
+        return {
+            "viewer": self.viewer_session_max_age_seconds,
+            "trader": self.trader_session_max_age_seconds,
+            "admin": self.admin_session_max_age_seconds,
+        }.get(role, self.session_max_age_seconds)
+
+    def session_idle_for_role(self, role: str) -> int:
+        return {
+            "viewer": self.viewer_session_idle_seconds,
+            "trader": self.trader_session_idle_seconds,
+            "admin": self.admin_session_idle_seconds,
+        }.get(role, self.session_max_age_seconds)
 
     def validate_runtime(self) -> None:
         missing: list[str] = []
@@ -83,6 +103,12 @@ def get_auth_settings() -> AuthSettings:
         admin_google_email=_normalized_email(os.getenv("TRADER_ADMIN_GOOGLE_EMAIL") or ""),
         session_secret=str(os.getenv("TRADER_SESSION_SECRET") or ""),
         session_max_age_seconds=_positive_integer("TRADER_SESSION_MAX_AGE_SECONDS", 28_800, 300),
+        viewer_session_max_age_seconds=_positive_integer("TRADER_VIEWER_SESSION_MAX_AGE_SECONDS", 43_200, 300),
+        viewer_session_idle_seconds=_positive_integer("TRADER_VIEWER_SESSION_IDLE_SECONDS", 7_200, 300),
+        trader_session_max_age_seconds=_positive_integer("TRADER_TRADER_SESSION_MAX_AGE_SECONDS", 28_800, 300),
+        trader_session_idle_seconds=_positive_integer("TRADER_TRADER_SESSION_IDLE_SECONDS", 3_600, 300),
+        admin_session_max_age_seconds=_positive_integer("TRADER_ADMIN_SESSION_MAX_AGE_SECONDS", 7_200, 300),
+        admin_session_idle_seconds=_positive_integer("TRADER_ADMIN_SESSION_IDLE_SECONDS", 1_800, 300),
         cookie_secure=secure,
         cookie_samesite=same_site,
         auth_storage=storage,
