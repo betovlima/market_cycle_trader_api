@@ -17,8 +17,12 @@ class AccessPreviewRequest(BaseModel):
     token: str | None = Field(default=None, min_length=12, max_length=256)
 
 
-class GoogleAccessRequest(AccessPreviewRequest):
+class GoogleAccessRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     credential: str = Field(min_length=100, max_length=16_384)
+    invitation_id: str | None = Field(default=None, min_length=8, max_length=128)
+    token: str | None = Field(default=None, min_length=12, max_length=256)
 
 
 class AccessPreviewResponse(BaseModel):

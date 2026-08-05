@@ -64,3 +64,10 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - Adds idempotent migration of old invitations to `legacy_unverified` and revokes their sessions.
 - Adds identity mismatch, claim, login and session replacement audit events.
 - Preserves all strategy, backtest, analytics, Portfolio and Paper automation behavior.
+
+## v1.13.14 — Unified Google authentication
+
+- Adds Google identity-bound Administrator access alongside Viewer and Trader.
+- Adds direct login for previously claimed identities.
+- Creates and protects the primary Google Administrator configured by `TRADER_ADMIN_GOOGLE_EMAIL`.
+- Keeps the password login endpoint as a recovery mechanism while removing it from the frontend.

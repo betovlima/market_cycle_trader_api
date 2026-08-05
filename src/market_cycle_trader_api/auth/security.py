@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 
-from fastapi import HTTPException, Request, Response, status
+from fastapi import HTTPException, Request, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from market_cycle_trader_api.auth.config import AuthSettings as Settings, get_auth_settings as get_settings
@@ -48,31 +48,41 @@ class SessionManager:
         return bool(expected) and hmac.compare_digest(expected, submitted)
 
     def create_admin_identity(self) -> SessionIdentity:
+        """Create the legacy password administrator used only as a recovery path."""
         return SessionIdentity(
             subject="trader-admin",
             role="admin",
-            scope="trader:read admin:manage",
+            scope="trader:read portfolio:read admin:manage",
             expires_at=datetime.now(UTC) + timedelta(seconds=self.settings.session_max_age_seconds),
             display_name="Administrator",
             email=None,
         )
 
-    def create_guest_identity(self, session: dict) -> SessionIdentity:
+    def create_access_identity(self, session: dict) -> SessionIdentity:
         role = str(session.get("role") or "viewer")
-        scope = "trader:read portfolio:read" if role == "trader" else "trader:read"
+        scope_by_role = {
+            "viewer": "trader:read",
+            "trader": "trader:read portfolio:read",
+            "admin": "trader:read portfolio:read admin:manage",
+        }
+        if role not in scope_by_role:
+            raise HTTPException(status_code=401, detail="Invalid access role.")
         identity_subject = str(session.get("identity_subject") or "")
         return SessionIdentity(
             subject=f"google:{identity_subject}",
             role=role,
-            scope=scope,
+            scope=scope_by_role[role],
             expires_at=session["expires_at"],
             session_id=session["_id"],
             display_name=session.get("display_name"),
             email=session.get("identity_email"),
         )
 
+    def create_guest_identity(self, session: dict) -> SessionIdentity:
+        return self.create_access_identity(session)
+
     def create_viewer_identity(self, session: dict) -> SessionIdentity:
-        return self.create_guest_identity(session)
+        return self.create_access_identity(session)
 
     def create_session_token(self, identity: SessionIdentity) -> str:
         return self.serializer.dumps(
@@ -115,15 +125,16 @@ class SessionManager:
             display_name=payload.get("display_name"),
             email=payload.get("email"),
         )
-        if role in {"viewer", "trader"}:
-            if not identity.session_id:
-                raise HTTPException(status_code=401, detail="Invalid guest session.")
+
+        if identity.session_id:
             from market_cycle_trader_api.auth.access_service import get_access_service
-            current = get_access_service().validate_viewer_session(identity.session_id)
+
+            current = get_access_service().validate_access_session(identity.session_id)
             if str(current.get("role") or "viewer") != role:
-                raise HTTPException(status_code=401, detail="Invalid guest session.")
-            return self.create_guest_identity(current)
-        if identity.subject != "trader-admin" or "admin:manage" not in scope.split():
+                raise HTTPException(status_code=401, detail="Invalid identity-bound session.")
+            return self.create_access_identity(current)
+
+        if identity.subject != "trader-admin" or role != "admin" or "admin:manage" not in scope.split():
             raise HTTPException(status_code=401, detail="Invalid administrator session.")
         return identity
 

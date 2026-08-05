@@ -11,14 +11,14 @@ class InvitationCreateRequest(BaseModel):
 
     guest_name: str = Field(min_length=1, max_length=120)
     authorized_email: EmailStr
-    role: Literal["viewer", "trader"] = "viewer"
+    role: Literal["viewer", "trader", "admin"] = "viewer"
     duration_seconds: int = Field(ge=300, le=31_536_000)
     max_active_sessions: int | None = Field(default=None, ge=1, le=5)
 
     @model_validator(mode="after")
     def default_session_limit(self):
         if self.max_active_sessions is None:
-            self.max_active_sessions = 1 if self.role == "trader" else 2
+            self.max_active_sessions = 1 if self.role in {"trader", "admin"} else 2
         return self
 
 
@@ -59,6 +59,7 @@ class InvitationResponse(BaseModel):
     max_active_sessions: int
     active_sessions: int = 0
     revoked_at: datetime | None = None
+    primary_administrator: bool = False
 
 
 class InvitationLinkResponse(InvitationResponse):

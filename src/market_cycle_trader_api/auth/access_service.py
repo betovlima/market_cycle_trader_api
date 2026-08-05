@@ -162,10 +162,11 @@ class AccessService:
             claimed_email=document.get("claimed_email") or None,
             max_active_sessions=int(
                 document.get("max_active_sessions")
-                or (1 if document.get("role") == "trader" else 2)
+                or (1 if document.get("role") in {"trader", "admin"} else 2)
             ),
             active_sessions=active_sessions,
             revoked_at=as_utc(document.get("revoked_at")),
+            primary_administrator=bool(document.get("primary_administrator")),
         )
 
     def _invitation_link_response(
@@ -233,6 +234,13 @@ class AccessService:
         state = _authorization_status(document)
         if state in {"revoked", "legacy_unverified"}:
             raise HTTPException(status_code=409, detail="This access record cannot be updated.")
+        if document.get("primary_administrator") and (
+            payload.duration_seconds is not None or payload.expires_at is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The primary Google administrator expiration cannot be changed.",
+            )
 
         now = utc_now()
         updates: dict = {"updated_at": now}
@@ -278,6 +286,11 @@ class AccessService:
         document = self.store.get_invitation(invitation_id)
         if not document:
             raise HTTPException(status_code=404, detail="Access record not found.")
+        if document.get("primary_administrator"):
+            raise HTTPException(
+                status_code=409,
+                detail="The primary Google administrator does not use a claim link.",
+            )
         state = _authorization_status(document)
         if state == "revoked":
             raise HTTPException(status_code=409, detail="Revoked access cannot generate a new link.")
@@ -319,6 +332,11 @@ class AccessService:
         document = self.store.get_invitation(invitation_id)
         if not document:
             raise HTTPException(status_code=404, detail="Access record not found.")
+        if document.get("primary_administrator"):
+            raise HTTPException(
+                status_code=409,
+                detail="The primary Google administrator cannot be revoked.",
+            )
         now = utc_now()
         updated = self.store.update_invitation(
             invitation_id,
@@ -354,6 +372,11 @@ class AccessService:
         document = self.store.get_invitation(invitation_id)
         if not document:
             raise HTTPException(status_code=404, detail="Access record not found.")
+        if document.get("primary_administrator"):
+            raise HTTPException(
+                status_code=409,
+                detail="The primary Google administrator cannot be deleted.",
+            )
         state = self._invitation_response(document).status
         if state in {"pending_verification", "claimed", "active"}:
             raise HTTPException(
@@ -434,21 +457,176 @@ class AccessService:
                 detail="This Google account is not authorized for this invitation.",
             )
 
+    def _primary_administrator_document(
+        self,
+        identity: VerifiedGoogleIdentity,
+        now: datetime,
+    ) -> dict:
+        identifier = hashlib.sha256(identity.email.encode("utf-8")).hexdigest()[:32]
+        invitation_id = f"google-admin-{identifier}"
+        existing = self.store.get_invitation(invitation_id)
+        document = {
+            "_id": invitation_id,
+            "guest_name": identity.display_name or "Administrator",
+            "authorized_email": identity.email,
+            "role": "admin",
+            "max_active_sessions": 1,
+            "token_hash": f"primary-admin:{identifier}",
+            "token_version": 0,
+            "status": "claimed",
+            "created_at": now,
+            "updated_at": now,
+            "expires_at": now + timedelta(days=36_500),
+            "last_access_at": None,
+            "claimed_at": now,
+            "claimed_subject": identity.subject,
+            "claimed_email": identity.email,
+            "google_display_name": identity.display_name,
+            "google_hosted_domain": identity.hosted_domain,
+            "token_consumed_at": now,
+            "revoked_at": None,
+            "primary_administrator": True,
+        }
+        stored = self.store.upsert_primary_administrator(document)
+        if existing is None:
+            return stored
+        if (
+            str(stored.get("claimed_subject") or "") != identity.subject
+            or normalize_email(stored.get("claimed_email") or "") != identity.email
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="The primary administrator email is already linked to another Google identity.",
+            )
+        return stored
+
+    def _direct_access_document(
+        self,
+        identity: VerifiedGoogleIdentity,
+        request: Request,
+        now: datetime,
+    ) -> dict:
+        matches = self.store.find_claimed_invitations(
+            identity.subject,
+            identity.email,
+            now,
+        )
+        if not matches and identity.email == self.settings.admin_google_email:
+            primary = self._primary_administrator_document(identity, now)
+            matches = [primary]
+            self._record_log(
+                event="primary_google_administrator_verified",
+                request=request,
+                invitation_id=primary["_id"],
+                guest_name=primary.get("guest_name"),
+                identity_email=identity.email,
+                role="admin",
+            )
+
+        active = [item for item in matches if _authorization_status(item, now) == "claimed"]
+        if not active:
+            self._record_log(
+                event="google_direct_login_denied",
+                request=request,
+                identity_email=identity.email,
+                success=False,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="This Google account does not have active access to Market Cycle Trader.",
+            )
+
+        role_priority = {"viewer": 1, "trader": 2, "admin": 3}
+        return max(
+            active,
+            key=lambda item: (
+                role_priority.get(str(item.get("role") or "viewer"), 0),
+                as_utc(item.get("created_at")) or now,
+            ),
+        )
+
+    def _create_identity_bound_session(
+        self,
+        document: dict,
+        identity: VerifiedGoogleIdentity,
+        request: Request,
+        now: datetime,
+    ) -> dict:
+        invitation_expires_at = as_utc(document.get("expires_at"))
+        if invitation_expires_at is None or invitation_expires_at <= now:
+            raise HTTPException(status_code=401, detail="Access expired or revoked.")
+        role = str(document.get("role") or "viewer")
+        if role not in {"viewer", "trader", "admin"}:
+            raise HTTPException(status_code=401, detail="Invalid access role.")
+        session_expires_at = min(
+            invitation_expires_at,
+            now + timedelta(seconds=self.settings.session_max_age_seconds),
+        )
+        session = {
+            "_id": str(uuid.uuid4()),
+            "invitation_id": document["_id"],
+            "role": role,
+            "display_name": document.get("guest_name") or identity.display_name or "User",
+            "identity_subject": identity.subject,
+            "identity_email": identity.email,
+            "created_at": now,
+            "expires_at": session_expires_at,
+            "revoked": False,
+        }
+        max_sessions = int(
+            document.get("max_active_sessions")
+            or (1 if role in {"trader", "admin"} else 2)
+        )
+        terminated = self.store.create_limited_session(session, max_sessions, now)
+        self.store.update_invitation(
+            document["_id"],
+            {"last_access_at": now, "updated_at": now},
+        )
+        if terminated:
+            self._record_log(
+                event="older_session_replaced",
+                request=request,
+                invitation_id=document["_id"],
+                guest_name=document.get("guest_name"),
+                identity_email=identity.email,
+                role=role,
+            )
+        self._record_log(
+            event="google_access_granted",
+            request=request,
+            invitation_id=document["_id"],
+            guest_name=document.get("guest_name"),
+            identity_email=identity.email,
+            role=role,
+        )
+        return session
+
     def create_google_session(self, payload: GoogleAccessRequest, request: Request) -> dict:
-        document = self._locate_invitation(payload)
+        identity = self.identity_verifier.verify(payload.credential)
+        now = utc_now()
+
+        if not payload.invitation_id:
+            if payload.token:
+                raise HTTPException(status_code=401, detail="Invalid invitation locator.")
+            document = self._direct_access_document(identity, request, now)
+            return self._create_identity_bound_session(document, identity, request, now)
+
+        document = self.store.get_invitation(payload.invitation_id)
+        if not document:
+            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
         state = _authorization_status(document)
         if state == "legacy_unverified":
             raise HTTPException(status_code=410, detail="A new identity-verified invitation is required.")
         if state in {"revoked", "expired", "blocked"}:
             raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
 
-        identity = self.identity_verifier.verify(payload.credential)
         self._verify_invited_identity(document, identity, request)
-        now = utc_now()
-
         if state == "pending_verification":
             if not payload.token:
-                raise HTTPException(status_code=401, detail="The complete invitation link is required.")
+                raise HTTPException(
+                    status_code=401,
+                    detail="Open the complete invitation link generated in Administration.",
+                )
             expected_digest = token_digest(payload.token, document["_id"])
             if not hmac.compare_digest(
                 str(document.get("token_hash") or ""),
@@ -467,8 +645,6 @@ class AccessService:
                     "google_display_name": identity.display_name,
                     "google_hosted_domain": identity.hosted_domain,
                     "token_consumed_at": now,
-                    # Replace the usable token digest atomically without violating
-                    # the existing unique token_hash index.
                     "token_hash": token_digest(_new_access_token(), document["_id"]),
                     "updated_at": now,
                 },
@@ -505,53 +681,9 @@ class AccessService:
                     detail="This invitation is already linked to another Google account.",
                 )
 
-        invitation_expires_at = as_utc(document.get("expires_at"))
-        if invitation_expires_at is None or invitation_expires_at <= now:
-            raise HTTPException(status_code=401, detail="Invalid or expired access invitation.")
-        session_expires_at = min(
-            invitation_expires_at,
-            now + timedelta(seconds=self.settings.session_max_age_seconds),
-        )
-        session = {
-            "_id": str(uuid.uuid4()),
-            "invitation_id": document["_id"],
-            "role": str(document.get("role") or "viewer"),
-            "display_name": document.get("guest_name") or identity.display_name or "Guest",
-            "identity_subject": identity.subject,
-            "identity_email": identity.email,
-            "created_at": now,
-            "expires_at": session_expires_at,
-            "revoked": False,
-        }
-        max_sessions = int(
-            document.get("max_active_sessions")
-            or (1 if document.get("role") == "trader" else 2)
-        )
-        terminated = self.store.create_limited_session(session, max_sessions, now)
-        self.store.update_invitation(
-            document["_id"],
-            {"last_access_at": now, "updated_at": now},
-        )
-        if terminated:
-            self._record_log(
-                event="older_session_replaced",
-                request=request,
-                invitation_id=document["_id"],
-                guest_name=document.get("guest_name"),
-                identity_email=identity.email,
-                role=str(document.get("role") or "viewer"),
-            )
-        self._record_log(
-            event="google_access_granted",
-            request=request,
-            invitation_id=document["_id"],
-            guest_name=document.get("guest_name"),
-            identity_email=identity.email,
-            role=str(document.get("role") or "viewer"),
-        )
-        return session
+        return self._create_identity_bound_session(document, identity, request, now)
 
-    def validate_guest_session(self, session_id: str) -> dict:
+    def validate_access_session(self, session_id: str) -> dict:
         session = self.store.get_session(session_id)
         now = utc_now()
         session_expires_at = as_utc(session.get("expires_at")) if session else None
@@ -561,29 +693,37 @@ class AccessService:
             or session_expires_at is None
             or session_expires_at <= now
         ):
-            raise HTTPException(status_code=401, detail="Guest session expired or revoked.")
+            raise HTTPException(status_code=401, detail="Identity-bound session expired or revoked.")
         invitation = self.store.get_invitation(session["invitation_id"])
         if not invitation or _authorization_status(invitation, now) != "claimed":
-            raise HTTPException(status_code=401, detail="Guest access expired or revoked.")
+            raise HTTPException(status_code=401, detail="Identity-bound access expired or revoked.")
         if (
             str(session.get("identity_subject") or "")
             != str(invitation.get("claimed_subject") or "")
             or normalize_email(session.get("identity_email") or "")
             != normalize_email(invitation.get("claimed_email") or "")
+            or str(session.get("role") or "viewer")
+            != str(invitation.get("role") or "viewer")
         ):
-            raise HTTPException(status_code=401, detail="Guest identity is no longer valid.")
+            raise HTTPException(status_code=401, detail="Google identity access is no longer valid.")
         session["expires_at"] = session_expires_at
         session["created_at"] = as_utc(session.get("created_at")) or now
         return session
 
-    def validate_viewer_session(self, session_id: str) -> dict:
-        return self.validate_guest_session(session_id)
+    def validate_guest_session(self, session_id: str) -> dict:
+        return self.validate_access_session(session_id)
 
-    def revoke_guest_session(self, session_id: str) -> None:
+    def validate_viewer_session(self, session_id: str) -> dict:
+        return self.validate_access_session(session_id)
+
+    def revoke_access_session(self, session_id: str) -> None:
         self.store.revoke_session(session_id)
 
+    def revoke_guest_session(self, session_id: str) -> None:
+        self.revoke_access_session(session_id)
+
     def revoke_viewer_session(self, session_id: str) -> None:
-        self.revoke_guest_session(session_id)
+        self.revoke_access_session(session_id)
 
     def list_logs(self, limit: int) -> list[AccessLogResponse]:
         return [

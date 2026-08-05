@@ -39,7 +39,7 @@ class InMemoryAccessStore:
                     item["status"] = "legacy_unverified"
                     item.setdefault("legacy_marked_at", now)
                     item["token_hash"] = f"legacy-disabled:{uuid.uuid4()}"
-                    item.setdefault("max_active_sessions", 1 if item.get("role") == "trader" else 2)
+                    item.setdefault("max_active_sessions", 1 if item.get("role") in {"trader", "admin"} else 2)
                     legacy_ids.add(invitation_id)
             for session in self.sessions.values():
                 if session.get("invitation_id") in legacy_ids:
@@ -61,6 +61,42 @@ class InMemoryAccessStore:
                 if item.get("token_hash") == token_hash:
                     return deepcopy(item)
         return None
+
+    def find_claimed_invitations(
+        self,
+        identity_subject: str,
+        identity_email: str,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        normalized_email = str(identity_email or "").strip().casefold()
+        with self.lock:
+            matches = []
+            for item in self.invitations.values():
+                expires_at = _aware_utc(item.get("expires_at"))
+                if (
+                    item.get("status") == "claimed"
+                    and str(item.get("claimed_subject") or "") == identity_subject
+                    and str(item.get("claimed_email") or "").strip().casefold() == normalized_email
+                    and expires_at is not None
+                    and expires_at > now
+                ):
+                    matches.append(deepcopy(item))
+            return sorted(
+                matches,
+                key=lambda item: item.get("created_at") or now,
+                reverse=True,
+            )
+
+    def upsert_primary_administrator(
+        self,
+        document: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.lock:
+            existing = self.invitations.get(document["_id"])
+            if existing is None:
+                self.invitations[document["_id"]] = deepcopy(document)
+                existing = self.invitations[document["_id"]]
+            return deepcopy(existing)
 
     def list_invitations(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -219,7 +255,7 @@ class MongoAccessStore:
                             "legacy_marked_at": now,
                             "updated_at": now,
                             "token_hash": f"legacy-disabled:{uuid.uuid4()}",
-                            "max_active_sessions": 1 if item.get("role") == "trader" else 2,
+                            "max_active_sessions": 1 if item.get("role") in {"trader", "admin"} else 2,
                         }
                     },
                 )
@@ -247,6 +283,28 @@ class MongoAccessStore:
 
     def get_invitation_by_token_hash(self, token_hash):
         return self.invitations.find_one({"token_hash": token_hash})
+
+    def find_claimed_invitations(self, identity_subject, identity_email, now):
+        return list(
+            self.invitations.find(
+                {
+                    "status": "claimed",
+                    "claimed_subject": identity_subject,
+                    "claimed_email": str(identity_email or "").strip().casefold(),
+                    "expires_at": {"$gt": now},
+                }
+            ).sort("created_at", -1)
+        )
+
+    def upsert_primary_administrator(self, document):
+        from pymongo import ReturnDocument
+
+        return self.invitations.find_one_and_update(
+            {"_id": document["_id"]},
+            {"$setOnInsert": document},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
 
     def list_invitations(self):
         return list(self.invitations.find({}).sort("created_at", -1))

@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.13
+# Market Cycle Trader API v1.13.14
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -72,6 +72,7 @@ TRADER_SESSION_MAX_AGE_SECONDS
 TRADER_COOKIE_SECURE
 TRADER_COOKIE_SAMESITE
 GOOGLE_CLIENT_ID
+TRADER_ADMIN_GOOGLE_EMAIL
 ```
 
 ## v1.13.12
@@ -119,3 +120,13 @@ GOOGLE_CLIENT_ID
 - Marks legacy token-only invitations as `legacy_unverified` and revokes their sessions at startup.
 - Keeps Administrator password authentication unchanged.
 - Stores no raw invitation token or Google ID token in MongoDB.
+
+
+## v1.13.14 — unified Google identity access
+
+- Supports Viewer, Trader and Administrator as Google identity-bound roles.
+- Adds direct Google sign-in for accounts that have already claimed active access.
+- Bootstraps the primary Google Administrator from `TRADER_ADMIN_GOOGLE_EMAIL` on the first verified login.
+- Keeps the password administrator endpoint as a server-side recovery path, but the frontend no longer exposes a password tab.
+- Protects the primary Google Administrator from revocation, deletion and claim-link regeneration.
+- Keeps one active session by default for Trader and Administrator and two for Viewer.
