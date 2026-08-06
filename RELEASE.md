@@ -1,3 +1,24 @@
+## v1.13.22 — Single Candidate and Winner Lifecycle
+
+- Enforces one active Candidate and one active Trader Winner.
+- Replacing a Candidate changes the former Candidate to a locked `superseded_candidate` snapshot.
+- Promoting the active Candidate changes its research profile to locked `promoted_candidate` and creates the immutable Winner snapshot.
+- The former Trader Winner remains a locked `former_winner`.
+- Adds `candidate_strategy_id` to the strategy-control document and migrates v1.13.21 catalogs without rewriting the protected winner configuration.
+- Candidate edits return the profile to Draft and clear the active Candidate pointer.
+- Only Draft strategies can be deleted; lifecycle history remains auditable.
+
+## v1.13.21 — Explicit Candidate Strategy Lifecycle
+
+- Adds `candidate` as an audited status between editable drafts and immutable Trader winners.
+- Adds `POST /api/admin/strategies/{strategy_id}/mark-as-candidate`.
+- Candidate status requires a completed backtest for the exact current strategy revision.
+- Candidate certification stores the exact backtest id, revision, reason, actor and timestamp.
+- Editing a candidate creates a new draft revision and clears candidate certification.
+- Promotion now requires an explicitly marked candidate revision in addition to the existing safe Trader/Paper state checks.
+- Research assets remain editable only in Administrator strategy profiles; the protected Trader winner is unchanged.
+- Preserves API v1.13.16 numerical execution compatibility and all v1.13.20 winner-isolation boundaries.
+
 ## v1.13.20 — Winner-Compatible Strategy Research Workspace
 
 - Preserves the existing API v1.13.16 production winner as an immutable Trader snapshot.

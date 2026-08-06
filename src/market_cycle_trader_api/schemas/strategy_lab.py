@@ -47,6 +47,19 @@ class StrategySelectRequest(BaseModel):
         return " ".join(str(value).split())
 
 
+class StrategyCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_mark_as_candidate: Literal[True]
+    expected_strategy_revision: int = Field(ge=1)
+    note: str = Field(min_length=3, max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str) -> str:
+        return " ".join(str(value).split())
+
+
 class StrategyPromoteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

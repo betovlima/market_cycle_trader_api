@@ -20,6 +20,7 @@ from market_cycle_trader_api.services.strategy_lab import (
     get_research_strategy_context,
     list_strategies,
     get_trader_winner_context,
+    mark_strategy_as_candidate,
     mark_strategy_backtest,
     promote_strategy_to_trader,
     select_research_strategy,
@@ -232,6 +233,16 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
         job_id="job-1",
         status="completed",
     )
+    candidate = mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        note="Candidate after exact completed backtest.",
+        actor_email="admin@example.com",
+    )
+    assert candidate["status"] == "candidate"
+    assert candidate["candidate_backtest_id"] == "job-1"
+
     db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] = {
         "_id": "default",
         "control_mode": "stopped",
@@ -244,7 +255,7 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     result = promote_strategy_to_trader(
         db,
         draft["id"],
-        expected_control_revision=2,
+        expected_control_revision=3,
         expected_strategy_revision=1,
         note="Promote after validation.",
         actor_email="admin@example.com",
@@ -256,6 +267,9 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     assert result["control"]["research_strategy_id"] == draft["id"]
     assert result["control"]["trader_winner_strategy_id"] == result["winner"]["id"]
     assert db[STRATEGY_PROFILES_COLLECTION].documents["winner-v1-13-2"]["status"] == "former_winner"
+    assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["status"] == "promoted_candidate"
+    assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["locked"] is True
+    assert result["control"]["candidate_strategy_id"] is None
 
 
 def test_catalog_migration_preserves_production_winner_identity_and_document() -> None:
@@ -337,6 +351,220 @@ def test_draft_can_be_edited_during_active_backtest_without_certifying_new_revis
     assert current.get("last_backtest_status") is None
 
 
+def test_candidate_requires_exact_completed_revision_and_editing_returns_to_draft() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Candidate lifecycle",
+        description="Lifecycle test.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+
+    try:
+        mark_strategy_as_candidate(
+            db,
+            draft["id"],
+            expected_strategy_revision=1,
+            note="Premature candidate.",
+            actor_email="admin@example.com",
+        )
+    except Exception as exc:
+        assert "complete a backtest" in str(exc).lower()
+    else:
+        raise AssertionError("Candidate status must require an exact completed backtest.")
+
+    db[JOBS_COLLECTION].documents["job-candidate"] = {
+        "_id": "job-candidate",
+        "id": "job-candidate",
+        "status": "completed",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=draft["id"],
+        strategy_revision=1,
+        job_id="job-candidate",
+        status="completed",
+    )
+    candidate = mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        note="Validated candidate.",
+        actor_email="admin@example.com",
+    )
+    assert candidate["status"] == "candidate"
+    assert candidate["candidate_revision"] == 1
+    assert candidate["candidate_backtest_id"] == "job-candidate"
+    assert db[STRATEGY_CONTROL_COLLECTION].documents["default"]["candidate_strategy_id"] == draft["id"]
+
+    changed = dict(candidate["configuration"])
+    changed["rotation_switch_margin"] = 0.0075
+    updated = update_strategy(
+        db,
+        draft["id"],
+        configuration=type(get_research_strategy_context(db)[0]).model_validate(changed),
+        name=candidate["name"],
+        description=candidate["description"],
+        note="Continue candidate research.",
+        expected_revision=1,
+        actor_email="admin@example.com",
+    )
+    assert updated["revision"] == 2
+    assert updated["status"] == "draft"
+    assert updated["candidate_revision"] is None
+    assert updated["candidate_backtest_id"] is None
+    assert db[STRATEGY_CONTROL_COLLECTION].documents["default"]["candidate_strategy_id"] is None
+
+
+def test_v11321_catalog_migration_keeps_only_latest_active_candidate() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    first = create_strategy(
+        db,
+        name="Legacy candidate one",
+        description="v1.13.21 migration.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    second = create_strategy(
+        db,
+        name="Legacy candidate two",
+        description="v1.13.21 migration.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[STRATEGY_PROFILES_COLLECTION].documents[first["id"]].update({
+        "status": "candidate",
+        "candidate_at": "2026-08-06T10:00:00+00:00",
+    })
+    db[STRATEGY_PROFILES_COLLECTION].documents[second["id"]].update({
+        "status": "candidate",
+        "candidate_at": "2026-08-06T11:00:00+00:00",
+    })
+    db[STRATEGY_CONTROL_COLLECTION].documents["default"].pop("candidate_strategy_id", None)
+
+    catalog = list_strategies(db)
+
+    assert catalog["control"]["candidate_strategy_id"] == second["id"]
+    assert catalog["control"]["candidate_strategy"]["id"] == second["id"]
+    previous = db[STRATEGY_PROFILES_COLLECTION].documents[first["id"]]
+    assert previous["status"] == "superseded_candidate"
+    assert previous["locked"] is True
+    assert db[STRATEGY_PROFILES_COLLECTION].documents[second["id"]]["status"] == "candidate"
+
+
+def test_marking_new_candidate_supersedes_and_locks_previous_candidate() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+
+    candidates = []
+    for index in (1, 2):
+        draft = create_strategy(
+            db,
+            name=f"Candidate {index}",
+            description="Unique candidate lifecycle.",
+            clone_from_strategy_id="winner-v1-13-2",
+            actor_email="admin@example.com",
+        )
+        job_id = f"job-candidate-{index}"
+        db[JOBS_COLLECTION].documents[job_id] = {
+            "_id": job_id,
+            "id": job_id,
+            "status": "completed",
+            "strategy_profile_id": draft["id"],
+            "strategy_profile_revision": 1,
+        }
+        mark_strategy_backtest(
+            db,
+            strategy_id=draft["id"],
+            strategy_revision=1,
+            job_id=job_id,
+            status="completed",
+        )
+        candidates.append(draft)
+
+    first = mark_strategy_as_candidate(
+        db,
+        candidates[0]["id"],
+        expected_strategy_revision=1,
+        note="First validated candidate.",
+        actor_email="admin@example.com",
+    )
+    assert first["status"] == "candidate"
+
+    second = mark_strategy_as_candidate(
+        db,
+        candidates[1]["id"],
+        expected_strategy_revision=1,
+        note="Second candidate replaces the first.",
+        actor_email="admin@example.com",
+    )
+    assert second["status"] == "candidate"
+    control = db[STRATEGY_CONTROL_COLLECTION].documents["default"]
+    assert control["candidate_strategy_id"] == candidates[1]["id"]
+    previous = db[STRATEGY_PROFILES_COLLECTION].documents[candidates[0]["id"]]
+    assert previous["status"] == "superseded_candidate"
+    assert previous["locked"] is True
+    active_candidates = [
+        item for item in db[STRATEGY_PROFILES_COLLECTION].documents.values()
+        if item.get("status") == "candidate"
+    ]
+    assert len(active_candidates) == 1
+    assert active_candidates[0]["_id"] == candidates[1]["id"]
+
+
+def test_promotion_rejects_completed_draft_until_marked_candidate() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Unmarked draft",
+        description="Promotion gate test.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[JOBS_COLLECTION].documents["job-gate"] = {
+        "_id": "job-gate",
+        "id": "job-gate",
+        "status": "completed",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=draft["id"],
+        strategy_revision=1,
+        job_id="job-gate",
+        status="completed",
+    )
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "control_mode": "stopped",
+    }
+    db[PAPER_TRADING_STATE_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "managed_symbol": None,
+    }
+    try:
+        promote_strategy_to_trader(
+            db,
+            draft["id"],
+            expected_control_revision=1,
+            expected_strategy_revision=1,
+            note="Should be blocked.",
+            actor_email="admin@example.com",
+        )
+    except Exception as exc:
+        assert "candidate" in str(exc).lower()
+    else:
+        raise AssertionError("Promotion must require candidate status.")
+
+
+
 def test_jobs_and_paper_use_separate_strategy_contexts() -> None:
     from pathlib import Path
 
@@ -349,6 +577,7 @@ def test_jobs_and_paper_use_separate_strategy_contexts() -> None:
     assert "get_research_strategy_context" in jobs
     assert "get_trader_winner_context" in paper
     assert '"/{strategy_id}/select-for-backtest"' in router
+    assert '"/{strategy_id}/mark-as-candidate"' in router
     assert '"/{strategy_id}/promote-to-trader"' in router
     assert '"strategy_manifest.json"' in exports
 

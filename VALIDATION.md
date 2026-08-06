@@ -44,6 +44,18 @@ Validated contracts:
 - Python compilation, unresolved-global scan and the complete automated API test suite pass.
 
 
+## v1.13.21 candidate lifecycle validation
+
+- Python compilation passed.
+- Complete automated API suite passed: 92 tests.
+- Candidate status requires a completed job for the exact current revision.
+- Candidate metadata records revision, job id, reason, actor and timestamp.
+- Editing a candidate returns it to draft and clears candidate certification.
+- Promotion rejects completed drafts until they are explicitly marked as candidates.
+- Candidate marking does not change the research selection or immutable Trader winner pointer.
+- Winner configuration and numerical execution semantics are unchanged.
+
+
 ## v1.13.20 winner-compatible strategy-boundary validation
 
 - Python compilation passed for API source and tests.
@@ -61,3 +73,13 @@ Validated contracts:
 - The initial catalog migration preserves the Railway production winner identity and does not rewrite `backtest_settings/default`.
 - Drafts may be edited while an immutable job snapshot runs; old jobs cannot certify newer revisions.
 - Backtests remain serialized to one active job.
+
+
+## v1.13.22 single-candidate lifecycle validation
+
+- Exactly one active `candidate` is represented by `strategy_control/default.candidate_strategy_id`.
+- A replaced Candidate becomes locked `superseded_candidate`.
+- A promoted Candidate becomes locked `promoted_candidate`.
+- Exactly one active `winner` remains selected by `trader_winner_strategy_id`; the previous winner becomes `former_winner`.
+- Candidate edits clear the active Candidate pointer and create a Draft revision.
+- Production winner configuration and execution semantics are unchanged.

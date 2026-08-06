@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database, refresh_locked_configuration_status
 from ...schemas.strategy_lab import (
+    StrategyCandidateRequest,
     StrategyCreateRequest,
     StrategyDeleteRequest,
     StrategyPromoteRequest,
@@ -23,6 +24,7 @@ from ...services.strategy_lab import (
     get_strategy,
     get_strategy_control,
     list_strategies,
+    mark_strategy_as_candidate,
     promote_strategy_to_trader,
     select_research_strategy,
     update_strategy,
@@ -127,6 +129,24 @@ def select_strategy_for_backtest(
         )
         refresh_locked_configuration_status()
         return result
+    except (StrategyLabError, ValidationError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{strategy_id}/mark-as-candidate")
+def mark_candidate(
+    strategy_id: str,
+    payload: StrategyCandidateRequest,
+    identity: AdminIdentity,
+) -> dict[str, Any]:
+    try:
+        return mark_strategy_as_candidate(
+            database(),
+            strategy_id,
+            expected_strategy_revision=payload.expected_strategy_revision,
+            note=payload.note,
+            actor_email=identity.email,
+        )
     except (StrategyLabError, ValidationError) as exc:
         raise _translate_error(exc) from exc
 
