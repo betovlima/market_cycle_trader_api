@@ -19,6 +19,7 @@ from ..infrastructure.trading.alpaca_paper import (
 from ..schemas.paper_trading import PaperTradingState
 from .paper_market_scheduler import arm_next_session, latest_paper_market_run
 from .paper_trading import initialize_paper_state
+from .strategy_lab import trader_winner_requires_state_reinitialization
 from .parameter_bootstrap import (
     bootstrap_missing_parameterizations,
     parameterization_status,
@@ -105,9 +106,13 @@ def initialize_application(db: Any, *, arm_market: bool) -> dict[str, Any]:
     )
 
     existing_state = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"})
+    requires_winner_reset = trader_winner_requires_state_reinitialization(db)
     if existing_state is None:
         state = initialize_paper_state(db, replace=False)
         state_action = "initialized"
+    elif requires_winner_reset:
+        state = initialize_paper_state(db, replace=True)
+        state_action = "reinitialized_for_promoted_winner"
     else:
         validated = PaperTradingState.model_validate(get_paper_trading_state(db))
         state = validated.model_dump(mode="python")

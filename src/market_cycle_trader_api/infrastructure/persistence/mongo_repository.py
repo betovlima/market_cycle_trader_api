@@ -16,6 +16,9 @@ MONGO_URI = str(os.getenv("MONGO_URL") or os.getenv("MONGO_URI") or "").strip()
 MONGO_DATABASE = str(os.getenv("MONGO_DATABASE") or "").strip()
 SETTINGS_COLLECTION = "backtest_settings"
 SETTINGS_HISTORY_COLLECTION = "backtest_settings_history"
+STRATEGY_PROFILES_COLLECTION = "strategy_profiles"
+STRATEGY_CONTROL_COLLECTION = "strategy_control"
+STRATEGY_PROMOTION_HISTORY_COLLECTION = "strategy_promotion_history"
 JOBS_COLLECTION = "backtest_jobs"
 RUNS_COLLECTION = "backtest_runs"
 PREDICTIONS_COLLECTION = "backtest_predictions"
@@ -34,6 +37,8 @@ PAPER_TRADE_ORDERS_COLLECTION = "paper_trade_orders"
 PAPER_MARKET_RUNS_COLLECTION = "paper_market_runs"
 PAPER_MARKET_AUTOMATION_COLLECTION = "paper_market_automation"
 ADMIN_OPERATION_LOGS_COLLECTION = "admin_operation_logs"
+SYSTEM_SETTINGS_COLLECTION = "system_settings"
+SYSTEM_SETTINGS_HISTORY_COLLECTION = "system_settings_history"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
 SETTINGS_SCHEMA_VERSION = 16
@@ -136,6 +141,18 @@ def ensure_database(db: Database) -> None:
         [("captured_at", DESCENDING)],
         name="ix_settings_history_captured",
     )
+    db[STRATEGY_PROFILES_COLLECTION].create_index(
+        [("locked", DESCENDING), ("updated_at", DESCENDING)],
+        name="ix_strategy_profiles_locked_updated",
+    )
+    db[STRATEGY_PROFILES_COLLECTION].create_index(
+        [("configuration_hash", ASCENDING)],
+        name="ix_strategy_profiles_configuration_hash",
+    )
+    db[STRATEGY_PROMOTION_HISTORY_COLLECTION].create_index(
+        [("promoted_at", DESCENDING), ("created_at", DESCENDING)],
+        name="ix_strategy_promotion_history",
+    )
     db[PAPER_TRADING_SETTINGS_HISTORY_COLLECTION].create_index(
         [("captured_at", DESCENDING)],
         name="ix_paper_settings_history_captured",
@@ -175,6 +192,14 @@ def ensure_database(db: Database) -> None:
     db[ADMIN_OPERATION_LOGS_COLLECTION].create_index(
         [("created_at", DESCENDING)],
         name="ix_admin_operation_logs_created",
+    )
+    db[SYSTEM_SETTINGS_COLLECTION].create_index(
+        [("updated_at", DESCENDING)],
+        name="ix_system_settings_updated",
+    )
+    db[SYSTEM_SETTINGS_HISTORY_COLLECTION].create_index(
+        [("settings_id", ASCENDING), ("updated_at", DESCENDING)],
+        name="ix_system_settings_history_updated",
     )
     db[PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION].create_index(
         [("recorded_at", DESCENDING)],

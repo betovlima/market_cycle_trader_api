@@ -9,12 +9,13 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "1.13.16"' in config
+    assert 'API_VERSION = "1.13.20"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
     main = (SRC / "main.py").read_text(encoding="utf-8")
     assert "strategy_configuration" in main
+    assert "strategy_lab" in main
     assert "parameter_bootstrap" in main
     assert "admin_setup" in main
     assert "paper_market" in main
@@ -52,3 +53,11 @@ def test_google_identity_access_is_server_verified_and_token_only_login_is_remov
     assert "claimed_subject" in access_service
     assert "google_identity_mismatch" in access_service
     assert "create_viewer_session" not in access_service
+
+
+def test_obsolete_direct_strategy_mutation_payloads_are_not_packaged() -> None:
+    scripts = ROOT / "script"
+    assert not (scripts / "patch_api_admin_strategy-configuration_cpu.json").exists()
+    assert not (scripts / "put_api_admin_strategy-configuration_champion.json").exists()
+    recovery = (scripts / "post_api_admin_strategy-configuration_winner_install.json").read_text(encoding="utf-8")
+    assert "DISASTER RECOVERY ONLY" in recovery

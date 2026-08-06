@@ -19,7 +19,6 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     get_paper_trading_settings,
     get_paper_trading_state,
-    get_settings,
     insert_paper_trade_order,
     insert_paper_trade_plan,
     replace_paper_trading_state,
@@ -42,6 +41,12 @@ from ..infrastructure.trading.alpaca_paper import (
 )
 from ..schemas.paper_trading import PaperTradePlan, PaperTradingSettings, PaperTradingState
 from ..schemas.requests import BacktestRequest
+from .system_settings import apply_training_runtime_settings, get_system_settings
+from .strategy_lab import (
+    get_trader_winner_context,
+    mark_trader_winner_state_initialized,
+    trader_winner_requires_state_reinitialization,
+)
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -57,8 +62,16 @@ def _et_date(value: Any) -> str:
 
 
 def _validated_context(db: Any) -> tuple[BacktestRequest, PaperTradingSettings, PaperTradingState]:
+    if trader_winner_requires_state_reinitialization(db):
+        raise RuntimeError(
+            "The Trader winner changed. Reinitialize the Paper strategy state before arming Trader."
+        )
     try:
-        strategy = BacktestRequest.model_validate(get_settings(db))
+        winner_configuration, _winner_profile = get_trader_winner_context(db)
+        strategy = apply_training_runtime_settings(
+            db,
+            winner_configuration,
+        )
         settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
         state = PaperTradingState.model_validate(get_paper_trading_state(db))
     except (RuntimeError, ValidationError) as exc:
@@ -207,7 +220,7 @@ def _reconcile_state_with_account(
 
 
 def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
-    strategy = BacktestRequest.model_validate(get_settings(db))
+    strategy, _winner_profile = get_trader_winner_context(db)
     settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
     if not settings.enabled:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
@@ -262,6 +275,7 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
         last_execution_session=None,
     )
     replace_paper_trading_state(db, state.model_dump(mode="python"))
+    mark_trader_winner_state_initialized(db)
     return {
         "paper_account_id": account["id"],
         "account_cash": account["cash"],
@@ -272,6 +286,9 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
 
 
 def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]:
+    runtime_training = get_system_settings(db)["training"]
+    if not bool(runtime_training["enabled"]):
+        raise RuntimeError("Model training is disabled in System Settings.")
     strategy, settings, state = _validated_context(db)
     client = create_paper_trading_client(db)
     account = account_snapshot(client)

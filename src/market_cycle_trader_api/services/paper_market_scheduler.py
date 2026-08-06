@@ -27,6 +27,8 @@ from ..infrastructure.trading.alpaca_paper import (
     create_paper_trading_client,
 )
 from ..schemas.paper_trading import PaperTradingSettings
+from .system_settings import get_system_settings
+from .strategy_lab import get_trader_winner_summary
 from .paper_trading import (
     execute_prepared_paper_plan,
     paper_market_readiness,
@@ -590,6 +592,21 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
 
 def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     run_id = str(run["run_id"])
+    runtime_training = get_system_settings(db)["training"]
+    if not bool(runtime_training["enabled"]) or not bool(runtime_training["automatic_training_enabled"]):
+        phase = "training_disabled" if not bool(runtime_training["enabled"]) else "automatic_training_disabled"
+        message = "Waiting for training to be enabled in System Settings."
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "armed"},
+            {
+                "$set": {
+                    "phase": phase,
+                    "updated_at": utc_now(),
+                    "last_message": message,
+                }
+            },
+        )
+        return
     expected_open = _utc_stamp(run["expected_market_open"])
     settings = _paper_settings(db)
     analysis_at = _premarket_analysis_at(expected_open, settings)
@@ -1172,6 +1189,12 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
     enabled = bool(controller.get("enabled"))
     control_mode = _control_mode(controller)
     status = str(controller.get("status") or control_mode)
+    try:
+        trader_winner = get_trader_winner_summary(db)
+        if public and trader_winner is not None:
+            trader_winner = {"name": trader_winner.get("name")}
+    except Exception:
+        trader_winner = None
     output: dict[str, Any] = {
         "enabled": enabled,
         "control_mode": control_mode,
@@ -1189,6 +1212,7 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "active_run": _public_robot_run(active),
         "latest_run": _public_robot_run(latest),
         "updated_at": bson_value(controller.get("updated_at")),
+        "trader_winner": trader_winner,
     }
     if not public:
         output.update({

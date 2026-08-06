@@ -42,3 +42,22 @@ Validated contracts:
 - Legacy invitations are marked `legacy_unverified` and cannot create new sessions.
 - OpenAPI requires `credential` for `POST /api/auth/access`.
 - Python compilation, unresolved-global scan and the complete automated API test suite pass.
+
+
+## v1.13.20 winner-compatible strategy-boundary validation
+
+- Python compilation passed for API source and tests.
+- Complete automated API suite passed: 89 tests.
+- Research profile edits and selections do not change the Trader winner pointer.
+- Backtest jobs store profile id, revision, hash, and an immutable execution request.
+- Paper preparation reads only the immutable Trader winner context.
+- Promotion requires a completed job for the exact candidate revision and safe Trader/Paper state.
+- Promotion creates a locked snapshot and preserves the former winner.
+- Administrator catalog metadata exposes every `BacktestRequest` field; non-Administrator payloads remain sanitized.
+- Legacy direct strategy mutation routes are disabled.
+- Administrator ZIP exports include `strategy_manifest.json`.
+
+- API v1.13.16 non-deterministic numerical-thread semantics are restored and contract-tested.
+- The initial catalog migration preserves the Railway production winner identity and does not rewrite `backtest_settings/default`.
+- Drafts may be edited while an immutable job snapshot runs; old jobs cannot certify newer revisions.
+- Backtests remain serialized to one active job.

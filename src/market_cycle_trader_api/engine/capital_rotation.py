@@ -348,6 +348,9 @@ def _curve_risk_adjusted_score(curve: pd.Series, config: Any) -> float:
     return float(score)
 
 def _numeric_thread_context(config: Any):
+    # Winner compatibility contract from API v1.13.16:
+    # numeric thread limiting is applied only for deterministic execution.
+    # Non-deterministic winner runs must inherit the host numerical runtime.
     if not bool(config.deterministic_execution):
         return nullcontext()
     return threadpool_limits(limits=int(config.numeric_thread_limit))

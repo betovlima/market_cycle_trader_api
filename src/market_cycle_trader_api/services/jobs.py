@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import sys
 from typing import Any
 
@@ -14,6 +15,32 @@ from ..core.environment import build_subprocess_environment, load_project_enviro
 from ..core.runtime import database
 from ..infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, JOBS_COLLECTION, RUNS_COLLECTION, utc_now
 from .serialization import iso_value
+from .strategy_lab import mark_strategy_backtest
+
+
+
+
+WINNER_ENGINE_COMPATIBILITY = "api-v1.13.16"
+_NUMERIC_THREAD_ENVIRONMENT_KEYS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def numeric_thread_environment(request_payload: dict[str, Any]) -> dict[str, str]:
+    """Build numerical thread overrides without changing winner semantics.
+
+    API v1.13.16 applied ``numeric_thread_limit`` only when deterministic
+    execution was enabled. The protected winner uses non-deterministic
+    execution, so its subprocess must inherit the host numerical runtime.
+    """
+
+    if not bool(request_payload.get("deterministic_execution")):
+        return {}
+    numeric_threads = max(1, int(request_payload.get("numeric_thread_limit") or 1))
+    return {key: str(numeric_threads) for key in _NUMERIC_THREAD_ENVIRONMENT_KEYS}
 
 
 PUBLIC_JOB_FIELDS = frozenset({
@@ -181,17 +208,28 @@ def run_job(job_id: str) -> None:
     # harmless on Railway and ensures local secrets are inherited by the child.
     load_project_environment()
     db = database()
+    job_document = db[JOBS_COLLECTION].find_one({"id": job_id}) or {}
+    strategy_profile_id = str(job_document.get("strategy_profile_id") or "") or None
+    strategy_profile_revision = int(job_document.get("strategy_profile_revision") or 0) or None
+    timeout_seconds = max(300, int(job_document.get("training_timeout_seconds") or 21_600))
+    request_payload = job_document.get("request") if isinstance(job_document.get("request"), dict) else {}
     db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0}})
     python_path = str(SOURCE_ROOT)
     existing_python_path = os.environ.get("PYTHONPATH", "")
     if existing_python_path:
         python_path = python_path + os.pathsep + existing_python_path
     command = [sys.executable, "-u", "-m", ENGINE_MODULE, "--job-id", job_id]
-    child_environment = build_subprocess_environment({"PYTHONPATH": python_path})
+    numeric_environment = numeric_thread_environment(request_payload)
+    child_environment = build_subprocess_environment({
+        "PYTHONPATH": python_path,
+        **numeric_environment,
+    })
     engine_identity = {
         "engine_module": ENGINE_MODULE,
         "engine_path": str(ENGINE_PATH),
         "python_executable": sys.executable,
+        "winner_engine_compatibility": WINNER_ENGINE_COMPATIBILITY,
+        "numeric_thread_environment_applied": bool(numeric_environment),
     }
     db[JOBS_COLLECTION].update_one(
         {"id": job_id},
@@ -224,14 +262,50 @@ def run_job(job_id: str) -> None:
             {"id": job_id},
             {"$set": {"process_id": process.pid, "updated_at": utc_now()}},
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            append_log(job_id, line)
-        return_code = process.wait()
+        timed_out = threading.Event()
+
+        def terminate_for_timeout() -> None:
+            if process.poll() is None:
+                timed_out.set()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+
+        timeout_timer = threading.Timer(timeout_seconds, terminate_for_timeout)
+        timeout_timer.daemon = True
+        timeout_timer.start()
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                append_log(job_id, line)
+            return_code = process.wait()
+        finally:
+            timeout_timer.cancel()
+
+        if timed_out.is_set():
+            append_log(job_id, "ERROR: Training exceeded the configured time limit.")
+            db[JOBS_COLLECTION].update_one(
+                {"id": job_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "stage": "Backtest failed",
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                        "return_code": return_code,
+                        "timed_out": True,
+                    },
+                    "$unset": {"process_id": ""},
+                },
+            )
+            mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
+            return
         run_count = db[RUNS_COLLECTION].count_documents({"job_id": job_id})
         comparison_exists = db[COMPARISONS_COLLECTION].find_one({"job_id": job_id}, {"_id": 1}) is not None
         if return_code == 0 and comparison_exists and run_count > 0:
             db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "completed", "stage": "Completed", "progress": 100, "completed_runs": run_count, "finished_at": utc_now(), "updated_at": utc_now(), "return_code": return_code}, "$unset": {"process_id": ""}})
+            mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="completed")
             return
         stored = db[COMPARISONS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0, "failures": 1}) or {}
         for failure in stored.get("failures", []):
@@ -239,6 +313,8 @@ def run_job(job_id: str) -> None:
         if return_code != 0 and not stored.get("failures"):
             append_log(job_id, f"ERROR: Backtest engine exited with code {return_code}.")
         db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "failed", "stage": "Backtest failed", "finished_at": utc_now(), "updated_at": utc_now(), "return_code": return_code}, "$unset": {"process_id": ""}})
+        mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
     except Exception as exc:
         append_log(job_id, f"ERROR: {exc}")
         db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "failed", "stage": "Backtest failed", "finished_at": utc_now(), "updated_at": utc_now(), "error": str(exc)}, "$unset": {"process_id": ""}})
+        mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")

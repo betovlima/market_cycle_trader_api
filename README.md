@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.16
+# Market Cycle Trader API v1.13.20
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -53,7 +53,8 @@ The analytics layer rejects protected output keys such as backend identifiers, s
 - `/api/auth/access/preview` — validates an invitation locator without exposing the complete email.
 - `/api/auth/access` — verifies the Google ID token and creates an identity-bound session.
 - `/api/admin/invitations` — administrator-only identity-bound access management.
-- `/api/admin/strategy-configuration` — administrator-only protected configuration administration.
+- `/api/admin/strategies` — administrator-only research catalog, backtest selection, and explicit Trader-winner promotion.
+- `/api/admin/strategy-configuration/winner/install` — emergency installation of the bundled protected winner.
 - `/api/health/live` and `/api/health/ready` — liveness and readiness.
 
 ## Required server variables
@@ -122,7 +123,7 @@ TRADER_ADMIN_GOOGLE_EMAIL
 - Stores no raw invitation token or Google ID token in MongoDB.
 
 
-## v1.13.16 — unified Google identity access
+## v1.13.14 — unified Google identity access
 
 - Supports Viewer, Trader and Administrator as Google identity-bound roles.
 - Adds direct Google sign-in for accounts that have already claimed active access.
@@ -132,7 +133,7 @@ TRADER_ADMIN_GOOGLE_EMAIL
 - Keeps one active session by default for Trader and Administrator and two for Viewer.
 
 
-## v1.13.16 — role-based session expiration
+## v1.13.15 — role-based session expiration
 
 Session limits are enforced by the API with absolute and inactivity expiration per role.
 
@@ -144,3 +145,60 @@ TRADER_TRADER_SESSION_IDLE_SECONDS=3600
 TRADER_ADMIN_SESSION_MAX_AGE_SECONDS=7200
 TRADER_ADMIN_SESSION_IDLE_SECONDS=1800
 ```
+
+
+## v1.13.16 — administrative Trader control
+
+- Adds Administrator-only `active`, `paused`, `exit_only`, and `stopped` Trader modes.
+- Persists operational state and audit history in MongoDB.
+- Keeps strategy parameters and model rules outside public responses.
+
+## v1.13.17 — Administrator System Settings
+
+- Adds Administrator-only, revision-controlled runtime settings in MongoDB.
+- Adds training enablement, automatic pre-market training, thread preferences, concurrent-job limit, and backtest timeout.
+- Adds optimistic revision checks and a settings history audit trail.
+- Keeps Railway plan, replica, CPU, and memory allocation outside application control.
+
+## v1.13.18 — Winner execution lock and Administrator exports
+
+- Preserves the installed winner execution configuration exactly in manual backtests and Paper preparation.
+- Stops System Settings from replacing model and numeric execution fields.
+- Keeps thread-preference fields only for backward compatibility; they no longer affect the winner.
+- Restricts all backtest export endpoints to Administrator sessions.
+
+Protected routes:
+
+```http
+GET   /api/admin/system-settings
+PATCH /api/admin/system-settings
+GET   /api/admin/system-settings/history
+```
+
+
+## v1.13.20 — Protected research catalog with v1.13.16 winner compatibility
+
+- Migrates the existing Railway production winner into an additive strategy catalog without rewriting `backtest_settings/default`.
+- Preserves the historical winner identity, including `winner-v1.13.1`, revision, schema version, source file, bootstrap source and configuration hash.
+- Restores the exact numerical execution semantics used by API v1.13.16: when `deterministic_execution=false`, no global numeric-thread limit or OMP/BLAS/MKL/NumExpr environment override is applied.
+- Applies `numeric_thread_limit` only when `deterministic_execution=true`.
+- Allows Administrators to clone and edit draft strategies while a backtest snapshot is running.
+- Keeps strategy selection, deletion, promotion and starting another backtest locked until the active job finishes.
+- Serializes backtests to one active job at a time.
+- Updates a draft's backtest certification only when the completed job used that exact strategy revision.
+- Backtests use the selected research snapshot; Paper Trader continues using only the immutable promoted winner snapshot.
+- Promotion remains explicit and requires the Trader to be paused or stopped, no active Paper run or pending plan, the controlled sleeve in cash, and a completed backtest for the exact candidate revision.
+
+### Administrator strategy endpoints
+
+```http
+GET    /api/admin/strategies
+POST   /api/admin/strategies
+GET    /api/admin/strategies/{strategy_id}
+PUT    /api/admin/strategies/{strategy_id}
+DELETE /api/admin/strategies/{strategy_id}
+POST   /api/admin/strategies/{strategy_id}/select-for-backtest
+POST   /api/admin/strategies/{strategy_id}/promote-to-trader
+```
+
+Direct PATCH, PUT, reset and restore operations on `/api/admin/strategy-configuration` remain disabled. `POST /api/admin/strategy-configuration/winner/install` remains an explicit recovery operation only and must not be used during the normal production migration.

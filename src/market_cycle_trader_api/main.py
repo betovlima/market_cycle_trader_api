@@ -27,6 +27,8 @@ from .api.routers import (
     public_paper_portfolio,
     parameter_bootstrap,
     strategy_configuration,
+    strategy_lab,
+    system_settings,
 )
 from .core.config import API_VERSION, cors_origins
 from .auth.config import get_auth_settings
@@ -79,7 +81,7 @@ def create_app() -> FastAPI:
     portfolio_required = [Depends(require_portfolio_session)]
     application.include_router(dashboard.router, dependencies=viewer_required)
     application.include_router(jobs.router, dependencies=viewer_required)
-    application.include_router(exports.router, dependencies=viewer_required)
+    application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)
     application.include_router(paper_market.router, dependencies=admin_required)
     application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
@@ -87,6 +89,8 @@ def create_app() -> FastAPI:
     application.include_router(admin_trader.router, dependencies=admin_required)
     application.include_router(parameter_bootstrap.router, dependencies=admin_required)
     application.include_router(strategy_configuration.router, dependencies=admin_required)
+    application.include_router(strategy_lab.router, dependencies=admin_required)
+    application.include_router(system_settings.router, dependencies=admin_required)
     application.include_router(admin_setup.router, dependencies=admin_required)
     return application
 
