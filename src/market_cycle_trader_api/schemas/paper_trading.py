@@ -11,7 +11,7 @@ class PaperTradingSettings(BaseModel):
 
     Strategy/model parameters are intentionally not repeated here. The paper
     trader always consumes the locked XGBoost configuration from
-    ``backtest_settings`` so research and execution cannot drift silently.
+    the immutable Trader winner snapshot so research and execution cannot drift silently.
     """
 
     model_config = ConfigDict(extra="forbid")

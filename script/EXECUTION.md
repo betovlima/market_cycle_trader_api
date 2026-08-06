@@ -1,188 +1,124 @@
-# Winner installation and execution sequence
+# Production migration and strategy-research sequence
 
-All commands are HTTP operations through Swagger or another API client. Do not write strategy documents directly in MongoDB.
+All changes must use the protected API or Administrator interface. Do not write strategy documents directly in MongoDB.
 
-## Required headers
+## 1. Preserve the current Railway winner
 
-Administrative endpoints:
+Before deployment, save:
 
-```text
-X-Parameter-Bootstrap-Token: <PARAMETER_BOOTSTRAP_API_TOKEN>
-```
+- the current API v1.13.16 deployment/commit;
+- the current `backtest_settings/default` document;
+- the latest winning backtest export;
+- the current Paper/Trader status.
 
-Paper endpoints:
+Pause Trader before replacing the API. Pausing must not liquidate an existing position.
 
-```text
-X-Paper-Market-Token: <PAPER_MARKET_API_TOKEN>
-```
-
-## 1. Start and verify the API
+## 2. Deploy API v1.13.20
 
 ```http
 GET /api/health/live
 ```
 
-Expected API version: `1.13.4`.
+Expected API version: `1.13.20`.
 
 ```http
 GET /api/health/ready
 ```
 
-With an empty database, strict readiness can report that the locked configuration is unavailable. This is expected until the winner installation finishes.
+On first startup, the API creates the additive strategy catalog from the existing production winner. It does not rewrite `backtest_settings/default` and does not install another winner.
 
-## 2. Install winner-v1.13.2 from the packaged file
+## 3. Do not reinstall the bundled winner during migration
+
+Do **not** call:
 
 ```http
 POST /api/admin/strategy-configuration/winner/install
 ```
 
-Payload file:
+That endpoint remains available only for an explicit disaster-recovery operation. Normal migration must preserve the production `winner-v1.13.1` provenance.
 
-```text
-script/post_api_admin_strategy-configuration_winner_install.json
-```
+## 4. Verify the imported production winner
 
-The endpoint reads only the packaged file:
-
-```text
-src/market_cycle_trader_api/parameterizations/winner-v1.13.2.json
-```
-
-It performs these strategy-only changes:
-
-1. Validates the JSON against `BacktestRequest`.
-2. Verifies configuration SHA-256 `22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953`.
-3. Replaces or creates `backtest_settings/default`.
-4. Deletes every extra document from `backtest_settings`.
-5. Deletes every document from `backtest_settings_history`.
-6. Stores the winner as revision 1.
-
-It does not delete backtest results, Alpaca market bars, or Paper execution data.
-
-The operation is rejected when a backtest is queued/running or a Paper run is active.
-
-Expected response values:
-
-```text
-status: winner_installed
-source_file: winner-v1.13.2.json
-configuration_hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
-metadata.revision: 1
-metadata.configuration_name: winner-v1.13.2
-```
-
-## 3. Install missing non-strategy parameter documents
+Using an Administrator session:
 
 ```http
-GET /api/admin/parameters/status
+GET /api/admin/strategies
+GET /api/admin/strategies/control
 ```
 
-When Paper settings are missing:
-
-```http
-POST /api/admin/parameters/bootstrap
-```
-
-Payload file:
+Expected initial state:
 
 ```text
-script/post_api_admin_parameters_bootstrap.json
+research strategy: imported production winner
+Trader winner: the same imported immutable snapshot
+winner source file: winner-v1.13.1.json
+winner configuration hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
+locked: true
+paper_state_reinitialization_required: false
 ```
 
-Bootstrap preserves the valid winner strategy and inserts missing non-strategy documents.
+The original `backtest_settings/default` document must remain unchanged.
 
-## 4. Confirm the winner strategy
+## 5. Validate winner-engine compatibility
 
-```http
-GET /api/admin/strategy-configuration
-```
-
-Required values:
-
-```text
-strategy_mode: COMPOUND_ROTATION_SWING_XGBOOST
-rotation_accelerator: cpu
-random_state: 42
-rotation_target_horizons: [5, 10, 20, 40, 60]
-rotation_target_horizon_weights: [0.1, 0.15, 0.2, 0.3, 0.25]
-rotation_movement_capture_weight: 0.35
-rotation_trend_persistence_weight: 0.2
-configuration_hash: 22a4193fbb30de33d75864fc28c3b1923e4dedd4970b14f9537f793bccf18953
-metadata.revision: 1
-metadata.winner_source_file: winner-v1.13.2.json
-```
-
-## 5. Inspect and initialize Paper state
-
-```http
-GET /api/admin/setup/status
-```
-
-Then initialize without arming a run:
-
-```http
-POST /api/admin/setup/initialize
-```
-
-Payload file:
-
-```text
-script/post_api_admin_setup_initialize.json
-```
-
-## 6. Run the full-history validation
+Start one full-history backtest:
 
 ```http
 POST /api/jobs
 ```
 
-Request body: none. The execution period is loaded from the installed winner configuration.
+Request body: none. The job uses the selected immutable strategy snapshot.
 
-Read the returned job id, then poll:
+Poll:
 
 ```http
 GET /api/jobs/{job_id}
 ```
 
-After `status=completed`:
+After completion:
 
 ```http
 GET /api/jobs/{job_id}/results
+GET /api/jobs/{job_id}/export.zip
 ```
 
-Do not arm Paper when the job fails or when the reproduced result is materially inconsistent with the champion artifact.
-
-## 7. Arm Paper only after validation
-
-Inspect current state:
-
-```http
-GET /api/paper-market/status
-```
-
-Cancel an obsolete active run when necessary:
-
-```http
-POST /api/paper-market/{run_id}/cancel
-```
-
-Payload file:
+The Administrator export must include:
 
 ```text
-script/post_api_paper-market_run-id_cancel.json
+strategy_manifest.json
+winner_engine_compatibility: api-v1.13.16
+numeric_thread_environment_applied: false
 ```
 
-Arm the next regular session:
+For the historical production winner, `deterministic_execution=false`; therefore no global OMP/BLAS/MKL/NumExpr thread override is applied.
 
-```http
-POST /api/paper-market/start-next-session
-```
+Do not resume Trader when the reproduced result is materially inconsistent with the preserved production result.
 
-Payload file:
+## 6. Resume the unchanged Trader winner
 
-```text
-script/post_api_paper-market_start-next-session.json
-```
+After validation, resume Trader through Administrator controls. No Paper-state reinitialization is required because the winner pointer did not change.
 
+## 7. Research workflow
 
-Paper automation v1.13.12 uses `premarket_analysis_minutes` from `paper_trading_settings/_id=default` (default: 90).
+1. Clone the current winner or another strategy.
+2. Edit any validated strategy parameter in the draft.
+3. A draft may be cloned or edited while another immutable backtest snapshot runs.
+4. Wait for the active backtest to finish before selecting another strategy or starting another backtest.
+5. Select the draft for future backtests. Trader remains on its current winner.
+6. Run and export the candidate backtest.
+7. Keep the current winner, or explicitly promote the exact tested revision.
+
+Promotion requires:
+
+- the candidate's current revision has a completed backtest;
+- no queued/running backtest;
+- Trader paused or stopped;
+- no active Paper run;
+- no pending Paper plan;
+- the controlled Paper sleeve in cash.
+
+Promotion creates a new immutable winner snapshot and preserves the former winner. Only after promotion must Paper state be reinitialized before Trader is restarted.
+
+## 8. Single-backtest rule
+
+Only one backtest may be queued or running. Cloning and editing drafts remain available during the run, but selection, deletion, promotion and `Start New Backtest` remain locked until completion.

@@ -1,36 +1,44 @@
-# MongoDB configuration administration
+# Strategy catalog and protected Trader winner
 
-All MongoDB configuration changes are performed through protected HTTP endpoints.
-The API startup creates storage indexes and validates state, but does not silently replace strategy documents.
+All strategy changes are performed through protected HTTP endpoints. Do not write strategy documents directly in MongoDB.
 
-Administrative authentication uses the `X-Parameter-Bootstrap-Token` header and the server-side `PARAMETER_BOOTSTRAP_API_TOKEN` environment variable.
+## Research strategies
 
-## Winner installation
+Administrator sessions use `/api/admin/strategies` to clone, edit, select, test, and delete draft strategies. Every configuration field is validated by `BacktestRequest`. Selecting a research strategy changes only future backtests.
 
-The validated strategy source is packaged as:
+```http
+GET    /api/admin/strategies
+POST   /api/admin/strategies
+GET    /api/admin/strategies/{strategy_id}
+PUT    /api/admin/strategies/{strategy_id}
+DELETE /api/admin/strategies/{strategy_id}
+POST   /api/admin/strategies/{strategy_id}/select-for-backtest
+```
+
+## Trader winner
+
+Trader reads only the immutable profile referenced by `strategy_control/default.trader_winner_strategy_id`. Editing or selecting a research profile never changes this pointer.
+
+A candidate can change Trader only through explicit Administrator promotion after a completed backtest of the same profile revision:
+
+```http
+POST /api/admin/strategies/{strategy_id}/promote-to-trader
+```
+
+Promotion creates a new locked snapshot, preserves the previous winner as a locked former winner, and requires Paper state reinitialization before Trader can restart.
+
+## Bundled winner recovery
+
+The packaged recovery source remains:
 
 ```text
 src/market_cycle_trader_api/parameterizations/winner-v1.13.2.json
 ```
 
-Install it through:
+Install it only through:
 
 ```http
 POST /api/admin/strategy-configuration/winner/install
 ```
 
-The endpoint replaces the active strategy document, removes extra strategy documents, clears strategy-configuration history, and installs the winner as revision 1. It does not delete jobs, backtest results, market bars, or Paper execution data.
-
-After installation:
-
-1. `GET /api/admin/parameters/status`
-2. `POST /api/admin/parameters/bootstrap` when non-strategy documents are missing
-3. `GET /api/admin/strategy-configuration`
-4. `POST /api/admin/setup/initialize`
-5. `GET /api/admin/setup/status`
-
-Other strategy changes continue to use the protected `/api/admin/strategy-configuration` endpoints.
-No MongoDB configuration script or Railway pre-deploy database command is required.
-
-
-Paper automation v1.13.12 uses `premarket_analysis_minutes` from `paper_trading_settings/_id=default` (default: 90).
+This explicit recovery operation resets both the research selection and Trader winner to the bundled snapshot. Direct PATCH, PUT, reset, and history restore operations on the legacy strategy-configuration route are disabled.

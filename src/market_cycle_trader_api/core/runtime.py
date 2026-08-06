@@ -15,10 +15,8 @@ from ..infrastructure.persistence.mongo_repository import (
     create_client,
     ensure_database,
     get_database,
-    get_settings,
     utc_now,
 )
-from ..schemas.requests import BacktestRequest
 
 _MONGO_CLIENT: MongoClient | None = None
 _MONGO_DB: Database | None = None
@@ -46,16 +44,18 @@ def refresh_locked_configuration_status() -> bool:
         return False
 
     try:
-        BacktestRequest.model_validate(get_settings(_MONGO_DB))
+        from ..services.strategy_lab import get_research_strategy_context, get_trader_winner_context
+        get_research_strategy_context(_MONGO_DB)
+        get_trader_winner_context(_MONGO_DB)
     except (RuntimeError, ValidationError) as exc:
         MONGO_STATUS["configuration_available"] = False
         MONGO_STATUS["configuration_message"] = (
-            f"Locked configuration is unavailable or invalid: {exc}"
+            f"Strategy catalog is unavailable or invalid: {exc}"
         )
         return False
 
     MONGO_STATUS["configuration_available"] = True
-    MONGO_STATUS["configuration_message"] = "Locked configuration is valid."
+    MONGO_STATUS["configuration_message"] = "Research strategy and Trader winner are valid."
     return True
 
 
@@ -79,12 +79,14 @@ def initialize_mongo() -> None:
         )
 
         configuration_available = True
-        configuration_message = "Locked configuration is valid."
+        configuration_message = "Research strategy and Trader winner are valid."
         try:
-            BacktestRequest.model_validate(get_settings(db))
+            from ..services.strategy_lab import get_research_strategy_context, get_trader_winner_context
+            get_research_strategy_context(db)
+            get_trader_winner_context(db)
         except (RuntimeError, ValidationError) as exc:
             configuration_available = False
-            configuration_message = f"Locked configuration is unavailable or invalid: {exc}"
+            configuration_message = f"Strategy catalog is unavailable or invalid: {exc}"
 
         _MONGO_CLIENT = client
         _MONGO_DB = db

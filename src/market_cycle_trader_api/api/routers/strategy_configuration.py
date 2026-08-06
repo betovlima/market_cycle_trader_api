@@ -20,10 +20,6 @@ from ...services.strategy_configuration import (
     get_strategy_configuration,
     install_winner_strategy_configuration,
     list_strategy_configuration_history,
-    patch_strategy_configuration,
-    replace_strategy_configuration,
-    reset_strategy_configuration,
-    restore_strategy_configuration,
 )
 from .parameter_bootstrap import require_parameter_bootstrap_token
 
@@ -64,42 +60,30 @@ def read_strategy_configuration(
         raise _translate_error(exc) from exc
 
 
-@router.patch("")
+def _raise_legacy_mutation_disabled() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "Direct strategy mutation is disabled. Create or edit a research strategy "
+            "through /api/admin/strategies so the protected Trader winner remains unchanged."
+        ),
+    )
+
+
+@router.patch("", deprecated=True)
 def update_strategy_configuration(
     request: StrategyConfigurationPatchRequest,
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
 ) -> dict[str, Any]:
-    try:
-        result = patch_strategy_configuration(
-            database(),
-            request.changes,
-            note=request.note,
-            source="strategy-configuration-api",
-            expected_revision=request.expected_revision,
-        )
-        refresh_locked_configuration_status()
-        return result
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
+    _raise_legacy_mutation_disabled()
 
 
-@router.put("")
+@router.put("", deprecated=True)
 def replace_active_strategy_configuration(
     request: StrategyConfigurationReplaceRequest,
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
 ) -> dict[str, Any]:
-    try:
-        result = replace_strategy_configuration(
-            database(),
-            request.configuration,
-            note=request.note,
-            source="strategy-configuration-api",
-            expected_revision=request.expected_revision,
-        )
-        refresh_locked_configuration_status()
-        return result
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
+    _raise_legacy_mutation_disabled()
 
 
 @router.post("/winner/install")
@@ -119,22 +103,12 @@ def install_winner_strategy(
         raise _translate_error(exc) from exc
 
 
-@router.post("/reset")
+@router.post("/reset", deprecated=True)
 def reset_active_strategy_configuration(
     request: StrategyConfigurationResetRequest,
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
 ) -> dict[str, Any]:
-    try:
-        result = reset_strategy_configuration(
-            database(),
-            note=request.note,
-            source="strategy-configuration-api",
-            expected_revision=request.expected_revision,
-        )
-        refresh_locked_configuration_status()
-        return result
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
+    _raise_legacy_mutation_disabled()
 
 
 @router.get("/history")
@@ -146,21 +120,10 @@ def read_strategy_configuration_history(
     return {"count": len(items), "items": items}
 
 
-@router.post("/history/{history_id}/restore")
+@router.post("/history/{history_id}/restore", deprecated=True)
 def restore_archived_strategy_configuration(
     history_id: str,
     request: StrategyConfigurationRestoreRequest,
     _: Annotated[None, Depends(require_parameter_bootstrap_token)],
 ) -> dict[str, Any]:
-    try:
-        result = restore_strategy_configuration(
-            database(),
-            history_id,
-            note=request.note,
-            source="strategy-configuration-api",
-            expected_revision=request.expected_revision,
-        )
-        refresh_locked_configuration_status()
-        return result
-    except (StrategyConfigurationError, ValidationError) as exc:
-        raise _translate_error(exc) from exc
+    _raise_legacy_mutation_disabled()

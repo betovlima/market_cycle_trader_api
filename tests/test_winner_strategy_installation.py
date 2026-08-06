@@ -60,6 +60,32 @@ class _Collection:
             return copy.deepcopy(value) if value is not None else None
         raise AssertionError(f"Unexpected query: {query}")
 
+
+    def find(self, query: dict[str, Any], *args, **kwargs):
+        del args, kwargs
+        items = []
+        for document in self.documents.values():
+            matches = True
+            for key, expected in query.items():
+                actual = document.get(key)
+                if isinstance(expected, dict) and "$ne" in expected:
+                    matches = matches and actual != expected["$ne"]
+                else:
+                    matches = matches and actual == expected
+            if matches:
+                items.append(copy.deepcopy(document))
+        return items
+
+    def update_one(self, query: dict[str, Any], update: dict[str, Any], **kwargs):
+        del kwargs
+        document_id = str(query["_id"])
+        document = self.documents.get(document_id)
+        if document is None:
+            return _ReplaceResult(matched_count=0)
+        document.update(copy.deepcopy(update.get("$set", {})))
+        self.documents[document_id] = document
+        return _ReplaceResult(matched_count=1)
+
     def replace_one(
         self,
         query: dict[str, Any],

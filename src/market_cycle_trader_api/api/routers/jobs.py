@@ -14,11 +14,12 @@ from ...infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     bson_value,
     get_alpaca_credentials,
-    get_settings,
     utc_now,
 )
-from ...schemas.requests import BacktestExecutionRequest, BacktestRequest
+from ...schemas.requests import BacktestExecutionRequest
 from ...services.jobs import public_job, require_job, run_job
+from ...services.system_settings import apply_training_runtime_settings, get_system_settings
+from ...services.strategy_lab import get_research_strategy_context
 from ...services.results import build_results
 
 router = APIRouter(tags=["jobs"])
@@ -26,26 +27,34 @@ router = APIRouter(tags=["jobs"])
 
 @router.post("/api/jobs", status_code=202)
 def create_job() -> dict[str, Any]:
-    """Queue a job using only the protected configuration stored in MongoDB.
+    """Queue a job from the Administrator-selected research strategy snapshot.
 
-    The public client supplies no historical dates or strategy parameters. The
-    complete execution period and every operational setting come from the
-    installed winner configuration.
+    The public client supplies no dates or strategy parameters. Selection and
+    editing happen only in the Administrator strategy workspace. Trader continues
+    using its separately promoted immutable winner snapshot.
     """
     db = database()
-    if db[JOBS_COLLECTION].find_one({"status": {"$in": ["queued", "running"]}}, {"_id": 1}) is not None:
-        raise HTTPException(status_code=409, detail="Another backtest is already running.")
+    runtime_settings = get_system_settings(db)
+    training_settings = runtime_settings["training"]
+    if not bool(training_settings["enabled"]):
+        raise HTTPException(status_code=409, detail="Model training is disabled in System Settings.")
+    active_jobs = db[JOBS_COLLECTION].count_documents({"status": {"$in": ["queued", "running"]}})
+    if active_jobs >= 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Wait for the active backtest to finish before starting another one.",
+        )
 
     try:
-        stored_settings = get_settings(db)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    try:
-        locked_configuration = BacktestRequest.model_validate(stored_settings)
-    except ValidationError as exc:
+        selected_configuration, selected_strategy = get_research_strategy_context(db)
+        locked_configuration = apply_training_runtime_settings(
+            db,
+            selected_configuration,
+        )
+    except (RuntimeError, ValidationError) as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Stored strategy configuration is invalid: {exc}",
+            detail=f"Selected backtest strategy is invalid: {exc}",
         ) from exc
 
     if locked_configuration.market_data_provider == "alpaca":
@@ -86,11 +95,18 @@ def create_job() -> dict[str, Any]:
         "strategy_lifecycle": lifecycle,
         "total_runs": total_runs,
         "request": payload,
+        "strategy_profile_id": selected_strategy["id"],
+        "strategy_profile_name": selected_strategy["name"],
+        "strategy_profile_revision": selected_strategy["revision"],
+        "strategy_configuration_hash": selected_strategy["configuration_hash"],
         "configuration_locked": True,
         "execution_period_locked": True,
         "live_trades": [],
         "live_trade_count": 0,
         "logs": ["Backtest queued."],
+        "system_settings_revision": int(runtime_settings["revision"]),
+        "training_timeout_seconds": int(training_settings["timeout_seconds"]),
+        "winner_engine_compatibility": "api-v1.13.16",
     }
     db[JOBS_COLLECTION].insert_one(job)
     threading.Thread(target=run_job, args=(job_id,), daemon=True).start()

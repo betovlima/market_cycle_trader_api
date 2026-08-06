@@ -7,12 +7,12 @@ MAIN = ROOT / "src" / "market_cycle_trader_api" / "main.py"
 ANALYTICS = ROOT / "src" / "market_cycle_trader_api" / "api" / "routers" / "analytics.py"
 
 
-def test_viewer_can_use_dashboard_jobs_exports_and_backtest_analytics() -> None:
+def test_viewer_can_use_dashboard_jobs_and_backtest_analytics_but_not_exports() -> None:
     source = MAIN.read_text(encoding="utf-8")
     analytics = ANALYTICS.read_text(encoding="utf-8")
     assert "application.include_router(dashboard.router, dependencies=viewer_required)" in source
     assert "application.include_router(jobs.router, dependencies=viewer_required)" in source
-    assert "application.include_router(exports.router, dependencies=viewer_required)" in source
+    assert "application.include_router(exports.router, dependencies=admin_required)" in source
     assert 'Depends(require_trader_session)' in analytics
     assert '@router.get("/backtests/{job_id}")' in analytics
 

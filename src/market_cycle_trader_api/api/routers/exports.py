@@ -221,7 +221,7 @@ def export_comparison_chart(job_id: str) -> Response:
 
 @router.get("/api/jobs/{job_id}/export.zip")
 def export_zip(job_id: str) -> Response:
-    require_job(job_id)
+    job = require_job(job_id)
     db = database()
 
     comparison = db[COMPARISONS_COLLECTION].find_one(
@@ -250,6 +250,29 @@ def export_zip(job_id: str) -> Response:
         archive.writestr(
             "failures.csv",
             csv_bytes(comparison.get("failures", [])),
+        )
+        archive.writestr(
+            "strategy_manifest.json",
+            json.dumps(
+                iso_value(
+                    {
+                        "job_id": job_id,
+                        "status": job.get("status"),
+                        "strategy_profile_id": job.get("strategy_profile_id"),
+                        "strategy_profile_name": job.get("strategy_profile_name"),
+                        "strategy_profile_revision": job.get("strategy_profile_revision"),
+                        "strategy_configuration_hash": job.get("strategy_configuration_hash"),
+                        "winner_engine_compatibility": job.get("winner_engine_compatibility"),
+                        "numeric_thread_environment_applied": job.get("numeric_thread_environment_applied"),
+                        "created_at": job.get("created_at"),
+                        "started_at": job.get("started_at"),
+                        "finished_at": job.get("finished_at"),
+                        "configuration": job.get("request"),
+                    }
+                ),
+                indent=2,
+                ensure_ascii=False,
+            ),
         )
         for run in runs:
             symbol = str(run["symbol"])

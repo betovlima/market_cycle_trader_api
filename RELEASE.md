@@ -1,3 +1,23 @@
+## v1.13.20 — Winner-Compatible Strategy Research Workspace
+
+- Preserves the existing API v1.13.16 production winner as an immutable Trader snapshot.
+- Migrates `winner-v1.13.1` metadata without renaming or rewriting the production source document.
+- Restores API v1.13.16 numerical execution semantics for non-deterministic XGBoost runs.
+- Adds editable research clones with every validated `BacktestRequest` parameter available to Administrators.
+- Allows cloning and editing while another immutable backtest snapshot runs.
+- Keeps one active backtest globally; selection, deletion and promotion wait for completion.
+- Prevents an old job from certifying a newer edited revision.
+- Keeps Trader isolated from research until explicit Administrator promotion.
+- Preserves former winners as locked snapshots and requires Paper-state reinitialization after promotion.
+- Adds winner-engine compatibility metadata to Administrator exports.
+
+## v1.13.18 — Winner Execution Lock and Administrator Exports
+
+- Preserves the installed winner execution configuration exactly during manual and automatic runs.
+- System Settings no longer overrides `xgb_n_jobs` or `numeric_thread_limit`.
+- Runtime thread preferences remain stored only for backward compatibility and are not applied to the winner.
+- Backtest exports are restricted to Administrator sessions.
+
 ## 1.13.9
 
 - Adds sanitized administrator-only capital-rotation reporting for completed backtests.
@@ -65,9 +85,26 @@ Viewer sessions can now use Dashboard, Backtest, job results and exports, includ
 - Adds identity mismatch, claim, login and session replacement audit events.
 - Preserves all strategy, backtest, analytics, Portfolio and Paper automation behavior.
 
-## v1.13.16 — Unified Google authentication
+## v1.13.14 — Unified Google authentication
 
 - Adds Google identity-bound Administrator access alongside Viewer and Trader.
 - Adds direct login for previously claimed identities.
 - Creates and protects the primary Google Administrator configured by `TRADER_ADMIN_GOOGLE_EMAIL`.
 - Keeps the password login endpoint as a recovery mechanism while removing it from the frontend.
+
+
+## v1.13.15 — Role-based session expiration
+
+- Enforces absolute and inactivity timeouts by Viewer, Trader, and Administrator role.
+
+## v1.13.16 — Administrative Trader controls
+
+- Adds persisted `active`, `paused`, `exit_only`, and `stopped` operation modes.
+- Adds Administrator operational audit history.
+
+## v1.13.17 — Administrator System Settings
+
+- Adds revision-controlled MongoDB runtime settings for model execution.
+- Adds XGBoost and numeric thread controls, concurrent-job limits, backtest timeout, and automatic pre-market training control.
+- Applies runtime settings to manual backtests and Paper model training while preserving the locked winner strategy.
+- Adds protected settings history and conflict-safe updates.

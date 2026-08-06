@@ -393,6 +393,15 @@ def install_winner_strategy_configuration(
             "The stored strategy does not match the validated winner-v1.13.2 hash."
         )
 
+    from .strategy_lab import synchronize_bundled_winner_installation
+
+    synchronize_bundled_winner_installation(
+        db,
+        validated,
+        note=note,
+        source=source,
+    )
+
     response = _public_configuration(stored)
     response.update(
         {
