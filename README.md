@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.20
+# Market Cycle Trader API v1.13.22
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -173,6 +173,24 @@ Protected routes:
 GET   /api/admin/system-settings
 PATCH /api/admin/system-settings
 GET   /api/admin/system-settings/history
+```
+
+
+## v1.13.21 — Candidate strategy lifecycle
+
+The Administrator strategy catalog now has an explicit lifecycle:
+
+- `draft`: editable research revision;
+- `candidate`: exact revision certified by a completed backtest;
+- `winner`: immutable snapshot used by Trader;
+- `former_winner`: preserved immutable historical winner.
+
+Marking a candidate never changes Trader. Editing a candidate returns it to draft. Promotion requires candidate status, the exact certified backtest revision, and the existing safe Trader/Paper state.
+
+Administrator endpoint:
+
+```http
+POST /api/admin/strategies/{strategy_id}/mark-as-candidate
 ```
 
 

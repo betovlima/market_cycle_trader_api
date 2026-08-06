@@ -13,13 +13,13 @@ Before deployment, save:
 
 Pause Trader before replacing the API. Pausing must not liquidate an existing position.
 
-## 2. Deploy API v1.13.20
+## 2. Deploy API v1.13.22
 
 ```http
 GET /api/health/live
 ```
 
-Expected API version: `1.13.20`.
+Expected API version: `1.13.22`.
 
 ```http
 GET /api/health/ready
@@ -122,3 +122,12 @@ Promotion creates a new immutable winner snapshot and preserves the former winne
 ## 8. Single-backtest rule
 
 Only one backtest may be queued or running. Cloning and editing drafts remain available during the run, but selection, deletion, promotion and `Start New Backtest` remain locked until completion.
+
+
+## Candidate workflow
+
+1. Save an editable research revision.
+2. Select it for backtest and complete the exact revision.
+3. Mark the validated revision as `candidate` with an audit reason.
+4. Keep researching by cloning it, or explicitly promote it only after production validation and safe Trader/Paper checks.
+5. Any edit to a candidate creates a new draft revision and requires a new backtest and candidate certification.

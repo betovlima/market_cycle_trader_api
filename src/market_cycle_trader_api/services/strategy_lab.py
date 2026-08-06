@@ -192,6 +192,16 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "last_backtest_id": document.get("last_backtest_id"),
         "last_backtest_status": document.get("last_backtest_status"),
         "last_backtest_revision": document.get("last_backtest_revision"),
+        "candidate_at": bson_value(document.get("candidate_at")),
+        "candidate_by": document.get("candidate_by"),
+        "candidate_note": document.get("candidate_note"),
+        "candidate_revision": document.get("candidate_revision"),
+        "candidate_backtest_id": document.get("candidate_backtest_id"),
+        "superseded_at": bson_value(document.get("superseded_at")),
+        "superseded_by_strategy_id": document.get("superseded_by_strategy_id"),
+        "supersession_note": document.get("supersession_note"),
+        "last_promoted_winner_strategy_id": document.get("last_promoted_winner_strategy_id"),
+        "last_promoted_at": bson_value(document.get("last_promoted_at")),
         "origin": {
             "configuration_name": document.get("origin_configuration_name"),
             "winner_source_file": document.get("origin_winner_source_file"),
@@ -212,15 +222,27 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
 def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     research_id = str(control.get("research_strategy_id") or "")
     winner_id = str(control.get("trader_winner_strategy_id") or "")
+    candidate_id = str(control.get("candidate_strategy_id") or "")
     research = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": research_id})
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
+    candidate = (
+        db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": candidate_id})
+        if candidate_id
+        else None
+    )
     if research is None or winner is None:
         raise StrategyLabError("Strategy selection references a missing strategy profile.")
     return {
         "revision": int(control.get("revision") or 1),
         "research_strategy_id": research_id,
+        "candidate_strategy_id": candidate_id or None,
         "trader_winner_strategy_id": winner_id,
         "research_strategy": _public_profile(research, include_configuration=False),
+        "candidate_strategy": (
+            _public_profile(candidate, include_configuration=False)
+            if candidate is not None
+            else None
+        ),
         "trader_winner": _public_profile(winner, include_configuration=False),
         "updated_at": bson_value(control.get("updated_at")),
         "updated_by": control.get("updated_by"),
@@ -255,6 +277,80 @@ def _legacy_winner_id(document: dict[str, Any], configuration_hash: str) -> str:
     return slug if slug.startswith("winner-") else f"initial-winner-{slug}"
 
 
+
+def _normalize_single_candidate_and_winner(
+    db: Any,
+    control: dict[str, Any],
+) -> dict[str, Any]:
+    """Migrate older catalogs to one active Candidate and one active Winner."""
+    now = utc_now()
+    winner_id = str(control.get("trader_winner_strategy_id") or "")
+    winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
+    if winner is not None and (
+        str(winner.get("status") or "") != "winner" or not bool(winner.get("locked"))
+    ):
+        db[STRATEGY_PROFILES_COLLECTION].update_one(
+            {"_id": winner_id},
+            {"$set": {"status": "winner", "locked": True, "updated_at": now}},
+        )
+    db[STRATEGY_PROFILES_COLLECTION].update_many(
+        {"_id": {"$ne": winner_id}, "status": "winner"},
+        {"$set": {"status": "former_winner", "locked": True, "updated_at": now}},
+    )
+
+    candidate_id = str(control.get("candidate_strategy_id") or "")
+    candidate = (
+        db[STRATEGY_PROFILES_COLLECTION].find_one(
+            {"_id": candidate_id, "status": "candidate"}
+        )
+        if candidate_id
+        else None
+    )
+    candidates = list(
+        db[STRATEGY_PROFILES_COLLECTION].find({"status": "candidate"})
+    )
+    if candidate is None:
+        candidate_id = ""
+    if candidate is None and candidates:
+        candidates.sort(
+            key=lambda item: str(
+                item.get("candidate_at") or item.get("updated_at") or item.get("created_at") or ""
+            ),
+            reverse=True,
+        )
+        candidate = candidates[0]
+        candidate_id = str(candidate.get("_id") or "")
+
+    for profile in candidates:
+        profile_id = str(profile.get("_id") or "")
+        if profile_id and profile_id != candidate_id:
+            db[STRATEGY_PROFILES_COLLECTION].update_one(
+                {"_id": profile_id, "status": "candidate"},
+                {
+                    "$set": {
+                        "status": "superseded_candidate",
+                        "locked": True,
+                        "superseded_at": now,
+                        "superseded_by_strategy_id": candidate_id or None,
+                        "updated_at": now,
+                    }
+                },
+            )
+
+    normalized_candidate_id = candidate_id or None
+    if control.get("candidate_strategy_id") != normalized_candidate_id:
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": CONTROL_ID},
+            {
+                "$set": {
+                    "candidate_strategy_id": normalized_candidate_id,
+                    "updated_at": now,
+                }
+            },
+        )
+        control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
+    return control
+
 def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
     control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID})
     if control is not None:
@@ -265,7 +361,7 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
             {"_id": str(control.get("trader_winner_strategy_id") or "")}
         )
         if research is not None and winner is not None:
-            return control
+            return _normalize_single_candidate_and_winner(db, control)
 
     # First migration from API v1.13.16: preserve the production winner exactly
     # as it exists in backtest_settings/default. The catalog is additive and does
@@ -309,6 +405,7 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
         "_id": CONTROL_ID,
         "revision": 1,
         "research_strategy_id": strategy_id,
+        "candidate_strategy_id": None,
         "trader_winner_strategy_id": strategy_id,
         "created_at": now,
         "updated_at": now,
@@ -366,6 +463,7 @@ def synchronize_bundled_winner_installation(
         "_id": CONTROL_ID,
         "revision": 1,
         "research_strategy_id": BUNDLED_WINNER_ID,
+        "candidate_strategy_id": None,
         "trader_winner_strategy_id": BUNDLED_WINNER_ID,
         "created_at": now,
         "updated_at": now,
@@ -514,6 +612,12 @@ def update_strategy(
                 "last_backtest_id": None,
                 "last_backtest_status": None,
                 "last_backtest_at": None,
+                "last_backtest_revision": None,
+                "candidate_at": None,
+                "candidate_by": None,
+                "candidate_note": None,
+                "candidate_revision": None,
+                "candidate_backtest_id": None,
             },
             "$inc": {"revision": 1},
         },
@@ -522,6 +626,18 @@ def update_strategy(
     if updated is None:
         raise StrategyLabConflict("Strategy changed before this update was applied.")
 
+    if str(current.get("status") or "draft") == "candidate":
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": CONTROL_ID, "candidate_strategy_id": strategy_id},
+            {
+                "$set": {
+                    "candidate_strategy_id": None,
+                    "updated_at": now,
+                    "updated_by": (actor_email or "").strip().lower() or None,
+                },
+                "$inc": {"revision": 1},
+            },
+        )
     return _public_profile(updated)
 
 
@@ -570,6 +686,140 @@ def select_research_strategy(
     if updated_control is None:
         raise StrategyLabConflict("Strategy selection changed before this update was applied.")
     return _control_response(db, updated_control)
+
+
+def mark_strategy_as_candidate(
+    db: Any,
+    strategy_id: str,
+    *,
+    expected_strategy_revision: int,
+    note: str,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    control = ensure_strategy_catalog(db)
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+    if profile is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
+    if bool(profile.get("locked")):
+        raise StrategyLabConflict(
+            "Protected lifecycle snapshots cannot be marked as candidates. Clone the strategy first."
+        )
+    current_revision = int(profile.get("revision") or 1)
+    if current_revision != expected_strategy_revision:
+        raise StrategyLabConflict(
+            f"Expected strategy revision {expected_strategy_revision}, current revision {current_revision}."
+        )
+    current_candidate_id = str(control.get("candidate_strategy_id") or "")
+    if current_candidate_id == strategy_id and str(profile.get("status") or "") == "candidate":
+        raise StrategyLabConflict("This exact strategy revision is already the active candidate.")
+
+    completed_job_id = str(profile.get("last_backtest_id") or "")
+    completed_job = (
+        db[JOBS_COLLECTION].find_one(
+            {
+                "id": completed_job_id,
+                "status": "completed",
+                "strategy_profile_id": strategy_id,
+                "strategy_profile_revision": current_revision,
+            },
+            {"_id": 0, "id": 1},
+        )
+        if completed_job_id
+        else None
+    )
+    if (
+        str(profile.get("last_backtest_status") or "") != "completed"
+        or int(profile.get("last_backtest_revision") or 0) != current_revision
+        or completed_job is None
+    ):
+        raise StrategyLabConflict(
+            "Run and complete a backtest with the current strategy revision before marking it as a candidate."
+        )
+
+    now = utc_now()
+    actor = (actor_email or "").strip().lower() or None
+    control_revision = int(control.get("revision") or 1)
+    updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {"_id": CONTROL_ID, "revision": control_revision},
+        {
+            "$set": {
+                "candidate_strategy_id": strategy_id,
+                "updated_at": now,
+                "updated_by": actor,
+                "last_candidate_note": note,
+            },
+            "$inc": {"revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated_control is None:
+        raise StrategyLabConflict("Candidate selection changed before this update was applied.")
+
+    db[STRATEGY_PROFILES_COLLECTION].update_many(
+        {"_id": {"$ne": strategy_id}, "status": "candidate"},
+        {
+            "$set": {
+                "status": "superseded_candidate",
+                "locked": True,
+                "superseded_at": now,
+                "superseded_by_strategy_id": strategy_id,
+                "superseded_by": actor,
+                "supersession_note": note,
+                "updated_at": now,
+                "updated_by": actor,
+            }
+        },
+    )
+
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {"_id": strategy_id, "revision": current_revision, "locked": {"$ne": True}},
+        {
+            "$set": {
+                "status": "candidate",
+                "candidate_at": now,
+                "candidate_by": actor,
+                "candidate_note": note,
+                "candidate_revision": current_revision,
+                "candidate_backtest_id": completed_job_id,
+                "updated_at": now,
+                "updated_by": actor,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {
+                "_id": CONTROL_ID,
+                "revision": control_revision + 1,
+                "candidate_strategy_id": strategy_id,
+            },
+            {
+                "$set": {
+                    "candidate_strategy_id": current_candidate_id or None,
+                    "updated_at": utc_now(),
+                },
+                "$inc": {"revision": 1},
+            },
+        )
+        raise StrategyLabConflict("Strategy changed before candidate status was applied.")
+
+    db[STRATEGY_PROMOTION_HISTORY_COLLECTION].insert_one(
+        bson_value(
+            {
+                "action": "candidate_replaced" if current_candidate_id else "candidate_marked",
+                "previous_candidate_strategy_id": current_candidate_id or None,
+                "new_candidate_strategy_id": strategy_id,
+                "strategy_revision": current_revision,
+                "backtest_id": completed_job_id,
+                "note": note,
+                "created_at": now,
+                "actor_email": actor,
+            }
+        )
+    )
+    return _public_profile(updated)
+
 
 
 def _assert_trader_safe_for_promotion(db: Any) -> None:
@@ -628,27 +878,32 @@ def promote_strategy_to_trader(
         raise StrategyLabConflict(
             f"Expected strategy revision {expected_strategy_revision}, current revision {source_revision}."
         )
-    last_backtest_id = str(source.get("last_backtest_id") or "")
+    if str(source.get("status") or "draft") != "candidate":
+        raise StrategyLabConflict(
+            "Mark the validated strategy revision as a candidate before promotion."
+        )
+    if str(control.get("candidate_strategy_id") or "") != strategy_id:
+        raise StrategyLabConflict("Only the single active candidate can be promoted.")
+    candidate_backtest_id = str(source.get("candidate_backtest_id") or "")
     completed_job = (
         db[JOBS_COLLECTION].find_one(
             {
-                "id": last_backtest_id,
+                "id": candidate_backtest_id,
                 "status": "completed",
                 "strategy_profile_id": strategy_id,
                 "strategy_profile_revision": source_revision,
             },
             {"_id": 0, "id": 1},
         )
-        if last_backtest_id
+        if candidate_backtest_id
         else None
     )
     if (
-        str(source.get("last_backtest_status") or "") != "completed"
-        or int(source.get("last_backtest_revision") or 0) != source_revision
+        int(source.get("candidate_revision") or 0) != source_revision
         or completed_job is None
     ):
         raise StrategyLabConflict(
-            "Run and complete a backtest with the current strategy revision before promotion."
+            "Candidate certification does not match the current strategy revision."
         )
     configuration = BacktestRequest.model_validate(source.get("configuration") or {})
     payload = configuration.model_dump(mode="json")
@@ -681,6 +936,7 @@ def promote_strategy_to_trader(
         {"_id": CONTROL_ID, "revision": control_revision},
         {
             "$set": {
+                "candidate_strategy_id": None,
                 "trader_winner_strategy_id": winner_id,
                 "updated_at": now,
                 "updated_by": (actor_email or "").strip().lower() or None,
@@ -712,6 +968,20 @@ def promote_strategy_to_trader(
             }
         )
     )
+    db[STRATEGY_PROFILES_COLLECTION].update_one(
+        {"_id": strategy_id, "revision": source_revision},
+        {
+            "$set": {
+                "status": "promoted_candidate",
+                "locked": True,
+                "last_promoted_winner_strategy_id": winner_id,
+                "last_promoted_at": now,
+                "last_promoted_by": (actor_email or "").strip().lower() or None,
+                "updated_at": now,
+                "updated_by": (actor_email or "").strip().lower() or None,
+            }
+        },
+    )
     return {
         "status": "promoted",
         "winner": _public_profile(winner),
@@ -738,7 +1008,11 @@ def delete_strategy(
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
     if bool(profile.get("locked")):
-        raise StrategyLabConflict("Protected winner snapshots cannot be deleted.")
+        raise StrategyLabConflict("Protected lifecycle snapshots cannot be deleted.")
+    if str(profile.get("status") or "draft") != "draft":
+        raise StrategyLabConflict(
+            "Only draft strategies can be deleted. Candidate and winner history is preserved for audit."
+        )
     active_job = db[JOBS_COLLECTION].find_one(
         {
             "status": {"$in": ["queued", "running"]},
@@ -756,7 +1030,8 @@ def delete_strategy(
     db[STRATEGY_PROMOTION_HISTORY_COLLECTION].insert_one(
         bson_value(
             {
-                "action": "draft_deleted",
+                "action": "research_strategy_deleted",
+                "strategy_status": profile.get("status") or "draft",
                 "strategy_id": strategy_id,
                 "strategy_name": profile.get("name"),
                 "note": note,
