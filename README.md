@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.22
+# Market Cycle Trader API v1.13.23
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 
@@ -205,7 +205,7 @@ POST /api/admin/strategies/{strategy_id}/mark-as-candidate
 - Serializes backtests to one active job at a time.
 - Updates a draft's backtest certification only when the completed job used that exact strategy revision.
 - Backtests use the selected research snapshot; Paper Trader continues using only the immutable promoted winner snapshot.
-- Promotion remains explicit and requires the Trader to be paused or stopped, no active Paper run or pending plan, the controlled sleeve in cash, and a completed backtest for the exact candidate revision.
+- Promotion remains explicit and requires an exact completed Candidate revision, no active backtest, and the Paper pipeline to be idle before calibration, prediction or order execution. The current position and operational state are preserved; no broker call is made.
 
 ### Administrator strategy endpoints
 
@@ -220,3 +220,14 @@ POST   /api/admin/strategies/{strategy_id}/promote-to-trader
 ```
 
 Direct PATCH, PUT, reset and restore operations on `/api/admin/strategy-configuration` remain disabled. `POST /api/admin/strategy-configuration/winner/install` remains an explicit recovery operation only and must not be used during the normal production migration.
+
+
+## v1.13.23 — Metadata-only Winner promotion
+
+- Promotes the single active Candidate to `Winner v1.13.23` without requiring cash or changing the Paper sleeve.
+- Preserves `managed_symbol`, quantity, entry price, holding sessions, strategy cash, realized P&L, trade history, controller mode and an armed next-session run.
+- Makes no Alpaca request and does not run calibration, prediction, training or order execution during promotion.
+- Verifies locally that the XNYS regular session is closed before changing the Winner pointer.
+- Allows an armed run that is still waiting for pre-market analysis; blocks `preparing`, `prepared`, `executing` and plans already pending execution.
+- The next scheduled pre-market cycle loads the new immutable Winner and evaluates its complete asset universe.
+- Newly prepared plans carry the Winner id, revision, configuration hash and asset list and cannot execute under a different Winner.

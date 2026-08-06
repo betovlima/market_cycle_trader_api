@@ -7,11 +7,15 @@ from typing import Any
 from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     PAPER_MARKET_AUTOMATION_COLLECTION,
+    PAPER_MARKET_RUNS_COLLECTION,
+    PAPER_TRADE_PLANS_COLLECTION,
     PAPER_TRADING_STATE_COLLECTION,
     SETTINGS_COLLECTION,
     STRATEGY_CONTROL_COLLECTION,
     STRATEGY_PROFILES_COLLECTION,
+    STRATEGY_PROMOTION_HISTORY_COLLECTION,
 )
+from market_cycle_trader_api.services import strategy_lab as strategy_lab_service
 from market_cycle_trader_api.services.strategy_configuration import (
     install_winner_strategy_configuration,
 )
@@ -26,6 +30,10 @@ from market_cycle_trader_api.services.strategy_lab import (
     select_research_strategy,
     update_strategy,
 )
+
+# Promotion tests exercise lifecycle semantics, not the wall-clock. Production
+# still enforces the XNYS regular-session boundary without calling Alpaca.
+strategy_lab_service._regular_market_is_open = lambda: False
 
 
 class _Result:
@@ -245,12 +253,35 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
 
     db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] = {
         "_id": "default",
-        "control_mode": "stopped",
+        "enabled": True,
+        "control_mode": "active",
+        "phase": "waiting_for_premarket_analysis",
     }
     db[PAPER_TRADING_STATE_COLLECTION].documents["default"] = {
         "_id": "default",
-        "managed_symbol": None,
+        "initial_capital": 10000.0,
+        "strategy_cash": 124.5,
+        "managed_symbol": "NVDA",
+        "managed_quantity": 12.345,
+        "average_entry_price": 101.25,
+        "holding_sessions": 4,
+        "realized_pnl": 875.0,
+        "last_decision_date": "2026-08-05",
+        "last_execution_session": "2026-08-06",
     }
+    db[PAPER_MARKET_RUNS_COLLECTION].documents["paper-next"] = {
+        "_id": "paper-next",
+        "run_id": "paper-next",
+        "active_key": "alpaca-paper-next-session",
+        "status": "armed",
+        "phase": "waiting_for_premarket_analysis",
+        "execution_session": "2026-08-07",
+        "premarket_analysis_at": "2026-08-07T12:00:00+00:00",
+        "plan_id": None,
+    }
+    state_before = copy.deepcopy(db[PAPER_TRADING_STATE_COLLECTION].documents["default"])
+    automation_before = copy.deepcopy(db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"])
+    run_before = copy.deepcopy(db[PAPER_MARKET_RUNS_COLLECTION].documents["paper-next"])
 
     result = promote_strategy_to_trader(
         db,
@@ -262,14 +293,142 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     )
 
     assert result["status"] == "promoted"
+    assert result["winner"]["name"] == "Winner v1.13.23"
     assert result["winner"]["locked"] is True
     assert result["winner"]["source_strategy_id"] == draft["id"]
+    assert result["promotion"]["broker_interaction_performed"] is False
+    assert result["promotion"]["operational_state_preserved"] is True
+    assert result["promotion"]["next_scheduled_evaluation_uses_new_winner"] is True
+    assert result["promotion"]["managed_symbol"] == "NVDA"
     assert result["control"]["research_strategy_id"] == draft["id"]
     assert result["control"]["trader_winner_strategy_id"] == result["winner"]["id"]
     assert db[STRATEGY_PROFILES_COLLECTION].documents["winner-v1-13-2"]["status"] == "former_winner"
     assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["status"] == "promoted_candidate"
     assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["locked"] is True
     assert result["control"]["candidate_strategy_id"] is None
+    assert result["control"]["paper_state_reinitialization_required"] is False
+    assert db[PAPER_TRADING_STATE_COLLECTION].documents["default"] == state_before
+    assert db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] == automation_before
+    assert db[PAPER_MARKET_RUNS_COLLECTION].documents["paper-next"] == run_before
+    history = list(db[STRATEGY_PROMOTION_HISTORY_COLLECTION].documents.values())
+    promotion = [item for item in history if item.get("action") == "winner_promoted_preserving_operational_state"]
+    assert len(promotion) == 1
+    assert promotion[0]["operational_snapshot"]["managed_symbol"] == "NVDA"
+
+
+def test_promotion_blocks_after_premarket_plan_exists_without_changing_state() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Prepared plan candidate",
+        description="Promotion must happen before model preparation.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[JOBS_COLLECTION].documents["job-prepared"] = {
+        "_id": "job-prepared",
+        "id": "job-prepared",
+        "status": "completed",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=draft["id"],
+        strategy_revision=1,
+        job_id="job-prepared",
+        status="completed",
+    )
+    mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        note="Validated candidate.",
+        actor_email="admin@example.com",
+    )
+    db[PAPER_TRADING_STATE_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "managed_symbol": "NVDA",
+        "managed_quantity": 1.0,
+    }
+    db[PAPER_MARKET_RUNS_COLLECTION].documents["paper-prepared"] = {
+        "_id": "paper-prepared",
+        "run_id": "paper-prepared",
+        "active_key": "alpaca-paper-next-session",
+        "status": "prepared",
+        "phase": "waiting_for_next_market_open",
+        "plan_id": "plan-old-winner",
+    }
+    state_before = copy.deepcopy(db[PAPER_TRADING_STATE_COLLECTION].documents["default"])
+    try:
+        promote_strategy_to_trader(
+            db,
+            draft["id"],
+            expected_control_revision=2,
+            expected_strategy_revision=1,
+            note="Must be blocked after predictions exist.",
+            actor_email="admin@example.com",
+        )
+    except Exception as exc:
+        assert "before calibration" in str(exc).lower() or "current run status" in str(exc).lower()
+    else:
+        raise AssertionError("Promotion must be blocked after pre-market preparation starts.")
+    assert db[PAPER_TRADING_STATE_COLLECTION].documents["default"] == state_before
+    assert db[STRATEGY_CONTROL_COLLECTION].documents["default"]["trader_winner_strategy_id"] == "winner-v1-13-2"
+    assert db[STRATEGY_CONTROL_COLLECTION].documents["default"].get("winner_promotion_in_progress") is False
+
+
+def test_promotion_blocks_when_current_position_is_outside_candidate_universe() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Universe compatibility candidate",
+        description="Current position compatibility.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[JOBS_COLLECTION].documents["job-universe"] = {
+        "_id": "job-universe",
+        "id": "job-universe",
+        "status": "completed",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=draft["id"],
+        strategy_revision=1,
+        job_id="job-universe",
+        status="completed",
+    )
+    mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        note="Validated candidate.",
+        actor_email="admin@example.com",
+    )
+    db[PAPER_TRADING_STATE_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "managed_symbol": "ZZZ",
+        "managed_quantity": 2.0,
+    }
+    try:
+        promote_strategy_to_trader(
+            db,
+            draft["id"],
+            expected_control_revision=2,
+            expected_strategy_revision=1,
+            note="Must preserve incompatible position.",
+            actor_email="admin@example.com",
+        )
+    except Exception as exc:
+        assert "not part of the candidate asset universe" in str(exc).lower()
+    else:
+        raise AssertionError("Promotion must block an incompatible managed symbol without liquidating it.")
+    assert db[PAPER_TRADING_STATE_COLLECTION].documents["default"]["managed_symbol"] == "ZZZ"
 
 
 def test_catalog_migration_preserves_production_winner_identity_and_document() -> None:

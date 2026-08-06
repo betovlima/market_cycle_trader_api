@@ -13,13 +13,13 @@ Before deployment, save:
 
 Pause Trader before replacing the API. Pausing must not liquidate an existing position.
 
-## 2. Deploy API v1.13.22
+## 2. Deploy API v1.13.23
 
 ```http
 GET /api/health/live
 ```
 
-Expected API version: `1.13.22`.
+Expected API version: `1.13.23`.
 
 ```http
 GET /api/health/ready
@@ -110,14 +110,13 @@ After validation, resume Trader through Administrator controls. No Paper-state r
 
 Promotion requires:
 
-- the candidate's current revision has a completed backtest;
+- the Candidate's current revision has the exact completed certified backtest;
 - no queued/running backtest;
-- Trader paused or stopped;
-- no active Paper run;
-- no pending Paper plan;
-- the controlled Paper sleeve in cash.
+- the market is closed and the Administrator confirms the metadata-only handoff;
+- no Paper calibration, prediction, prepared plan or order execution is in progress;
+- any current managed symbol belongs to the Candidate asset universe.
 
-Promotion creates a new immutable winner snapshot and preserves the former winner. Only after promotion must Paper state be reinitialized before Trader is restarted.
+The Trader may remain active, paused, exit-only or stopped. Promotion preserves the Paper position, strategy cash, history, controller mode and an armed run waiting for pre-market analysis. It does not contact Alpaca and does not require Paper-state reinitialization. The next scheduled pre-market cycle loads every asset from the new Winner.
 
 ## 8. Single-backtest rule
 

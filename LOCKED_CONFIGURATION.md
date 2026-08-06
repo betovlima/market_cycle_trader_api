@@ -25,7 +25,7 @@ A candidate can change Trader only through explicit Administrator promotion afte
 POST /api/admin/strategies/{strategy_id}/promote-to-trader
 ```
 
-Promotion creates a new locked snapshot, preserves the previous winner as a locked former winner, and requires Paper state reinitialization before Trader can restart.
+Promotion creates a new locked snapshot and preserves the previous winner as a locked former winner. It is a metadata-only handoff: the current Paper position, cash, state, scheduler and armed next-session run remain unchanged, `paper_state_reinitialization_required` stays false, and the next scheduled pre-market cycle loads the new Winner asset universe.
 
 ## Bundled winner recovery
 
