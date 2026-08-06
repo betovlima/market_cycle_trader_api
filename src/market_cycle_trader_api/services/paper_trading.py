@@ -16,6 +16,7 @@ from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_ORDERS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
     PAPER_TRADING_STATE_COLLECTION,
+    STRATEGY_CONTROL_COLLECTION,
     bson_value,
     get_paper_trading_settings,
     get_paper_trading_state,
@@ -61,13 +62,20 @@ def _et_date(value: Any) -> str:
     return stamp.tz_convert(EASTERN).date().isoformat()
 
 
-def _validated_context(db: Any) -> tuple[BacktestRequest, PaperTradingSettings, PaperTradingState]:
+def _validated_context(
+    db: Any,
+) -> tuple[BacktestRequest, PaperTradingSettings, PaperTradingState, dict[str, Any]]:
+    strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
+    if bool(strategy_control.get("winner_promotion_in_progress")):
+        raise RuntimeError(
+            "Winner promotion is in progress. The scheduled model pipeline will retry after the metadata handoff completes."
+        )
     if trader_winner_requires_state_reinitialization(db):
         raise RuntimeError(
-            "The Trader winner changed. Reinitialize the Paper strategy state before arming Trader."
+            "The Trader winner requires protected Paper state initialization before arming Trader."
         )
     try:
-        winner_configuration, _winner_profile = get_trader_winner_context(db)
+        winner_configuration, winner_profile = get_trader_winner_context(db)
         strategy = apply_training_runtime_settings(
             db,
             winner_configuration,
@@ -101,14 +109,14 @@ def _validated_context(db: Any) -> tuple[BacktestRequest, PaperTradingSettings, 
             "Paper state initial capital differs from the locked strategy capital: "
             f"state={state.initial_capital:.2f}, locked={strategy.initial_capital:.2f}."
         )
-    return strategy, settings, state
+    return strategy, settings, state, winner_profile
 
 
 
 def paper_market_readiness(db: Any) -> dict[str, Any]:
     """Validate every dependency required to arm next-session paper execution."""
 
-    strategy, settings, state = _validated_context(db)
+    strategy, settings, state, winner_profile = _validated_context(db)
     client = create_paper_trading_client(db)
     account = account_snapshot(client)
     assert_account_can_trade(account)
@@ -289,7 +297,7 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
     runtime_training = get_system_settings(db)["training"]
     if not bool(runtime_training["enabled"]):
         raise RuntimeError("Model training is disabled in System Settings.")
-    strategy, settings, state = _validated_context(db)
+    strategy, settings, state, winner_profile = _validated_context(db)
     client = create_paper_trading_client(db)
     account = account_snapshot(client)
     assert_account_can_trade(account)
@@ -361,6 +369,11 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
     plan = PaperTradePlan(
         plan_id=plan_id,
         status="prepared",
+        winner_strategy_id=str(winner_profile["id"]),
+        winner_strategy_name=str(winner_profile["name"]),
+        winner_strategy_revision=int(winner_profile["revision"]),
+        winner_configuration_hash=str(winner_profile["configuration_hash"]),
+        winner_assets=list(strategy.assets),
         decision_date=decision_date,
         expected_market_open=expected_open.isoformat(),
         execution_session=execution_session,
@@ -591,7 +604,7 @@ def _execute_buy(
 
 
 def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[str, Any]:
-    strategy, settings, state = _validated_context(db)
+    strategy, settings, state, winner_profile = _validated_context(db)
     query: dict[str, Any]
     if plan_id:
         query = {"plan_id": plan_id}
@@ -604,6 +617,23 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
         return {key: bson_value(value) for key, value in plan.items() if key != "_id"}
     if plan.get("status") != "prepared":
         raise RuntimeError(f"Paper plan is not executable: status={plan.get('status')}.")
+
+    plan_winner_id = str(plan.get("winner_strategy_id") or "")
+    plan_winner_revision = int(plan.get("winner_strategy_revision") or 0)
+    plan_winner_hash = str(plan.get("winner_configuration_hash") or "")
+    if not plan_winner_id or not plan_winner_hash:
+        raise RuntimeError(
+            "The prepared Paper plan predates Winner identity binding and cannot be executed safely."
+        )
+    if (
+        plan_winner_id != str(winner_profile["id"])
+        or plan_winner_revision != int(winner_profile["revision"])
+        or plan_winner_hash != str(winner_profile["configuration_hash"])
+    ):
+        raise RuntimeError(
+            "The prepared Paper plan belongs to a different Trader Winner. "
+            "Discard it and let the scheduled pre-market cycle recalibrate and rebuild the plan."
+        )
 
     client = create_paper_trading_client(db)
     account = account_snapshot(client)

@@ -83,3 +83,17 @@ Validated contracts:
 - Exactly one active `winner` remains selected by `trader_winner_strategy_id`; the previous winner becomes `former_winner`.
 - Candidate edits clear the active Candidate pointer and create a Draft revision.
 - Production winner configuration and execution semantics are unchanged.
+
+
+## v1.13.23 metadata-only promotion validation
+
+- Python source and test compilation passed.
+- Complete automated API suite passed: 97 tests.
+- Promotion enforces the XNYS closed-session boundary through `exchange-calendars`, without a broker request.
+- Promotion succeeds with an existing managed position when its symbol belongs to the Candidate universe.
+- The Paper state, controller document and an armed next-session run remain byte-for-byte unchanged in the promotion contract test.
+- Promotion is blocked after pre-market preparation starts or a plan exists.
+- Promotion is blocked for an incompatible managed symbol without liquidation or broker interaction.
+- The promoted snapshot is named `Winner v1.13.23` and leaves `paper_state_reinitialization_required=false`.
+- Paper plans are bound to Winner id, revision, configuration hash and full asset list before order execution.
+- The numerical engine, bundled recovery winner and production backtest semantics are unchanged.

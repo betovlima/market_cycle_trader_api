@@ -1,3 +1,15 @@
+## v1.13.23 — Metadata-only Winner promotion
+
+- Removes the obsolete requirement that the Paper sleeve be in cash before a Candidate can become Winner.
+- Promotes only the immutable Winner pointer and lifecycle metadata; no Alpaca request, order, liquidation, calibration, prediction or Paper-state reset is executed.
+- Preserves the current managed position, quantities, entry price, holding sessions, strategy cash, realized P&L, scheduler control mode and an armed next-session run.
+- Blocks promotion after pre-market preparation begins or while a Paper plan is pending/executing.
+- Enforces that the XNYS regular session is closed using the local exchange calendar, without contacting Alpaca.
+- Validates that the current managed symbol belongs to the Candidate asset universe without contacting Alpaca.
+- Names the promoted snapshot `Winner v1.13.23`.
+- Binds every newly prepared Paper plan to Winner id, revision, configuration hash and full asset universe.
+- Ensures the next scheduled pre-market cycle dynamically loads the promoted Winner and evaluates all of its assets.
+
 ## v1.13.22 — Single Candidate and Winner Lifecycle
 
 - Enforces one active Candidate and one active Trader Winner.

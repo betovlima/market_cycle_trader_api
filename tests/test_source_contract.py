@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "1.13.22"' in config
+    assert 'API_VERSION = "1.13.23"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -61,3 +61,19 @@ def test_obsolete_direct_strategy_mutation_payloads_are_not_packaged() -> None:
     assert not (scripts / "put_api_admin_strategy-configuration_champion.json").exists()
     recovery = (scripts / "post_api_admin_strategy-configuration_winner_install.json").read_text(encoding="utf-8")
     assert "DISASTER RECOVERY ONLY" in recovery
+
+
+def test_winner_promotion_is_metadata_only_and_binds_next_plan_to_winner() -> None:
+    strategy_lab = (SRC / "services" / "strategy_lab.py").read_text(encoding="utf-8")
+    paper = (SRC / "services" / "paper_trading.py").read_text(encoding="utf-8")
+    schema = (SRC / "schemas" / "strategy_lab.py").read_text(encoding="utf-8")
+
+    assert "Trader must be in cash before another winner can be promoted" not in strategy_lab
+    assert "broker_interaction_performed\": False" in strategy_lab
+    assert "operational_state_preserved\": True" in strategy_lab
+    assert "paper_state_reinitialization_required\": False" in strategy_lab
+    assert "confirm_market_closed: Literal[True]" in schema
+    assert "confirm_preserve_operational_state: Literal[True]" in schema
+    assert "winner_strategy_id=str(winner_profile[\"id\"])" in paper
+    assert "winner_assets=list(strategy.assets)" in paper
+    assert "The prepared Paper plan belongs to a different Trader Winner" in paper

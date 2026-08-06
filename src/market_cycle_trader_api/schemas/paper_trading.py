@@ -91,6 +91,11 @@ class PaperTradePlan(BaseModel):
 
     plan_id: str
     status: Literal["prepared", "executing", "executed", "failed", "cancelled"]
+    winner_strategy_id: str
+    winner_strategy_name: str
+    winner_strategy_revision: int = Field(ge=1)
+    winner_configuration_hash: str = Field(min_length=64, max_length=64)
+    winner_assets: list[str] = Field(min_length=1)
     decision_date: str
     expected_market_open: str
     execution_session: str

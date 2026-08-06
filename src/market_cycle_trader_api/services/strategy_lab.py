@@ -6,8 +6,11 @@ import re
 import uuid
 from typing import Any
 
+import exchange_calendars as xcals
+import pandas as pd
 from pymongo import ReturnDocument
 
+from ..core.config import API_VERSION
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     PAPER_MARKET_AUTOMATION_COLLECTION,
@@ -202,6 +205,11 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "supersession_note": document.get("supersession_note"),
         "last_promoted_winner_strategy_id": document.get("last_promoted_winner_strategy_id"),
         "last_promoted_at": bson_value(document.get("last_promoted_at")),
+        "source_candidate_backtest_id": document.get("source_candidate_backtest_id"),
+        "winner_api_version": document.get("winner_api_version"),
+        "promotion_mode": document.get("promotion_mode"),
+        "operational_state_preserved": document.get("operational_state_preserved"),
+        "broker_interaction_performed": document.get("broker_interaction_performed"),
         "origin": {
             "configuration_name": document.get("origin_configuration_name"),
             "winner_source_file": document.get("origin_winner_source_file"),
@@ -249,6 +257,10 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "paper_state_reinitialization_required": bool(
             control.get("paper_state_reinitialization_required")
         ),
+        "last_promotion_mode": control.get("last_promotion_mode"),
+        "last_promoted_api_version": control.get("last_promoted_api_version"),
+        "last_promoted_configuration_hash": control.get("last_promoted_configuration_hash"),
+        "last_promoted_assets_count": control.get("last_promoted_assets_count"),
     }
 
 
@@ -822,35 +834,145 @@ def mark_strategy_as_candidate(
 
 
 
-def _assert_trader_safe_for_promotion(db: Any) -> None:
+def _acquire_winner_promotion_lock(
+    db: Any,
+    *,
+    expected_control_revision: int,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    now = utc_now()
+    actor = (actor_email or "").strip().lower() or None
+    locked = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {
+            "_id": CONTROL_ID,
+            "revision": expected_control_revision,
+            "winner_promotion_in_progress": {"$ne": True},
+        },
+        {
+            "$set": {
+                "winner_promotion_in_progress": True,
+                "winner_promotion_started_at": now,
+                "winner_promotion_started_by": actor,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if locked is None:
+        raise StrategyLabConflict(
+            "Strategy selection changed or another Winner promotion is already in progress."
+        )
+    return locked
+
+
+def _release_winner_promotion_lock(
+    db: Any,
+    *,
+    expected_control_revision: int,
+) -> None:
+    db[STRATEGY_CONTROL_COLLECTION].update_one(
+        {"_id": CONTROL_ID, "revision": expected_control_revision},
+        {
+            "$set": {
+                "winner_promotion_in_progress": False,
+                "winner_promotion_started_at": None,
+                "winner_promotion_started_by": None,
+            }
+        },
+    )
+
+
+def _regular_market_is_open() -> bool:
+    """Return XNYS regular-session state without contacting the broker."""
+
+    stamp = pd.Timestamp(utc_now())
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    else:
+        stamp = stamp.tz_convert("UTC")
+    calendar = xcals.get_calendar("XNYS")
+    return bool(calendar.is_open_on_minute(stamp.floor("min"), ignore_breaks=True))
+
+
+def _assert_trader_safe_for_promotion(
+    db: Any,
+    *,
+    candidate_assets: list[str],
+) -> dict[str, Any]:
+    """Validate a metadata-only Winner handoff without contacting Alpaca.
+
+    An armed run that is only waiting for the configured pre-market analysis window
+    is intentionally preserved. The next preparation cycle loads the then-current
+    immutable Trader Winner, so every asset in the promoted snapshot participates.
+    """
+
+    if _regular_market_is_open():
+        raise StrategyLabConflict(
+            "Winner promotion is allowed only while the XNYS regular market is closed. "
+            "No broker request was performed."
+        )
+
     _assert_no_active_backtest(db)
+
     active_run = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
-        {"active_key": ACTIVE_PAPER_KEY}, {"_id": 0, "run_id": 1, "status": 1}
+        {"active_key": ACTIVE_PAPER_KEY},
+        {
+            "_id": 0,
+            "run_id": 1,
+            "status": 1,
+            "phase": 1,
+            "plan_id": 1,
+            "execution_session": 1,
+            "premarket_analysis_at": 1,
+        },
     )
     if active_run is not None:
-        raise StrategyLabConflict(
-            "Cancel the active Paper run before promoting another Trader winner."
-        )
-    controller = db[PAPER_MARKET_AUTOMATION_COLLECTION].find_one({"_id": "default"}) or {}
-    mode = str(controller.get("control_mode") or "stopped").strip().lower()
-    if mode not in {"paused", "stopped"}:
-        raise StrategyLabConflict(
-            "Pause or stop Trader before promoting another winner."
-        )
-    state = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"}) or {}
-    if state.get("managed_symbol"):
-        raise StrategyLabConflict(
-            "Trader must be in cash before another winner can be promoted."
-        )
+        status = str(active_run.get("status") or "").strip().lower()
+        if status != "armed":
+            raise StrategyLabConflict(
+                "Winner promotion requires the Paper pipeline to be idle before calibration, "
+                "prediction or order execution. Current run status: "
+                f"{status or 'unknown'}."
+            )
+        if active_run.get("plan_id"):
+            raise StrategyLabConflict(
+                "A Paper plan already exists for the next session. Promote only before the "
+                "scheduled pre-market calibration and prediction cycle starts."
+            )
+
     pending_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
-        {"status": {"$in": ["prepared", "submitted", "pending"]}},
-        {"_id": 0, "plan_id": 1},
+        {"status": {"$in": ["prepared", "executing", "submitted", "pending"]}},
+        {"_id": 0, "plan_id": 1, "status": 1},
     )
     if pending_plan is not None:
         raise StrategyLabConflict(
-            "Cancel the pending Paper plan before promoting another winner."
+            "A Paper plan is already pending or executing. Promote only before the next "
+            "scheduled calibration and prediction cycle."
         )
 
+    state = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"}) or {}
+    managed_symbol = str(state.get("managed_symbol") or "").strip().upper() or None
+    normalized_assets = {str(symbol).strip().upper() for symbol in candidate_assets}
+    if managed_symbol and managed_symbol not in normalized_assets:
+        raise StrategyLabConflict(
+            "The currently managed position is not part of the Candidate asset universe: "
+            f"{managed_symbol}. Promotion was blocked without contacting Alpaca or changing the position."
+        )
+
+    controller = db[PAPER_MARKET_AUTOMATION_COLLECTION].find_one({"_id": "default"}) or {}
+    return {
+        "trader_control_mode": str(controller.get("control_mode") or "stopped").strip().lower(),
+        "active_run_id": (active_run or {}).get("run_id"),
+        "active_run_status": (active_run or {}).get("status"),
+        "active_run_phase": (active_run or {}).get("phase"),
+        "active_run_execution_session": (active_run or {}).get("execution_session"),
+        "active_run_premarket_analysis_at": bson_value(
+            (active_run or {}).get("premarket_analysis_at")
+        ),
+        "managed_symbol": managed_symbol,
+        "managed_quantity": float(state.get("managed_quantity") or 0.0),
+        "strategy_cash": float(state.get("strategy_cash") or 0.0),
+        "holding_sessions": int(state.get("holding_sessions") or 0),
+    }
 
 def promote_strategy_to_trader(
     db: Any,
@@ -861,7 +983,6 @@ def promote_strategy_to_trader(
     note: str,
     actor_email: str | None,
 ) -> dict[str, Any]:
-    _assert_trader_safe_for_promotion(db)
     control = ensure_strategy_catalog(db)
     control_revision = int(control.get("revision") or 1)
     if control_revision != expected_control_revision:
@@ -870,6 +991,7 @@ def promote_strategy_to_trader(
         )
     if strategy_id == str(control.get("trader_winner_strategy_id") or ""):
         raise StrategyLabConflict("This strategy is already the active Trader winner.")
+
     source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if source is None:
         raise StrategyLabNotFound("Strategy profile not found.")
@@ -884,6 +1006,7 @@ def promote_strategy_to_trader(
         )
     if str(control.get("candidate_strategy_id") or "") != strategy_id:
         raise StrategyLabConflict("Only the single active candidate can be promoted.")
+
     candidate_backtest_id = str(source.get("candidate_backtest_id") or "")
     completed_job = (
         db[JOBS_COLLECTION].find_one(
@@ -893,101 +1016,262 @@ def promote_strategy_to_trader(
                 "strategy_profile_id": strategy_id,
                 "strategy_profile_revision": source_revision,
             },
-            {"_id": 0, "id": 1},
+            {
+                "_id": 0,
+                "id": 1,
+                "strategy_configuration_hash": 1,
+            },
         )
         if candidate_backtest_id
         else None
     )
-    if (
-        int(source.get("candidate_revision") or 0) != source_revision
-        or completed_job is None
-    ):
+    if int(source.get("candidate_revision") or 0) != source_revision or completed_job is None:
         raise StrategyLabConflict(
             "Candidate certification does not match the current strategy revision."
         )
+
     configuration = BacktestRequest.model_validate(source.get("configuration") or {})
     payload = configuration.model_dump(mode="json")
     configuration_hash = _configuration_hash(payload)
-    now = utc_now()
-    winner_id = (
-        f"winner-{now.strftime('%Y%m%dT%H%M%S')}-"
-        f"{configuration_hash[:8]}-{uuid.uuid4().hex[:6]}"
-    )
-    winner = {
-        "_id": winner_id,
-        "name": f"{source.get('name') or 'Strategy'} · Winner",
-        "description": str(source.get("description") or ""),
-        "status": "winner",
-        "locked": True,
-        "revision": 1,
-        "configuration": bson_value(payload),
-        "configuration_hash": configuration_hash,
-        "source_strategy_id": strategy_id,
-        "source_strategy_revision": source_revision,
-        "created_at": now,
-        "updated_at": now,
-        "promoted_at": now,
-        "promoted_by": (actor_email or "").strip().lower() or None,
-        "promotion_note": note,
-    }
-    db[STRATEGY_PROFILES_COLLECTION].insert_one(winner)
-    previous_winner_id = str(control.get("trader_winner_strategy_id") or "")
-    updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
-        {"_id": CONTROL_ID, "revision": control_revision},
-        {
-            "$set": {
-                "candidate_strategy_id": None,
-                "trader_winner_strategy_id": winner_id,
-                "updated_at": now,
-                "updated_by": (actor_email or "").strip().lower() or None,
-                "last_promotion_note": note,
-                "paper_state_reinitialization_required": True,
-            },
-            "$inc": {"revision": 1},
-        },
-        return_document=ReturnDocument.AFTER,
-    )
-    if updated_control is None:
-        db[STRATEGY_PROFILES_COLLECTION].delete_one({"_id": winner_id})
-        raise StrategyLabConflict("Winner selection changed before promotion completed.")
-    db[STRATEGY_PROFILES_COLLECTION].update_one(
-        {"_id": previous_winner_id},
-        {"$set": {"status": "former_winner", "locked": True, "updated_at": now}},
-    )
-    db[STRATEGY_PROMOTION_HISTORY_COLLECTION].insert_one(
-        bson_value(
-            {
-                "previous_winner_strategy_id": previous_winner_id,
-                "new_winner_strategy_id": winner_id,
-                "source_strategy_id": strategy_id,
-                "source_strategy_revision": source_revision,
-                "configuration_hash": configuration_hash,
-                "note": note,
-                "promoted_at": now,
-                "promoted_by": (actor_email or "").strip().lower() or None,
-            }
+    stored_hash = str(source.get("configuration_hash") or "")
+    if stored_hash and stored_hash != configuration_hash:
+        raise StrategyLabConflict(
+            "Candidate configuration hash does not match its stored immutable revision."
         )
-    )
-    db[STRATEGY_PROFILES_COLLECTION].update_one(
-        {"_id": strategy_id, "revision": source_revision},
-        {
-            "$set": {
-                "status": "promoted_candidate",
-                "locked": True,
-                "last_promoted_winner_strategy_id": winner_id,
-                "last_promoted_at": now,
-                "last_promoted_by": (actor_email or "").strip().lower() or None,
-                "updated_at": now,
-                "updated_by": (actor_email or "").strip().lower() or None,
-            }
-        },
-    )
-    return {
-        "status": "promoted",
-        "winner": _public_profile(winner),
-        "control": _control_response(db, updated_control),
-    }
+    job_hash = str((completed_job or {}).get("strategy_configuration_hash") or "")
+    if job_hash and job_hash != configuration_hash:
+        raise StrategyLabConflict(
+            "Candidate backtest hash does not match the configuration being promoted."
+        )
 
+    winner_name = f"Winner v{API_VERSION}"
+    existing_release_winner = db[STRATEGY_PROFILES_COLLECTION].find_one(
+        {"name": winner_name}
+    )
+    if existing_release_winner is not None:
+        raise StrategyLabConflict(
+            f"{winner_name} already exists. Each API release can officialize only one Winner snapshot."
+        )
+
+    actor = (actor_email or "").strip().lower() or None
+    _acquire_winner_promotion_lock(
+        db,
+        expected_control_revision=control_revision,
+        actor_email=actor,
+    )
+    winner_id: str | None = None
+    promotion_history_id: str | None = None
+    previous_winner_id: str | None = None
+    previous_transitioned = False
+    source_transitioned = False
+    promotion_completed = False
+    try:
+        operational_snapshot = _assert_trader_safe_for_promotion(
+            db,
+            candidate_assets=list(configuration.assets),
+        )
+        now = utc_now()
+        winner_id = (
+            f"winner-v{API_VERSION.replace('.', '-')}-"
+            f"{configuration_hash[:8]}-{uuid.uuid4().hex[:6]}"
+        )
+        winner = {
+            "_id": winner_id,
+            "name": winner_name,
+            "description": str(source.get("description") or ""),
+            "status": "winner",
+            "locked": True,
+            "revision": 1,
+            "configuration": bson_value(payload),
+            "configuration_hash": configuration_hash,
+            "source_strategy_id": strategy_id,
+            "source_strategy_revision": source_revision,
+            "source_candidate_backtest_id": candidate_backtest_id,
+            "winner_api_version": API_VERSION,
+            "created_at": now,
+            "updated_at": now,
+            "promoted_at": now,
+            "promoted_by": actor,
+            "promotion_note": note,
+            "promotion_mode": "metadata_only_operational_state_preserved",
+            "market_closed_confirmed": True,
+            "broker_interaction_performed": False,
+            "operational_state_preserved": True,
+        }
+        db[STRATEGY_PROFILES_COLLECTION].insert_one(winner)
+
+        previous_winner_id = str(control.get("trader_winner_strategy_id") or "")
+        promotion_history_id = f"promotion-{uuid.uuid4().hex}"
+        previous_updated = db[STRATEGY_PROFILES_COLLECTION].update_one(
+            {"_id": previous_winner_id, "status": "winner"},
+            {
+                "$set": {
+                    "status": "former_winner",
+                    "locked": True,
+                    "updated_at": now,
+                    "superseded_by_winner_strategy_id": winner_id,
+                }
+            },
+        )
+        previous_transitioned = previous_updated.matched_count == 1
+        source_updated = db[STRATEGY_PROFILES_COLLECTION].update_one(
+            {
+                "_id": strategy_id,
+                "revision": source_revision,
+                "status": "candidate",
+            },
+            {
+                "$set": {
+                    "status": "promoted_candidate",
+                    "locked": True,
+                    "last_promoted_winner_strategy_id": winner_id,
+                    "last_promoted_at": now,
+                    "last_promoted_by": actor,
+                    "updated_at": now,
+                    "updated_by": actor,
+                }
+            },
+        )
+        source_transitioned = source_updated.matched_count == 1
+        if not previous_transitioned or not source_transitioned:
+            raise StrategyLabConflict(
+                "Winner or Candidate lifecycle changed before promotion could be committed."
+            )
+
+        db[STRATEGY_PROMOTION_HISTORY_COLLECTION].insert_one(
+            bson_value(
+                {
+                    "_id": promotion_history_id,
+                    "status": "pending_control_commit",
+                    "action": "winner_promoted_preserving_operational_state",
+                    "previous_winner_strategy_id": previous_winner_id,
+                    "new_winner_strategy_id": winner_id,
+                    "new_winner_name": winner_name,
+                    "winner_api_version": API_VERSION,
+                    "source_strategy_id": strategy_id,
+                    "source_strategy_revision": source_revision,
+                    "candidate_backtest_id": candidate_backtest_id,
+                    "configuration_hash": configuration_hash,
+                    "assets_count": len(configuration.assets),
+                    "note": note,
+                    "promoted_at": now,
+                    "promoted_by": actor,
+                    "market_closed_confirmed": True,
+                    "broker_interaction_performed": False,
+                    "operational_state_preserved": True,
+                    "next_scheduled_evaluation_uses_new_winner": True,
+                    "operational_snapshot": operational_snapshot,
+                }
+            )
+        )
+
+        updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+            {
+                "_id": CONTROL_ID,
+                "revision": control_revision,
+                "winner_promotion_in_progress": True,
+            },
+            {
+                "$set": {
+                    "candidate_strategy_id": None,
+                    "trader_winner_strategy_id": winner_id,
+                    "updated_at": now,
+                    "updated_by": actor,
+                    "last_promotion_note": note,
+                    "last_promotion_mode": "metadata_only_operational_state_preserved",
+                    "last_promoted_api_version": API_VERSION,
+                    "last_promoted_configuration_hash": configuration_hash,
+                    "last_promoted_assets_count": len(configuration.assets),
+                    "paper_state_reinitialization_required": False,
+                    "winner_promotion_in_progress": False,
+                    "winner_promotion_started_at": None,
+                    "winner_promotion_started_by": None,
+                },
+                "$inc": {"revision": 1},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated_control is None:
+            raise StrategyLabConflict(
+                "Winner selection changed before the metadata-only promotion completed."
+            )
+
+        # The compare-and-set above is the logical commit point. From this line on,
+        # operational state and broker state remain untouched and the new immutable
+        # Winner is authoritative for the next scheduled model cycle.
+        promotion_completed = True
+        try:
+            db[STRATEGY_PROMOTION_HISTORY_COLLECTION].update_one(
+                {"_id": promotion_history_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "control_revision_after": int(updated_control.get("revision") or 0),
+                        "completed_at": utc_now(),
+                    }
+                },
+            )
+        except Exception:
+            # The control pointer has already committed. Keep the pending audit row
+            # instead of reporting a false promotion failure after a successful handoff.
+            pass
+        return {
+            "status": "promoted",
+            "winner": _public_profile(winner),
+            "control": _control_response(db, updated_control),
+            "promotion": {
+                "mode": "metadata_only_operational_state_preserved",
+                "market_closed_confirmed": True,
+                "broker_interaction_performed": False,
+                "operational_state_preserved": True,
+                "current_position_preserved": True,
+                "paper_pipeline_preserved": True,
+                "next_scheduled_evaluation_uses_new_winner": True,
+                "next_scheduled_evaluation_assets_count": len(configuration.assets),
+                **operational_snapshot,
+            },
+        }
+    except Exception:
+        if not promotion_completed:
+            if previous_transitioned and previous_winner_id:
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": previous_winner_id},
+                    {
+                        "$set": {
+                            "status": "winner",
+                            "locked": True,
+                            "updated_at": utc_now(),
+                            "superseded_by_winner_strategy_id": None,
+                        }
+                    },
+                )
+            if source_transitioned:
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": strategy_id, "revision": source_revision},
+                    {
+                        "$set": {
+                            "status": "candidate",
+                            "locked": False,
+                            "last_promoted_winner_strategy_id": None,
+                            "last_promoted_at": None,
+                            "last_promoted_by": None,
+                            "updated_at": utc_now(),
+                        }
+                    },
+                )
+            if promotion_history_id:
+                db[STRATEGY_PROMOTION_HISTORY_COLLECTION].delete_one(
+                    {"_id": promotion_history_id}
+                )
+            if winner_id:
+                db[STRATEGY_PROFILES_COLLECTION].delete_one({"_id": winner_id})
+        raise
+    finally:
+        if not promotion_completed:
+            _release_winner_promotion_lock(
+                db,
+                expected_control_revision=control_revision,
+            )
 
 def delete_strategy(
     db: Any,

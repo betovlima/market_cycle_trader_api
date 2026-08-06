@@ -311,6 +311,11 @@ def _public_robot_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
         "premarket_analysis_at",
         "premarket_analysis_started_at",
         "premarket_analysis_completed_at",
+        "winner_strategy_id",
+        "winner_strategy_name",
+        "winner_strategy_revision",
+        "winner_configuration_hash",
+        "winner_assets_count",
         "finished_at",
     )
     return {key: bson_value(document.get(key)) for key in allowed if document.get(key) is not None}
@@ -746,6 +751,11 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                     "action": str(plan["action"]),
                     "target_asset": str(plan["target_asset"]),
                     "decision_date": str(plan["decision_date"]),
+                    "winner_strategy_id": str(plan["winner_strategy_id"]),
+                    "winner_strategy_name": str(plan["winner_strategy_name"]),
+                    "winner_strategy_revision": int(plan["winner_strategy_revision"]),
+                    "winner_configuration_hash": str(plan["winner_configuration_hash"]),
+                    "winner_assets_count": len(plan["winner_assets"]),
                     "updated_at": completed_at,
                     "last_message": (
                         f"Mandatory pre-market XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
