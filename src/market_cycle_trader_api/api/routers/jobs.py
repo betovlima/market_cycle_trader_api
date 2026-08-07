@@ -104,6 +104,7 @@ def create_job() -> dict[str, Any]:
         "live_trades": [],
         "live_trade_count": 0,
         "logs": ["Backtest queued."],
+        "progress_detail": {},
         "system_settings_revision": int(runtime_settings["revision"]),
         "training_timeout_seconds": int(training_settings["timeout_seconds"]),
         "winner_engine_compatibility": "api-v1.13.16",

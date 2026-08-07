@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -17,7 +18,7 @@ from ..infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION
 from .serialization import iso_value
 from .strategy_lab import mark_strategy_backtest
 
-
+logger = logging.getLogger("uvicorn.error")
 
 
 WINNER_ENGINE_COMPATIBILITY = "api-v1.13.16"
@@ -55,6 +56,8 @@ PUBLIC_JOB_FIELDS = frozenset({
     "completed_runs",
     "total_runs",
     "return_code",
+    "strategy_profile_name",
+    "progress_detail",
 })
 
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
@@ -64,6 +67,73 @@ _MONGODB_CREDENTIAL_PATTERN = re.compile(
     r"(mongodb(?:\+srv)?://)([^@\s]+)@",
     flags=re.IGNORECASE,
 )
+_SAFE_PROGRESS_PATTERNS = (
+    re.compile(r"^Prepared \d+ assets and \d+ folds — XGBoost=(?:CPU|CUDA(?: — .+)?)$"),
+    re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — (?:calibration training|final training) \d+/\d+$"),
+    re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — evaluating rotation policy candidates$"),
+    re.compile(r"^Run \d+/\d+ — fold \d+/\d+ completed$"),
+    re.compile(r"^Run \d+/\d+ — simulating out-of-sample portfolio$"),
+    re.compile(r"^XGBoost Utility run \d+/\d+ completed$"),
+)
+_PROGRESS_DETAIL_FIELDS = frozenset({
+    "run_index",
+    "run_count",
+    "fold_index",
+    "fold_count",
+    "phase",
+    "trained_models",
+    "total_models",
+    "device",
+})
+_PROGRESS_PHASES = frozenset({
+    "Preparing run",
+    "Calibration training",
+    "Policy calibration",
+    "Final training",
+    "Fold completed",
+    "Out-of-sample simulation",
+    "Run completed",
+})
+_PROGRESS_DEVICES = frozenset({"CPU", "CUDA"})
+
+
+def _redact_sensitive_text(raw_line: Any) -> str:
+    line = str(raw_line).strip()
+    line = _SECRET_ASSIGNMENT_PATTERN.sub(r"\1=***", line)
+    return _MONGODB_CREDENTIAL_PATTERN.sub(r"\1***@", line)
+
+
+def _safe_progress_line(line: str) -> bool:
+    return any(pattern.fullmatch(line) is not None for pattern in _SAFE_PROGRESS_PATTERNS)
+
+
+def _clean_progress_detail(raw_detail: Any) -> dict[str, Any]:
+    if not isinstance(raw_detail, dict):
+        return {}
+
+    clean: dict[str, Any] = {}
+    for key in (
+        "run_index",
+        "run_count",
+        "fold_index",
+        "fold_count",
+        "trained_models",
+        "total_models",
+    ):
+        try:
+            clean[key] = max(0, min(10_000, int(raw_detail.get(key) or 0)))
+        except (TypeError, ValueError):
+            clean[key] = 0
+
+    phase = str(raw_detail.get("phase") or "").strip()
+    if phase in _PROGRESS_PHASES:
+        clean["phase"] = phase
+
+    device = str(raw_detail.get("device") or "").strip().upper()
+    if device in _PROGRESS_DEVICES:
+        clean["device"] = device
+
+    return clean
 
 
 def _public_stage(raw_stage: Any) -> str:
@@ -71,6 +141,8 @@ def _public_stage(raw_stage: Any) -> str:
     lowered = stage.lower()
     if not lowered:
         return "Queued"
+    if _safe_progress_line(stage):
+        return "Running analysis"
     if "interrupt" in lowered or "cancel" in lowered:
         return "Interrupted"
     if "fail" in lowered or "error" in lowered:
@@ -97,9 +169,11 @@ def _public_log_line(raw_line: Any) -> str | None:
     if not line:
         return None
 
-    line = _SECRET_ASSIGNMENT_PATTERN.sub(r"\1=***", line)
-    line = _MONGODB_CREDENTIAL_PATTERN.sub(r"\1***@", line)
+    line = _redact_sensitive_text(line)
     lowered = line.lower()
+
+    if _safe_progress_line(line):
+        return line
 
     if lowered == "backtest queued.":
         return "Backtest queued."
@@ -129,7 +203,20 @@ def public_job(document: dict[str, Any] | None) -> dict[str, Any] | None:
         for key, value in document.items()
         if key in PUBLIC_JOB_FIELDS
     }
-    payload["stage"] = _public_stage(document.get("stage"))
+    status = str(document.get("status") or "").strip().lower()
+    if status == "failed":
+        payload["stage"] = "Backtest failed"
+    elif status in {"interrupted", "cancelled"}:
+        payload["stage"] = "Interrupted"
+    elif status == "completed":
+        payload["stage"] = "Completed"
+    else:
+        payload["stage"] = _public_stage(document.get("stage"))
+
+    payload["progress_detail"] = {
+        key: iso_value(value)
+        for key, value in _clean_progress_detail(document.get("progress_detail")).items()
+    }
 
     raw_logs = document.get("logs")
     if isinstance(raw_logs, list):
@@ -163,6 +250,24 @@ def append_log(job_id: str, raw_line: str) -> None:
     db = database()
     job = db[JOBS_COLLECTION].find_one({"id": job_id}, {"completed_runs": 1, "total_runs": 1, "live_trade_count": 1}) or {}
     stripped = line.strip()
+    if stripped.startswith("JOB_DETAIL|"):
+        try:
+            detail = json.loads(stripped.removeprefix("JOB_DETAIL|"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(detail, dict):
+            return
+        clean = {
+            key: iso_value(value)
+            for key, value in _clean_progress_detail(detail).items()
+        }
+        db[JOBS_COLLECTION].update_one(
+            {"id": job_id},
+            {"$set": {"progress_detail": clean, "updated_at": utc_now()}},
+        )
+        return
+    if stripped.startswith("XGB_TECH|"):
+        return
     if stripped.startswith("JOB_TRADE|"):
         try:
             trade = json.loads(stripped.removeprefix("JOB_TRADE|"))
@@ -203,6 +308,29 @@ def append_log(job_id: str, raw_line: str) -> None:
     db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": changes, "$push": {"logs": {"$each": [log_line], "$slice": -400}}})
 
 
+def _write_child_line_to_console(job_id: str, raw_line: str) -> None:
+    line = _redact_sensitive_text(raw_line)
+    if not line or line.startswith("JOB_TRADE|") or line.startswith("JOB_DETAIL|"):
+        return
+    if line.startswith("JOB_PROGRESS|"):
+        parts = line.split("|", 3)
+        if len(parts) == 4:
+            logger.info(
+                "Backtest %s | progress=%s%% | %s",
+                job_id,
+                parts[1],
+                parts[3],
+            )
+        return
+    if line.startswith("XGB_TECH|"):
+        logger.info("Backtest %s | XGBoost | %s", job_id, line.removeprefix("XGB_TECH|"))
+        return
+    if line.startswith("ERROR") or line.startswith("Traceback"):
+        logger.error("Backtest %s | %s", job_id, line)
+        return
+    logger.info("Backtest %s | %s", job_id, line)
+
+
 def run_job(job_id: str) -> None:
     # Refresh local .env values before creating the engine subprocess. This is
     # harmless on Railway and ensures local secrets are inherited by the child.
@@ -213,7 +341,7 @@ def run_job(job_id: str) -> None:
     strategy_profile_revision = int(job_document.get("strategy_profile_revision") or 0) or None
     timeout_seconds = max(300, int(job_document.get("training_timeout_seconds") or 21_600))
     request_payload = job_document.get("request") if isinstance(job_document.get("request"), dict) else {}
-    db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0}})
+    db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0, "progress_detail": {}}})
     python_path = str(SOURCE_ROOT)
     existing_python_path = os.environ.get("PYTHONPATH", "")
     if existing_python_path:
@@ -278,6 +406,7 @@ def run_job(job_id: str) -> None:
         try:
             assert process.stdout is not None
             for line in process.stdout:
+                _write_child_line_to_console(job_id, line)
                 append_log(job_id, line)
             return_code = process.wait()
         finally:
@@ -315,6 +444,7 @@ def run_job(job_id: str) -> None:
         db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "failed", "stage": "Backtest failed", "finished_at": utc_now(), "updated_at": utc_now(), "return_code": return_code}, "$unset": {"process_id": ""}})
         mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
     except Exception as exc:
+        logger.exception("Backtest %s failed in the API worker", job_id)
         append_log(job_id, f"ERROR: {exc}")
         db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "failed", "stage": "Backtest failed", "finished_at": utc_now(), "updated_at": utc_now(), "error": str(exc)}, "$unset": {"process_id": ""}})
         mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
