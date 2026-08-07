@@ -293,7 +293,7 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     )
 
     assert result["status"] == "promoted"
-    assert result["winner"]["name"] == "Winner v1.13.23"
+    assert result["winner"]["name"] == "Winner v1.13.25"
     assert result["winner"]["locked"] is True
     assert result["winner"]["source_strategy_id"] == draft["id"]
     assert result["promotion"]["broker_interaction_performed"] is False

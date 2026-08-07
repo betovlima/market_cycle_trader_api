@@ -106,6 +106,34 @@ def emit_progress(percent: float, stage: str, completed_runs: int = 0) -> None:
     print(f"JOB_PROGRESS|{float(percent):.1f}|{int(completed_runs)}|{safe_stage}", flush=True)
 
 
+
+def emit_progress_detail(detail: dict[str, Any]) -> None:
+    safe = {
+        key: value
+        for key, value in detail.items()
+        if key in {
+            "run_index",
+            "run_count",
+            "fold_index",
+            "fold_count",
+            "phase",
+            "trained_models",
+            "total_models",
+            "device",
+        }
+    }
+    print(
+        "JOB_DETAIL|"
+        + json.dumps(safe, ensure_ascii=False, separators=(",", ":"), default=str),
+        flush=True,
+    )
+
+
+def emit_xgboost_technical(message: str) -> None:
+    safe_message = str(message).replace("\n", " ").replace("\r", " ").strip()
+    if safe_message:
+        print(f"XGB_TECH|{safe_message}", flush=True)
+
 def emit_trade(trade: dict[str, Any]) -> None:
     normalized = bson_value(trade)
     for key in ("timestamp", "entry_timestamp"):
@@ -249,6 +277,8 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         apply_slippage,
         progress_callback=emit_progress,
         trade_callback=emit_trade,
+        progress_detail_callback=emit_progress_detail,
+        technical_log_callback=emit_xgboost_technical,
     )
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))

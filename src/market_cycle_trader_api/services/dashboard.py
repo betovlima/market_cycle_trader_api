@@ -11,6 +11,8 @@ from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     PREDICTIONS_COLLECTION,
     RUNS_COLLECTION,
+    STRATEGY_CONTROL_COLLECTION,
+    STRATEGY_PROFILES_COLLECTION,
 )
 from .serialization import downsample_documents, iso_value
 
@@ -25,6 +27,7 @@ _PUBLIC_JOB_PROJECTION = {
     "updated_at": 1,
     "started_at": 1,
     "finished_at": 1,
+    "strategy_profile_name": 1,
 }
 
 _METRIC_KEYS = {
@@ -123,6 +126,7 @@ def _public_job_summary(
         "started_at": iso_value(job.get("started_at")),
         "finished_at": iso_value(job.get("finished_at")),
         "duration_seconds": _duration_seconds(job),
+        "strategy_profile_name": str(job.get("strategy_profile_name") or "") or None,
         "metrics": metrics,
     }
 
@@ -139,6 +143,26 @@ def _comparison_map(db: Any, job_ids: list[str]) -> dict[str, dict[str, Any]]:
         for document in documents
         if document.get("job_id")
     }
+
+
+def _selected_backtest_strategy_name(db: Any) -> str | None:
+    """Return only the public display name of the strategy selected for backtests."""
+    try:
+        control = db[STRATEGY_CONTROL_COLLECTION].find_one(
+            {"_id": "default"},
+            {"_id": 0, "research_strategy_id": 1},
+        )
+        strategy_id = str((control or {}).get("research_strategy_id") or "")
+        if not strategy_id:
+            return None
+        profile = db[STRATEGY_PROFILES_COLLECTION].find_one(
+            {"_id": strategy_id},
+            {"_id": 0, "name": 1},
+        )
+        name = str((profile or {}).get("name") or "").strip()
+        return name or None
+    except (KeyError, TypeError, AttributeError):
+        return None
 
 
 def dashboard_summary(db: Any, *, limit: int = 10) -> dict[str, Any]:
@@ -226,6 +250,7 @@ def dashboard_summary(db: Any, *, limit: int = 10) -> dict[str, Any]:
         "best_performance": best_performance,
         "last_backtest": last_backtest,
         "recent_backtests": recent_backtests,
+        "selected_backtest_strategy_name": _selected_backtest_strategy_name(db),
     }
 
 

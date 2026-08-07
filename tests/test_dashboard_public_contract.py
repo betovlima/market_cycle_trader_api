@@ -105,6 +105,7 @@ def _database() -> FakeDatabase:
                 "started_at": now + timedelta(minutes=1),
                 "finished_at": now + timedelta(minutes=45),
                 "request": {"private": True},
+                "strategy_profile_name": "Drawdown Reduction Test A2 - Cash 0.005",
             },
             {
                 "id": "failed-job",
@@ -120,6 +121,12 @@ def _database() -> FakeDatabase:
         ]),
         "backtest_runs": FakeCollection([
             {"job_id": job_id, "symbol": "PORTFOLIO", "backend": "internal-backend"},
+        ]),
+        "strategy_control": FakeCollection([
+            {"_id": "default", "research_strategy_id": "drawdown-test-a2"},
+        ]),
+        "strategy_profiles": FakeCollection([
+            {"_id": "drawdown-test-a2", "name": "Drawdown Reduction Test A2 - Cash 0.005"},
         ]),
         "backtest_predictions": FakeCollection([
             {
@@ -161,6 +168,8 @@ def test_dashboard_summary_is_additive_and_strategy_neutral() -> None:
     assert payload["best_performance"]["metrics"]["simulation_return"] == 0.575
     assert payload["average_sharpe"] == 1.24
     assert payload["profitable_backtest_rate"] == 1.0
+    assert payload["selected_backtest_strategy_name"] == "Drawdown Reduction Test A2 - Cash 0.005"
+    assert payload["recent_backtests"][0]["strategy_profile_name"] == "Drawdown Reduction Test A2 - Cash 0.005"
 
     forbidden = {
         "assets",
@@ -180,6 +189,7 @@ def test_dashboard_job_detail_contains_only_public_metrics_and_series() -> None:
 
     assert payload["metrics"]["ending_capital"] == 15750.0
     assert payload["metrics"]["position_changes"] == 42.0
+    assert payload["strategy_profile_name"] == "Drawdown Reduction Test A2 - Cash 0.005"
     assert payload["series"] == [
         {
             "timestamp": "2026-08-02T20:00:00+00:00",
