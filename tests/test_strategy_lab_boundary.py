@@ -754,6 +754,11 @@ def test_strategy_catalog_exposes_every_validated_parameter_to_administrator() -
     assert len(grouped) == len(expected)
     assert set(grouped) == set(expected)
     assert set(catalog["parameter_schema"]["properties"]) == set(expected)
+    descriptions = [
+        catalog["parameter_schema"]["properties"][field].get("description", "").strip()
+        for field in expected
+    ]
+    assert all(descriptions)
 
 
 def test_legacy_direct_mutation_routes_are_disabled() -> None:
