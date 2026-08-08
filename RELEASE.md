@@ -1,3 +1,10 @@
+## v1.13.26 — Administrator parameter descriptions
+
+- The protected strategy catalog now enriches every editable strategy parameter schema with an administrator-facing description.
+- Existing validation bounds, parameter names, strategy values and execution behavior are unchanged.
+- Descriptions are served only through the existing authenticated Administrator strategy-catalog endpoint; no strategy documentation is hardcoded into the public frontend bundle.
+- No MongoDB migration or environment-variable change is required.
+
 ## v1.13.25 — XGBoost observability and fold progress
 
 - Streams the backtest subprocess output into the protected API console.
