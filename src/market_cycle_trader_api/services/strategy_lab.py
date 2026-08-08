@@ -138,6 +138,78 @@ STRATEGY_PARAMETER_GROUPS: tuple[dict[str, Any], ...] = (
 )
 
 
+STRATEGY_PARAMETER_DESCRIPTIONS: dict[str, str] = {
+    'assets': 'Universe of symbols evaluated together by this strategy. The backend validates and normalizes the symbol list before execution.',
+    'strategy_mode': 'Selects the supported strategy execution mode for this configuration.',
+    'start_date': 'Earliest market date available to the strategy analysis and backtest dataset.',
+    'end_date': 'Optional final market date for the analysis. Leaving it empty allows the backend to resolve the latest permitted date.',
+    'timeframe': 'Bar interval used when loading and evaluating market data for this strategy.',
+    'market_data_provider': 'Backend provider used to obtain the market data required by the strategy.',
+    'alpaca_historical_feed': 'Alpaca feed used for historical bars during research and backtests.',
+    'alpaca_live_feed': 'Alpaca feed selected for live or near-live Paper market data.',
+    'alpaca_adjustment': 'Corporate-action adjustment mode applied to Alpaca historical market data.',
+    'market_data_history_backfill_enabled': 'Controls whether missing historical coverage may be backfilled before analysis begins.',
+    'market_data_history_backfill_provider': 'Provider authorized to supply missing historical data when backfill is enabled.',
+    'market_data_history_start_tolerance_days': 'Maximum tolerated difference between the requested history start and the first available market-data date.',
+    'market_data_require_complete_history': 'When enabled, the analysis requires the configured historical coverage instead of silently accepting an incomplete range.',
+    'rotation_horizon_days': 'Primary forward horizon, measured in trading sessions, used by the rotation decision model.',
+    'rotation_target_horizons': 'Set of forward trading-session horizons evaluated by the target construction process.',
+    'rotation_target_horizon_weights': 'Relative contribution assigned to each configured target horizon. The list must correspond to the target-horizon list.',
+    'rotation_movement_capture_weight': 'Weight assigned to the component that rewards capturing favorable forward price movement.',
+    'rotation_trend_persistence_weight': 'Weight assigned to the component that rewards persistence of the projected directional trend.',
+    'rotation_minimum_training_rows': 'Minimum number of valid training observations required before a model can be fitted for an evaluation segment.',
+    'rotation_walk_forward_enabled': 'Controls expanding walk-forward validation, preserving chronological separation between training and evaluation periods.',
+    'rotation_walk_forward_calibration_days': 'Number of trading sessions reserved for calibration inside each walk-forward cycle.',
+    'rotation_walk_forward_test_days': 'Target number of trading sessions evaluated in each walk-forward test segment.',
+    'rotation_walk_forward_min_test_days': 'Minimum acceptable number of test sessions for a walk-forward segment to be considered valid.',
+    'rotation_purge_days': 'Trading-session gap used to separate training observations from later evaluation data and reduce temporal leakage.',
+    'rotation_downside_penalty': 'Penalty weight applied when the utility calculation identifies unfavorable downside behavior.',
+    'rotation_drawdown_penalty': 'Penalty weight applied to drawdown-related behavior in the rotation utility calculation.',
+    'rotation_min_holding_days': 'Minimum number of trading sessions a selected asset should remain held before ordinary rotation is allowed.',
+    'rotation_min_expected_edge': 'Minimum modeled advantage required before the rotation policy treats an opportunity as sufficiently attractive.',
+    'rotation_cash_threshold': 'Decision threshold used when comparing an investable opportunity with remaining in cash.',
+    'rotation_switch_margin': 'Additional advantage required before replacing the currently selected asset with another candidate.',
+    'rotation_switch_margin_candidates': 'Candidate switch-margin values evaluated during calibration to select the operating margin.',
+    'rotation_models': 'Model family enabled for the rotation stage. This release accepts only the model family supported by the backend.',
+    'rotation_xgb_n_estimators': 'Maximum number of boosting trees configured for the rotation XGBoost model.',
+    'rotation_xgb_learning_rate': 'Boosting step size controlling how strongly each new XGBoost tree contributes to the model.',
+    'rotation_xgb_max_depth': 'Maximum depth allowed for individual rotation XGBoost trees.',
+    'rotation_accelerator': 'Requested execution device for rotation-model training, such as CPU, CUDA or automatic selection.',
+    'rotation_allow_cpu_fallback': 'Allows model training to continue on CPU when the requested accelerator cannot be used.',
+    'rotation_xgb_repetitions': 'Number of repeated XGBoost training passes used by the rotation evaluation process.',
+    'rotation_seed_step': 'Increment applied between repeated model seeds so repeated training runs use distinct reproducible seeds.',
+    'xgb_min_child_weight': 'XGBoost minimum child-weight regularization parameter used when deciding whether a tree split has enough supporting weight.',
+    'xgb_subsample': 'Fraction of training rows sampled for each boosting tree.',
+    'xgb_colsample_bytree': 'Fraction of available features sampled when building each boosting tree.',
+    'xgb_reg_alpha': 'L1 regularization strength applied to XGBoost leaf weights.',
+    'xgb_reg_lambda': 'L2 regularization strength applied to XGBoost leaf weights.',
+    'xgb_n_jobs': 'Number of CPU worker threads made available to XGBoost. The backend validates special values and deterministic-mode requirements.',
+    'deterministic_execution': 'Forces the supported deterministic execution constraints so repeated runs are less affected by thread scheduling.',
+    'numeric_thread_limit': 'Maximum thread count allowed for supporting numeric libraries used by model training.',
+    'random_state': 'Base random seed used to make supported stochastic model operations reproducible.',
+    'initial_capital': 'Starting portfolio capital used by the backtest simulation.',
+    'whole_shares': 'Controls whether simulated positions must use whole-share quantities instead of fractional shares.',
+    'slippage_bps': 'Simulated execution slippage expressed in basis points and applied to modeled trade prices.',
+    'commission_rate': 'Commission rate included in simulated transaction costs.',
+    'sec_fee_rate': 'SEC fee rate included in applicable simulated sell-side transaction costs.',
+    'taf_fee_per_share': 'Trading Activity Fee amount applied per share where the simulation models that fee.',
+    'taf_fee_cap': 'Maximum Trading Activity Fee charged to one simulated transaction.',
+    'cat_fee_per_share': 'Consolidated Audit Trail fee amount modeled per share when applicable.',
+    'mongo_cache_enabled': 'Controls use of the MongoDB-backed market-data cache for repeated research and backtest requests.',
+    'mongo_refresh_overlap_days': 'Number of previously cached days re-requested during refresh so recent records can be reconciled.',
+    'mongo_write_batch_size': 'Maximum number of cache records grouped into one MongoDB write batch.',
+}
+
+
+def _strategy_parameter_schema() -> dict[str, Any]:
+    schema = BacktestRequest.model_json_schema()
+    properties = schema.get("properties", {})
+    for name, description in STRATEGY_PARAMETER_DESCRIPTIONS.items():
+        if name in properties:
+            properties[name]["description"] = description
+    return schema
+
+
 class StrategyLabError(RuntimeError):
     pass
 
@@ -504,7 +576,7 @@ def list_strategies(db: Any) -> dict[str, Any]:
             {"id": item["id"], "label": item["label"], "fields": list(item["fields"])}
             for item in STRATEGY_PARAMETER_GROUPS
         ],
-        "parameter_schema": BacktestRequest.model_json_schema(),
+        "parameter_schema": _strategy_parameter_schema(),
     }
 
 
