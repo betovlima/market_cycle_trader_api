@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from threadpoolctl import threadpool_limits
 
+from .rotation_diagnostics import enrich_trade_diagnostics
+
 ROTATION_FEATURES = [
     'return_1', 'return_2', 'return_3', 'return_5', 'return_10', 'return_20',
     'return_40', 'return_60', 'return_120',
@@ -254,18 +256,38 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     return data
 
 def prepare_rotation_panel(bars_by_symbol: dict[str, pd.DataFrame], config: Any) -> tuple[dict[str, pd.DataFrame], pd.DatetimeIndex]:
-    frames = {symbol: build_rotation_frame(frame, config) for symbol, frame in bars_by_symbol.items() if frame is not None and (not frame.empty)}
+    """Build a stable portfolio calendar without letting younger candidates move it.
+
+    The promoted Winner assets are carried in ``calendar_anchor_assets`` on the
+    immutable execution request. Their intersection defines the walk-forward
+    calendar. Research-only assets are reindexed onto that calendar and remain
+    unavailable until their own features exist. This keeps the Winner fold
+    boundaries stable when a newer candidate is added to a research universe.
+    """
+
+    frames = {
+        symbol: build_rotation_frame(frame, config)
+        for symbol, frame in bars_by_symbol.items()
+        if frame is not None and not frame.empty
+    }
     if len(frames) < 2:
         raise ValueError('Compound rotation needs at least two assets with valid aligned data.')
+
+    configured_anchors = list(getattr(config, 'calendar_anchor_assets', []) or [])
+    anchor_symbols = [symbol for symbol in configured_anchors if symbol in frames]
+    if len(anchor_symbols) < 2:
+        anchor_symbols = sorted(frames)
+
     common: pd.DatetimeIndex | None = None
-    for frame in frames.values():
-        index = pd.DatetimeIndex(frame.index)
+    for symbol in anchor_symbols:
+        index = pd.DatetimeIndex(frames[symbol].index)
         common = index if common is None else common.intersection(index)
     if common is None or len(common) < 700:
-        raise ValueError('The common aligned history is too short for train/calibration/test.')
+        raise ValueError('The anchored aligned history is too short for train/calibration/test.')
+
     common = common.sort_values()
-    frames = {symbol: frame.loc[common].copy() for symbol, frame in frames.items()}
-    return (frames, common)
+    aligned = {symbol: frame.reindex(common).copy() for symbol, frame in frames.items()}
+    return aligned, common
 
 def _annualized_sharpe(curve: pd.Series, periods_per_year: float=252.0) -> float:
     returns = curve.pct_change().dropna()
@@ -373,6 +395,8 @@ def _fit_xgb_models(
     except ImportError as exc:
         raise RuntimeError('XGBoost Utility requires xgboost. Install requirements.txt.') from exc
     allow_fallback = bool(config.rotation_allow_cpu_fallback)
+    anchor_assets = set(getattr(config, 'calendar_anchor_assets', []) or [])
+    minimum_rows = int(config.rotation_minimum_training_rows)
 
     def technical(message: str) -> None:
         if technical_log_callback is not None:
@@ -391,13 +415,21 @@ def _fit_xgb_models(
         with _numeric_thread_context(config):
             for position, symbol in enumerate(symbols, start=1):
                 frame = frames[symbol].loc[train_dates].dropna(
-                    subset=['forward_risk_adjusted_utility']
+                    subset=['forward_risk_adjusted_utility', *ROTATION_FEATURES]
                 )
-                if len(frame) < int(config.rotation_minimum_training_rows):
-                    raise ValueError(
-                        f'{symbol}: only {len(frame)} utility rows are available; '
-                        f'{config.rotation_minimum_training_rows} are required.'
+                if len(frame) < minimum_rows:
+                    if symbol in anchor_assets:
+                        raise ValueError(
+                            f'{symbol}: only {len(frame)} utility rows are available; '
+                            f'{minimum_rows} are required for an anchor asset.'
+                        )
+                    technical(
+                        f'phase={phase} event=model_deferred model={position}/{total_symbols} '
+                        f'asset={symbol} rows={len(frame)} required={minimum_rows}'
                     )
+                    if progress_callback is not None:
+                        progress_callback(position, total_symbols, effective_device)
+                    continue
                 model_started = time.perf_counter()
                 technical(
                     f'phase={phase} event=model_start model={position}/{total_symbols} '
@@ -456,10 +488,33 @@ def _fit_xgb_models(
         return (fit_on_device('cpu'), 'cpu', fallback_reason)
 
 def _xgb_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], timestamp: pd.Timestamp, config: Any) -> np.ndarray:
+    """Return utilities while treating not-yet-model-ready candidates as unavailable."""
+
     values = [0.0]
     for symbol in symbols:
-        row = frames[symbol].loc[[timestamp], ROTATION_FEATURES]
-        prediction = float(models[symbol].predict(row)[0])
+        model = models.get(symbol)
+        frame = frames[symbol]
+        if model is None or timestamp not in frame.index:
+            values.append(float('-inf'))
+            continue
+
+        row = frame.loc[[timestamp], ROTATION_FEATURES]
+        if row.empty or row.isna().any(axis=None):
+            values.append(float('-inf'))
+            continue
+
+        location = frame.index.get_loc(timestamp)
+        if not isinstance(location, (int, np.integer)) or location + 1 >= len(frame.index):
+            values.append(float('-inf'))
+            continue
+        next_row = frame.iloc[int(location) + 1]
+        next_open = float(next_row.get('open', float('nan')))
+        next_close = float(next_row.get('close', float('nan')))
+        if not (np.isfinite(next_open) and next_open > 0 and np.isfinite(next_close) and next_close > 0):
+            values.append(float('-inf'))
+            continue
+
+        prediction = float(model.predict(row)[0])
         values.append(prediction)
     return np.asarray(values, dtype=np.float64)
 
@@ -470,7 +525,11 @@ def _xgb_policy(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols
         best = int(np.nanargmax(utilities))
         best_value = float(utilities[best])
         current_value = float(utilities[current_position])
-        if current_position > 0 and holding_days < int(config.rotation_min_holding_days):
+        if (
+            current_position > 0
+            and np.isfinite(current_value)
+            and holding_days < int(config.rotation_min_holding_days)
+        ):
             return (current_position, current_value)
         minimum = float(config.rotation_cash_threshold)
         if best == 0 or best_value <= minimum:
@@ -528,10 +587,27 @@ def _equal_weight_benchmark(frames: dict[str, pd.DataFrame], symbols: list[str],
     if len(execution_dates) < 2:
         return pd.Series(dtype=float)
     first = execution_dates[0]
-    capital_per_asset = float(initial_capital) / len(symbols)
+    last = execution_dates[-1]
+    benchmark_symbols: list[str] = []
+    for symbol in symbols:
+        frame = frames[symbol]
+        window = frame.reindex(execution_dates)
+        first_open = float(window.iloc[0].get('open', float('nan')))
+        closes = pd.to_numeric(window['close'], errors='coerce')
+        if (
+            np.isfinite(first_open)
+            and first_open > 0
+            and closes.notna().all()
+            and (closes > 0).all()
+        ):
+            benchmark_symbols.append(symbol)
+    if not benchmark_symbols:
+        raise ValueError('No asset has complete prices for the benchmark execution window.')
+
+    capital_per_asset = float(initial_capital) / len(benchmark_symbols)
     quantities: dict[str, float] = {}
     residual = 0.0
-    for symbol in symbols:
+    for symbol in benchmark_symbols:
         buy_price = float(slippage(float(frames[symbol].loc[first, 'open']), 'BUY', config))
         quantity = capital_per_asset / buy_price
         for _ in range(20):
@@ -553,7 +629,6 @@ def _equal_weight_benchmark(frames: dict[str, pd.DataFrame], symbols: list[str],
             equity += quantity * float(frames[symbol].loc[timestamp, 'close'])
         values.append(equity)
     series = pd.Series(values, index=execution_dates, dtype=float)
-    last = execution_dates[-1]
     final_cash = residual
     for symbol, quantity in quantities.items():
         sell_price = float(slippage(float(frames[symbol].loc[last, 'close']), 'SELL', config))
@@ -661,6 +736,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
         prediction_rows[-1]['strategy_equity'] = cash
         prediction_rows[-1]['trade_action'] = prediction_rows[-1]['trade_action'] or 'FINAL_SELL'
         prediction_rows[-1]['trade_reason'] = prediction_rows[-1]['trade_reason'] or 'FINAL_LIQUIDATION'
+    records = enrich_trade_diagnostics(records, frames, symbols)
     predictions = pd.DataFrame(prediction_rows).set_index('timestamp')
     predictions.index = pd.to_datetime(predictions.index, utc=True)
     predictions.index.name = 'timestamp'
@@ -682,8 +758,10 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     days = max(1, (pd.Timestamp(execution_dates[-1]) - pd.Timestamp(execution_dates[0])).days)
     years = max(days / 365.25, 1 / 365.25)
     periods_per_year = 252.0
-    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': 'XGBoost Utility', 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
-    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across the same available assets.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}.", '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
+    anchor_assets = [symbol for symbol in getattr(config, 'calendar_anchor_assets', []) if symbol in symbols]
+    candidate_assets = [symbol for symbol in symbols if symbol not in set(anchor_assets)]
+    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': 'XGBoost Utility', 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
+    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}.", '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:

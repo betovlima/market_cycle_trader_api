@@ -30,6 +30,27 @@ def normalize_assets(value: list[str]) -> list[str]:
     return result
 
 
+def normalize_assets_input(value: str) -> list[str]:
+    """Build the canonical asset list from administrator-entered plain text.
+
+    The UI sends text, never a JSON array. Commas, semicolons, pipes, whitespace and
+    line breaks are accepted as separators. Brackets and quotes are tolerated only
+    to make pasting legacy JSON-style values safe during migration.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("At least two asset symbols are required.")
+
+    migration_safe_text = re.sub(r"[\[\]\"']", " ", text)
+    tokens = [token for token in re.split(r"[\s,;|]+", migration_safe_text) if token]
+    invalid = [token for token in tokens if not re.fullmatch(r"[A-Za-z0-9.\-^=]+", token)]
+    if invalid:
+        rendered = ", ".join(dict.fromkeys(invalid))
+        raise ValueError(f"Invalid asset symbol(s): {rendered}.")
+    return normalize_assets(tokens)
+
+
 def normalize_iso_date(value: str, *, field_name: str) -> str:
     text = str(value).strip()
     if not text:
@@ -209,6 +230,12 @@ class BacktestExecutionRequest(BacktestRequest):
 
     analysis_start_date: str
     analysis_end_date: str | None
+    calendar_anchor_assets: list[str]
+
+    @field_validator("calendar_anchor_assets")
+    @classmethod
+    def validate_calendar_anchor_assets(cls, value: list[str]) -> list[str]:
+        return normalize_assets(value)
 
     @field_validator("analysis_start_date")
     @classmethod
@@ -253,6 +280,14 @@ class BacktestExecutionRequest(BacktestRequest):
                     "Analysis end date cannot be later than the locked historical data end "
                     f"({self.end_date})."
                 )
+        missing_anchors = [
+            symbol for symbol in self.calendar_anchor_assets if symbol not in self.assets
+        ]
+        if missing_anchors:
+            raise ValueError(
+                "Calendar anchor assets must be included in the backtest universe: "
+                + ", ".join(missing_anchors)
+            )
         return self
 
     @property

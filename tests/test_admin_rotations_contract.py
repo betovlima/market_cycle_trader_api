@@ -98,6 +98,18 @@ def _database() -> FakeDatabase:
                 "position_return": 0,
                 "realized_pnl": 0,
                 "total_fee": 1.75,
+                "subsequent_holding_days": 12,
+                "subsequent_position_return": 0.15,
+                "chosen_market_return": 0.14,
+                "counterfactual_previous_asset_return": 0.05,
+                "rotation_value_added": 0.09,
+                "rotation_regret": 0.0,
+                "best_alternative_asset": "MSFT",
+                "best_alternative_return": 0.18,
+                "opportunity_cost": 0.04,
+                "maximum_favorable_excursion": 0.22,
+                "maximum_adverse_excursion": -0.06,
+                "profit_capture_ratio": 0.68,
                 "q_delta_final_vs_current": 100,
                 "random_seed": 43,
             },
@@ -129,8 +141,23 @@ def test_admin_rotation_payload_is_useful_and_strategy_neutral() -> None:
             "position_return": 0.12,
             "realized_pnl": 120.0,
             "transaction_fees": 3.0,
+            "subsequent_holding_days": 12.0,
+            "subsequent_position_return": 0.15,
+            "chosen_market_return": 0.14,
+            "counterfactual_previous_asset_return": 0.05,
+            "rotation_value_added": 0.09,
+            "rotation_regret": 0.0,
+            "best_alternative_asset": "MSFT",
+            "best_alternative_return": 0.18,
+            "opportunity_cost": 0.04,
+            "maximum_favorable_excursion": 0.22,
+            "maximum_adverse_excursion": -0.06,
+            "profit_capture_ratio": 0.68,
         }
     ]
+    assert payload["summary"]["diagnosed_rotations"] == 1
+    assert payload["summary"]["positive_value_added_rate"] == 1.0
+    assert payload["summary"]["average_opportunity_cost"] == 0.04
 
     forbidden = {
         "backend",

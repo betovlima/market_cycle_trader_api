@@ -1,3 +1,10 @@
+## v1.13.28 — Asset Discovery
+
+- Adds Administrator-only candidate-asset discovery with manual start/stop, bounded automatic batches and persisted execution history.
+- Applies a cheap recent-market prefilter before loading the fixed historical window; qualifying assets reuse the existing MongoDB market-data cache and refresh incrementally.
+- Candidate discovery never changes the Winner universe or promotes assets automatically.
+- Automatic discovery is disabled by default until enabled by an Administrator.
+
 ## v1.13.26 — Administrator parameter descriptions
 
 - The protected strategy catalog now enriches every editable strategy parameter schema with an administrator-facing description.

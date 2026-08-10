@@ -19,7 +19,7 @@ from ...infrastructure.persistence.mongo_repository import (
 from ...schemas.requests import BacktestExecutionRequest
 from ...services.jobs import public_job, require_job, run_job
 from ...services.system_settings import apply_training_runtime_settings, get_system_settings
-from ...services.strategy_lab import get_research_strategy_context
+from ...services.strategy_lab import get_research_strategy_context, get_trader_winner_context
 from ...services.results import build_results
 
 router = APIRouter(tags=["jobs"])
@@ -47,10 +47,17 @@ def create_job() -> dict[str, Any]:
 
     try:
         selected_configuration, selected_strategy = get_research_strategy_context(db)
+        winner_configuration, _winner_profile = get_trader_winner_context(db)
         locked_configuration = apply_training_runtime_settings(
             db,
             selected_configuration,
         )
+        selected_assets = set(locked_configuration.assets)
+        calendar_anchor_assets = [
+            symbol for symbol in winner_configuration.assets if symbol in selected_assets
+        ]
+        if len(calendar_anchor_assets) < 2:
+            calendar_anchor_assets = list(locked_configuration.assets)
     except (RuntimeError, ValidationError) as exc:
         raise HTTPException(
             status_code=500,
@@ -69,6 +76,7 @@ def create_job() -> dict[str, Any]:
                 **locked_configuration.model_dump(mode="python"),
                 "analysis_start_date": locked_configuration.start_date,
                 "analysis_end_date": locked_configuration.end_date,
+                "calendar_anchor_assets": calendar_anchor_assets,
             }
         )
     except ValidationError as exc:

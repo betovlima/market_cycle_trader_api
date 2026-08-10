@@ -67,6 +67,7 @@ def _rotation_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         if (value := _as_float(row.get("total_fee"))) is not None
     ]
 
+    analytics_source = buy or {}
     return {
         "executed_at": iso_value(timestamp),
         "from_asset": str(
@@ -83,6 +84,18 @@ def _rotation_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         "position_return": _as_float((sell or {}).get("position_return")),
         "realized_pnl": _as_float((sell or {}).get("realized_pnl")),
         "transaction_fees": float(sum(fees)) if fees else 0.0,
+        "subsequent_holding_days": _as_float(analytics_source.get("subsequent_holding_days")),
+        "subsequent_position_return": _as_float(analytics_source.get("subsequent_position_return")),
+        "chosen_market_return": _as_float(analytics_source.get("chosen_market_return")),
+        "counterfactual_previous_asset_return": _as_float(analytics_source.get("counterfactual_previous_asset_return")),
+        "rotation_value_added": _as_float(analytics_source.get("rotation_value_added")),
+        "rotation_regret": _as_float(analytics_source.get("rotation_regret")),
+        "best_alternative_asset": analytics_source.get("best_alternative_asset"),
+        "best_alternative_return": _as_float(analytics_source.get("best_alternative_return")),
+        "opportunity_cost": _as_float(analytics_source.get("opportunity_cost")),
+        "maximum_favorable_excursion": _as_float(analytics_source.get("maximum_favorable_excursion")),
+        "maximum_adverse_excursion": _as_float(analytics_source.get("maximum_adverse_excursion")),
+        "profit_capture_ratio": _as_float(analytics_source.get("profit_capture_ratio")),
     }
 
 
@@ -110,6 +123,15 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
                 "total_transaction_fees": 0.0,
                 "first_rotation_at": None,
                 "last_rotation_at": None,
+                "diagnosed_rotations": 0,
+                "positive_value_added_rotations": 0,
+                "negative_value_added_rotations": 0,
+                "average_rotation_value_added": None,
+                "positive_value_added_rate": None,
+                "average_opportunity_cost": None,
+                "average_maximum_favorable_excursion": None,
+                "average_maximum_adverse_excursion": None,
+                "average_profit_capture_ratio": None,
             },
             "rotations": [],
         }
@@ -130,6 +152,18 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
                 "position_return": 1,
                 "realized_pnl": 1,
                 "total_fee": 1,
+                "subsequent_holding_days": 1,
+                "subsequent_position_return": 1,
+                "chosen_market_return": 1,
+                "counterfactual_previous_asset_return": 1,
+                "rotation_value_added": 1,
+                "rotation_regret": 1,
+                "best_alternative_asset": 1,
+                "best_alternative_return": 1,
+                "opportunity_cost": 1,
+                "maximum_favorable_excursion": 1,
+                "maximum_adverse_excursion": 1,
+                "profit_capture_ratio": 1,
             },
         )
     )
@@ -168,6 +202,31 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
         for item in rotations
         if (value := _as_float(item.get("transaction_fees"))) is not None
     ]
+    value_added = [
+        value
+        for item in rotations
+        if (value := _as_float(item.get("rotation_value_added"))) is not None
+    ]
+    opportunity_costs = [
+        value
+        for item in rotations
+        if (value := _as_float(item.get("opportunity_cost"))) is not None
+    ]
+    mfe_values = [
+        value
+        for item in rotations
+        if (value := _as_float(item.get("maximum_favorable_excursion"))) is not None
+    ]
+    mae_values = [
+        value
+        for item in rotations
+        if (value := _as_float(item.get("maximum_adverse_excursion"))) is not None
+    ]
+    capture_values = [
+        value
+        for item in rotations
+        if (value := _as_float(item.get("profit_capture_ratio"))) is not None
+    ]
 
     return {
         "job_id": job_id,
@@ -181,6 +240,18 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
             "total_transaction_fees": float(sum(fees)) if fees else 0.0,
             "first_rotation_at": rotations[0]["executed_at"] if rotations else None,
             "last_rotation_at": rotations[-1]["executed_at"] if rotations else None,
+            "diagnosed_rotations": len(value_added),
+            "positive_value_added_rotations": sum(value > 0 for value in value_added),
+            "negative_value_added_rotations": sum(value < 0 for value in value_added),
+            "average_rotation_value_added": float(fmean(value_added)) if value_added else None,
+            "positive_value_added_rate": (
+                sum(value > 0 for value in value_added) / len(value_added)
+                if value_added else None
+            ),
+            "average_opportunity_cost": float(fmean(opportunity_costs)) if opportunity_costs else None,
+            "average_maximum_favorable_excursion": float(fmean(mfe_values)) if mfe_values else None,
+            "average_maximum_adverse_excursion": float(fmean(mae_values)) if mae_values else None,
+            "average_profit_capture_ratio": float(fmean(capture_values)) if capture_values else None,
         },
         "rotations": rotations,
     }
