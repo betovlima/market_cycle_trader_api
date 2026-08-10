@@ -100,7 +100,7 @@ def replace_strategy(
         result = update_strategy(
             database(),
             strategy_id,
-            configuration=payload.configuration,
+            configuration=payload.build_configuration(),
             name=payload.name,
             description=payload.description,
             note=payload.note,

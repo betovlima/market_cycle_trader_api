@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "1.13.26"' in config
+    assert 'API_VERSION = "1.13.35"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -77,3 +77,58 @@ def test_winner_promotion_is_metadata_only_and_binds_next_plan_to_winner() -> No
     assert "winner_strategy_id=str(winner_profile[\"id\"])" in paper
     assert "winner_assets=list(strategy.assets)" in paper
     assert "The prepared Paper plan belongs to a different Trader Winner" in paper
+
+
+def test_asset_discovery_is_admin_only_and_isolated_from_winner_promotion() -> None:
+    root = SRC
+    main = (root / "main.py").read_text(encoding="utf-8")
+    router = (root / "api" / "routers" / "asset_discovery.py").read_text(encoding="utf-8")
+    service = (root / "services" / "asset_discovery.py").read_text(encoding="utf-8")
+    worker = (root / "services" / "asset_discovery_worker.py").read_text(encoding="utf-8")
+
+    assert "asset_discovery.router, dependencies=admin_required" in main
+    assert 'prefix="/api/admin/asset-discovery"' in router
+    assert '"/start"' in router and '"/stop"' in router
+    assert "get_research_strategy_context" in worker
+    assert "promote" not in (service + worker).lower()
+    assert "trader_winner_strategy_id" not in (service + worker)
+
+
+def test_asset_discovery_prefilters_before_loading_available_history_cache() -> None:
+    market = (SRC / "services" / "asset_discovery_market.py").read_text(encoding="utf-8")
+    recent_gate = market.index("if not all(checks.values())")
+    full_history = market.index("frame = _available_history(symbol, config)")
+
+    assert recent_gate < full_history
+    assert "historical_cache_ready" in market
+    assert "RECENT_PREFILTER_DAYS" in market
+    assert '"market_data_require_complete_history": False' in market
+    assert '"limited_history"' in market
+    assert '"young_history"' in market
+    assert 'status = "candidate" if model_ready else "watchlist"' in market
+
+
+def test_asset_discovery_batch_counts_only_evaluable_assets_and_skips_expected_no_data() -> None:
+    worker = (SRC / "services" / "asset_discovery_worker.py").read_text(encoding="utf-8")
+
+    assert 'return "skipped"' in worker
+    assert 'NoRecentMarketData' in worker
+    assert 'NoHistoricalMarketData' in worker
+    assert 'result in {"candidate", "watchlist", "rejected"}' in worker
+    assert 'if processed >= batch_target' in worker
+    assert '"attempted_count"' in worker
+
+
+def test_asset_discovery_uses_completed_sip_safe_sessions_and_does_not_persist_technical_failures() -> None:
+    market = (SRC / "services" / "asset_discovery_market.py").read_text(encoding="utf-8")
+    worker = (SRC / "services" / "asset_discovery_worker.py").read_text(encoding="utf-8")
+
+    assert 'SIP_DELAY_BUFFER_MINUTES = 20' in market
+    assert '/v2/calendar' in market
+    assert '_latest_safe_completed_session_end' in market
+    assert 'subscription does not permit querying recent sip data' in market
+    assert 'class MarketDataAccessBlocked' in market
+    assert 'except MarketDataAccessBlocked as exc' in worker
+    assert 'Asset Discovery stopped because Alpaca market-data access is unavailable' in worker
+    assert 'Technical evaluation failure for {symbol}' in worker
+    assert '"status": "failed",\n                    "reason_codes": ["technical_failure"]' not in worker

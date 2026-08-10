@@ -231,14 +231,20 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
     failures: list[dict[str, str]] = []
     emit_progress(2.0, "Preparing shared-capital rotation")
     total_assets = max(1, len(config.assets))
+    calendar_anchor_assets = set(config.calendar_anchor_assets)
     for asset_position, symbol in enumerate(config.assets, start=1):
         emit_progress(
             3.0 + 12.0 * ((asset_position - 1) / total_assets),
             f"Loading market data {asset_position}/{total_assets} — {symbol}",
         )
         try:
-            raw = load_market_bars(symbol, config)
-            cleaned = validate_and_clean_bars(raw, config)
+            asset_config = (
+                config
+                if symbol in calendar_anchor_assets
+                else config.model_copy(update={"market_data_require_complete_history": False})
+            )
+            raw = load_market_bars(symbol, asset_config)
+            cleaned = validate_and_clean_bars(raw, asset_config)
             bars_by_symbol[symbol] = cleaned
             provenance = dict(cleaned.attrs.get("market_data_provenance", {}))
             first_session = pd.Timestamp(cleaned.index.min()).date().isoformat()
@@ -266,6 +272,14 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
+    missing_anchor_assets = [
+        symbol for symbol in config.calendar_anchor_assets if symbol not in bars_by_symbol
+    ]
+    if missing_anchor_assets:
+        raise ValueError(
+            "Calendar anchor market data failed to load; the Winner comparison calendar "
+            "cannot be preserved: " + ", ".join(missing_anchor_assets)
+        )
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
     reproducibility = build_reproducibility_manifest(config, bars_by_symbol)

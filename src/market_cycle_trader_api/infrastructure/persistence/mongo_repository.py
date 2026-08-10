@@ -41,6 +41,11 @@ SYSTEM_SETTINGS_COLLECTION = "system_settings"
 SYSTEM_SETTINGS_HISTORY_COLLECTION = "system_settings_history"
 PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION = "paper_portfolio_snapshots"
 PARAMETER_BOOTSTRAP_RUNS_COLLECTION = "parameter_bootstrap_runs"
+ASSET_DISCOVERY_SETTINGS_COLLECTION = "asset_discovery_settings"
+ASSET_DISCOVERY_SETTINGS_HISTORY_COLLECTION = "asset_discovery_settings_history"
+ASSET_DISCOVERY_CANDIDATES_COLLECTION = "asset_discovery_candidates"
+ASSET_DISCOVERY_RUNS_COLLECTION = "asset_discovery_runs"
+ASSET_DISCOVERY_STATE_COLLECTION = "asset_discovery_state"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -208,6 +213,37 @@ def ensure_database(db: Database) -> None:
     db[PARAMETER_BOOTSTRAP_RUNS_COLLECTION].create_index(
         [("finished_at", DESCENDING)],
         name="ix_parameter_bootstrap_finished",
+    )
+    db[ASSET_DISCOVERY_SETTINGS_COLLECTION].create_index(
+        [("updated_at", DESCENDING)],
+        name="ix_asset_discovery_settings_updated",
+    )
+    db[ASSET_DISCOVERY_SETTINGS_HISTORY_COLLECTION].create_index(
+        [("settings_id", ASCENDING), ("updated_at", DESCENDING)],
+        name="ix_asset_discovery_settings_history",
+    )
+    db[ASSET_DISCOVERY_CANDIDATES_COLLECTION].create_index(
+        [("symbol", ASCENDING)],
+        unique=True,
+        name="uq_asset_discovery_candidate_symbol",
+    )
+    db[ASSET_DISCOVERY_CANDIDATES_COLLECTION].create_index(
+        [("status", ASCENDING), ("last_evaluated_at", DESCENDING)],
+        name="ix_asset_discovery_candidate_status",
+    )
+    db[ASSET_DISCOVERY_CANDIDATES_COLLECTION].create_index(
+        [("next_evaluation_at", ASCENDING)],
+        name="ix_asset_discovery_candidate_next_evaluation",
+    )
+    db[ASSET_DISCOVERY_RUNS_COLLECTION].create_index(
+        [("active_key", ASCENDING)],
+        unique=True,
+        sparse=True,
+        name="uq_asset_discovery_active_key",
+    )
+    db[ASSET_DISCOVERY_RUNS_COLLECTION].create_index(
+        [("created_at", DESCENDING)],
+        name="ix_asset_discovery_runs_created",
     )
 
 

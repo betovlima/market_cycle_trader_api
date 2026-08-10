@@ -139,7 +139,7 @@ STRATEGY_PARAMETER_GROUPS: tuple[dict[str, Any], ...] = (
 
 
 STRATEGY_PARAMETER_DESCRIPTIONS: dict[str, str] = {
-    'assets': 'Universe of symbols evaluated together by this strategy. The backend validates and normalizes the symbol list before execution.',
+    'assets': 'Universe of symbols evaluated together by this strategy. Administrators enter plain ticker text; the backend normalizes, deduplicates and constructs the canonical asset list before saving.',
     'strategy_mode': 'Selects the supported strategy execution mode for this configuration.',
     'start_date': 'Earliest market date available to the strategy analysis and backtest dataset.',
     'end_date': 'Optional final market date for the analysis. Leaving it empty allows the backend to resolve the latest permitted date.',
