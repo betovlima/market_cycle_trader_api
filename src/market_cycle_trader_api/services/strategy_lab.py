@@ -1117,8 +1117,14 @@ def promote_strategy_to_trader(
         )
 
     winner_name = f"Winner v{API_VERSION}"
+    # A research Candidate is allowed to use the same display name as the Winner
+    # snapshot that will be created for this API release. Release uniqueness is
+    # defined by immutable Winner metadata, not by a mutable profile name.
     existing_release_winner = db[STRATEGY_PROFILES_COLLECTION].find_one(
-        {"name": winner_name}
+        {
+            "winner_api_version": API_VERSION,
+            "status": {"$in": ["winner", "former_winner"]},
+        }
     )
     if existing_release_winner is not None:
         raise StrategyLabConflict(
