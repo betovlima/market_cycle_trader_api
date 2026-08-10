@@ -215,8 +215,8 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     install_winner_strategy_configuration(db, note="Install winner.", source="test")
     draft = create_strategy(
         db,
-        name="Promotion candidate",
-        description="Validated candidate.",
+        name=f"Winner v{strategy_lab_service.API_VERSION}",
+        description="Validated candidate with the future Winner display name.",
         clone_from_strategy_id="winner-v1-13-2",
         actor_email="admin@example.com",
     )
@@ -293,7 +293,7 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     )
 
     assert result["status"] == "promoted"
-    assert result["winner"]["name"] == "Winner v1.13.25"
+    assert result["winner"]["name"] == f"Winner v{strategy_lab_service.API_VERSION}"
     assert result["winner"]["locked"] is True
     assert result["winner"]["source_strategy_id"] == draft["id"]
     assert result["promotion"]["broker_interaction_performed"] is False
@@ -314,6 +314,63 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     promotion = [item for item in history if item.get("action") == "winner_promoted_preserving_operational_state"]
     assert len(promotion) == 1
     assert promotion[0]["operational_snapshot"]["managed_symbol"] == "NVDA"
+
+
+def test_promotion_blocks_only_when_official_winner_snapshot_exists_for_release() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name=f"Winner v{strategy_lab_service.API_VERSION}",
+        description="Candidate name alone must not define release uniqueness.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[JOBS_COLLECTION].documents["job-release-guard"] = {
+        "_id": "job-release-guard",
+        "id": "job-release-guard",
+        "status": "completed",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=draft["id"],
+        strategy_revision=1,
+        job_id="job-release-guard",
+        status="completed",
+    )
+    mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        note="Validated candidate.",
+        actor_email="admin@example.com",
+    )
+
+    db[STRATEGY_PROFILES_COLLECTION].documents["former-release-winner"] = {
+        "_id": "former-release-winner",
+        "name": f"Winner v{strategy_lab_service.API_VERSION}",
+        "status": "former_winner",
+        "locked": True,
+        "revision": 1,
+        "winner_api_version": strategy_lab_service.API_VERSION,
+    }
+
+    try:
+        promote_strategy_to_trader(
+            db,
+            draft["id"],
+            expected_control_revision=2,
+            expected_strategy_revision=1,
+            note="Must be blocked because this release already officialized a Winner.",
+            actor_email="admin@example.com",
+        )
+    except Exception as exc:
+        assert "already exists" in str(exc).lower()
+        assert "one winner snapshot" in str(exc).lower()
+    else:
+        raise AssertionError("A second official Winner snapshot for the same API release must be blocked.")
 
 
 def test_promotion_blocks_after_premarket_plan_exists_without_changing_state() -> None:
