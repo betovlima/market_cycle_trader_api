@@ -95,7 +95,7 @@ _IQN_DEFAULTS: dict[str, Any] = {
 
 _FIELD_METADATA: dict[str, dict[str, dict[str, Any]]] = {
     "xgboost_utility": {
-        "n_estimators": {"label": "Estimators", "step": 10, "description": "Maximum number of XGBoost trees trained for each asset model."},
+        "n_estimators": {"label": "Estimators", "step": 1, "description": "Maximum number of XGBoost trees trained for each asset model."},
         "learning_rate": {"label": "Learning rate", "step": 0.001, "description": "Boosting shrinkage applied to each new XGBoost tree."},
         "max_depth": {"label": "Maximum depth", "step": 1, "description": "Maximum depth of each XGBoost tree."},
         "min_child_weight": {"label": "Minimum child weight", "step": 0.1, "description": "Minimum child-weight regularization used by XGBoost splits."},
@@ -109,7 +109,7 @@ _FIELD_METADATA: dict[str, dict[str, dict[str, Any]]] = {
         "random_state": {"label": "Random state", "step": 1, "description": "Base random seed used by this XGBoost research profile."},
     },
     "lightgbm_utility": {
-        "n_estimators": {"label": "Estimators", "step": 10, "description": "Maximum number of boosting trees trained for each asset model."},
+        "n_estimators": {"label": "Estimators", "step": 1, "description": "Maximum number of boosting trees trained for each asset model."},
         "learning_rate": {"label": "Learning rate", "step": 0.001, "description": "Boosting shrinkage applied to each new tree."},
         "max_depth": {"label": "Maximum depth", "step": 1, "description": "Maximum tree depth. -1 allows unrestricted depth subject to the other leaf controls."},
         "num_leaves": {"label": "Number of leaves", "step": 1, "description": "Maximum leaves per tree; a primary LightGBM complexity control."},

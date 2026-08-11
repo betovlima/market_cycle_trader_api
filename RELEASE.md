@@ -1,4 +1,4 @@
-## v1.13.43 — Strategy-owned Backtest Model
+## v1.13.44 — Model estimator step metadata fix
 
 - Makes the model saved on the selected Strategy the only source of truth for Backtest execution.
 - `POST /api/jobs` no longer accepts or resolves a UI-selected algorithm; it loads the immutable model snapshot from the selected Strategy.

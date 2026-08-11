@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "1.13.43"' in config
+    assert 'API_VERSION = "1.13.44"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -146,3 +146,9 @@ def test_research_decision_diagnostics_are_admin_export_only_and_public_trades_a
     assert 'not key.startswith("q_")' in results
     assert 'not key.startswith("top_")' in results
     assert '"trades": _public_trade_rows(trades)' in results
+
+
+def test_model_estimator_metadata_does_not_reject_valid_intermediate_integers() -> None:
+    service = (SRC / "services" / "model_research.py").read_text(encoding="utf-8")
+    assert service.count('"n_estimators": {"label": "Estimators", "step": 1') == 2
+    assert '"n_estimators": {"label": "Estimators", "step": 10' not in service
