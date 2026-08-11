@@ -10,7 +10,7 @@ import pandas as pd
 from pydantic import ValidationError
 from pymongo import ReturnDocument
 
-from ..engine.live_xgboost_signal import build_live_xgboost_decision
+from ..engine.live_model_signal import build_live_model_decision
 from ..engine.market_data import load_market_bars, validate_and_clean_bars
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_ORDERS_COLLECTION,
@@ -42,9 +42,11 @@ from ..infrastructure.trading.alpaca_paper import (
 )
 from ..schemas.paper_trading import PaperTradePlan, PaperTradingSettings, PaperTradingState
 from ..schemas.requests import BacktestRequest
+from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings, get_system_settings
 from .strategy_lab import (
     get_trader_winner_context,
+    get_trader_winner_model_snapshot,
     mark_trader_winner_state_initialized,
     trader_winner_requires_state_reinitialization,
 )
@@ -64,7 +66,7 @@ def _et_date(value: Any) -> str:
 
 def _validated_context(
     db: Any,
-) -> tuple[BacktestRequest, PaperTradingSettings, PaperTradingState, dict[str, Any]]:
+) -> tuple[BacktestRequest, PaperTradingSettings, PaperTradingState, dict[str, Any], dict[str, Any]]:
     strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
     if bool(strategy_control.get("winner_promotion_in_progress")):
         raise RuntimeError(
@@ -76,9 +78,21 @@ def _validated_context(
         )
     try:
         winner_configuration, winner_profile = get_trader_winner_context(db)
+        winner_model = get_trader_winner_model_snapshot(db)
         strategy = apply_training_runtime_settings(
             db,
             winner_configuration,
+        )
+        strategy = apply_execution_profile(
+            strategy,
+            winner_model["family"],
+            winner_model.get("settings_snapshot") or {},
+        )
+        strategy = strategy.model_copy(
+            update={
+                "research_model_family": winner_model["family"],
+                "research_model_settings": winner_model.get("settings_snapshot") or {},
+            }
         )
         settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
         state = PaperTradingState.model_validate(get_paper_trading_state(db))
@@ -88,9 +102,13 @@ def _validated_context(
     if not settings.enabled:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
     if strategy.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise RuntimeError("Paper trading requires the locked XGBoost swing strategy.")
+        raise RuntimeError("Paper trading requires the validated compound-rotation strategy contract.")
     if strategy.rotation_models != ["xgboost_utility"]:
-        raise RuntimeError("Paper trading requires rotation_models=['xgboost_utility'].")
+        raise RuntimeError("The legacy strategy model marker changed unexpectedly.")
+    if winner_model["family"] not in {"xgboost_utility", "lightgbm_utility"}:
+        raise RuntimeError(
+            f"Trader Winner model {winner_model['family']!r} does not have a protected live engine."
+        )
     if strategy.market_data_provider != "alpaca":
         raise RuntimeError("Paper trading requires market_data_provider='alpaca'.")
     if strategy.end_date is not None:
@@ -109,14 +127,14 @@ def _validated_context(
             "Paper state initial capital differs from the locked strategy capital: "
             f"state={state.initial_capital:.2f}, locked={strategy.initial_capital:.2f}."
         )
-    return strategy, settings, state, winner_profile
+    return strategy, settings, state, winner_profile, winner_model
 
 
 
 def paper_market_readiness(db: Any) -> dict[str, Any]:
     """Validate every dependency required to arm next-session paper execution."""
 
-    strategy, settings, state, winner_profile = _validated_context(db)
+    strategy, settings, state, winner_profile, winner_model = _validated_context(db)
     client = create_paper_trading_client(db)
     account = account_snapshot(client)
     assert_account_can_trade(account)
@@ -297,7 +315,7 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
     runtime_training = get_system_settings(db)["training"]
     if not bool(runtime_training["enabled"]):
         raise RuntimeError("Model training is disabled in System Settings.")
-    strategy, settings, state, winner_profile = _validated_context(db)
+    strategy, settings, state, winner_profile, winner_model = _validated_context(db)
     client = create_paper_trading_client(db)
     account = account_snapshot(client)
     assert_account_can_trade(account)
@@ -323,9 +341,10 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
             raise RuntimeError(f"No completed daily bars are available for {symbol}.")
         bars_by_symbol[symbol] = bars
 
-    decision = build_live_xgboost_decision(
+    decision = build_live_model_decision(
         bars_by_symbol,
         strategy,
+        model_family=winner_model["family"],
         current_asset=state.managed_symbol,
         holding_sessions=state.holding_sessions,
     )
@@ -365,7 +384,7 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
     else:
         action = "rotate"
 
-    plan_id = f"xgb-{decision_date}-{uuid.uuid4().hex[:8]}"
+    plan_id = f"{winner_model['family'].split('_')[0]}-{decision_date}-{uuid.uuid4().hex[:8]}"
     plan = PaperTradePlan(
         plan_id=plan_id,
         status="prepared",
@@ -373,6 +392,9 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         winner_strategy_name=str(winner_profile["name"]),
         winner_strategy_revision=int(winner_profile["revision"]),
         winner_configuration_hash=str(winner_profile["configuration_hash"]),
+        winner_model_family=str(winner_model["family"]),
+        winner_model_profile_id=str(winner_model["profile_id"]),
+        winner_model_settings_hash=str(winner_model["settings_hash"]),
         winner_assets=list(strategy.assets),
         decision_date=decision_date,
         expected_market_open=expected_open.isoformat(),
@@ -604,7 +626,7 @@ def _execute_buy(
 
 
 def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[str, Any]:
-    strategy, settings, state, winner_profile = _validated_context(db)
+    strategy, settings, state, winner_profile, winner_model = _validated_context(db)
     query: dict[str, Any]
     if plan_id:
         query = {"plan_id": plan_id}
@@ -633,6 +655,21 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
         raise RuntimeError(
             "The prepared Paper plan belongs to a different Trader Winner. "
             "Discard it and let the scheduled pre-market cycle recalibrate and rebuild the plan."
+        )
+
+    plan_model_family = str(plan.get("winner_model_family") or "")
+    plan_model_hash = str(plan.get("winner_model_settings_hash") or "")
+    if not plan_model_family or not plan_model_hash:
+        raise RuntimeError(
+            "The prepared Paper plan predates Winner model binding and cannot be executed safely."
+        )
+    if (
+        plan_model_family != str(winner_model["family"])
+        or plan_model_hash != str(winner_model["settings_hash"])
+    ):
+        raise RuntimeError(
+            "The prepared Paper plan belongs to a different Winner model snapshot. "
+            "Discard it and let the scheduled pre-market cycle rebuild the plan."
         )
 
     client = create_paper_trading_client(db)

@@ -1,4 +1,4 @@
-# Market Cycle Trader API v1.13.28
+# Market Cycle Trader API v1.13.43
 
 FastAPI and MongoDB backend for protected historical simulations, sanitized analytics and Alpaca Paper portfolio monitoring.
 

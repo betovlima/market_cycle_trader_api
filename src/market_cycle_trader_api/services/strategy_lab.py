@@ -27,6 +27,13 @@ from ..infrastructure.persistence.mongo_repository import (
     utc_now,
 )
 from ..schemas.requests import BacktestRequest
+from .model_research import (
+    execution_settings_for,
+    execution_settings_from_values,
+    model_execution_snapshot,
+    model_values_from_snapshot,
+    public_model_snapshot,
+)
 
 CONTROL_ID = "default"
 BUNDLED_WINNER_ID = "winner-v1-13-2"
@@ -135,6 +142,14 @@ STRATEGY_PARAMETER_GROUPS: tuple[dict[str, Any], ...] = (
             "mongo_write_batch_size",
         ),
     },
+)
+
+
+MODEL_OWNED_STRATEGY_FIELDS: frozenset[str] = frozenset(
+    field
+    for group in STRATEGY_PARAMETER_GROUPS
+    if group["id"] == "model"
+    for field in group["fields"]
 )
 
 
@@ -250,6 +265,111 @@ def _profile_id(name: str) -> str:
     return f"{_slug(name)}-{uuid.uuid4().hex[:8]}"
 
 
+def _xgboost_strategy_settings(document: dict[str, Any]) -> dict[str, Any]:
+    configuration = BacktestRequest.model_validate(document.get("configuration") or {})
+    values = {
+        "n_estimators": int(configuration.rotation_xgb_n_estimators),
+        "learning_rate": float(configuration.rotation_xgb_learning_rate),
+        "max_depth": int(configuration.rotation_xgb_max_depth),
+        "min_child_weight": float(configuration.xgb_min_child_weight),
+        "subsample": float(configuration.xgb_subsample),
+        "colsample_bytree": float(configuration.xgb_colsample_bytree),
+        "reg_alpha": float(configuration.xgb_reg_alpha),
+        "reg_lambda": float(configuration.xgb_reg_lambda),
+        "n_jobs": int(configuration.xgb_n_jobs),
+        "repetitions": int(configuration.rotation_xgb_repetitions),
+        "seed_step": int(configuration.rotation_seed_step),
+        "random_state": int(configuration.random_state),
+    }
+    return execution_settings_from_values(
+        "xgboost_utility",
+        values,
+        settings_revision=max(1, int(document.get("revision") or 1)),
+        profile_id="strategy",
+    )
+
+
+def _full_xgboost_strategy_snapshot(document: dict[str, Any]) -> dict[str, Any]:
+    snapshot = model_execution_snapshot(
+        "xgboost_utility",
+        _xgboost_strategy_settings(document),
+    )
+    snapshot["source"] = "migrated_strategy_binding"
+    return snapshot
+
+
+def _validated_model_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    family = str(snapshot.get("family") or "xgboost_utility")
+    settings = snapshot.get("settings_snapshot") if isinstance(snapshot.get("settings_snapshot"), dict) else {}
+    resolved = model_execution_snapshot(family, settings)
+    stored_hash = str(snapshot.get("settings_hash") or "")
+    if stored_hash and stored_hash != resolved["settings_hash"]:
+        raise StrategyLabError("Stored Strategy model settings hash does not match its immutable snapshot.")
+    resolved["source"] = str(snapshot.get("source") or resolved.get("source") or "strategy_profile")
+    return resolved
+
+
+def _resolved_strategy_model_snapshot(db: Any, document: dict[str, Any]) -> dict[str, Any]:
+    stored = document.get("research_model_snapshot")
+    if isinstance(stored, dict):
+        return _validated_model_snapshot(stored)
+
+    # Migration path for profiles created before model ownership moved into the
+    # Strategy. Prefer the exact model already certified/run for this revision.
+    for field in ("candidate_model_snapshot", "last_backtest_model_snapshot", "winner_model_snapshot"):
+        candidate = document.get(field)
+        if not isinstance(candidate, dict):
+            continue
+        if field == "last_backtest_model_snapshot" and int(document.get("last_backtest_revision") or 0) != int(document.get("revision") or 1):
+            continue
+        resolved = _validated_model_snapshot(candidate)
+        if resolved["family"] == "xgboost_utility" and not model_values_from_snapshot(resolved):
+            return _full_xgboost_strategy_snapshot(document)
+        resolved["source"] = "migrated_strategy_binding"
+        return resolved
+
+    if str(document.get("status") or "") in {"winner", "former_winner"}:
+        if isinstance(document.get("configuration"), dict) and document.get("configuration"):
+            return _full_xgboost_strategy_snapshot(document)
+        legacy = model_execution_snapshot("xgboost_utility", {})
+        legacy["source"] = "legacy_strategy_owned"
+        return legacy
+
+    settings = execution_settings_for(db, "xgboost_utility")
+    resolved = model_execution_snapshot("xgboost_utility", settings)
+    resolved["source"] = "default_strategy_binding"
+    return resolved
+
+
+def _ensure_strategy_model_bindings(db: Any) -> None:
+    for document in db[STRATEGY_PROFILES_COLLECTION].find({}):
+        has_snapshot = isinstance(document.get("research_model_snapshot"), dict)
+        has_binding_revision = int(document.get("research_model_revision") or 0) >= 1
+        if has_snapshot and has_binding_revision:
+            continue
+        snapshot = _resolved_strategy_model_snapshot(db, document)
+        updates: dict[str, Any] = {}
+        if not has_snapshot:
+            updates["research_model_snapshot"] = bson_value(snapshot)
+        if not has_binding_revision:
+            updates["research_model_revision"] = 1
+        if updates:
+            updates["updated_at"] = document.get("updated_at") or utc_now()
+            db[STRATEGY_PROFILES_COLLECTION].update_one(
+                {"_id": document.get("_id")},
+                {"$set": updates},
+            )
+
+
+def _strategy_model_detail(document: dict[str, Any]) -> dict[str, Any] | None:
+    snapshot = document.get("research_model_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    public = public_model_snapshot(snapshot)
+    public["values"] = model_values_from_snapshot(snapshot)
+    return public
+
+
 def _public_profile(document: dict[str, Any], *, include_configuration: bool = True) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": str(document.get("_id")),
@@ -258,9 +378,16 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "status": str(document.get("status") or "draft"),
         "locked": bool(document.get("locked")),
         "revision": int(document.get("revision") or 1),
+        "research_model_revision": int(document.get("research_model_revision") or 1),
         "configuration_hash": str(document.get("configuration_hash") or ""),
         "source_strategy_id": document.get("source_strategy_id"),
         "source_strategy_revision": document.get("source_strategy_revision"),
+        "research_model": (
+            public_model_snapshot(document.get("research_model_snapshot"))
+            if isinstance(document.get("research_model_snapshot"), dict)
+            else None
+        ),
+        "research_reference_assets": list(document.get("research_reference_assets") or []),
         "created_at": bson_value(document.get("created_at")),
         "updated_at": bson_value(document.get("updated_at")),
         "promoted_at": bson_value(document.get("promoted_at")),
@@ -278,6 +405,25 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "last_promoted_winner_strategy_id": document.get("last_promoted_winner_strategy_id"),
         "last_promoted_at": bson_value(document.get("last_promoted_at")),
         "source_candidate_backtest_id": document.get("source_candidate_backtest_id"),
+        "last_backtest_model": (
+            public_model_snapshot(document.get("last_backtest_model_snapshot"))
+            if isinstance(document.get("last_backtest_model_snapshot"), dict)
+            else None
+        ),
+        "candidate_model": (
+            public_model_snapshot(document.get("candidate_model_snapshot"))
+            if isinstance(document.get("candidate_model_snapshot"), dict)
+            else None
+        ),
+        "winner_model": (
+            public_model_snapshot(document.get("winner_model_snapshot"))
+            if isinstance(document.get("winner_model_snapshot"), dict)
+            else (
+                public_model_snapshot(model_execution_snapshot("xgboost_utility", {}))
+                if str(document.get("status") or "") in {"winner", "former_winner"}
+                else None
+            )
+        ),
         "winner_api_version": document.get("winner_api_version"),
         "promotion_mode": document.get("promotion_mode"),
         "operational_state_preserved": document.get("operational_state_preserved"),
@@ -296,15 +442,18 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
             document.get("configuration") or {}
         ).model_dump(mode="json")
         payload["configuration"] = configuration
+        payload["research_model_configuration"] = _strategy_model_detail(document)
     return payload
 
 
 def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     research_id = str(control.get("research_strategy_id") or "")
     winner_id = str(control.get("trader_winner_strategy_id") or "")
+    reference_id = str(control.get("research_reference_strategy_id") or research_id)
     candidate_id = str(control.get("candidate_strategy_id") or "")
     research = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": research_id})
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
+    reference = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": reference_id})
     candidate = (
         db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": candidate_id})
         if candidate_id
@@ -315,9 +464,17 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     return {
         "revision": int(control.get("revision") or 1),
         "research_strategy_id": research_id,
+        "research_reference_strategy_id": reference_id,
         "candidate_strategy_id": candidate_id or None,
         "trader_winner_strategy_id": winner_id,
         "research_strategy": _public_profile(research, include_configuration=False),
+        "research_reference_strategy": (
+            _public_profile(reference, include_configuration=False)
+            if reference is not None
+            else None
+        ),
+        "research_reference_configuration_hash": control.get("research_reference_configuration_hash"),
+        "research_reference_assets": list(control.get("research_reference_assets") or []),
         "candidate_strategy": (
             _public_profile(candidate, include_configuration=False)
             if candidate is not None
@@ -382,6 +539,38 @@ def _normalize_single_candidate_and_winner(
         {"$set": {"status": "former_winner", "locked": True, "updated_at": now}},
     )
 
+    # v1.13.38 introduces a research reference that is independent from the
+    # Trader Winner and from the currently selected editable strategy. Existing
+    # catalogs snapshot the strategy selected for research at migration time;
+    # later selection or edits do not silently change the reference universe.
+    reference_assets = list(control.get("research_reference_assets") or [])
+    if len(reference_assets) < 2:
+        fallback_reference_id = str(control.get("research_strategy_id") or winner_id)
+        fallback_reference = db[STRATEGY_PROFILES_COLLECTION].find_one(
+            {"_id": fallback_reference_id}
+        )
+        if fallback_reference is None:
+            fallback_reference_id = winner_id
+            fallback_reference = winner
+        if fallback_reference is not None:
+            fallback_configuration = BacktestRequest.model_validate(
+                fallback_reference.get("configuration") or {}
+            )
+            db[STRATEGY_CONTROL_COLLECTION].update_one(
+                {"_id": CONTROL_ID},
+                {
+                    "$set": {
+                        "research_reference_strategy_id": fallback_reference_id,
+                        "research_reference_configuration_hash": str(
+                            fallback_reference.get("configuration_hash") or ""
+                        ),
+                        "research_reference_assets": list(fallback_configuration.assets),
+                        "updated_at": now,
+                    }
+                },
+            )
+            control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
+
     candidate_id = str(control.get("candidate_strategy_id") or "")
     candidate = (
         db[STRATEGY_PROFILES_COLLECTION].find_one(
@@ -445,7 +634,9 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
             {"_id": str(control.get("trader_winner_strategy_id") or "")}
         )
         if research is not None and winner is not None:
-            return _normalize_single_candidate_and_winner(db, control)
+            normalized_control = _normalize_single_candidate_and_winner(db, control)
+            _ensure_strategy_model_bindings(db)
+            return normalized_control
 
     # First migration from API v1.13.16: preserve the production winner exactly
     # as it exists in backtest_settings/default. The catalog is additive and does
@@ -472,6 +663,7 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
         "configuration_hash": configuration_hash,
         "source_strategy_id": None,
         "source_strategy_revision": None,
+        "research_reference_assets": list(configuration.assets),
         "created_at": legacy.get("created_at") or now,
         "updated_at": legacy.get("updated_at") or now,
         "promoted_at": legacy.get("updated_at") or legacy.get("created_at") or now,
@@ -482,6 +674,8 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
         "origin_schema_version": legacy.get("schema_version"),
         "origin_revision": legacy_revision,
     }
+    profile["research_model_snapshot"] = bson_value(_full_xgboost_strategy_snapshot(profile))
+    profile["research_model_revision"] = 1
     db[STRATEGY_PROFILES_COLLECTION].replace_one(
         {"_id": strategy_id}, profile, upsert=True
     )
@@ -489,6 +683,9 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
         "_id": CONTROL_ID,
         "revision": 1,
         "research_strategy_id": strategy_id,
+        "research_reference_strategy_id": strategy_id,
+        "research_reference_configuration_hash": configuration_hash,
+        "research_reference_assets": list(configuration.assets),
         "candidate_strategy_id": None,
         "trader_winner_strategy_id": strategy_id,
         "created_at": now,
@@ -500,6 +697,7 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
     db[STRATEGY_CONTROL_COLLECTION].replace_one(
         {"_id": CONTROL_ID}, control, upsert=True
     )
+    _ensure_strategy_model_bindings(db)
     return control
 
 
@@ -526,12 +724,15 @@ def synchronize_bundled_winner_installation(
         "configuration_hash": configuration_hash,
         "source_strategy_id": None,
         "source_strategy_revision": None,
+        "research_reference_assets": list(configuration.assets),
         "created_at": now,
         "updated_at": now,
         "promoted_at": now,
         "note": note,
         "source": source,
     }
+    profile["research_model_snapshot"] = bson_value(_full_xgboost_strategy_snapshot(profile))
+    profile["research_model_revision"] = 1
     db[STRATEGY_PROFILES_COLLECTION].replace_one(
         {"_id": BUNDLED_WINNER_ID}, profile, upsert=True
     )
@@ -547,6 +748,9 @@ def synchronize_bundled_winner_installation(
         "_id": CONTROL_ID,
         "revision": 1,
         "research_strategy_id": BUNDLED_WINNER_ID,
+        "research_reference_strategy_id": BUNDLED_WINNER_ID,
+        "research_reference_configuration_hash": configuration_hash,
+        "research_reference_assets": list(configuration.assets),
         "candidate_strategy_id": None,
         "trader_winner_strategy_id": BUNDLED_WINNER_ID,
         "created_at": now,
@@ -571,10 +775,18 @@ def list_strategies(db: Any) -> dict[str, Any]:
         "control": _control_response(db, control),
         "count": len(items),
         "items": items,
-        "parameter_order": list(BacktestRequest.model_fields),
+        "parameter_order": [
+            field for field in BacktestRequest.model_fields
+            if field not in MODEL_OWNED_STRATEGY_FIELDS
+        ],
         "parameter_groups": [
-            {"id": item["id"], "label": item["label"], "fields": list(item["fields"])}
+            {
+                "id": item["id"],
+                "label": item["label"],
+                "fields": [field for field in item["fields"] if field not in MODEL_OWNED_STRATEGY_FIELDS],
+            }
             for item in STRATEGY_PARAMETER_GROUPS
+            if any(field not in MODEL_OWNED_STRATEGY_FIELDS for field in item["fields"])
         ],
         "parameter_schema": _strategy_parameter_schema(),
     }
@@ -602,6 +814,40 @@ def get_research_strategy_context(db: Any) -> tuple[BacktestRequest, dict[str, A
     return configuration, _public_profile(profile, include_configuration=False)
 
 
+def get_research_strategy_model_snapshot(db: Any) -> dict[str, Any]:
+    control = ensure_strategy_catalog(db)
+    strategy_id = str(control["research_strategy_id"])
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+    if profile is None:
+        raise StrategyLabNotFound("Selected backtest strategy does not exist.")
+    return _resolved_strategy_model_snapshot(db, profile)
+
+
+def get_research_reference_context(db: Any) -> tuple[list[str], dict[str, Any]]:
+    control = ensure_strategy_catalog(db)
+    assets = [str(item).strip().upper() for item in control.get("research_reference_assets") or []]
+    assets = list(dict.fromkeys(item for item in assets if item))
+    if len(assets) < 2:
+        raise StrategyLabError("Research reference must contain at least two assets.")
+    strategy_id = str(control.get("research_reference_strategy_id") or "")
+    profile = (
+        db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+        if strategy_id
+        else None
+    )
+    metadata = {
+        "id": strategy_id or None,
+        "name": str((profile or {}).get("name") or "Research reference"),
+        "configuration_hash": str(
+            control.get("research_reference_configuration_hash")
+            or (profile or {}).get("configuration_hash")
+            or ""
+        ),
+        "assets": assets,
+    }
+    return assets, metadata
+
+
 def get_trader_winner_context(db: Any) -> tuple[BacktestRequest, dict[str, Any]]:
     control = ensure_strategy_catalog(db)
     strategy_id = str(control["trader_winner_strategy_id"])
@@ -612,6 +858,26 @@ def get_trader_winner_context(db: Any) -> tuple[BacktestRequest, dict[str, Any]]
         raise StrategyLabError("Trader winner strategy must be an immutable snapshot.")
     configuration = BacktestRequest.model_validate(profile.get("configuration") or {})
     return configuration, _public_profile(profile, include_configuration=False)
+
+
+def get_trader_winner_model_snapshot(db: Any) -> dict[str, Any]:
+    control = ensure_strategy_catalog(db)
+    strategy_id = str(control["trader_winner_strategy_id"])
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+    if profile is None:
+        raise StrategyLabNotFound("Trader winner strategy does not exist.")
+    stored = profile.get("winner_model_snapshot")
+    if not isinstance(stored, dict):
+        return model_execution_snapshot("xgboost_utility", {})
+    family = str(stored.get("family") or "xgboost_utility")
+    resolved = model_execution_snapshot(
+        family,
+        stored.get("settings_snapshot") if isinstance(stored.get("settings_snapshot"), dict) else {},
+    )
+    stored_hash = str(stored.get("settings_hash") or "")
+    if stored_hash and stored_hash != resolved["settings_hash"]:
+        raise StrategyLabError("Trader winner model settings hash does not match its immutable snapshot.")
+    return resolved
 
 
 def get_trader_winner_summary(db: Any) -> dict[str, Any]:
@@ -633,6 +899,10 @@ def create_strategy(
     if source is None:
         raise StrategyLabNotFound("Source strategy profile not found.")
     configuration = BacktestRequest.model_validate(source.get("configuration") or {})
+    source_model_snapshot = _resolved_strategy_model_snapshot(db, source)
+    source_reference_assets = list(source.get("research_reference_assets") or [])
+    if not source_reference_assets and str(source.get("status") or "") in {"winner", "former_winner"}:
+        source_reference_assets = list(configuration.assets)
     now = utc_now()
     strategy_id = _profile_id(name)
     profile = {
@@ -646,6 +916,9 @@ def create_strategy(
         "configuration_hash": _configuration_hash(configuration.model_dump(mode="json")),
         "source_strategy_id": source_id,
         "source_strategy_revision": int(source.get("revision") or 1),
+        "research_model_snapshot": bson_value(source_model_snapshot),
+        "research_model_revision": 1,
+        "research_reference_assets": source_reference_assets,
         "created_at": now,
         "updated_at": now,
         "created_by": (actor_email or "").strip().lower() or None,
@@ -697,11 +970,13 @@ def update_strategy(
                 "last_backtest_status": None,
                 "last_backtest_at": None,
                 "last_backtest_revision": None,
+                "last_backtest_model_snapshot": None,
                 "candidate_at": None,
                 "candidate_by": None,
                 "candidate_note": None,
                 "candidate_revision": None,
                 "candidate_backtest_id": None,
+                "candidate_model_snapshot": None,
             },
             "$inc": {"revision": 1},
         },
@@ -718,6 +993,170 @@ def update_strategy(
                     "candidate_strategy_id": None,
                     "updated_at": now,
                     "updated_by": (actor_email or "").strip().lower() or None,
+                },
+                "$inc": {"revision": 1},
+            },
+        )
+    return _public_profile(updated)
+
+
+def _job_model_snapshot(job: dict[str, Any], strategy_document: dict[str, Any]) -> dict[str, Any] | None:
+    request = job.get("request") if isinstance(job.get("request"), dict) else {}
+    family = str(
+        job.get("research_model_family")
+        or request.get("research_model_family")
+        or "xgboost_utility"
+    )
+    if family not in {"xgboost_utility", "lightgbm_utility", "iqn"}:
+        return None
+    settings = request.get("research_model_settings") if isinstance(request.get("research_model_settings"), dict) else {}
+    try:
+        if settings:
+            return model_execution_snapshot(family, settings)
+        if family == "xgboost_utility":
+            return _full_xgboost_strategy_snapshot(strategy_document)
+    except (ValueError, StrategyLabError):
+        return None
+    return None
+
+
+def _same_model_values(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        str(left.get("family") or "") == str(right.get("family") or "")
+        and model_values_from_snapshot(left) == model_values_from_snapshot(right)
+    )
+
+
+def _matching_completed_model_job(
+    db: Any,
+    strategy_document: dict[str, Any],
+    desired_snapshot: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    jobs = list(
+        db[JOBS_COLLECTION].find(
+            {
+                "status": "completed",
+                "strategy_profile_id": str(strategy_document.get("_id") or ""),
+                "strategy_profile_revision": int(strategy_document.get("revision") or 1),
+            }
+        )
+    )
+    jobs.sort(
+        key=lambda item: str(item.get("finished_at") or item.get("created_at") or item.get("id") or ""),
+        reverse=True,
+    )
+    for job in jobs:
+        snapshot = _job_model_snapshot(job, strategy_document)
+        if snapshot is not None and _same_model_values(snapshot, desired_snapshot):
+            return job, snapshot
+    return None, None
+
+
+def update_strategy_model(
+    db: Any,
+    strategy_id: str,
+    *,
+    model_family: str,
+    values: dict[str, Any],
+    note: str,
+    expected_strategy_revision: int,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    """Bind one algorithm + parameter set to the Strategy used by Backtest.
+
+    The shared Strategy revision is intentionally not incremented here. Strategy
+    parameters and model parameters have independent identities: Backtest jobs bind
+    the Strategy revision *and* the immutable model settings hash. This also lets a
+    pre-v1.13.43 completed job be adopted when its exact model values already match.
+    """
+    ensure_strategy_catalog(db)
+    current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+    if current is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
+    if bool(current.get("locked")):
+        raise StrategyLabConflict(
+            "Protected lifecycle snapshots cannot change model configuration. Clone the strategy first."
+        )
+    current_revision = int(current.get("revision") or 1)
+    if current_revision != expected_strategy_revision:
+        raise StrategyLabConflict(
+            f"Expected strategy revision {expected_strategy_revision}, current revision {current_revision}."
+        )
+
+    current_model_revision = max(1, int(current.get("research_model_revision") or 1))
+    desired_settings = execution_settings_from_values(
+        model_family,
+        values,
+        settings_revision=current_model_revision + 1,
+        profile_id="strategy",
+    )
+    desired_snapshot = model_execution_snapshot(model_family, desired_settings)
+    matching_job, matching_snapshot = _matching_completed_model_job(db, current, desired_snapshot)
+    if matching_snapshot is not None:
+        snapshot = dict(matching_snapshot)
+        snapshot["source"] = "strategy_profile_adopted_job"
+    else:
+        snapshot = desired_snapshot
+        snapshot["source"] = "strategy_profile"
+
+    now = utc_now()
+    actor = (actor_email or "").strip().lower() or None
+    completed_job_id = str(matching_job.get("id") or "") if matching_job else None
+    completed_at = (
+        matching_job.get("finished_at") or matching_job.get("updated_at") or matching_job.get("created_at")
+        if matching_job
+        else None
+    )
+    model_backtest_fields: dict[str, Any]
+    if matching_job and matching_snapshot:
+        model_backtest_fields = {
+            "last_backtest_id": completed_job_id,
+            "last_backtest_status": "completed",
+            "last_backtest_at": completed_at,
+            "last_backtest_revision": current_revision,
+            "last_backtest_model_snapshot": bson_value(matching_snapshot),
+        }
+    else:
+        model_backtest_fields = {
+            "last_backtest_id": None,
+            "last_backtest_status": None,
+            "last_backtest_at": None,
+            "last_backtest_revision": None,
+            "last_backtest_model_snapshot": None,
+        }
+
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {"_id": strategy_id, "revision": current_revision, "locked": {"$ne": True}},
+        {
+            "$set": {
+                "research_model_snapshot": bson_value(snapshot),
+                "status": "draft",
+                "updated_at": now,
+                "updated_by": actor,
+                "last_change_note": note,
+                **model_backtest_fields,
+                "candidate_at": None,
+                "candidate_by": None,
+                "candidate_note": None,
+                "candidate_revision": None,
+                "candidate_backtest_id": None,
+                "candidate_model_snapshot": None,
+            },
+            "$inc": {"research_model_revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise StrategyLabConflict("Strategy changed before the model configuration was saved.")
+
+    if str(current.get("status") or "draft") == "candidate":
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": CONTROL_ID, "candidate_strategy_id": strategy_id},
+            {
+                "$set": {
+                    "candidate_strategy_id": None,
+                    "updated_at": now,
+                    "updated_by": actor,
                 },
                 "$inc": {"revision": 1},
             },
@@ -777,6 +1216,7 @@ def mark_strategy_as_candidate(
     strategy_id: str,
     *,
     expected_strategy_revision: int,
+    model_family: str | None = None,
     note: str,
     actor_email: str | None,
 ) -> dict[str, Any]:
@@ -797,27 +1237,33 @@ def mark_strategy_as_candidate(
     if current_candidate_id == strategy_id and str(profile.get("status") or "") == "candidate":
         raise StrategyLabConflict("This exact strategy revision is already the active candidate.")
 
-    completed_job_id = str(profile.get("last_backtest_id") or "")
-    completed_job = (
-        db[JOBS_COLLECTION].find_one(
-            {
-                "id": completed_job_id,
-                "status": "completed",
-                "strategy_profile_id": strategy_id,
-                "strategy_profile_revision": current_revision,
-            },
-            {"_id": 0, "id": 1},
-        )
-        if completed_job_id
-        else None
-    )
-    if (
-        str(profile.get("last_backtest_status") or "") != "completed"
-        or int(profile.get("last_backtest_revision") or 0) != current_revision
-        or completed_job is None
-    ):
+    bound_model_snapshot = _resolved_strategy_model_snapshot(db, profile)
+    bound_model_family = str(bound_model_snapshot["family"])
+    requested_model_family = str(model_family or "").strip() or None
+    if requested_model_family and requested_model_family != bound_model_family:
         raise StrategyLabConflict(
-            "Run and complete a backtest with the current strategy revision before marking it as a candidate."
+            "The requested Candidate model differs from the model saved with this Strategy revision."
+        )
+    if bound_model_family == "iqn":
+        raise StrategyLabConflict(
+            "IQN does not have a protected live Trader engine yet and cannot be promoted."
+        )
+    completed_job, candidate_model_snapshot = _matching_completed_model_job(
+        db, profile, bound_model_snapshot
+    )
+    if completed_job is None or candidate_model_snapshot is None:
+        raise StrategyLabConflict(
+            f"Run and complete a backtest for the saved {bound_model_snapshot['label']} configuration on this Strategy revision before marking it as a candidate."
+        )
+    completed_job_id = str(completed_job.get("id") or "")
+    completed_family = str(candidate_model_snapshot.get("family") or "")
+    if completed_family not in {"xgboost_utility", "lightgbm_utility"}:
+        raise StrategyLabConflict(
+            "Only XGBoost and LightGBM currently have protected live Trader engines."
+        )
+    if not _same_model_values(candidate_model_snapshot, bound_model_snapshot):
+        raise StrategyLabConflict(
+            "Completed backtest model settings do not match the model saved with this Strategy."
         )
 
     now = utc_now()
@@ -865,6 +1311,7 @@ def mark_strategy_as_candidate(
                 "candidate_note": note,
                 "candidate_revision": current_revision,
                 "candidate_backtest_id": completed_job_id,
+                "candidate_model_snapshot": bson_value(candidate_model_snapshot),
                 "updated_at": now,
                 "updated_by": actor,
             }
@@ -896,6 +1343,10 @@ def mark_strategy_as_candidate(
                 "new_candidate_strategy_id": strategy_id,
                 "strategy_revision": current_revision,
                 "backtest_id": completed_job_id,
+                "model_family": candidate_model_snapshot["family"],
+                "model_profile_id": candidate_model_snapshot["profile_id"],
+                "model_settings_revision": candidate_model_snapshot["settings_revision"],
+                "model_settings_hash": candidate_model_snapshot["settings_hash"],
                 "note": note,
                 "created_at": now,
                 "actor_email": actor,
@@ -1092,6 +1543,8 @@ def promote_strategy_to_trader(
                 "_id": 0,
                 "id": 1,
                 "strategy_configuration_hash": 1,
+                "research_model_family": 1,
+                "request": 1,
             },
         )
         if candidate_backtest_id
@@ -1100,6 +1553,21 @@ def promote_strategy_to_trader(
     if int(source.get("candidate_revision") or 0) != source_revision or completed_job is None:
         raise StrategyLabConflict(
             "Candidate certification does not match the current strategy revision."
+        )
+
+    winner_model_snapshot = _job_model_snapshot(completed_job, source)
+    if winner_model_snapshot is None:
+        raise StrategyLabConflict("Certified backtest does not contain a valid model snapshot.")
+    if winner_model_snapshot["family"] not in {"xgboost_utility", "lightgbm_utility"}:
+        raise StrategyLabConflict(
+            "Only XGBoost and LightGBM currently have protected live Trader engines."
+        )
+    candidate_model_snapshot = source.get("candidate_model_snapshot")
+    if isinstance(candidate_model_snapshot, dict) and not _same_model_values(
+        candidate_model_snapshot, winner_model_snapshot
+    ):
+        raise StrategyLabConflict(
+            "Candidate model settings do not match the certified backtest."
         )
 
     configuration = BacktestRequest.model_validate(source.get("configuration") or {})
@@ -1165,7 +1633,10 @@ def promote_strategy_to_trader(
             "source_strategy_id": strategy_id,
             "source_strategy_revision": source_revision,
             "source_candidate_backtest_id": candidate_backtest_id,
+            "research_model_snapshot": bson_value(winner_model_snapshot),
+            "winner_model_snapshot": bson_value(winner_model_snapshot),
             "winner_api_version": API_VERSION,
+            "research_reference_assets": list(configuration.assets),
             "created_at": now,
             "updated_at": now,
             "promoted_at": now,
@@ -1205,6 +1676,7 @@ def promote_strategy_to_trader(
                     "last_promoted_winner_strategy_id": winner_id,
                     "last_promoted_at": now,
                     "last_promoted_by": actor,
+                    "research_reference_assets": list(configuration.assets),
                     "updated_at": now,
                     "updated_by": actor,
                 }
@@ -1230,6 +1702,10 @@ def promote_strategy_to_trader(
                     "source_strategy_revision": source_revision,
                     "candidate_backtest_id": candidate_backtest_id,
                     "configuration_hash": configuration_hash,
+                    "model_family": winner_model_snapshot["family"],
+                    "model_profile_id": winner_model_snapshot["profile_id"],
+                    "model_settings_revision": winner_model_snapshot["settings_revision"],
+                    "model_settings_hash": winner_model_snapshot["settings_hash"],
                     "assets_count": len(configuration.assets),
                     "note": note,
                     "promoted_at": now,
@@ -1253,12 +1729,18 @@ def promote_strategy_to_trader(
                 "$set": {
                     "candidate_strategy_id": None,
                     "trader_winner_strategy_id": winner_id,
+                    "research_reference_strategy_id": winner_id,
+                    "research_reference_configuration_hash": configuration_hash,
+                    "research_reference_assets": list(configuration.assets),
                     "updated_at": now,
                     "updated_by": actor,
                     "last_promotion_note": note,
                     "last_promotion_mode": "metadata_only_operational_state_preserved",
                     "last_promoted_api_version": API_VERSION,
                     "last_promoted_configuration_hash": configuration_hash,
+                    "last_promoted_model_family": winner_model_snapshot["family"],
+                    "last_promoted_model_profile_id": winner_model_snapshot["profile_id"],
+                    "last_promoted_model_settings_hash": winner_model_snapshot["settings_hash"],
                     "last_promoted_assets_count": len(configuration.assets),
                     "paper_state_reinitialization_required": False,
                     "winner_promotion_in_progress": False,
@@ -1306,6 +1788,7 @@ def promote_strategy_to_trader(
                 "paper_pipeline_preserved": True,
                 "next_scheduled_evaluation_uses_new_winner": True,
                 "next_scheduled_evaluation_assets_count": len(configuration.assets),
+                "winner_model": public_model_snapshot(winner_model_snapshot),
                 **operational_snapshot,
             },
         }
@@ -1361,10 +1844,11 @@ def delete_strategy(
     control = ensure_strategy_catalog(db)
     if strategy_id in {
         str(control.get("research_strategy_id")),
+        str(control.get("research_reference_strategy_id")),
         str(control.get("trader_winner_strategy_id")),
     }:
         raise StrategyLabConflict(
-            "A selected backtest strategy or Trader winner cannot be deleted."
+            "A selected backtest strategy, research reference, or Trader winner cannot be deleted."
         )
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
@@ -1421,6 +1905,7 @@ def mark_trader_winner_state_initialized(db: Any) -> None:
                 "paper_state_reinitialization_required": False,
                 "paper_state_winner_strategy_id": winner_id,
                 "paper_state_winner_configuration_hash": winner.get("configuration_hash"),
+                "paper_state_winner_model_settings_hash": get_trader_winner_model_snapshot(db).get("settings_hash"),
                 "paper_state_initialized_at": utc_now(),
             }
         },
@@ -1434,9 +1919,14 @@ def mark_strategy_backtest(
     strategy_revision: int | None,
     job_id: str,
     status: str,
+    research_model_family: str = "xgboost_utility",
+    research_model_settings: dict[str, Any] | None = None,
 ) -> None:
     if not strategy_id or not strategy_revision:
         return
+    model_snapshot = model_execution_snapshot(
+        research_model_family, research_model_settings or {}
+    )
     # Update only the exact revision that produced the job. If an Administrator
     # edits the draft while the backtest is running, the old result must not
     # certify the newer revision for Trader promotion.
@@ -1448,6 +1938,8 @@ def mark_strategy_backtest(
                 "last_backtest_status": status,
                 "last_backtest_at": utc_now(),
                 "last_backtest_revision": int(strategy_revision),
+                "last_backtest_model_snapshot": bson_value(model_snapshot),
             }
         },
     )
+

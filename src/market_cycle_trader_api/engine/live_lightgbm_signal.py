@@ -6,18 +6,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .capital_rotation import (
-    _fit_xgb_models,
-    _simple_policy_growth,
-    _xgb_policy,
-    prepare_rotation_panel,
-    resolve_xgboost_compute_plan,
-)
+from .capital_rotation import _simple_policy_growth, _xgb_policy, prepare_rotation_panel
 from .live_policy import build_live_rotation_policy, live_model_utilities
+from .research_challengers import _lightgbm_fit_models
 
 
 @dataclass(frozen=True)
-class LiveXGBoostDecision:
+class LiveLightGBMDecision:
     decision_date: pd.Timestamp
     current_asset: str
     target_asset: str
@@ -36,30 +31,28 @@ class LiveXGBoostDecision:
     random_state: int
 
 
-def build_live_xgboost_decision(
+def build_live_lightgbm_decision(
     bars_by_symbol: dict[str, pd.DataFrame],
     config: Any,
     *,
     current_asset: str | None,
     holding_sessions: int,
-) -> LiveXGBoostDecision:
-    """Train the validated live fold and decide the next-open target.
+) -> LiveLightGBMDecision:
+    """Train the Winner LightGBM fold and decide the next-open target.
 
-    This mirrors the backtest's expanding walk-forward convention for a decision
-    made after the latest completed daily close:
-
-    * a purge separates training labels from calibration;
-    * a second purge separates final fitting from the live decision;
-    * the model reads features from the latest completed session;
-    * any position change is intended for the next regular-session open.
+    The chronology, calibration window, purge, utility target and rotation policy
+    are intentionally identical to the validated XGBoost live path. Only the model
+    fitter changes, using the immutable LightGBM settings snapshot stored in Winner.
     """
 
     if config.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise ValueError("Paper execution supports only COMPOUND_ROTATION_SWING_XGBOOST.")
+        raise ValueError("Paper execution requires the validated compound-rotation strategy contract.")
     if list(config.rotation_models) != ["xgboost_utility"]:
-        raise ValueError("Paper execution requires rotation_models=['xgboost_utility'].")
+        raise ValueError("The legacy strategy model marker changed unexpectedly.")
     if config.timeframe != "1Day":
         raise ValueError("Paper execution requires 1Day market data.")
+    if str(getattr(config, "research_model_family", "")) != "lightgbm_utility":
+        raise ValueError("The live LightGBM engine requires a LightGBM Winner model snapshot.")
 
     frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
     symbols = sorted(frames)
@@ -73,8 +66,6 @@ def build_live_xgboost_decision(
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     minimum_training_rows = int(config.rotation_minimum_training_rows)
 
-    # A live decision occurs after common_dates[-1], so the unseen execution
-    # session would start at index len(common_dates).
     live_test_start = len(common_dates)
     calibration_end_index = live_test_start - purge
     calibration_start_index = calibration_end_index - calibration_days
@@ -83,7 +74,7 @@ def build_live_xgboost_decision(
 
     if train_end_index < minimum_training_rows:
         raise ValueError(
-            "Not enough completed history for the live XGBoost fold: "
+            "Not enough completed history for the live LightGBM fold: "
             f"training_rows={train_end_index}, required={minimum_training_rows}, "
             f"calibration={calibration_days}, purge={purge}."
         )
@@ -97,19 +88,13 @@ def build_live_xgboost_decision(
     final_fit_dates = common_dates[:final_fit_end_index]
     decision_date = pd.Timestamp(common_dates[-1])
 
-    compute_plan = resolve_xgboost_compute_plan(config)
-    effective_device = compute_plan.selected
-    fallback_reasons: list[str] = []
-
-    calibration_models, effective_device, fallback_reason = _fit_xgb_models(
+    calibration_models = _lightgbm_fit_models(
         frames,
         symbols,
         train_dates,
         config,
-        effective_device,
+        phase="live_calibration",
     )
-    if fallback_reason:
-        fallback_reasons.append(fallback_reason)
 
     candidates = tuple(float(value) for value in config.rotation_switch_margin_candidates)
     if not candidates:
@@ -136,37 +121,22 @@ def build_live_xgboost_decision(
             best_score = float(score)
             best_candidate = float(candidate)
 
-    final_models, effective_device, fallback_reason = _fit_xgb_models(
+    final_models = _lightgbm_fit_models(
         frames,
         symbols,
         final_fit_dates,
         config,
-        effective_device,
+        phase="live_final",
     )
-    if fallback_reason:
-        fallback_reasons.append(fallback_reason)
+    effective_margin = max(float(config.rotation_switch_margin), float(best_candidate))
 
-    effective_margin = max(
-        float(config.rotation_switch_margin),
-        float(best_candidate),
-    )
-
-    current_label = str(current_asset or "CASH").strip().upper()
     labels = ["CASH", *symbols]
+    current_label = str(current_asset or "CASH").strip().upper()
     if current_label not in labels:
         raise ValueError(
             f"Managed asset {current_label!r} is not present in the locked asset universe."
         )
     current_position = labels.index(current_label)
-
-    utilities_array = live_model_utilities(
-        final_models,
-        frames,
-        symbols,
-        decision_date,
-    )
-    if not np.isfinite(utilities_array[1:]).any():
-        raise ValueError("The live XGBoost models produced no finite asset utilities.")
 
     policy = build_live_rotation_policy(
         final_models,
@@ -180,14 +150,21 @@ def build_live_xgboost_decision(
         current_position,
         int(holding_sessions),
     )
+    utilities_array = live_model_utilities(
+        final_models,
+        frames,
+        symbols,
+        decision_date,
+    )
+    if not np.isfinite(utilities_array[1:]).any():
+        raise ValueError("The live LightGBM models produced no finite asset utilities.")
     raw_best_position = int(np.nanargmax(utilities_array))
-
     utilities = {
         label: float(utilities_array[index])
         for index, label in enumerate(labels)
     }
 
-    return LiveXGBoostDecision(
+    return LiveLightGBMDecision(
         decision_date=decision_date,
         current_asset=current_label,
         target_asset=labels[int(target_position)],
@@ -201,11 +178,7 @@ def build_live_xgboost_decision(
         calibration_start=pd.Timestamp(calibration_dates[0]),
         calibration_end=pd.Timestamp(calibration_dates[-1]),
         final_fit_end=pd.Timestamp(final_fit_dates[-1]),
-        effective_compute_device=str(effective_device),
-        compute_fallback_reason=(
-            fallback_reasons[-1]
-            if fallback_reasons
-            else compute_plan.fallback_reason
-        ),
+        effective_compute_device="cpu",
+        compute_fallback_reason=None,
         random_state=int(config.random_state),
     )

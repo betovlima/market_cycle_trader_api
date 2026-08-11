@@ -19,20 +19,20 @@ from ...infrastructure.persistence.mongo_repository import (
 from ...schemas.requests import BacktestExecutionRequest
 from ...services.jobs import public_job, require_job, run_job
 from ...services.system_settings import apply_training_runtime_settings, get_system_settings
-from ...services.strategy_lab import get_research_strategy_context, get_trader_winner_context
+from ...services.strategy_lab import (
+    get_research_reference_context,
+    get_research_strategy_context,
+    get_research_strategy_model_snapshot,
+    get_trader_winner_context,
+)
 from ...services.results import build_results
+from ...services.model_research import apply_execution_profile, model_execution_snapshot, model_label
 
 router = APIRouter(tags=["jobs"])
 
 
-@router.post("/api/jobs", status_code=202)
-def create_job() -> dict[str, Any]:
-    """Queue a job from the Administrator-selected research strategy snapshot.
-
-    The public client supplies no dates or strategy parameters. Selection and
-    editing happen only in the Administrator strategy workspace. Trader continues
-    using its separately promoted immutable winner snapshot.
-    """
+def queue_backtest_job() -> dict[str, Any]:
+    """Queue the model already saved with the selected Strategy revision."""
     db = database()
     runtime_settings = get_system_settings(db)
     training_settings = runtime_settings["training"]
@@ -47,10 +47,23 @@ def create_job() -> dict[str, Any]:
 
     try:
         selected_configuration, selected_strategy = get_research_strategy_context(db)
-        winner_configuration, _winner_profile = get_trader_winner_context(db)
+        selected_model_snapshot = get_research_strategy_model_snapshot(db)
+        research_model_family = str(selected_model_snapshot["family"])
+        research_model_settings = (
+            dict(selected_model_snapshot.get("settings_snapshot") or {})
+            if isinstance(selected_model_snapshot.get("settings_snapshot"), dict)
+            else {}
+        )
+        reference_assets_snapshot, reference_profile = get_research_reference_context(db)
+        winner_configuration, winner_profile = get_trader_winner_context(db)
         locked_configuration = apply_training_runtime_settings(
             db,
             selected_configuration,
+        )
+        locked_configuration = apply_execution_profile(
+            locked_configuration,
+            research_model_family,
+            research_model_settings,
         )
         selected_assets = set(locked_configuration.assets)
         calendar_anchor_assets = [
@@ -58,6 +71,17 @@ def create_job() -> dict[str, Any]:
         ]
         if len(calendar_anchor_assets) < 2:
             calendar_anchor_assets = list(locked_configuration.assets)
+        research_reference_assets = [
+            symbol for symbol in reference_assets_snapshot if symbol in selected_assets
+        ]
+        if len(research_reference_assets) < 2:
+            research_reference_assets = list(locked_configuration.assets)
+        research_reference_set = set(research_reference_assets)
+        research_candidate_assets = [
+            symbol
+            for symbol in locked_configuration.assets
+            if symbol not in research_reference_set
+        ]
     except (RuntimeError, ValidationError) as exc:
         raise HTTPException(
             status_code=500,
@@ -77,6 +101,10 @@ def create_job() -> dict[str, Any]:
                 "analysis_start_date": locked_configuration.start_date,
                 "analysis_end_date": locked_configuration.end_date,
                 "calendar_anchor_assets": calendar_anchor_assets,
+                "research_reference_assets": research_reference_assets,
+                "research_candidate_assets": research_candidate_assets,
+                "research_model_family": research_model_family,
+                "research_model_settings": dict(research_model_settings or {}),
             }
         )
     except ValidationError as exc:
@@ -90,6 +118,8 @@ def create_job() -> dict[str, Any]:
     payload = bson_value(request_payload)
     lifecycle = strategy_lifecycle(payload["strategy_mode"])
     total_runs = int(payload["rotation_xgb_repetitions"])
+    research_label = model_label(research_model_family)
+    model_snapshot = selected_model_snapshot
     job = {
         "id": job_id,
         "status": "queued",
@@ -106,6 +136,11 @@ def create_job() -> dict[str, Any]:
         "strategy_profile_id": selected_strategy["id"],
         "strategy_profile_name": selected_strategy["name"],
         "strategy_profile_revision": selected_strategy["revision"],
+        "research_model_family": research_model_family,
+        "research_model_label": research_label,
+        "research_model_profile_id": model_snapshot["profile_id"],
+        "research_model_settings_revision": model_snapshot["settings_revision"],
+        "research_model_settings_hash": model_snapshot["settings_hash"],
         "strategy_configuration_hash": selected_strategy["configuration_hash"],
         "configuration_locked": True,
         "execution_period_locked": True,
@@ -116,10 +151,25 @@ def create_job() -> dict[str, Any]:
         "system_settings_revision": int(runtime_settings["revision"]),
         "training_timeout_seconds": int(training_settings["timeout_seconds"]),
         "winner_engine_compatibility": "api-v1.13.16",
+        "trader_winner_strategy_id_at_queue": winner_profile.get("id"),
+        "trader_winner_strategy_name_at_queue": winner_profile.get("name"),
+        "trader_winner_configuration_hash_at_queue": winner_profile.get("configuration_hash"),
+        "trader_winner_api_version_at_queue": winner_profile.get("winner_api_version"),
+        "research_reference_strategy_id_at_queue": reference_profile.get("id"),
+        "research_reference_strategy_name_at_queue": reference_profile.get("name"),
+        "research_reference_configuration_hash_at_queue": reference_profile.get("configuration_hash"),
+        "research_reference_assets": research_reference_assets,
+        "research_candidate_assets": research_candidate_assets,
     }
     db[JOBS_COLLECTION].insert_one(job)
     threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
     return public_job(job) or {}
+
+
+@router.post("/api/jobs", status_code=202)
+def create_job() -> dict[str, Any]:
+    """Queue the immutable model saved with the selected research Strategy."""
+    return queue_backtest_job()
 
 
 @router.get("/api/jobs/latest")

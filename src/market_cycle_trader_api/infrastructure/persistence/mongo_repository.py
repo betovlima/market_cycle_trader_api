@@ -46,6 +46,8 @@ ASSET_DISCOVERY_SETTINGS_HISTORY_COLLECTION = "asset_discovery_settings_history"
 ASSET_DISCOVERY_CANDIDATES_COLLECTION = "asset_discovery_candidates"
 ASSET_DISCOVERY_RUNS_COLLECTION = "asset_discovery_runs"
 ASSET_DISCOVERY_STATE_COLLECTION = "asset_discovery_state"
+MODEL_RESEARCH_SETTINGS_COLLECTION = "model_research_settings"
+MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION = "model_research_settings_history"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -244,6 +246,14 @@ def ensure_database(db: Database) -> None:
     db[ASSET_DISCOVERY_RUNS_COLLECTION].create_index(
         [("created_at", DESCENDING)],
         name="ix_asset_discovery_runs_created",
+    )
+    db[MODEL_RESEARCH_SETTINGS_COLLECTION].create_index(
+        [("updated_at", DESCENDING)],
+        name="ix_model_research_settings_updated",
+    )
+    db[MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION].create_index(
+        [("settings_id", ASCENDING), ("updated_at", DESCENDING)],
+        name="ix_model_research_settings_history",
     )
 
 

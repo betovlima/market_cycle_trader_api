@@ -11,6 +11,7 @@ from ...schemas.strategy_lab import (
     StrategyCandidateRequest,
     StrategyCreateRequest,
     StrategyDeleteRequest,
+    StrategyModelUpdateRequest,
     StrategyPromoteRequest,
     StrategySelectRequest,
     StrategyUpdateRequest,
@@ -28,6 +29,7 @@ from ...services.strategy_lab import (
     promote_strategy_to_trader,
     select_research_strategy,
     update_strategy,
+    update_strategy_model,
 )
 
 router = APIRouter(prefix="/api/admin/strategies", tags=["admin-strategies"])
@@ -44,6 +46,8 @@ def _translate_error(exc: Exception) -> HTTPException:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=exc.errors(include_url=False),
         )
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     if isinstance(exc, StrategyLabError):
         return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
     return HTTPException(status_code=500, detail="Unexpected strategy management error.")
@@ -113,6 +117,28 @@ def replace_strategy(
         raise _translate_error(exc) from exc
 
 
+@router.put("/{strategy_id}/model")
+def replace_strategy_model(
+    strategy_id: str,
+    payload: StrategyModelUpdateRequest,
+    identity: AdminIdentity,
+) -> dict[str, Any]:
+    try:
+        result = update_strategy_model(
+            database(),
+            strategy_id,
+            model_family=payload.model_family,
+            values=payload.values,
+            note=payload.note,
+            expected_strategy_revision=payload.expected_strategy_revision,
+            actor_email=identity.email,
+        )
+        refresh_locked_configuration_status()
+        return result
+    except (StrategyLabError, ValidationError, ValueError) as exc:
+        raise _translate_error(exc) from exc
+
+
 @router.post("/{strategy_id}/select-for-backtest")
 def select_strategy_for_backtest(
     strategy_id: str,
@@ -144,6 +170,7 @@ def mark_candidate(
             database(),
             strategy_id,
             expected_strategy_revision=payload.expected_strategy_revision,
+            model_family=payload.model_family,
             note=payload.note,
             actor_email=identity.email,
         )

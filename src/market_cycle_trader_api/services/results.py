@@ -22,6 +22,76 @@ from .serialization import clean_mongo_rows, downsample_documents, iso_value
 
 LOGGER = logging.getLogger(__name__)
 
+PROTECTED_DECISION_TRADE_FIELDS = frozenset({
+    "decision_diagnostics_schema_version",
+    "current_asset",
+    "current_score",
+    "holding_days_at_decision",
+    "raw_best_asset",
+    "raw_best_score",
+    "best_asset",
+    "best_score",
+    "second_asset",
+    "second_score",
+    "best_vs_second_gap",
+    "best_vs_current_gap",
+    "best_vs_cash_gap",
+    "cash_score",
+    "current_asset_rank",
+    "universe_score_mean",
+    "universe_score_std",
+    "current_score_zscore",
+    "best_score_zscore",
+    "best_vs_second_zscore",
+    "positive_score_count",
+    "finite_score_count",
+    "base_switch_margin",
+    "calibrated_switch_margin",
+    "effective_switch_margin",
+    "final_action_asset",
+    "final_action_score",
+    "decision_reason",
+    "switch_margin_guard_applied",
+    "cash_threshold_guard_applied",
+    "minimum_expected_edge_guard_applied",
+    "raw_action_asset",
+    "min_hold_guard_applied",
+    "day_trade_constraint_applied",
+    "position_risk_diagnostics_schema_version",
+    "position_entry_timestamp",
+    "position_entry_price",
+    "position_entry_score",
+    "position_return_since_entry",
+    "position_peak_return",
+    "position_drawdown_from_peak",
+    "position_mfe_so_far",
+    "position_mae_so_far",
+    "score_change_from_entry",
+    "days_current_not_top1",
+    "consecutive_days_current_not_top1",
+    "market_regime_diagnostics_schema_version",
+    "spy_return_5",
+    "spy_return_20",
+    "spy_realized_volatility_20",
+    "universe_breadth_5",
+    "universe_breadth_20",
+    "universe_breadth_5_valid_assets",
+    "universe_breadth_20_valid_assets",
+})
+
+
+def _public_trade_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in PROTECTED_DECISION_TRADE_FIELDS
+            and not key.startswith("q_")
+            and not key.startswith("top_")
+        }
+        for row in clean_mongo_rows(rows)
+    ]
+
 
 def diagnostic_csv_rows(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -95,7 +165,7 @@ def build_run_payload(run: dict[str, Any]) -> dict[str, Any]:
         "metrics": iso_value(run.get("metrics", {})),
         "summary": run.get("summary", ""),
         "series": series,
-        "trades": clean_mongo_rows(trades),
+        "trades": _public_trade_rows(trades),
         "diagnostics": iso_value(diagnostics),
         "downloads": {
             "predictions": f"/api/jobs/{job_id}/runs/{symbol}/{backend}/predictions.csv",

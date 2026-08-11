@@ -10,8 +10,8 @@ class PaperTradingSettings(BaseModel):
     """Administrative paper-execution settings stored in MongoDB.
 
     Strategy/model parameters are intentionally not repeated here. The paper
-    trader always consumes the locked XGBoost configuration from
-    the immutable Trader winner snapshot so research and execution cannot drift silently.
+    trader always consumes the locked Strategy and model snapshots from
+    the immutable Trader Winner so research and execution cannot drift silently.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -95,6 +95,9 @@ class PaperTradePlan(BaseModel):
     winner_strategy_name: str
     winner_strategy_revision: int = Field(ge=1)
     winner_configuration_hash: str = Field(min_length=64, max_length=64)
+    winner_model_family: str | None = None
+    winner_model_profile_id: str | None = None
+    winner_model_settings_hash: str | None = Field(default=None, min_length=64, max_length=64)
     winner_assets: list[str] = Field(min_length=1)
     decision_date: str
     expected_market_open: str

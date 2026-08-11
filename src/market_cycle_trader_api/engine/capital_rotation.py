@@ -518,32 +518,219 @@ def _xgb_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symb
         values.append(prediction)
     return np.asarray(values, dtype=np.float64)
 
-def _xgb_policy(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], config: Any, switch_margin: float) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+def _xgb_policy(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    switch_margin: float,
+    *,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+    fold_id: int | None = None,
+    calibrated_switch_margin: float | None = None,
+) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+    """Build the XGBoost policy and optionally record strategy-neutral diagnostics.
+
+    The diagnostic path observes the utilities already computed by the policy. It
+    never changes ranking, thresholds, guards or the returned action/score.
+    """
+
+    def position_asset(position: int) -> str:
+        return 'CASH' if position <= 0 else symbols[position - 1]
+
+    def finite(value: float) -> float | None:
+        return float(value) if np.isfinite(value) else None
 
     def policy(timestamp: pd.Timestamp, current_position: int, holding_days: int) -> tuple[int, float]:
         utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
         best = int(np.nanargmax(utilities))
         best_value = float(utilities[best])
         current_value = float(utilities[current_position])
+        minimum = float(config.rotation_cash_threshold)
+        required = max(float(config.rotation_switch_margin), float(switch_margin))
+
+        ranked_assets = sorted(
+            (
+                (symbols[position - 1], float(utilities[position]))
+                for position in range(1, len(utilities))
+                if np.isfinite(utilities[position])
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        best_asset, best_asset_score = ranked_assets[0] if ranked_assets else (None, None)
+        second_asset, second_asset_score = (
+            ranked_assets[1] if len(ranked_assets) > 1 else (None, None)
+        )
+        best_vs_second_gap = (
+            float(best_asset_score - second_asset_score)
+            if best_asset_score is not None and second_asset_score is not None
+            else None
+        )
+        best_vs_current_gap = (
+            float(best_asset_score - current_value)
+            if best_asset_score is not None and np.isfinite(current_value)
+            else None
+        )
+        finite_asset_scores = np.asarray(
+            [score for _, score in ranked_assets],
+            dtype=np.float64,
+        )
+        universe_score_mean = (
+            float(np.mean(finite_asset_scores)) if len(finite_asset_scores) else None
+        )
+        universe_score_std = (
+            float(np.std(finite_asset_scores)) if len(finite_asset_scores) else None
+        )
+        positive_score_count = int(np.sum(finite_asset_scores > 0.0))
+        current_asset_rank = None
+        if current_position > 0:
+            current_symbol = symbols[current_position - 1]
+            current_asset_rank = next(
+                (rank for rank, (asset, _) in enumerate(ranked_assets, start=1) if asset == current_symbol),
+                None,
+            )
+        stable_std = (
+            universe_score_std
+            if universe_score_std is not None and universe_score_std > 1e-12
+            else None
+        )
+        best_score_zscore = (
+            float((best_asset_score - universe_score_mean) / stable_std)
+            if best_asset_score is not None
+            and universe_score_mean is not None
+            and stable_std is not None
+            else None
+        )
+        current_score_zscore = (
+            float((current_value - universe_score_mean) / stable_std)
+            if np.isfinite(current_value)
+            and universe_score_mean is not None
+            and stable_std is not None
+            else None
+        )
+        best_vs_second_zscore = (
+            float(best_vs_second_gap / stable_std)
+            if best_vs_second_gap is not None and stable_std is not None
+            else None
+        )
+
+        def finish(
+            target_position: int,
+            final_score: float,
+            reason: str,
+            *,
+            min_hold_guard: bool = False,
+            switch_margin_guard: bool = False,
+            cash_threshold_guard: bool = False,
+            expected_edge_guard: bool = False,
+        ) -> tuple[int, float]:
+            if decision_diagnostics is not None:
+                top = ranked_assets[:3]
+                diagnostic = {
+                    'decision_diagnostics_schema_version': 2,
+                    'decision_fold_id': fold_id,
+                    'current_asset': position_asset(current_position),
+                    'current_score': finite(current_value),
+                    'holding_days_at_decision': int(holding_days),
+                    'raw_best_asset': position_asset(best),
+                    'raw_best_score': finite(best_value),
+                    'best_asset': best_asset,
+                    'best_score': finite(best_asset_score) if best_asset_score is not None else None,
+                    'second_asset': second_asset,
+                    'second_score': finite(second_asset_score) if second_asset_score is not None else None,
+                    'best_vs_second_gap': best_vs_second_gap,
+                    'best_vs_current_gap': best_vs_current_gap,
+                    'best_vs_cash_gap': float(best_asset_score) if best_asset_score is not None else None,
+                    'cash_score': 0.0,
+                    'current_asset_rank': current_asset_rank,
+                    'universe_score_mean': universe_score_mean,
+                    'universe_score_std': universe_score_std,
+                    'current_score_zscore': current_score_zscore,
+                    'best_score_zscore': best_score_zscore,
+                    'best_vs_second_zscore': best_vs_second_zscore,
+                    'positive_score_count': positive_score_count,
+                    'finite_score_count': int(len(finite_asset_scores)),
+                    'rotation_cash_threshold': minimum,
+                    'rotation_min_expected_edge': float(config.rotation_min_expected_edge),
+                    'base_switch_margin': float(config.rotation_switch_margin),
+                    'calibrated_switch_margin': (
+                        float(calibrated_switch_margin)
+                        if calibrated_switch_margin is not None
+                        else float(switch_margin)
+                    ),
+                    'effective_switch_margin': required,
+                    'final_action_asset': position_asset(target_position),
+                    'final_action_score': finite(final_score),
+                    'decision_reason': reason,
+                    'decision_is_rotation': bool(
+                        current_position > 0
+                        and target_position > 0
+                        and target_position != current_position
+                    ),
+                    'decision_is_entry': bool(current_position == 0 and target_position > 0),
+                    'decision_is_exit_to_cash': bool(current_position > 0 and target_position == 0),
+                    'min_hold_guard_applied': bool(min_hold_guard),
+                    'switch_margin_guard_applied': bool(switch_margin_guard),
+                    'cash_threshold_guard_applied': bool(cash_threshold_guard),
+                    'minimum_expected_edge_guard_applied': bool(expected_edge_guard),
+                    'day_trade_constraint_applied': False,
+                    # Compatibility aliases already consumed by protected analytics/exports.
+                    'q_current_position': finite(current_value),
+                    'q_raw_best': finite(best_value),
+                    'q_final_action': finite(final_score),
+                    'q_delta_final_vs_current': (
+                        float(final_score - current_value)
+                        if np.isfinite(final_score) and np.isfinite(current_value)
+                        else None
+                    ),
+                    'q_gap_best_vs_second': best_vs_second_gap,
+                    'raw_action_asset': position_asset(best),
+                }
+                for rank in range(3):
+                    asset, score = top[rank] if rank < len(top) else (None, None)
+                    diagnostic[f'top_{rank + 1}_asset'] = asset
+                    diagnostic[f'top_{rank + 1}_score'] = finite(score) if score is not None else None
+                decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
+            return (target_position, final_score)
+
         if (
             current_position > 0
             and np.isfinite(current_value)
             and holding_days < int(config.rotation_min_holding_days)
         ):
-            return (current_position, current_value)
-        minimum = float(config.rotation_cash_threshold)
+            return finish(
+                current_position,
+                current_value,
+                'MIN_HOLD_GUARD',
+                min_hold_guard=True,
+            )
         if best == 0 or best_value <= minimum:
-            return (0, 0.0)
+            return finish(
+                0,
+                0.0,
+                'CASH_THRESHOLD',
+                cash_threshold_guard=True,
+            )
         if current_position == 0:
             if best_value >= minimum + float(config.rotation_min_expected_edge):
-                return (best, best_value)
-            return (0, 0.0)
+                return finish(best, best_value, 'ENTER_BEST_ASSET')
+            return finish(
+                0,
+                0.0,
+                'MIN_EXPECTED_EDGE_GUARD',
+                expected_edge_guard=True,
+            )
         if best == current_position:
-            return (current_position, current_value)
-        required = max(float(config.rotation_switch_margin), float(switch_margin))
+            return finish(current_position, current_value, 'HOLD_CURRENT_BEST')
         if best_value >= current_value + required:
-            return (best, best_value)
-        return (current_position, current_value)
+            return finish(best, best_value, 'ROTATE_TO_BEST_ASSET')
+        return finish(
+            current_position,
+            current_value,
+            'SWITCH_MARGIN_GUARD',
+            switch_margin_guard=True,
+        )
+
     return policy
 
 def _simple_policy_growth(policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any) -> float:
@@ -637,16 +824,87 @@ def _equal_weight_benchmark(frames: dict[str, pd.DataFrame], symbols: list[str],
     series.iloc[-1] = final_cash
     return series
 
-def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None) -> RotationRunResult:
+def _precompute_market_regime_diagnostics(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    decision_dates: pd.DatetimeIndex,
+) -> dict[pd.Timestamp, dict[str, Any]]:
+    """Compute point-in-time market context for diagnostics only.
+
+    Every value uses closes available on or before the decision timestamp. The
+    result is observational and never feeds the rotation policy.
+    """
+    if len(decision_dates) == 0:
+        return {}
+
+    close_columns: dict[str, pd.Series] = {}
+    for symbol in symbols:
+        frame = frames.get(symbol)
+        if frame is None or 'close' not in frame:
+            continue
+        close_columns[symbol] = pd.to_numeric(frame['close'], errors='coerce').reindex(decision_dates)
+    if not close_columns:
+        return {}
+
+    closes = pd.DataFrame(close_columns, index=decision_dates, dtype=float)
+    return_5 = closes.pct_change(periods=5, fill_method=None)
+    return_20 = closes.pct_change(periods=20, fill_method=None)
+
+    valid_5 = return_5.notna().sum(axis=1).replace(0, np.nan)
+    valid_20 = return_20.notna().sum(axis=1).replace(0, np.nan)
+    breadth_5 = (return_5 > 0.0).sum(axis=1) / valid_5
+    breadth_20 = (return_20 > 0.0).sum(axis=1) / valid_20
+
+    spy_return_5 = pd.Series(np.nan, index=decision_dates, dtype=float)
+    spy_return_20 = pd.Series(np.nan, index=decision_dates, dtype=float)
+    spy_realized_volatility_20 = pd.Series(np.nan, index=decision_dates, dtype=float)
+    if 'SPY' in closes.columns:
+        spy = closes['SPY']
+        spy_return_5 = spy.pct_change(periods=5, fill_method=None)
+        spy_return_20 = spy.pct_change(periods=20, fill_method=None)
+        spy_realized_volatility_20 = (
+            spy.pct_change(fill_method=None).rolling(20, min_periods=10).std() * math.sqrt(252.0)
+        )
+
+    output: dict[pd.Timestamp, dict[str, Any]] = {}
+    for timestamp in decision_dates:
+        ts = pd.Timestamp(timestamp)
+
+        def finite(series: pd.Series) -> float | None:
+            value = series.get(timestamp, np.nan)
+            return float(value) if pd.notna(value) and np.isfinite(float(value)) else None
+
+        output[ts] = {
+            'market_regime_diagnostics_schema_version': 1,
+            'spy_return_5': finite(spy_return_5),
+            'spy_return_20': finite(spy_return_20),
+            'spy_realized_volatility_20': finite(spy_realized_volatility_20),
+            'universe_breadth_5': finite(breadth_5),
+            'universe_breadth_20': finite(breadth_20),
+            'universe_breadth_5_valid_assets': int(valid_5.get(timestamp)) if pd.notna(valid_5.get(timestamp)) else 0,
+            'universe_breadth_20_valid_assets': int(valid_20.get(timestamp)) if pd.notna(valid_20.get(timestamp)) else 0,
+        }
+    return output
+
+
+def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None, *, model_label: str='XGBoost Utility', method_line: str | None=None) -> RotationRunResult:
     if len(decision_dates) < 2:
         raise ValueError('The final-test interval is too short.')
     execution_dates = decision_dates[1:]
     benchmark = _equal_weight_benchmark(frames, symbols, execution_dates, float(config.initial_capital), config, fee_calculator, slippage)
+    market_regime_by_date = _precompute_market_regime_diagnostics(
+        frames, symbols, decision_dates
+    )
     cash = float(config.initial_capital)
     position = 0
     quantity = 0.0
     entry_price = float('nan')
     entry_time = None
+    position_entry_score: float | None = None
+    position_peak_price = float('nan')
+    position_low_price = float('nan')
+    days_current_not_top1 = 0
+    consecutive_days_current_not_top1 = 0
     holding_days = 0
     total_fees = 0.0
     turnover = 0.0
@@ -662,13 +920,169 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
         fold_id = metadata.get('fold_id')
         target_position, score = policy(decision_date, position, holding_days)
         decision_diag = dict((policy_decision_diagnostics or {}).get(pd.Timestamp(decision_date), {}))
+        decision_diag.update(market_regime_by_date.get(pd.Timestamp(decision_date), {}))
+
+        if position > 0 and np.isfinite(entry_price) and entry_price > 0:
+            current_symbol = symbols[position - 1]
+            current_row = frames[current_symbol].loc[decision_date]
+            current_close = float(current_row.get('close', float('nan')))
+            current_high = float(current_row.get('high', current_close))
+            current_low = float(current_row.get('low', current_close))
+            if np.isfinite(current_high):
+                position_peak_price = (
+                    max(position_peak_price, current_high)
+                    if np.isfinite(position_peak_price)
+                    else current_high
+                )
+            if np.isfinite(current_low):
+                position_low_price = (
+                    min(position_low_price, current_low)
+                    if np.isfinite(position_low_price)
+                    else current_low
+                )
+
+            best_asset_now = decision_diag.get('best_asset')
+            if best_asset_now and best_asset_now != current_symbol:
+                days_current_not_top1 += 1
+                consecutive_days_current_not_top1 += 1
+            elif best_asset_now == current_symbol:
+                consecutive_days_current_not_top1 = 0
+
+            current_score = decision_diag.get('current_score')
+            decision_diag.update({
+                'position_risk_diagnostics_schema_version': 1,
+                'position_entry_timestamp': entry_time,
+                'position_entry_price': float(entry_price),
+                'position_entry_score': position_entry_score,
+                'position_return_since_entry': (
+                    float(current_close / entry_price - 1.0)
+                    if np.isfinite(current_close) else None
+                ),
+                'position_peak_return': (
+                    float(position_peak_price / entry_price - 1.0)
+                    if np.isfinite(position_peak_price) else None
+                ),
+                'position_drawdown_from_peak': (
+                    float(current_close / position_peak_price - 1.0)
+                    if np.isfinite(current_close)
+                    and np.isfinite(position_peak_price)
+                    and position_peak_price > 0
+                    else None
+                ),
+                'position_mfe_so_far': (
+                    float(position_peak_price / entry_price - 1.0)
+                    if np.isfinite(position_peak_price) else None
+                ),
+                'position_mae_so_far': (
+                    float(position_low_price / entry_price - 1.0)
+                    if np.isfinite(position_low_price) else None
+                ),
+                'score_change_from_entry': (
+                    float(current_score - position_entry_score)
+                    if current_score is not None
+                    and position_entry_score is not None
+                    and np.isfinite(float(current_score))
+                    and np.isfinite(float(position_entry_score))
+                    else None
+                ),
+                'days_current_not_top1': int(days_current_not_top1),
+                'consecutive_days_current_not_top1': int(consecutive_days_current_not_top1),
+            })
+        else:
+            decision_diag.update({
+                'position_risk_diagnostics_schema_version': 1,
+                'position_entry_timestamp': None,
+                'position_entry_price': None,
+                'position_entry_score': None,
+                'position_return_since_entry': None,
+                'position_peak_return': None,
+                'position_drawdown_from_peak': None,
+                'position_mfe_so_far': None,
+                'position_mae_so_far': None,
+                'score_change_from_entry': None,
+                'days_current_not_top1': 0,
+                'consecutive_days_current_not_top1': 0,
+            })
         day_trades: list[dict[str, Any]] = []
         if target_position != position:
             old_symbol = symbols[position - 1] if position > 0 else None
             new_symbol = symbols[target_position - 1] if target_position > 0 else None
             is_rotation = previous_position > 0 and target_position > 0
             rotation_id = f'{pd.Timestamp(execution_date).isoformat()}::{old_symbol}->{new_symbol}' if is_rotation else None
-            decision_trade_fields = {'decision_timestamp': pd.Timestamp(decision_date), 'rotation_id': rotation_id, 'rotation_from_asset': old_symbol if is_rotation else None, 'rotation_to_asset': new_symbol if is_rotation else None, 'q_current_position': decision_diag.get('q_current_position'), 'q_raw_best': decision_diag.get('q_raw_best'), 'q_final_action': decision_diag.get('q_final_action'), 'q_delta_final_vs_current': decision_diag.get('q_delta_final_vs_current'), 'q_gap_best_vs_second': decision_diag.get('q_gap_best_vs_second'), 'raw_action_asset': decision_diag.get('raw_action_asset'), 'final_action_asset': decision_diag.get('final_action_asset'), 'min_hold_guard_applied': decision_diag.get('min_hold_guard_applied'), 'day_trade_constraint_applied': decision_diag.get('day_trade_constraint_applied')}
+            decision_trade_fields = {
+                'decision_timestamp': pd.Timestamp(decision_date),
+                'rotation_id': rotation_id,
+                'rotation_from_asset': old_symbol if is_rotation else None,
+                'rotation_to_asset': new_symbol if is_rotation else None,
+            }
+            for diagnostic_key in (
+                'decision_diagnostics_schema_version',
+                'current_asset',
+                'current_score',
+                'holding_days_at_decision',
+                'raw_best_asset',
+                'raw_best_score',
+                'best_asset',
+                'best_score',
+                'second_asset',
+                'second_score',
+                'best_vs_second_gap',
+                'best_vs_current_gap',
+                'best_vs_cash_gap',
+                'cash_score',
+                'base_switch_margin',
+                'calibrated_switch_margin',
+                'effective_switch_margin',
+                'final_action_asset',
+                'final_action_score',
+                'decision_reason',
+                'switch_margin_guard_applied',
+                'cash_threshold_guard_applied',
+                'minimum_expected_edge_guard_applied',
+                'q_current_position',
+                'q_raw_best',
+                'q_final_action',
+                'q_delta_final_vs_current',
+                'q_gap_best_vs_second',
+                'raw_action_asset',
+                'min_hold_guard_applied',
+                'day_trade_constraint_applied',
+                'top_1_asset',
+                'top_1_score',
+                'top_2_asset',
+                'top_2_score',
+                'top_3_asset',
+                'top_3_score',
+                'current_asset_rank',
+                'universe_score_mean',
+                'universe_score_std',
+                'current_score_zscore',
+                'best_score_zscore',
+                'best_vs_second_zscore',
+                'positive_score_count',
+                'finite_score_count',
+                'position_risk_diagnostics_schema_version',
+                'position_entry_timestamp',
+                'position_entry_price',
+                'position_entry_score',
+                'position_return_since_entry',
+                'position_peak_return',
+                'position_drawdown_from_peak',
+                'position_mfe_so_far',
+                'position_mae_so_far',
+                'score_change_from_entry',
+                'days_current_not_top1',
+                'consecutive_days_current_not_top1',
+                'market_regime_diagnostics_schema_version',
+                'spy_return_5',
+                'spy_return_20',
+                'spy_realized_volatility_20',
+                'universe_breadth_5',
+                'universe_breadth_20',
+                'universe_breadth_5_valid_assets',
+                'universe_breadth_20_valid_assets',
+            ):
+                decision_trade_fields[diagnostic_key] = decision_diag.get(diagnostic_key)
             if position > 0:
                 symbol = symbols[position - 1]
                 price = float(slippage(float(frames[symbol].loc[execution_date, 'open']), 'SELL', config))
@@ -683,6 +1097,11 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
                 quantity = 0.0
                 entry_price = float('nan')
                 entry_time = None
+                position_entry_score = None
+                position_peak_price = float('nan')
+                position_low_price = float('nan')
+                days_current_not_top1 = 0
+                consecutive_days_current_not_top1 = 0
                 holding_days = 0
             position = target_position
             if position > 0:
@@ -695,6 +1114,16 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
                 turnover += gross
                 entry_price = price
                 entry_time = execution_date
+                entry_score_value = decision_diag.get('final_action_score')
+                position_entry_score = (
+                    float(entry_score_value)
+                    if entry_score_value is not None and np.isfinite(float(entry_score_value))
+                    else None
+                )
+                position_peak_price = float(price)
+                position_low_price = float(price)
+                days_current_not_top1 = 0
+                consecutive_days_current_not_top1 = 0
                 holding_days = 1
                 day_trades.append({'timestamp': execution_date, 'action': 'BUY', 'asset': symbol, 'reason': f'ROTATE_FROM_{old_symbol}' if old_symbol else 'BEST_CAPITAL_UTILITY', 'execution_price': price, 'quantity': quantity, 'gross_trade_value': gross, **fees, 'realized_pnl': 0.0, 'position_return': 0.0, 'holding_bars': 0, 'entry_timestamp': execution_date, 'entry_price': price, 'cash_after_trade': cash, 'shares_after_trade': quantity, 'walk_forward_fold': fold_id, **decision_trade_fields})
             if previous_position > 0 and target_position > 0:
@@ -704,7 +1133,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
         records.extend(day_trades)
         if trade_callback is not None:
             for trade in day_trades:
-                trade_callback({**trade, 'backend': backend, 'model': 'XGBoost Utility'})
+                trade_callback({**trade, 'backend': backend, 'model': model_label})
         if position > 0:
             symbol = symbols[position - 1]
             close_price = float(frames[symbol].loc[execution_date, 'close'])
@@ -731,7 +1160,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
         final_trade = {'timestamp': final_date, 'action': 'FINAL_SELL', 'asset': symbol, 'reason': 'FINAL_LIQUIDATION', 'execution_price': price, 'quantity': quantity, 'gross_trade_value': gross, **fees, 'realized_pnl': realized, 'position_return': position_return, 'holding_bars': holding_days, 'entry_timestamp': entry_time, 'entry_price': entry_price, 'cash_after_trade': cash, 'shares_after_trade': 0.0, 'walk_forward_fold': prediction_rows[-1].get('walk_forward_fold')}
         records.append(final_trade)
         if trade_callback is not None:
-            trade_callback({**final_trade, 'backend': backend, 'model': 'XGBoost Utility'})
+            trade_callback({**final_trade, 'backend': backend, 'model': model_label})
         equity_values[-1] = cash
         prediction_rows[-1]['strategy_equity'] = cash
         prediction_rows[-1]['trade_action'] = prediction_rows[-1]['trade_action'] or 'FINAL_SELL'
@@ -759,9 +1188,15 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     years = max(days / 365.25, 1 / 365.25)
     periods_per_year = 252.0
     anchor_assets = [symbol for symbol in getattr(config, 'calendar_anchor_assets', []) if symbol in symbols]
-    candidate_assets = [symbol for symbol in symbols if symbol not in set(anchor_assets)]
-    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': 'XGBoost Utility', 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
-    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}.", '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
+    reference_assets = [symbol for symbol in getattr(config, 'research_reference_assets', []) if symbol in symbols]
+    if len(reference_assets) < 2:
+        reference_assets = list(anchor_assets)
+    reference_set = set(reference_assets)
+    candidate_assets = [symbol for symbol in getattr(config, 'research_candidate_assets', []) if symbol in symbols and symbol not in reference_set]
+    if not getattr(config, 'research_candidate_assets', None):
+        candidate_assets = [symbol for symbol in symbols if symbol not in reference_set]
+    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
+    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
@@ -902,7 +1337,7 @@ def _fold_performance(predictions: pd.DataFrame, folds: list[dict[str, Any]], in
         })
     return output
 
-def run_rotation_models(
+def _run_xgboost_rotation_models(
     bars_by_symbol: dict[str, pd.DataFrame],
     config: Any,
     fee_calculator: Callable,
@@ -912,7 +1347,7 @@ def run_rotation_models(
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
 ) -> list[RotationRunResult]:
-    """Run the locked XGBoost walk-forward strategy without changing model semantics."""
+    """Run the locked XGBoost walk-forward baseline without changing its semantics."""
     if config.strategy_mode != 'COMPOUND_ROTATION_SWING_XGBOOST':
         raise ValueError('This version supports only COMPOUND_ROTATION_SWING_XGBOOST.')
     if list(config.rotation_models) != ['xgboost_utility']:
@@ -992,6 +1427,7 @@ def run_rotation_models(
         seed = int(config.random_state) + repetition * seed_step
         rep_config = config.model_copy(update={'random_state': seed})
         policies: dict[int, Callable] = {}
+        decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
         fallback_reasons: list[str] = []
         technical(
@@ -1159,6 +1595,9 @@ def run_rotation_models(
                 symbols,
                 rep_config,
                 effective_margin,
+                decision_diagnostics=decision_diagnostics,
+                fold_id=fold_id,
+                calibrated_switch_margin=float(best_candidate),
             )
             margin_details.append({
                 'fold_id': fold_id,
@@ -1217,6 +1656,7 @@ def run_rotation_models(
             fee_calculator,
             slippage,
             decision_metadata=decision_metadata,
+            policy_decision_diagnostics=decision_diagnostics,
             trade_callback=trade_wrapper(seed, run_index),
         )
         unique_backend = backend_id(seed)
@@ -1265,6 +1705,23 @@ def run_rotation_models(
             'deterministic_execution': bool(rep_config.deterministic_execution),
             'numeric_thread_limit': int(rep_config.numeric_thread_limit),
             'xgb_n_jobs': int(rep_config.xgb_n_jobs),
+            'decision_diagnostics_schema_version': 2,
+            'position_risk_diagnostics_schema_version': 1,
+            'market_regime_diagnostics_schema_version': 1,
+            'decision_diagnostics_rows': int(len(decision_diagnostics)),
+            'position_risk_diagnostics_rows': int(
+                result.predictions.get('position_risk_diagnostics_schema_version', pd.Series(dtype=float)).notna().sum()
+            ),
+            'market_regime_diagnostics_rows': int(
+                result.predictions.get('market_regime_diagnostics_schema_version', pd.Series(dtype=float)).notna().sum()
+            ),
+            'decision_diagnostics_rotation_rows': int(sum(
+                bool(item.get('decision_is_rotation')) for item in decision_diagnostics.values()
+            )),
+            'decision_diagnostics_hold_rows': int(sum(
+                str(item.get('decision_reason') or '').startswith(('HOLD_', 'SWITCH_MARGIN_', 'MIN_HOLD_'))
+                for item in decision_diagnostics.values()
+            )),
         })
         result.summary += '\n\nROBUSTNESS / COMPUTE\n'
         result.summary += f'Seed: {seed}\n'
@@ -1299,4 +1756,44 @@ def run_rotation_models(
     results.sort(key=lambda result: int(result.metrics.get('repetition_index', 1)))
     technical(f'event=walk_forward_complete runs={repetitions} results={len(results)}')
     return results
+
+def run_rotation_models(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    config: Any,
+    fee_calculator: Callable,
+    slippage: Callable,
+    progress_callback: Callable[[float, str, int], None] | None = None,
+    trade_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
+    technical_log_callback: Callable[[str], None] | None = None,
+) -> list[RotationRunResult]:
+    """Dispatch an execution-only model challenger over the locked research snapshot.
+
+    The stored strategy remains XGBoost-only and the Trader Winner is untouched.
+    ``research_model_family`` exists only on the immutable execution request.
+    """
+    model_family = str(getattr(config, 'research_model_family', 'xgboost_utility'))
+    if model_family == 'xgboost_utility':
+        return _run_xgboost_rotation_models(
+            bars_by_symbol,
+            config,
+            fee_calculator,
+            slippage,
+            progress_callback=progress_callback,
+            trade_callback=trade_callback,
+            progress_detail_callback=progress_detail_callback,
+            technical_log_callback=technical_log_callback,
+        )
+    from .research_challengers import run_research_challenger
+    return run_research_challenger(
+        model_family,
+        bars_by_symbol,
+        config,
+        fee_calculator,
+        slippage,
+        progress_callback=progress_callback,
+        trade_callback=trade_callback,
+        progress_detail_callback=progress_detail_callback,
+        technical_log_callback=technical_log_callback,
+    )
 

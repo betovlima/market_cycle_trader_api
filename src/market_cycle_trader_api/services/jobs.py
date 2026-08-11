@@ -69,11 +69,16 @@ _MONGODB_CREDENTIAL_PATTERN = re.compile(
 )
 _SAFE_PROGRESS_PATTERNS = (
     re.compile(r"^Prepared \d+ assets and \d+ folds — XGBoost=(?:CPU|CUDA(?: — .+)?)$"),
+    re.compile(r"^Prepared \d+ assets and \d+ folds — LightGBM=CPU$"),
+    re.compile(r"^Prepared \d+ assets and \d+ folds — IQN=(?:CPU|CUDA(?: — .+)?)$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — (?:calibration training|final training) \d+/\d+$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — evaluating rotation policy candidates$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ completed$"),
     re.compile(r"^Run \d+/\d+ — simulating out-of-sample portfolio$"),
     re.compile(r"^XGBoost Utility run \d+/\d+ completed$"),
+    re.compile(r"^LightGBM Utility run \d+/\d+ completed$"),
+    re.compile(r"^IQN run \d+/\d+ completed$"),
+    re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — IQN training \d+%$"),
 )
 _PROGRESS_DETAIL_FIELDS = frozenset({
     "run_index",
@@ -93,6 +98,7 @@ _PROGRESS_PHASES = frozenset({
     "Fold completed",
     "Out-of-sample simulation",
     "Run completed",
+    "IQN training",
 })
 _PROGRESS_DEVICES = frozenset({"CPU", "CUDA"})
 
@@ -266,7 +272,7 @@ def append_log(job_id: str, raw_line: str) -> None:
             {"$set": {"progress_detail": clean, "updated_at": utc_now()}},
         )
         return
-    if stripped.startswith("XGB_TECH|"):
+    if stripped.startswith("XGB_TECH|") or stripped.startswith("RESEARCH_TECH|"):
         return
     if stripped.startswith("JOB_TRADE|"):
         try:
@@ -325,6 +331,9 @@ def _write_child_line_to_console(job_id: str, raw_line: str) -> None:
     if line.startswith("XGB_TECH|"):
         logger.info("Backtest %s | XGBoost | %s", job_id, line.removeprefix("XGB_TECH|"))
         return
+    if line.startswith("RESEARCH_TECH|"):
+        logger.info("Backtest %s | Model Research | %s", job_id, line.removeprefix("RESEARCH_TECH|"))
+        return
     if line.startswith("ERROR") or line.startswith("Traceback"):
         logger.error("Backtest %s | %s", job_id, line)
         return
@@ -341,6 +350,17 @@ def run_job(job_id: str) -> None:
     strategy_profile_revision = int(job_document.get("strategy_profile_revision") or 0) or None
     timeout_seconds = max(300, int(job_document.get("training_timeout_seconds") or 21_600))
     request_payload = job_document.get("request") if isinstance(job_document.get("request"), dict) else {}
+    research_model_family = str(
+        job_document.get("research_model_family")
+        or request_payload.get("research_model_family")
+        or "xgboost_utility"
+    )
+    research_model_settings = (
+        request_payload.get("research_model_settings")
+        if isinstance(request_payload.get("research_model_settings"), dict)
+        else {}
+    )
+    certifies_strategy = research_model_family in {"xgboost_utility", "lightgbm_utility"}
     db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0, "progress_detail": {}}})
     python_path = str(SOURCE_ROOT)
     existing_python_path = os.environ.get("PYTHONPATH", "")
@@ -428,13 +448,15 @@ def run_job(job_id: str) -> None:
                     "$unset": {"process_id": ""},
                 },
             )
-            mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
+            if certifies_strategy:
+                mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed", research_model_family=research_model_family, research_model_settings=research_model_settings)
             return
         run_count = db[RUNS_COLLECTION].count_documents({"job_id": job_id})
         comparison_exists = db[COMPARISONS_COLLECTION].find_one({"job_id": job_id}, {"_id": 1}) is not None
         if return_code == 0 and comparison_exists and run_count > 0:
             db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "completed", "stage": "Completed", "progress": 100, "completed_runs": run_count, "finished_at": utc_now(), "updated_at": utc_now(), "return_code": return_code}, "$unset": {"process_id": ""}})
-            mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="completed")
+            if certifies_strategy:
+                mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="completed", research_model_family=research_model_family, research_model_settings=research_model_settings)
             return
         stored = db[COMPARISONS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0, "failures": 1}) or {}
         for failure in stored.get("failures", []):
@@ -442,9 +464,11 @@ def run_job(job_id: str) -> None:
         if return_code != 0 and not stored.get("failures"):
             append_log(job_id, f"ERROR: Backtest engine exited with code {return_code}.")
         db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "failed", "stage": "Backtest failed", "finished_at": utc_now(), "updated_at": utc_now(), "return_code": return_code}, "$unset": {"process_id": ""}})
-        mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
+        if certifies_strategy:
+            mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed", research_model_family=research_model_family, research_model_settings=research_model_settings)
     except Exception as exc:
         logger.exception("Backtest %s failed in the API worker", job_id)
         append_log(job_id, f"ERROR: {exc}")
         db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "failed", "stage": "Backtest failed", "finished_at": utc_now(), "updated_at": utc_now(), "error": str(exc)}, "$unset": {"process_id": ""}})
-        mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed")
+        if certifies_strategy:
+            mark_strategy_backtest(db, strategy_id=strategy_profile_id, strategy_revision=strategy_profile_revision, job_id=job_id, status="failed", research_model_family=research_model_family, research_model_settings=research_model_settings)

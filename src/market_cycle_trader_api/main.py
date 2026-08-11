@@ -24,6 +24,7 @@ from .api.routers import (
     exports,
     health,
     jobs,
+    model_research,
     paper_market,
     public_paper_portfolio,
     parameter_bootstrap,
@@ -88,6 +89,7 @@ def create_app() -> FastAPI:
     portfolio_required = [Depends(require_portfolio_session)]
     application.include_router(dashboard.router, dependencies=viewer_required)
     application.include_router(jobs.router, dependencies=viewer_required)
+    application.include_router(model_research.router, dependencies=admin_required)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)
     application.include_router(paper_market.router, dependencies=admin_required)

@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .model_research import ResearchModelFamily
 from .requests import BacktestRequest, normalize_assets_input
 
 
@@ -50,6 +51,27 @@ class StrategyUpdateRequest(BaseModel):
         return self
 
 
+class StrategyModelUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_strategy_revision: int = Field(ge=1)
+    model_family: ResearchModelFamily
+    values: dict[str, Any]
+    note: str = Field(min_length=3, max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str) -> str:
+        return " ".join(str(value).split())
+
+    @field_validator("values")
+    @classmethod
+    def require_values(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not value:
+            raise ValueError("At least one model setting is required.")
+        return value
+
+
 class StrategySelectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -67,6 +89,7 @@ class StrategyCandidateRequest(BaseModel):
 
     confirm_mark_as_candidate: Literal[True]
     expected_strategy_revision: int = Field(ge=1)
+    model_family: ResearchModelFamily | None = None
     note: str = Field(min_length=3, max_length=500)
 
     @field_validator("note")

@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "1.13.36"' in config
+    assert 'API_VERSION = "1.13.43"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -132,3 +132,17 @@ def test_asset_discovery_uses_completed_sip_safe_sessions_and_does_not_persist_t
     assert 'Asset Discovery stopped because Alpaca market-data access is unavailable' in worker
     assert 'Technical evaluation failure for {symbol}' in worker
     assert '"status": "failed",\n                    "reason_codes": ["technical_failure"]' not in worker
+
+
+def test_research_decision_diagnostics_are_admin_export_only_and_public_trades_are_sanitized() -> None:
+    exports = (SRC / "api" / "routers" / "exports.py").read_text(encoding="utf-8")
+    results = (SRC / "services" / "results.py").read_text(encoding="utf-8")
+    main = (SRC / "main.py").read_text(encoding="utf-8")
+
+    assert '"/api/jobs/{job_id}/runs/{symbol}/{backend}/decision-diagnostics.csv"' in exports
+    assert '"experiment_manifest.json"' in exports
+    assert "exports.router, dependencies=admin_required" in main
+    assert "PROTECTED_DECISION_TRADE_FIELDS" in results
+    assert 'not key.startswith("q_")' in results
+    assert 'not key.startswith("top_")' in results
+    assert '"trades": _public_trade_rows(trades)' in results

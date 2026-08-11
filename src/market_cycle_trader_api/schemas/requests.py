@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .model_research import ResearchModelFamily
+
 StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST"]
 Timeframe = Literal["1Day"]
 MarketDataProvider = Literal["alpaca"]
@@ -18,13 +20,17 @@ RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
 
 
-def normalize_assets(value: list[str]) -> list[str]:
+def normalize_asset_metadata(value: list[str]) -> list[str]:
     cleaned: list[str] = []
     for asset in value:
         symbol = str(asset).strip().upper()
         if symbol and re.fullmatch(r"[A-Z0-9.\-^=]+", symbol):
             cleaned.append(symbol)
-    result = list(dict.fromkeys(cleaned))
+    return list(dict.fromkeys(cleaned))
+
+
+def normalize_assets(value: list[str]) -> list[str]:
+    result = normalize_asset_metadata(value)
     if len(result) < 2:
         raise ValueError("Compound Capital Rotation requires at least two valid assets.")
     return result
@@ -231,11 +237,20 @@ class BacktestExecutionRequest(BacktestRequest):
     analysis_start_date: str
     analysis_end_date: str | None
     calendar_anchor_assets: list[str]
+    research_reference_assets: list[str] = Field(default_factory=list)
+    research_candidate_assets: list[str] = Field(default_factory=list)
+    research_model_family: ResearchModelFamily = "xgboost_utility"
+    research_model_settings: dict[str, object] = Field(default_factory=dict)
 
     @field_validator("calendar_anchor_assets")
     @classmethod
     def validate_calendar_anchor_assets(cls, value: list[str]) -> list[str]:
         return normalize_assets(value)
+
+    @field_validator("research_reference_assets", "research_candidate_assets")
+    @classmethod
+    def validate_research_asset_metadata(cls, value: list[str]) -> list[str]:
+        return normalize_asset_metadata(value)
 
     @field_validator("analysis_start_date")
     @classmethod
@@ -287,6 +302,30 @@ class BacktestExecutionRequest(BacktestRequest):
             raise ValueError(
                 "Calendar anchor assets must be included in the backtest universe: "
                 + ", ".join(missing_anchors)
+            )
+        missing_references = [
+            symbol for symbol in self.research_reference_assets if symbol not in self.assets
+        ]
+        if missing_references:
+            raise ValueError(
+                "Research reference assets must be included in the backtest universe: "
+                + ", ".join(missing_references)
+            )
+        missing_candidates = [
+            symbol for symbol in self.research_candidate_assets if symbol not in self.assets
+        ]
+        if missing_candidates:
+            raise ValueError(
+                "Research candidate assets must be included in the backtest universe: "
+                + ", ".join(missing_candidates)
+            )
+        overlap = sorted(
+            set(self.research_reference_assets).intersection(self.research_candidate_assets)
+        )
+        if overlap:
+            raise ValueError(
+                "Research reference and candidate assets must be disjoint: "
+                + ", ".join(overlap)
             )
         return self
 

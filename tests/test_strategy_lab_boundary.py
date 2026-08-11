@@ -21,6 +21,8 @@ from market_cycle_trader_api.services.strategy_configuration import (
 )
 from market_cycle_trader_api.services.strategy_lab import (
     create_strategy,
+    ensure_strategy_catalog,
+    get_research_reference_context,
     get_research_strategy_context,
     list_strategies,
     get_trader_winner_context,
@@ -29,6 +31,7 @@ from market_cycle_trader_api.services.strategy_lab import (
     promote_strategy_to_trader,
     select_research_strategy,
     update_strategy,
+    update_strategy_model,
 )
 
 # Promotion tests exercise lifecycle semantics, not the wall-clock. Production
@@ -210,6 +213,68 @@ def test_research_strategy_changes_do_not_change_trader_winner() -> None:
     assert updated["last_backtest_status"] is None
 
 
+def test_research_reference_is_snapshotted_from_selected_strategy_and_does_not_follow_selection() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    baseline = create_strategy(
+        db,
+        name="Research baseline",
+        description="Reference universe.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    baseline_configuration = dict(baseline["configuration"])
+    baseline_configuration["assets"] = list(baseline_configuration["assets"]) + ["TESTREF"]
+    baseline = update_strategy(
+        db,
+        baseline["id"],
+        configuration=type(get_research_strategy_context(db)[0]).model_validate(baseline_configuration),
+        name=baseline["name"],
+        description=baseline["description"],
+        note="Expand reference universe.",
+        expected_revision=1,
+        actor_email="admin@example.com",
+    )
+    select_research_strategy(
+        db,
+        baseline["id"],
+        expected_control_revision=1,
+        note="Select reference before migration.",
+        actor_email="admin@example.com",
+    )
+
+    # Simulate a catalog created before v1.13.38, which did not persist a
+    # separate research-reference snapshot in strategy_control/default.
+    control = db[STRATEGY_CONTROL_COLLECTION].documents["default"]
+    control.pop("research_reference_strategy_id", None)
+    control.pop("research_reference_configuration_hash", None)
+    control.pop("research_reference_assets", None)
+
+    normalized = ensure_strategy_catalog(db)
+    reference_assets, reference = get_research_reference_context(db)
+    assert normalized["research_reference_strategy_id"] == baseline["id"]
+    assert reference["id"] == baseline["id"]
+    assert reference_assets == baseline["configuration"]["assets"]
+
+    challenger = create_strategy(
+        db,
+        name="Challenger",
+        description="Must not move the research reference.",
+        clone_from_strategy_id=baseline["id"],
+        actor_email="admin@example.com",
+    )
+    select_research_strategy(
+        db,
+        challenger["id"],
+        expected_control_revision=int(normalized["revision"]),
+        note="Select challenger.",
+        actor_email="admin@example.com",
+    )
+    reference_assets_after, reference_after = get_research_reference_context(db)
+    assert reference_after["id"] == baseline["id"]
+    assert reference_assets_after == reference_assets
+
+
 def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     db = _Database()
     install_winner_strategy_configuration(db, note="Install winner.", source="test")
@@ -302,6 +367,8 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     assert result["promotion"]["managed_symbol"] == "NVDA"
     assert result["control"]["research_strategy_id"] == draft["id"]
     assert result["control"]["trader_winner_strategy_id"] == result["winner"]["id"]
+    assert result["control"]["research_reference_strategy_id"] == result["winner"]["id"]
+    assert result["control"]["research_reference_assets"] == result["winner"]["research_reference_assets"]
     assert db[STRATEGY_PROFILES_COLLECTION].documents["winner-v1-13-2"]["status"] == "former_winner"
     assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["status"] == "promoted_candidate"
     assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["locked"] is True
@@ -798,24 +865,103 @@ def test_jobs_and_paper_use_separate_strategy_contexts() -> None:
     assert '"strategy_manifest.json"' in exports
 
 
-def test_strategy_catalog_exposes_every_validated_parameter_to_administrator() -> None:
+def test_strategy_catalog_exposes_strategy_fields_and_moves_model_fields_out() -> None:
     from market_cycle_trader_api.schemas.requests import BacktestRequest
+    from market_cycle_trader_api.services.strategy_lab import MODEL_OWNED_STRATEGY_FIELDS
 
     db = _Database()
     install_winner_strategy_configuration(db, note="Install winner.", source="test")
 
     catalog = list_strategies(db)
-    expected = list(BacktestRequest.model_fields)
+    expected = [field for field in BacktestRequest.model_fields if field not in MODEL_OWNED_STRATEGY_FIELDS]
     assert catalog["parameter_order"] == expected
     grouped = [field for group in catalog["parameter_groups"] for field in group["fields"]]
     assert len(grouped) == len(expected)
     assert set(grouped) == set(expected)
-    assert set(catalog["parameter_schema"]["properties"]) == set(expected)
+    assert not set(grouped).intersection(MODEL_OWNED_STRATEGY_FIELDS)
+    assert set(catalog["parameter_schema"]["properties"]) == set(BacktestRequest.model_fields)
     descriptions = [
         catalog["parameter_schema"]["properties"][field].get("description", "").strip()
         for field in expected
     ]
     assert all(descriptions)
+
+
+def test_strategy_model_binding_is_saved_without_changing_shared_strategy_revision() -> None:
+    from market_cycle_trader_api.services.model_research import execution_settings_for
+
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Saved model UX",
+        description="Backtest must use the model saved with this Strategy.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    lightgbm = execution_settings_for(db, "lightgbm_utility")
+    updated = update_strategy_model(
+        db,
+        draft["id"],
+        model_family="lightgbm_utility",
+        values=lightgbm["lightgbm"],
+        note="Use LightGBM for this cloned Strategy.",
+        expected_strategy_revision=1,
+        actor_email="admin@example.com",
+    )
+
+    assert updated["revision"] == 1
+    assert updated["research_model_revision"] == 2
+    assert updated["research_model"]["family"] == "lightgbm_utility"
+    stored = db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]
+    assert stored["revision"] == 1
+    assert stored["research_model_snapshot"]["family"] == "lightgbm_utility"
+
+
+def test_strategy_model_binding_adopts_matching_completed_backtest_snapshot() -> None:
+    from market_cycle_trader_api.services.model_research import execution_settings_for, model_execution_snapshot
+
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Historical LightGBM",
+        description="Reuse an exact completed research run.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    settings = execution_settings_for(db, "lightgbm_utility")
+    exact_snapshot = model_execution_snapshot("lightgbm_utility", settings)
+    db[JOBS_COLLECTION].documents["existing-lightgbm"] = {
+        "_id": "existing-lightgbm",
+        "id": "existing-lightgbm",
+        "status": "completed",
+        "created_at": "2026-08-11T12:05:57+00:00",
+        "finished_at": "2026-08-11T12:16:00+00:00",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+        "research_model_family": "lightgbm_utility",
+        "research_model_settings_hash": exact_snapshot["settings_hash"],
+        "request": {
+            "research_model_family": "lightgbm_utility",
+            "research_model_settings": settings,
+        },
+    }
+
+    updated = update_strategy_model(
+        db,
+        draft["id"],
+        model_family="lightgbm_utility",
+        values=settings["lightgbm"],
+        note="Adopt exact historical LightGBM configuration.",
+        expected_strategy_revision=1,
+        actor_email="admin@example.com",
+    )
+
+    assert updated["revision"] == 1
+    assert updated["last_backtest_id"] == "existing-lightgbm"
+    assert updated["last_backtest_status"] == "completed"
+    assert updated["research_model"]["settings_hash"] == exact_snapshot["settings_hash"]
 
 
 def test_legacy_direct_mutation_routes_are_disabled() -> None:
@@ -832,3 +978,83 @@ def test_legacy_direct_mutation_routes_are_disabled() -> None:
 
     assert "Direct strategy mutation is disabled" in router
     assert "through /api/admin/strategies" in router
+
+
+def test_lightgbm_candidate_and_winner_freeze_exact_model_snapshot() -> None:
+    from market_cycle_trader_api.services.model_research import execution_settings_for
+
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="LightGBM champion",
+        description="Model-aware Winner test.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    model_settings = execution_settings_for(db, "lightgbm_utility")
+    job_id = "job-lightgbm-champion"
+    db[JOBS_COLLECTION].documents[job_id] = {
+        "_id": job_id,
+        "id": job_id,
+        "status": "completed",
+        "created_at": "2026-08-11T12:05:57+00:00",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+        "strategy_configuration_hash": draft["configuration_hash"],
+        "research_model_family": "lightgbm_utility",
+        "request": {
+            "research_model_family": "lightgbm_utility",
+            "research_model_settings": model_settings,
+        },
+    }
+
+    bound = update_strategy_model(
+        db,
+        draft["id"],
+        model_family="lightgbm_utility",
+        values=model_settings["lightgbm"],
+        note="Bind the validated LightGBM champion to this Strategy.",
+        expected_strategy_revision=1,
+        actor_email="admin@example.com",
+    )
+    assert bound["revision"] == 1
+    assert bound["research_model"]["family"] == "lightgbm_utility"
+    assert bound["last_backtest_id"] == job_id
+
+    candidate = mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        model_family="lightgbm_utility",
+        note="Promote the validated LightGBM research champion.",
+        actor_email="admin@example.com",
+    )
+    assert candidate["candidate_model"]["family"] == "lightgbm_utility"
+    assert candidate["candidate_model"]["profile_id"] == "baseline"
+    assert len(candidate["candidate_model"]["settings_hash"]) == 64
+
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "control_mode": "stopped",
+    }
+    db[PAPER_TRADING_STATE_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "managed_symbol": None,
+        "managed_quantity": 0.0,
+        "strategy_cash": 10000.0,
+        "holding_sessions": 0,
+    }
+    result = promote_strategy_to_trader(
+        db,
+        draft["id"],
+        expected_control_revision=2,
+        expected_strategy_revision=1,
+        note="Officialize LightGBM Winner.",
+        actor_email="admin@example.com",
+    )
+    assert result["winner"]["winner_model"]["family"] == "lightgbm_utility"
+    assert result["winner"]["winner_model"]["settings_hash"] == candidate["candidate_model"]["settings_hash"]
+    stored = db[STRATEGY_PROFILES_COLLECTION].documents[result["winner"]["id"]]
+    assert stored["winner_model_snapshot"]["family"] == "lightgbm_utility"
+    assert stored["winner_model_snapshot"]["settings_snapshot"]["lightgbm"]["num_leaves"] == 8

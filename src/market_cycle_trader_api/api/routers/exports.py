@@ -13,11 +13,95 @@ from fastapi.responses import Response
 from ...core.runtime import database
 from ...infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, PREDICTIONS_COLLECTION, RUNS_COLLECTION, TRADES_COLLECTION
 from ...services.diagnostics.performance import build_performance_diagnostics
+from ...services.experiment_manifest import build_experiment_manifest
 from ...services.jobs import require_job
 from ...services.results import csv_bytes, csv_response, diagnostic_csv_rows, figure_response, require_run
 from ...services.serialization import iso_value
 
 router = APIRouter(tags=["exports"])
+
+XGBOOST_DECISION_DIAGNOSTIC_FIELDS = (
+    "timestamp",
+    "decision_date",
+    "walk_forward_fold",
+    "fold_test_start",
+    "fold_test_end",
+    "current_asset",
+    "current_score",
+    "holding_days_at_decision",
+    "raw_best_asset",
+    "raw_best_score",
+    "best_asset",
+    "best_score",
+    "second_asset",
+    "second_score",
+    "best_vs_second_gap",
+    "best_vs_current_gap",
+    "best_vs_cash_gap",
+    "cash_score",
+    "current_asset_rank",
+    "universe_score_mean",
+    "universe_score_std",
+    "current_score_zscore",
+    "best_score_zscore",
+    "best_vs_second_zscore",
+    "positive_score_count",
+    "finite_score_count",
+    "rotation_cash_threshold",
+    "rotation_min_expected_edge",
+    "base_switch_margin",
+    "calibrated_switch_margin",
+    "effective_switch_margin",
+    "final_action_asset",
+    "final_action_score",
+    "decision_reason",
+    "decision_is_rotation",
+    "decision_is_entry",
+    "decision_is_exit_to_cash",
+    "min_hold_guard_applied",
+    "switch_margin_guard_applied",
+    "cash_threshold_guard_applied",
+    "minimum_expected_edge_guard_applied",
+    "top_1_asset",
+    "top_1_score",
+    "top_2_asset",
+    "top_2_score",
+    "top_3_asset",
+    "top_3_score",
+    "position_risk_diagnostics_schema_version",
+    "position_entry_timestamp",
+    "position_entry_price",
+    "position_entry_score",
+    "position_return_since_entry",
+    "position_peak_return",
+    "position_drawdown_from_peak",
+    "position_mfe_so_far",
+    "position_mae_so_far",
+    "score_change_from_entry",
+    "days_current_not_top1",
+    "consecutive_days_current_not_top1",
+    "market_regime_diagnostics_schema_version",
+    "spy_return_5",
+    "spy_return_20",
+    "spy_realized_volatility_20",
+    "universe_breadth_5",
+    "universe_breadth_20",
+    "universe_breadth_5_valid_assets",
+    "universe_breadth_20_valid_assets",
+    "selected_asset",
+    "previous_asset",
+    "trade_action",
+    "strategy_equity",
+    "buy_hold_equity",
+)
+
+
+def _xgboost_decision_rows(predictions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: row.get(key) for key in XGBOOST_DECISION_DIAGNOSTIC_FIELDS}
+        for row in predictions
+        if row.get("decision_diagnostics_schema_version") is not None
+    ]
 
 @router.get("/api/jobs/{job_id}/comparison.csv")
 def export_comparison(job_id: str) -> Response:
@@ -83,6 +167,31 @@ def export_trades(
         rows,
         f"{symbol.upper()}_{backend.lower()}_trades.csv",
         excluded_fields={"_id", "job_id", "symbol", "backend"},
+    )
+
+
+@router.get("/api/jobs/{job_id}/runs/{symbol}/{backend}/decision-diagnostics.csv")
+def export_decision_diagnostics(
+    job_id: str,
+    symbol: str,
+    backend: str,
+) -> Response:
+    require_run(job_id, symbol, backend)
+    rows = list(
+        database()[PREDICTIONS_COLLECTION]
+        .find(
+            {
+                "job_id": job_id,
+                "symbol": symbol.upper(),
+                "backend": backend.lower(),
+            },
+            {"_id": 0},
+        )
+        .sort("timestamp", 1)
+    )
+    return csv_response(
+        _xgboost_decision_rows(rows),
+        f"{symbol.upper()}_{backend.lower()}_decision_diagnostics.csv",
     )
 
 
@@ -274,6 +383,14 @@ def export_zip(job_id: str) -> Response:
                 ensure_ascii=False,
             ),
         )
+        archive.writestr(
+            "experiment_manifest.json",
+            json.dumps(
+                iso_value(build_experiment_manifest(job, runs)),
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
         for run in runs:
             symbol = str(run["symbol"])
             backend = str(run["backend"])
@@ -332,6 +449,12 @@ def export_zip(job_id: str) -> Response:
                     excluded_fields={"_id", "job_id", "symbol", "backend"},
                 ),
             )
+            decision_rows = _xgboost_decision_rows(predictions)
+            if decision_rows:
+                archive.writestr(
+                    f"{folder}/{symbol}_{backend}_decision_diagnostics.csv",
+                    csv_bytes(decision_rows),
+                )
             archive.writestr(
                 f"{folder}/{symbol}_{backend}_trades.csv",
                 csv_bytes(
