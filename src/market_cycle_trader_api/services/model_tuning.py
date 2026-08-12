@@ -314,6 +314,7 @@ def tuning_catalog() -> dict[str, Any]:
         "adoption_requires_final_backtest": True,
         "dedicated_worker": False,
         "execution_mode": "integrated_api_worker",
+        "market_data_access": "database_only",
         "prior_campaign_reuse": True,
         "reproducibility_guard": "frozen_execution_snapshot_and_market_data_signature",
         "restart_recovery": "rerun_current_candidate_from_frozen_snapshot",
@@ -646,6 +647,10 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
         # Freezing both fields makes all candidates consume the same historical sessions.
         request_snapshot["end_date"] = cutoff_date
         request_snapshot["analysis_end_date"] = cutoff_date
+    # Optimization is a pure replay over MongoDB. It must never download, refresh
+    # or backfill market data, even when the baseline was a normal backtest that
+    # was allowed to bootstrap a completely missing asset before analysis.
+    request_snapshot["research_market_data_mode"] = "database_only"
     return {
         "job_id": str(job_id),
         "request": bson_value(request_snapshot),

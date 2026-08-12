@@ -15,10 +15,10 @@ from ...infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
     bson_value,
-    get_alpaca_credentials,
     utc_now,
 )
 from ...schemas.requests import BacktestExecutionRequest
+from ...engine.market_data import resolve_backtest_analysis_end_date
 from ...services.jobs import public_job, require_job, run_job
 from ...services.system_settings import apply_training_runtime_settings, get_system_settings
 from ...services.strategy_lab import (
@@ -98,6 +98,9 @@ def queue_backtest_job(
             )
             request_payload["research_model_family"] = research_model_family
             request_payload["research_model_settings"] = research_model_settings
+            # Tuning/optimization is strictly database-only. A campaign may never
+            # mutate its market-data snapshot by downloading or refreshing assets.
+            request_payload["research_market_data_mode"] = "database_only"
             # These generic execution fields are model-owned and remain frozen across
             # the campaign except when an explicitly supplied candidate changes them.
             if "repetitions" in model_values_override:
@@ -166,26 +169,22 @@ def queue_backtest_job(
                 research_reference_assets = list(locked_configuration.assets)
             research_reference_set = set(research_reference_assets)
             research_candidate_assets = [symbol for symbol in locked_configuration.assets if symbol not in research_reference_set]
+            resolved_analysis_end = resolve_backtest_analysis_end_date(locked_configuration)
             request = BacktestExecutionRequest.model_validate(
                 {
                     **locked_configuration.model_dump(mode="python"),
                     "analysis_start_date": locked_configuration.start_date,
-                    "analysis_end_date": locked_configuration.end_date,
+                    "analysis_end_date": resolved_analysis_end,
                     "calendar_anchor_assets": calendar_anchor_assets,
                     "research_reference_assets": research_reference_assets,
                     "research_candidate_assets": research_candidate_assets,
                     "research_model_family": research_model_family,
                     "research_model_settings": dict(research_model_settings or {}),
+                    "research_market_data_mode": "backtest_bootstrap_missing",
                 }
             )
     except (RuntimeError, ValidationError) as exc:
         raise HTTPException(status_code=500, detail=f"Selected backtest strategy is invalid: {exc}") from exc
-
-    if request.market_data_provider == "alpaca":
-        try:
-            get_alpaca_credentials()
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     request_payload = request.model_dump(mode="python")

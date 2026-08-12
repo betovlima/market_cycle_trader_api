@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 
@@ -28,7 +30,12 @@ def effective_execution_end_date(config: Any) -> str | None:
     return str(locked_end) if locked_end else None
 
 
+EASTERN = ZoneInfo("America/New_York")
+
+
 def normalize_end_date(value: str | None) -> str | None:
+    """Normalize an already-resolved research cutoff without applying wall-clock policy."""
+
     if not value:
         return None
     parsed = pd.Timestamp(value)
@@ -36,24 +43,95 @@ def normalize_end_date(value: str | None) -> str | None:
         raise ValueError(f"Invalid end date: {value}")
     if parsed.tzinfo is not None:
         parsed = parsed.tz_convert("UTC").tz_localize(None)
-    if parsed.normalize() >= pd.Timestamp(date.today()):
-        return None
     return parsed.strftime("%Y-%m-%d")
 
 
 def inclusive_end_exclusive_boundary(value: str | None) -> pd.Timestamp | None:
-    """Convert an inclusive user-facing end date into an exclusive UTC boundary.
-
-    A historical end_date of 2026-08-11 means that the completed daily session
-    on 2026-08-11 belongs to the experiment.  Mongo and Alpaca range queries use
-    an exclusive right-hand boundary, so the internal boundary must be midnight
-    at the start of the following calendar day.
-    """
+    """Convert an inclusive session date into an exclusive UTC storage boundary."""
 
     normalized = normalize_end_date(value)
     if normalized is None:
         return None
     return pd.Timestamp(normalized, tz="UTC") + pd.Timedelta(days=1)
+
+
+def latest_completed_xnys_session(now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
+    """Return the latest XNYS regular session whose official close has already passed."""
+
+    stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    local_day = pd.Timestamp(stamp.tz_convert(EASTERN).date())
+    calendar = xcals.get_calendar("XNYS")
+    if calendar.is_session(local_day):
+        close_at = calendar.session_close(local_day)
+        if stamp >= close_at:
+            return local_day
+        return pd.Timestamp(calendar.previous_session(local_day))
+    return pd.Timestamp(calendar.date_to_session(local_day, direction="previous"))
+
+
+def _market_data_identity(symbol: str, config: Any) -> dict[str, Any]:
+    return {
+        "symbol": str(symbol).strip().upper(),
+        "interval": config.timeframe,
+        "feed": config.alpaca_historical_feed,
+        "adjustment": config.alpaca_adjustment,
+    }
+
+
+def _cache_has_session(collection: Any, identity: dict[str, Any], session: pd.Timestamp) -> bool:
+    start = pd.Timestamp(session.date(), tz="UTC")
+    end = start + pd.Timedelta(days=1)
+    return collection.find_one(
+        {
+            **identity,
+            "timestamp": {"$gte": start.to_pydatetime(), "$lt": end.to_pydatetime()},
+        },
+        {"_id": 1},
+    ) is not None
+
+
+def resolve_backtest_analysis_end_date(
+    config: Any,
+    *,
+    now: datetime | pd.Timestamp | None = None,
+) -> str:
+    """Resolve one immutable daily research cutoff before a normal backtest is queued.
+
+    The current open XNYS session is never eligible.  After today's close, today's
+    session is used only when every configured asset identity is already present for
+    that session in MongoDB; otherwise the previous completed session is used.  A
+    missing asset can then be bootstrapped once by the normal backtest path.
+    """
+
+    calendar = xcals.get_calendar("XNYS")
+    latest_closed = latest_completed_xnys_session(now)
+    requested = normalize_end_date(getattr(config, "end_date", None))
+    if requested:
+        requested_session = pd.Timestamp(
+            calendar.date_to_session(pd.Timestamp(requested), direction="previous")
+        )
+        target = min(requested_session, latest_closed)
+    else:
+        target = latest_closed
+
+    stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    local_today = stamp.tz_convert(EASTERN).date()
+    if target.date() == local_today and calendar.is_session(pd.Timestamp(local_today)):
+        client = create_client()
+        try:
+            collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
+            available = all(
+                _cache_has_session(collection, _market_data_identity(symbol, config), target)
+                for symbol in list(getattr(config, "assets", []) or [])
+            )
+        finally:
+            client.close()
+        if not available:
+            target = pd.Timestamp(calendar.previous_session(target))
+
+    return target.date().isoformat()
 
 
 def _utc_timestamp(value: Any) -> pd.Timestamp:
@@ -281,7 +359,7 @@ def complete_market_history(
     initial_rows: int | None = None,
     history_backfill_rows: int = 0,
 ) -> pd.DataFrame:
-    """Validate that the Alpaca-only cache reaches the locked historical start."""
+    """Validate that the MongoDB research cache reaches the locked historical start."""
 
     effective_frame = filter_non_trading_rows(frame, config.timeframe)
     effective_frame = effective_frame[
@@ -302,11 +380,11 @@ def complete_market_history(
     )
     if not provenance["history_complete"] and require_complete:
         raise RuntimeError(
-            f"Incomplete Alpaca market history for {symbol}: requested "
+            f"Incomplete MongoDB market history for {symbol}: requested "
             f"{config.start_date}, but the earliest available session is "
             f"{provenance['actual_start'] or 'unavailable'}. "
             f"Historical feed={config.alpaca_historical_feed}; adjustment={config.alpaca_adjustment}. "
-            "The backtest was stopped instead of silently changing the promoted strategy result."
+            "Existing cached assets are not backfilled from Alpaca by research executions."
         )
     return effective_frame
 
@@ -317,26 +395,23 @@ def _download_alpaca_bars(
     start_date: str,
     end_date: str | None,
 ) -> pd.DataFrame:
-    """Download the requested range from Alpaca in bounded date chunks.
+    """Bootstrap one completely missing asset identity from Alpaca.
 
-    The application contract treats a historical ``end_date`` as inclusive.
-    Alpaca receives timestamps, and daily-bar boundary handling can otherwise
-    omit the final requested session at midnight boundaries.  For explicit
-    daily cutoffs we therefore fetch one extra calendar day beyond the normal
-    exclusive boundary and always trim the returned frame back to the exact
-    inclusive cutoff before it can reach the backtest.  This makes frozen CARO
-    replays deterministic without allowing the safety look-ahead into results.
+    This function is never used by tuning/optimization.  For daily research it
+    stops at the official close of the already-resolved completed XNYS session;
+    it never extends the request into the current open session.
     """
 
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
-    trim_end = inclusive_end_exclusive_boundary(end_date)
-    if trim_end is None:
-        requested_end = pd.Timestamp(date.today(), tz="UTC")
-    else:
-        requested_end = trim_end
-        if config.timeframe == "1Day":
-            requested_end = requested_end + pd.Timedelta(days=1)
+    normalized_end = normalize_end_date(end_date)
+    if normalized_end is None:
+        normalized_end = latest_completed_xnys_session().date().isoformat()
+    calendar = xcals.get_calendar("XNYS")
+    session = pd.Timestamp(
+        calendar.date_to_session(pd.Timestamp(normalized_end), direction="previous")
+    )
+    requested_end = pd.Timestamp(calendar.session_close(session)).tz_convert("UTC")
     if requested_end <= requested_start:
         return pd.DataFrame()
 
@@ -375,25 +450,31 @@ def _download_alpaca_bars(
     )
 
 
-def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
-    start = pd.Timestamp(config.start_date, tz="UTC")
-    execution_end = effective_execution_end_date(config)
-    end = inclusive_end_exclusive_boundary(execution_end)
+def _end_is_complete(frame: pd.DataFrame, config: Any) -> bool:
+    cutoff = normalize_end_date(effective_execution_end_date(config))
+    if cutoff is None:
+        return True
+    if frame is None or frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return False
+    last = _optional_utc_timestamp(frame.index.max())
+    if last is None:
+        return False
+    return last.date() >= date.fromisoformat(cutoff)
 
-    if not config.mongo_cache_enabled:
-        downloaded = _download_alpaca_bars(
-            symbol,
-            config,
-            config.start_date,
-            execution_end,
+
+def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
+    """Load research bars from MongoDB, bootstrapping only a wholly missing asset in a normal backtest."""
+
+    if not bool(getattr(config, "mongo_cache_enabled", True)):
+        raise RuntimeError(
+            "Research market data is MongoDB-only. Enable the MongoDB market-data cache for backtests and tuning."
         )
-        return complete_market_history(
-            symbol,
-            downloaded,
-            config,
-            provider="alpaca",
-            initial_rows=len(downloaded),
-        )
+
+    execution_end = effective_execution_end_date(config)
+    start = pd.Timestamp(config.start_date, tz="UTC")
+    end = inclusive_end_exclusive_boundary(execution_end)
+    access_mode = str(getattr(config, "research_market_data_mode", "database_only"))
+    allow_bootstrap = access_mode == "backtest_bootstrap_missing"
 
     client = create_client()
     try:
@@ -412,103 +493,69 @@ def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
             unique=True,
             name="uq_alpaca_market_bar",
         )
-        identity = {
-            "symbol": symbol,
-            "interval": config.timeframe,
-            "feed": config.alpaca_historical_feed,
-            "adjustment": config.alpaca_adjustment,
-        }
-        first = collection.find_one(
-            identity,
-            {"timestamp": 1, "_id": 0},
-            sort=[("timestamp", 1)],
-        )
-        last = collection.find_one(
-            identity,
-            {"timestamp": 1, "_id": 0},
-            sort=[("timestamp", -1)],
-        )
+        identity = _market_data_identity(symbol, config)
+        first = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", 1)])
+        bootstrapped_rows = 0
 
-        history_backfill_rows = 0
-        initial_rows = 0
         if first is None:
+            if not allow_bootstrap:
+                raise RuntimeError(
+                    f"MarketDataMissingInMongoDB: {symbol} has no cached {config.timeframe} "
+                    f"bars for feed={config.alpaca_historical_feed}, adjustment={config.alpaca_adjustment}. "
+                    "Model tuning and parameter optimization are database-only and never download market data."
+                )
             downloaded = _download_alpaca_bars(
                 symbol,
                 config,
                 config.start_date,
                 execution_end,
             )
-            initial_rows = len(downloaded)
-            _upsert_frame(
-                collection,
-                downloaded,
-                identity,
-                config.mongo_write_batch_size,
-            )
-        else:
-            first_ts = _utc_timestamp(first["timestamp"])
-            last_ts = _utc_timestamp(last["timestamp"])
-            cached_before = _read_frame(collection, identity, start, end)
-            initial_rows = len(cached_before)
-
-            if (
-                bool(config.market_data_history_backfill_enabled)
-                and start.normalize() < first_ts.normalize()
-            ):
-                historical = _download_alpaca_bars(
-                    symbol,
-                    config,
-                    config.start_date,
-                    first_ts.isoformat(),
+            if downloaded.empty:
+                raise RuntimeError(
+                    f"MarketDataBootstrapFailed: Alpaca returned no historical bars for missing asset {symbol}."
                 )
-                history_backfill_rows = len(historical)
-                _upsert_frame(
-                    collection,
-                    historical,
-                    identity,
-                    config.mongo_write_batch_size,
-                )
-
-            refresh = max(
-                start,
-                last_ts
-                - pd.Timedelta(int(config.mongo_refresh_overlap_days), unit="D"),
-            )
-            if end is None or refresh < end:
-                recent = _download_alpaca_bars(
-                    symbol,
-                    config,
-                    refresh.isoformat(),
-                    execution_end,
-                )
-                _upsert_frame(
-                    collection,
-                    recent,
-                    identity,
-                    config.mongo_write_batch_size,
-                )
+            _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
+            bootstrapped_rows = len(downloaded)
 
         cached = _read_frame(collection, identity, start, end)
         if cached.empty:
-            raise RuntimeError("Alpaca MongoDB cache returned no bars")
-        return complete_market_history(
+            raise RuntimeError(
+                f"MarketDataMissingInMongoDB: no cached bars for {symbol} inside the locked research window."
+            )
+
+        result = complete_market_history(
             symbol,
             cached,
             config,
             provider="alpaca",
-            initial_rows=initial_rows or len(cached),
-            history_backfill_rows=history_backfill_rows,
+            initial_rows=len(cached),
+            history_backfill_rows=0,
         )
+        provenance = dict(result.attrs.get("market_data_provenance", {}))
+        provenance["research_access_path"] = (
+            "alpaca_bootstrap_then_mongodb" if bootstrapped_rows else "mongodb_only"
+        )
+        provenance["cache_bootstrap_rows"] = int(bootstrapped_rows)
+        provenance["requested_end"] = normalize_end_date(execution_end)
+        provenance["end_complete"] = _end_is_complete(result, config)
+        result = _attach_provenance(result, provenance)
+        if not provenance["end_complete"]:
+            last = provenance.get("actual_end") or "unavailable"
+            raise RuntimeError(
+                f"MarketDataIncomplete: MongoDB market data for {symbol} ends at {last}; "
+                f"the frozen research cutoff is {provenance.get('requested_end')}. "
+                "Existing cached assets are never refreshed from Alpaca by a backtest or tuning run."
+            )
+        return result
     finally:
         client.close()
 
 
 def load_market_bars(symbol: str, config: Any) -> pd.DataFrame:
     if config.market_data_provider != "alpaca":
-        raise ValueError(
-            "This release supports Alpaca as the only market data provider."
-        )
-    return load_alpaca_bars(symbol, config)
+        raise ValueError("This release supports Alpaca-origin market data stored in MongoDB.")
+    return load_mongo_market_bars(symbol, config)
+
 
 def validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     source_attrs = dict(getattr(bars, "attrs", {}))

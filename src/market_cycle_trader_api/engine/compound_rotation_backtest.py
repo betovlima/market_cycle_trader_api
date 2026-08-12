@@ -268,10 +268,11 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
                 or provenance.get("provider")
                 or config.market_data_provider
             )
+            access_path = str(provenance.get("research_access_path") or "mongodb_only")
             print(
                 "MARKET_DATA|"
                 f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
-                f"source={source_label}|backfill_rows={backfill_rows}|"
+                f"source={source_label}|access={access_path}|backfill_rows={backfill_rows}|"
                 f"complete={bool(provenance.get('history_complete', True))}",
                 flush=True,
             )
@@ -385,6 +386,11 @@ def main() -> None:
             f"Research execution: seed={config.random_state}, "
             f"repetitions={config.rotation_xgb_repetitions}, "
             f"deterministic={config.deterministic_execution}",
+            flush=True,
+        )
+        print(
+            f"Research market data: mode={getattr(config, 'research_market_data_mode', 'database_only')}; "
+            f"cutoff={config.analysis_end_date or config.end_date or 'unresolved'}",
             flush=True,
         )
         print(

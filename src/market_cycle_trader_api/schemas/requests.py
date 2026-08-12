@@ -16,6 +16,7 @@ AlpacaHistoricalFeed = Literal["sip", "iex"]
 AlpacaLiveFeed = Literal["iex", "sip"]
 AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
 HistoryBackfillProvider = Literal["alpaca"]
+ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
 
@@ -241,6 +242,7 @@ class BacktestExecutionRequest(BacktestRequest):
     research_candidate_assets: list[str] = Field(default_factory=list)
     research_model_family: ResearchModelFamily = "xgboost_utility"
     research_model_settings: dict[str, object] = Field(default_factory=dict)
+    research_market_data_mode: ResearchMarketDataMode = "database_only"
 
     @field_validator("calendar_anchor_assets")
     @classmethod

@@ -14,7 +14,8 @@ def test_public_job_endpoint_has_no_date_request_model() -> None:
     assert "PublicBacktestRequest" not in router
     assert "class PublicBacktestRequest" not in requests
     assert '"analysis_start_date": locked_configuration.start_date' in router
-    assert '"analysis_end_date": locked_configuration.end_date' in router
+    assert "resolved_analysis_end = resolve_backtest_analysis_end_date(locked_configuration)" in router
+    assert '"analysis_end_date": resolved_analysis_end' in router
     assert "public_date_range" not in router
 
 

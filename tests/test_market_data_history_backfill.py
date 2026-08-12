@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -11,9 +13,11 @@ from market_cycle_trader_api.engine.market_data import (
     _download_alpaca_bars,
     complete_market_history,
     inclusive_end_exclusive_boundary,
+    latest_completed_xnys_session,
+    load_mongo_market_bars,
     trim_downloaded_range,
 )
-from market_cycle_trader_api.schemas.requests import BacktestRequest
+from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest, BacktestRequest
 
 
 def _config() -> BacktestRequest:
@@ -25,6 +29,25 @@ def _config() -> BacktestRequest:
         / "winner-v1.13.2.json"
     )
     return BacktestRequest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _execution_config(*, mode: str, end_date: str = "2024-01-09") -> BacktestExecutionRequest:
+    base = _config()
+    payload = base.model_dump(mode="python")
+    payload.update(
+        {
+            "end_date": None,
+            "analysis_start_date": base.start_date,
+            "analysis_end_date": end_date,
+            "calendar_anchor_assets": list(base.assets),
+            "research_reference_assets": list(base.assets),
+            "research_candidate_assets": [],
+            "research_model_family": "lightgbm_utility",
+            "research_model_settings": {},
+            "research_market_data_mode": mode,
+        }
+    )
+    return BacktestExecutionRequest.model_validate(payload)
 
 
 def _frame(start: str, periods: int, base: float) -> pd.DataFrame:
@@ -40,6 +63,30 @@ def _frame(start: str, periods: int, base: float) -> pd.DataFrame:
         },
         index=index,
     )
+
+
+class _FakeCollection:
+    def __init__(self, *, first=None):
+        self.first = first
+
+    def create_index(self, *args, **kwargs):
+        return None
+
+    def find_one(self, *args, **kwargs):
+        return self.first
+
+
+class _FakeClient:
+    def close(self):
+        return None
+
+
+class _FakeDatabase:
+    def __init__(self, collection):
+        self.collection = collection
+
+    def __getitem__(self, name):
+        return self.collection
 
 
 def test_complete_alpaca_history_is_accepted() -> None:
@@ -62,11 +109,11 @@ def test_complete_alpaca_history_is_accepted() -> None:
     assert provenance["history_backfill_rows"] == 0
 
 
-def test_incomplete_alpaca_history_stops_without_secondary_provider() -> None:
+def test_incomplete_mongodb_history_stops_without_remote_backfill() -> None:
     config = _config()
     incomplete = _frame("2020-07-27", 500, 200.0)
 
-    with pytest.raises(RuntimeError, match="Incomplete Alpaca market history"):
+    with pytest.raises(RuntimeError, match="Incomplete MongoDB market history"):
         complete_market_history(
             "MSFT",
             incomplete,
@@ -99,7 +146,7 @@ def test_long_alpaca_history_is_downloaded_in_date_chunks() -> None:
             "NVDA",
             config,
             "2016-01-01",
-            "2026-01-01",
+            "2026-01-02",
         )
 
     assert downloader.call_count > 1
@@ -124,14 +171,12 @@ def test_historical_end_date_is_inclusive_for_daily_bars() -> None:
     assert inclusive_end_exclusive_boundary("2024-01-09") == pd.Timestamp("2024-01-10", tz="UTC")
 
 
-def test_alpaca_daily_replay_uses_safety_fetch_and_trims_to_inclusive_cutoff() -> None:
+def test_alpaca_bootstrap_stops_at_resolved_session_close_without_safety_lookahead() -> None:
     config = _config()
     calls = []
 
     def fake_download(**kwargs):
         calls.append(kwargs)
-        # Simulate a provider returning the requested final session plus the
-        # safety-window session. Only the inclusive cutoff may reach research.
         return _frame("2024-01-09", 2, 100.0)
 
     with (
@@ -152,7 +197,46 @@ def test_alpaca_daily_replay_uses_safety_fetch_and_trims_to_inclusive_cutoff() -
         )
 
     assert calls
-    # Normal exclusive boundary is Jan 10. Daily Alpaca requests get one extra
-    # safety day, while trim_downloaded_range still cuts strictly at Jan 10.
-    assert pd.Timestamp(calls[-1]["end"]) == pd.Timestamp("2024-01-11", tz="UTC")
+    assert pd.Timestamp(calls[-1]["end"]) == pd.Timestamp("2024-01-09T21:00:00Z")
     assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-09"]
+
+
+def test_latest_completed_session_never_uses_current_open_session() -> None:
+    # 15:00 UTC = 11:00 New York on 2026-08-12, during regular trading.
+    result = latest_completed_xnys_session(datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc))
+    assert result.date().isoformat() == "2026-08-11"
+
+
+def test_tuning_database_only_missing_asset_never_calls_alpaca() -> None:
+    config = _execution_config(mode="database_only")
+    collection = _FakeCollection(first=None)
+    with (
+        patch("market_cycle_trader_api.engine.market_data.create_client", return_value=_FakeClient()),
+        patch("market_cycle_trader_api.engine.market_data.get_database", return_value=_FakeDatabase(collection)),
+        patch("market_cycle_trader_api.engine.market_data._download_alpaca_bars") as downloader,
+    ):
+        with pytest.raises(RuntimeError, match="Model tuning and parameter optimization are database-only"):
+            load_mongo_market_bars("HD", config)
+    downloader.assert_not_called()
+
+
+def test_normal_backtest_bootstraps_only_a_completely_missing_asset_then_reads_mongodb() -> None:
+    config = _execution_config(mode="backtest_bootstrap_missing")
+    collection = _FakeCollection(first=None)
+    downloaded = _frame("2016-01-04", 2092, 100.0)
+    # Force the final cached row to the frozen cutoff used by the execution.
+    downloaded = downloaded.loc[downloaded.index < pd.Timestamp("2024-01-10", tz="UTC")]
+
+    with (
+        patch("market_cycle_trader_api.engine.market_data.create_client", return_value=_FakeClient()),
+        patch("market_cycle_trader_api.engine.market_data.get_database", return_value=_FakeDatabase(collection)),
+        patch("market_cycle_trader_api.engine.market_data._download_alpaca_bars", return_value=downloaded) as downloader,
+        patch("market_cycle_trader_api.engine.market_data._upsert_frame") as upsert,
+        patch("market_cycle_trader_api.engine.market_data._read_frame", return_value=downloaded),
+    ):
+        result = load_mongo_market_bars("HD", config)
+
+    downloader.assert_called_once()
+    upsert.assert_called_once()
+    assert result.attrs["market_data_provenance"]["research_access_path"] == "alpaca_bootstrap_then_mongodb"
+    assert result.attrs["market_data_provenance"]["cache_bootstrap_rows"] == len(downloaded)

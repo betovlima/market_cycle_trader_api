@@ -156,6 +156,7 @@ def test_tuning_catalog_declares_integrated_worker_prior_reuse_and_reproducibili
     assert {item["id"] for item in catalog["methods"]} == {"latin_hypercube", "champion_probability"}
     assert catalog["dedicated_worker"] is False
     assert catalog["execution_mode"] == "integrated_api_worker"
+    assert catalog["market_data_access"] == "database_only"
     assert catalog["prior_campaign_reuse"] is True
     assert catalog["reproducibility_guard"] == "frozen_execution_snapshot_and_market_data_signature"
     assert catalog["probability"]["probability_model"] == PROBABILITY_MODEL
@@ -208,6 +209,9 @@ def test_tuning_routes_and_integrated_execution_contract() -> None:
     assert "recover_integrated_model_tuning_runs" in service
     assert "champion_gate_passed" in service
     assert "execution_request_override" in jobs_router
+    assert 'request_payload["research_market_data_mode"] = "database_only"' in jobs_router
+    assert '"research_market_data_mode": "backtest_bootstrap_missing"' in jobs_router
+    assert 'request_snapshot["research_market_data_mode"] = "database_only"' in service
     assert "MarketDataSignatureMismatch" in service
     assert '"tuning_summary_only": tuning_run_id is not None' in jobs_router
     assert '"tuning_summary_only": {"$ne": True}' in strategy_lab
