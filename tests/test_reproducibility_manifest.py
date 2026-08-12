@@ -49,7 +49,7 @@ def test_manifest_is_stable_for_same_configuration_and_bars() -> None:
     assert first["numeric_thread_limit"] == 1
     assert first["xgb_n_jobs"] == -1
     assert first["reproducibility_schema_version"] == 3
-    assert first["api_version"] == "2.0.4"
+    assert first["api_version"] == "2.0.10"
     assert first["runtime_fingerprint_sha256"]
     assert first["engine_source_sha256"]
     assert first["package_source_sha256"]
@@ -216,3 +216,61 @@ def test_engine_rejects_signature_mismatch_before_model_training() -> None:
 
     assert raised
     trainer.assert_not_called()
+
+
+def test_research_signature_ignores_optional_non_model_bar_fields() -> None:
+    first_bars = _bars([100.0, 101.0, 102.0])
+    second_bars = _bars([100.0, 101.0, 102.0])
+    first_bars["AAPL"]["vwap"] = [100.1, 101.1, 102.1]
+    first_bars["AAPL"]["trade_count"] = [100.0, 110.0, 120.0]
+    second_bars["AAPL"]["vwap"] = [999.0, 998.0, 997.0]
+    second_bars["AAPL"]["trade_count"] = [1.0, 2.0, 3.0]
+
+    first = build_reproducibility_manifest(_config(), first_bars)
+    second = build_reproducibility_manifest(_config(), second_bars)
+
+    assert first["market_data_signature_sha256"] == second["market_data_signature_sha256"]
+    assert first["market_data_audit_signature_sha256"] != second["market_data_audit_signature_sha256"]
+    assert first["market_data_signature_schema_version"] == 4
+
+
+def test_market_data_signature_is_dtype_and_datetime_unit_canonical() -> None:
+    from market_cycle_trader_api.services.reproducibility import market_data_manifest
+
+    base_index = pd.date_range("2016-01-04", periods=4, freq="B", tz="UTC")
+    source_index = base_index.as_unit("us")
+    restored_index = base_index.as_unit("ns")
+
+    source = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0, 103.0],
+            "high": [101.0, 102.0, 103.0, 104.0],
+            "low": [99.0, 100.0, 101.0, 102.0],
+            "close": [100.5, 101.5, 102.5, 103.5],
+            "volume": [1000, 1100, 1200, 1300],
+        },
+        index=source_index,
+    )
+    restored = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0, 103.0],
+            "high": [101.0, 102.0, 103.0, 104.0],
+            "low": [99.0, 100.0, 101.0, 102.0],
+            "close": [100.5, 101.5, 102.5, 103.5],
+            "volume": [1000.0, 1100.0, 1200.0, 1300.0],
+        },
+        index=restored_index,
+    )
+    provenance = {
+        "history_complete": True,
+        "historical_feed": "sip",
+        "adjustment": "all",
+    }
+    source.attrs["market_data_provenance"] = dict(provenance)
+    restored.attrs["market_data_provenance"] = dict(provenance)
+
+    source_signature, source_manifests = market_data_manifest({"AAPL": source})
+    restored_signature, restored_manifests = market_data_manifest({"AAPL": restored})
+
+    assert source_manifests["AAPL"]["sha256"] == restored_manifests["AAPL"]["sha256"]
+    assert source_signature == restored_signature

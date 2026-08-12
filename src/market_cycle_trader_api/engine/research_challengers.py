@@ -11,11 +11,13 @@ import pandas as pd
 
 from .capital_rotation import (
     ROTATION_FEATURES,
+    SUPPORTED_ROTATION_MODES,
     RotationRunResult,
     _analysis_decision_dates,
     _build_walk_forward_folds,
     _fold_performance,
     _risk_adjusted_reward,
+    _risk_off_enabled,
     _scheduled_policy,
     _simple_policy_growth,
     _simulate_exact,
@@ -70,8 +72,8 @@ def _build_execution_context(
     dict[pd.Timestamp, int],
     dict[pd.Timestamp, dict[str, Any]],
 ]:
-    if config.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise ValueError("Research challengers require the locked XGBoost strategy contract.")
+    if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
+        raise ValueError(f"Unsupported research strategy mode: {config.strategy_mode}.")
     if list(config.rotation_models) != ["xgboost_utility"]:
         raise ValueError("Research challengers cannot mutate the locked strategy model contract.")
 
@@ -110,6 +112,7 @@ def _lightgbm_fit_models(
     phase: str,
     progress_callback: Callable[[int, int, str], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
+    target_column: str = "forward_risk_adjusted_utility",
 ) -> dict[str, Any]:
     try:
         from lightgbm import LGBMRegressor
@@ -133,7 +136,7 @@ def _lightgbm_fit_models(
     )
     for position, symbol in enumerate(symbols, start=1):
         frame = frames[symbol].loc[train_dates].dropna(
-            subset=["forward_risk_adjusted_utility", *ROTATION_FEATURES]
+            subset=[target_column, *ROTATION_FEATURES]
         )
         if len(frame) < minimum_rows:
             if symbol in anchor_assets:
@@ -165,7 +168,7 @@ def _lightgbm_fit_models(
             force_col_wise=bool(config.deterministic_execution),
             verbosity=-1,
         )
-        model.fit(frame[ROTATION_FEATURES], frame["forward_risk_adjusted_utility"])
+        model.fit(frame[ROTATION_FEATURES], frame[target_column])
         fitted[symbol] = model
         if progress_callback is not None:
             progress_callback(position, len(symbols), "cpu")
@@ -277,6 +280,17 @@ def _run_lightgbm(
                 progress_callback=phase_progress("calibration training", 0.02, 0.38),
                 technical_log_callback=technical_log_callback,
             )
+            calibration_cash_edge_models = None
+            if _risk_off_enabled(rep_config):
+                calibration_cash_edge_models = _lightgbm_fit_models(
+                    frames,
+                    symbols,
+                    train_dates,
+                    rep_config,
+                    phase=f"run_{run_index}_fold_{fold_position}_calibration_cash_edge",
+                    technical_log_callback=technical_log_callback,
+                    target_column="forward_cash_edge",
+                )
             candidate_margins = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
             best_candidate = candidate_margins[0]
             best_score = float("-inf")
@@ -287,6 +301,7 @@ def _run_lightgbm(
                     symbols,
                     rep_config,
                     candidate,
+                    cash_edge_models=calibration_cash_edge_models,
                 )
                 score = _simple_policy_growth(
                     calibration_policy,
@@ -318,6 +333,17 @@ def _run_lightgbm(
                 progress_callback=phase_progress("final training", 0.50, 0.90),
                 technical_log_callback=technical_log_callback,
             )
+            final_cash_edge_models = None
+            if _risk_off_enabled(rep_config):
+                final_cash_edge_models = _lightgbm_fit_models(
+                    frames,
+                    symbols,
+                    final_fit_dates,
+                    rep_config,
+                    phase=f"run_{run_index}_fold_{fold_position}_final_cash_edge",
+                    technical_log_callback=technical_log_callback,
+                    target_column="forward_cash_edge",
+                )
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             policies[fold_id] = _xgb_policy(
                 final_models,
@@ -325,6 +351,7 @@ def _run_lightgbm(
                 symbols,
                 rep_config,
                 effective_margin,
+                cash_edge_models=final_cash_edge_models,
                 decision_diagnostics=diagnostics,
                 fold_id=fold_id,
                 calibrated_switch_margin=float(best_candidate),

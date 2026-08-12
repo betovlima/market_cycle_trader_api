@@ -215,32 +215,67 @@ def market_data_research_signature_from_manifests(
 def market_data_manifest(
     bars_by_symbol: dict[str, pd.DataFrame],
 ) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Build the immutable research-input signature plus a broader audit manifest.
+
+    The rotation models consume OHLCV only. Optional provider fields such as VWAP and
+    trade_count remain in the audit fingerprint, but they must not invalidate a tuning
+    campaign when the model inputs themselves are byte-identical.
+    """
     manifests: dict[str, dict[str, Any]] = {}
+    research_columns_order = ("open", "high", "low", "close", "volume")
+    audit_columns_order = (*research_columns_order, "vwap", "trade_count")
     for symbol in sorted(bars_by_symbol):
         frame = bars_by_symbol[symbol].copy().sort_index()
-        columns = [
-            column
-            for column in ("open", "high", "low", "close", "volume", "vwap", "trade_count")
-            if column in frame.columns
-        ]
-        canonical = frame[columns].copy()
+        research_columns = [column for column in research_columns_order if column in frame.columns]
+        audit_columns = [column for column in audit_columns_order if column in frame.columns]
+
+        canonical = frame[research_columns].copy()
         canonical.index = pd.to_datetime(canonical.index, utc=True, errors="coerce")
         canonical = canonical.loc[~canonical.index.isna()]
-        for column in columns:
-            canonical[column] = pd.to_numeric(canonical[column], errors="coerce")
-
+        try:
+            canonical.index = canonical.index.as_unit("ns")
+        except AttributeError:  # pandas < 2.0 compatibility
+            canonical.index = pd.DatetimeIndex(
+                canonical.index.to_numpy(dtype="datetime64[ns]"),
+                tz="UTC",
+            )
+        for column in research_columns:
+            canonical[column] = pd.to_numeric(canonical[column], errors="coerce").astype(
+                np.float64, copy=False
+            )
         row_hashes = pd.util.hash_pandas_object(canonical, index=True).to_numpy(
-            dtype=np.uint64,
-            copy=False,
+            dtype=np.uint64, copy=False
         )
         digest = hashlib.sha256(row_hashes.tobytes()).hexdigest()
+
+        audit = frame[audit_columns].copy()
+        audit.index = pd.to_datetime(audit.index, utc=True, errors="coerce")
+        audit = audit.loc[~audit.index.isna()]
+        try:
+            audit.index = audit.index.as_unit("ns")
+        except AttributeError:  # pandas < 2.0 compatibility
+            audit.index = pd.DatetimeIndex(
+                audit.index.to_numpy(dtype="datetime64[ns]"),
+                tz="UTC",
+            )
+        for column in audit_columns:
+            audit[column] = pd.to_numeric(audit[column], errors="coerce").astype(
+                np.float64, copy=False
+            )
+        audit_hashes = pd.util.hash_pandas_object(audit, index=True).to_numpy(
+            dtype=np.uint64, copy=False
+        )
+        audit_digest = hashlib.sha256(audit_hashes.tobytes()).hexdigest()
+
         provenance = dict(frame.attrs.get("market_data_provenance", {}))
         manifests[symbol] = {
             "sha256": digest,
+            "audit_sha256": audit_digest,
             "rows": int(len(canonical)),
             "first_timestamp": _series_timestamp(canonical.index.min()) if len(canonical) else None,
             "last_timestamp": _series_timestamp(canonical.index.max()) if len(canonical) else None,
-            "columns": columns,
+            "columns": research_columns,
+            "audit_columns": audit_columns,
             "history_complete": bool(provenance.get("history_complete", True)),
             "provider": provenance.get("provider") or provenance.get("effective_provider"),
             "effective_provider": provenance.get("effective_provider"),
@@ -301,7 +336,7 @@ def build_reproducibility_manifest(
         "reproducibility_schema_version": 3,
         "api_version": API_VERSION,
         "strategy_configuration_sha256": strategy_configuration_fingerprint(config),
-        "market_data_signature_schema_version": 2,
+        "market_data_signature_schema_version": 4,
         "market_data_signature_sha256": data_hash,
         "market_data_audit_signature_sha256": _sha256_json(data_manifests),
         "market_data_signatures": data_manifests,

@@ -332,7 +332,7 @@ def test_v204_tuning_reproducibility_contract_is_control_frozen_and_preflighted(
     engine = (SRC / "engine" / "compound_rotation_backtest.py").read_text(encoding="utf-8")
 
     assert 'expected_market_data_signature: str | None = None' in service
-    assert 'market_data_signature_source = "control_candidate"' in service
+    assert 'market_data_signature_source = "frozen_campaign_snapshot"' in service
     assert 'candidate_request["expected_market_data_signature_sha256"] = expected_signature or None' in service
     assert '"market_data_signature_established_by_candidate_id": candidate_id' in service
     assert '"source": "fresh_control"' in service
@@ -373,3 +373,241 @@ def test_derived_caro_uses_source_campaign_frozen_context() -> None:
     assert context["market_data_cutoff_date"] == "2026-08-11"
     assert context["context_hash"] == "ctx-1"
     assert context["request"]["research_market_data_mode"] == "database_only"
+
+
+def test_v206_model_tuning_stop_cancels_active_candidate_and_front_is_explicit() -> None:
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    jobs = (SRC / "services" / "jobs.py").read_text(encoding="utf-8")
+    panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
+
+    assert "request_job_cancel(current_job_id" in service
+    assert '"phase": "cancelling_active_candidate"' in service
+    assert '"candidates.$.status": "cancelled"' in service
+    assert '"cancelled_candidates": int(document.get("cancelled_candidates") or 0)' in service
+    assert "_ACTIVE_JOB_PROCESSES" in jobs
+    assert '"cancel_requested": True' in jobs
+    assert '"status": "cancelled"' in jobs
+    assert "Start Latin Hypercube" in panel
+    assert "Start CARO Probability" in panel
+    assert "Stopping…" in panel
+    assert "The active tuning candidate is being cancelled" in panel
+    assert "Active candidates will finish safely" not in panel
+
+
+def test_v206_stop_endpoint_requests_immediate_current_job_cancellation(monkeypatch) -> None:
+    from copy import deepcopy
+    from market_cycle_trader_api.services import model_tuning as tuning_service
+    from market_cycle_trader_api.infrastructure.persistence.mongo_repository import MODEL_TUNING_RUNS_COLLECTION
+
+    class Collection:
+        def __init__(self, document):
+            self.document = deepcopy(document)
+
+        def find_one(self, query, *args, **kwargs):
+            if query.get("id") == self.document.get("id"):
+                return deepcopy(self.document)
+            return None
+
+        def find_one_and_update(self, query, update, **kwargs):
+            assert query.get("id") == self.document.get("id")
+            self.document.update(deepcopy(update.get("$set") or {}))
+            return deepcopy(self.document)
+
+    run = {
+        "id": "run-stop-1",
+        "status": "running",
+        "phase": "running_candidate",
+        "current_candidate_id": 11,
+        "current_job_id": "job-11",
+        "candidates": [{"candidate_id": 11, "status": "running", "job_id": "job-11"}],
+    }
+    collection = Collection(run)
+    db = {MODEL_TUNING_RUNS_COLLECTION: collection}
+    cancelled = []
+
+    monkeypatch.setattr(tuning_service, "request_job_cancel", lambda job_id, *, reason: cancelled.append((job_id, reason)) or True)
+    monkeypatch.setattr(tuning_service, "_append_campaign_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tuning_service, "public_model_tuning_run", lambda _db, document: document)
+
+    result = tuning_service.request_model_tuning_stop(db, "run-stop-1")
+
+    assert result["status"] == "stop_requested"
+    assert result["phase"] == "cancelling_active_candidate"
+    assert result["stop_requested"] is True
+    assert cancelled and cancelled[0][0] == "job-11"
+
+
+def test_v206_job_cancel_sets_authoritative_flag_and_terminates_local_process(monkeypatch) -> None:
+    from copy import deepcopy
+    from market_cycle_trader_api.services import jobs as jobs_service
+    from market_cycle_trader_api.infrastructure.persistence.mongo_repository import JOBS_COLLECTION
+
+    class JobCollection:
+        def __init__(self):
+            self.document = {"id": "job-1", "status": "running"}
+
+        def find_one(self, query, *args, **kwargs):
+            return deepcopy(self.document) if query.get("id") == "job-1" else None
+
+        def update_one(self, query, update, *args, **kwargs):
+            assert query.get("id") == "job-1"
+            self.document.update(deepcopy(update.get("$set") or {}))
+
+    class Process:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None if not self.terminated else -15
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return -15
+
+    collection = JobCollection()
+    db = {JOBS_COLLECTION: collection}
+    process = Process()
+    monkeypatch.setattr(jobs_service, "database", lambda: db)
+    with jobs_service._ACTIVE_JOB_PROCESSES_LOCK:
+        jobs_service._ACTIVE_JOB_PROCESSES["job-1"] = process
+    try:
+        assert jobs_service.request_job_cancel("job-1", reason="Stop tuning") is True
+        assert collection.document["cancel_requested"] is True
+        assert collection.document["cancel_reason"] == "Stop tuning"
+        assert process.terminated is True
+    finally:
+        with jobs_service._ACTIVE_JOB_PROCESSES_LOCK:
+            jobs_service._ACTIVE_JOB_PROCESSES.pop("job-1", None)
+
+
+def test_tuning_uses_physical_content_addressed_market_snapshot() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "src" / "market_cycle_trader_api"
+    service = (root / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    market = (root / "engine" / "market_data.py").read_text(encoding="utf-8")
+    snapshot = (root / "services" / "model_tuning_market_snapshot.py").read_text(encoding="utf-8")
+
+    assert "_ensure_campaign_market_snapshot" in service
+    assert 'candidate_request["research_market_data_snapshot_id"] = snapshot_id or None' in service
+    assert '"frozen_tuning_snapshot"' in market
+    assert "freeze_tuning_market_snapshot" in snapshot
+    assert "SourceMarketDataSnapshotMismatch" in snapshot
+
+
+def test_v209_caro_source_requires_pristine_completed_latin_campaign() -> None:
+    from market_cycle_trader_api.services.model_tuning import _is_pristine_completed_latin_campaign
+
+    completed = generate_latin_hypercube_candidates(BASE_LIGHTGBM, candidate_count=4, seed=42)
+    for candidate in completed:
+        candidate["status"] = "completed"
+        candidate["metrics"] = {"eligible": True}
+
+    pristine = {
+        "status": "completed",
+        "method": "latin_hypercube",
+        "total_candidates": len(completed),
+        "completed_candidates": len(completed),
+        "failed_candidates": 0,
+        "cancelled_candidates": 0,
+        "candidates": completed,
+    }
+    assert _is_pristine_completed_latin_campaign(pristine) is True
+
+    failed = dict(pristine)
+    failed["failed_candidates"] = 1
+    failed["completed_candidates"] = len(completed) - 1
+    failed["candidates"] = [dict(item) for item in completed]
+    failed["candidates"][-1]["status"] = "failed"
+    assert _is_pristine_completed_latin_campaign(failed) is False
+
+    cancelled = dict(pristine)
+    cancelled["cancelled_candidates"] = 1
+    cancelled["completed_candidates"] = len(completed) - 1
+    cancelled["candidates"] = [dict(item) for item in completed]
+    cancelled["candidates"][-1]["status"] = "cancelled"
+    assert _is_pristine_completed_latin_campaign(cancelled) is False
+
+    stopped = dict(pristine)
+    stopped["status"] = "stopped"
+    assert _is_pristine_completed_latin_campaign(stopped) is False
+
+
+def test_v209_restart_invalidates_unfinished_campaign_instead_of_resuming(monkeypatch) -> None:
+    from copy import deepcopy
+    from market_cycle_trader_api.services import model_tuning as tuning_service
+    from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
+        JOBS_COLLECTION,
+        MODEL_TUNING_RUNS_COLLECTION,
+    )
+
+    class RunCollection:
+        def __init__(self, document):
+            self.document = deepcopy(document)
+
+        def find(self, query, *args, **kwargs):
+            return [deepcopy(self.document)]
+
+        def update_one(self, query, update, *args, **kwargs):
+            self.document.update(deepcopy(update.get("$set") or {}))
+            for key, value in (update.get("$inc") or {}).items():
+                self.document[key] = int(self.document.get(key) or 0) + int(value)
+
+    class JobCollection:
+        def __init__(self, document):
+            self.document = deepcopy(document)
+
+        def update_one(self, query, update, *args, **kwargs):
+            self.document.update(deepcopy(update.get("$set") or {}))
+
+    run_collection = RunCollection({
+        "id": "run-restart-1",
+        "status": "running",
+        "phase": "running_candidate",
+        "execution_mode": "integrated_api_worker",
+        "current_candidate_id": 2,
+        "current_job_id": "job-2",
+        "completed_candidates": 2,
+        "failed_candidates": 0,
+        "cancelled_candidates": 0,
+        "candidates": [
+            {"candidate_id": 0, "status": "completed"},
+            {"candidate_id": 1, "status": "completed"},
+            {"candidate_id": 2, "status": "running", "job_id": "job-2"},
+            {"candidate_id": 3, "status": "pending"},
+        ],
+    })
+    job_collection = JobCollection({"id": "job-2", "status": "running"})
+    db = {
+        MODEL_TUNING_RUNS_COLLECTION: run_collection,
+        JOBS_COLLECTION: job_collection,
+    }
+
+    monkeypatch.setattr(tuning_service, "_cleanup_job_artifacts", lambda _db, _job_id: None)
+    monkeypatch.setattr(tuning_service, "_append_campaign_event", lambda *args, **kwargs: None)
+
+    recovered = tuning_service.recover_integrated_model_tuning_runs(db)
+
+    assert recovered == 1
+    assert run_collection.document["status"] == "stopped"
+    assert run_collection.document["phase"] == "invalidated_after_restart"
+    assert run_collection.document["current_candidate_id"] is None
+    assert run_collection.document["current_job_id"] is None
+    statuses = {item["candidate_id"]: item["status"] for item in run_collection.document["candidates"]}
+    assert statuses == {0: "completed", 1: "completed", 2: "cancelled", 3: "cancelled"}
+    assert run_collection.document["cancelled_candidates"] == 2
+    assert job_collection.document["status"] == "cancelled"
+
+
+def test_v209_failure_is_terminal_and_incomplete_campaign_cannot_complete() -> None:
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    assert 'else "CandidateFailed"' in service
+    assert '"candidate_failed_terminal"' in service
+    assert '"IncompleteTuningCampaign"' in service
+    assert 'Campaign completed with every candidate successful.' in service
+    assert 'threading.Thread(target=run_model_tuning, args=(run_id,), daemon=True).start()' in service
+    recovery = service[service.index("def recover_integrated_model_tuning_runs"):service.index("def request_model_tuning_stop")]
+    assert "threading.Thread(target=run_model_tuning" not in recovery
+    assert '"invalidated_after_restart"' in recovery

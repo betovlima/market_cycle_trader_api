@@ -29,10 +29,16 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     utc_now,
 )
-from .jobs import _redact_sensitive_text, run_job
+from .jobs import _redact_sensitive_text, request_job_cancel, run_job
 from .model_research import model_values_from_snapshot
 from .reproducibility import market_data_research_signature_from_manifests
 from .model_tuning_probability import PROBABILITY_MODEL, champion_gate_evaluation, propose_champion_probability_candidate
+from .model_tuning_market_snapshot import (
+    TuningMarketSnapshotMismatch,
+    freeze_tuning_market_snapshot,
+    market_snapshot_exists,
+    require_tuning_market_snapshot,
+)
 from .strategy_lab import (
     get_research_strategy_context,
     get_research_strategy_model_snapshot,
@@ -42,7 +48,7 @@ from .strategy_lab import (
 TUNING_METHOD = "latin_hypercube"
 PROBABILITY_METHOD = "champion_probability"
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 3
+TUNING_SCHEMA_VERSION = 4
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
@@ -615,6 +621,8 @@ def _execution_request_context_hash(request_payload: dict[str, Any]) -> str:
     """Hash the immutable research context while ignoring the model hyperparameter payload."""
     context = deepcopy(request_payload)
     context.pop("research_model_settings", None)
+    context.pop("expected_market_data_signature_sha256", None)
+    context.pop("research_market_data_snapshot_id", None)
     encoded = json.dumps(context, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -720,6 +728,7 @@ def _frozen_execution_context_from_campaign(db: Any, document: dict[str, Any]) -
         "request": bson_value(request_snapshot),
         "context_hash": str(document.get("execution_context_hash") or "") or _execution_request_context_hash(request_snapshot),
         "market_data_signature_sha256": signature,
+        "market_data_snapshot_id": str(document.get("market_data_snapshot_id") or request_snapshot.get("research_market_data_snapshot_id") or "").strip().lower() or None,
         "market_data_cutoff_date": cutoff_date,
         "strategy_profile_id": document.get("strategy_profile_id"),
         "strategy_profile_name": document.get("strategy_profile_name"),
@@ -730,12 +739,35 @@ def _frozen_execution_context_from_campaign(db: Any, document: dict[str, Any]) -
     }
 
 
+def _is_pristine_completed_latin_campaign(document: dict[str, Any]) -> bool:
+    """Return True only when every expected LHS candidate completed successfully.
+
+    Failed, cancelled, stopped, interrupted, or partially completed campaigns are
+    never valid CARO evidence. A new research run must start fresh instead of
+    inheriting observations from an incomplete campaign.
+    """
+    if str(document.get("status") or "") != "completed":
+        return False
+    if str(document.get("method") or "") != TUNING_METHOD:
+        return False
+    if int(document.get("failed_candidates") or 0) != 0:
+        return False
+    if int(document.get("cancelled_candidates") or 0) != 0:
+        return False
+    candidates = list(document.get("candidates") or [])
+    total = int(document.get("total_candidates") or len(candidates))
+    completed = int(document.get("completed_candidates") or 0)
+    if total <= 0 or len(candidates) != total or completed != total:
+        return False
+    return all(str(item.get("status") or "") == "completed" for item in candidates)
+
+
 def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     """Return completed Latin Hypercube campaigns that can seed CARO without rerunning them."""
     documents = list(
         db[MODEL_TUNING_RUNS_COLLECTION]
         .find(
-            {"status": "completed", "method": TUNING_METHOD},
+            {"status": "completed", "method": TUNING_METHOD, "failed_candidates": 0, "cancelled_candidates": 0},
             {
                 "_id": 0,
                 "id": 1,
@@ -753,6 +785,7 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
                 "execution_request_snapshot": 1,
                 "execution_context_hash": 1,
                 "expected_market_data_signature_sha256": 1,
+                "market_data_snapshot_id": 1,
                 "market_data_cutoff_date": 1,
                 "model_family": 1,
                 "model_label": 1,
@@ -763,6 +796,8 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
     )
     result: list[dict[str, Any]] = []
     for document in documents:
+        if not _is_pristine_completed_latin_campaign(document):
+            continue
         observations = [
             item for item in document.get("candidates") or []
             if item.get("status") == "completed"
@@ -824,6 +859,7 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
                 ],
                 "execution_context_hash": context.get("context_hash"),
                 "market_data_signature_sha256": context.get("market_data_signature_sha256"),
+                "market_data_snapshot_id": context.get("market_data_snapshot_id"),
                 "market_data_cutoff_date": context.get("market_data_cutoff_date"),
             })
         )
@@ -834,8 +870,11 @@ def _source_campaign(db: Any, run_id: str) -> dict[str, Any]:
     document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": str(run_id)})
     if document is None:
         raise ModelTuningNotFound("Source tuning campaign not found.")
-    if str(document.get("status") or "") != "completed" or str(document.get("method") or "") != TUNING_METHOD:
-        raise ModelTuningConflict("CARO can import observations only from a completed Latin Hypercube campaign.")
+    if not _is_pristine_completed_latin_campaign(document):
+        raise ModelTuningConflict(
+            "CARO can import observations only from a fully completed Latin Hypercube campaign "
+            "with zero failed or cancelled candidates."
+        )
     if list(document.get("search_space") or []) != [dict(item) for item in _SEARCH_SPACE]:
         raise ModelTuningConflict("The source tuning campaign uses a different LightGBM search space.")
     return document
@@ -1000,6 +1039,7 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
         "anchor_ending_capital": ((document.get("probability_anchor") or {}).get("metrics") or {}).get("ending_capital") if isinstance((document.get("probability_anchor") or {}).get("metrics"), dict) else None,
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),
         "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
+        "market_data_snapshot_id": document.get("market_data_snapshot_id"),
         "control_candidate_id": document.get("control_candidate_id"),
         "best_candidate_id": document.get("best_candidate_id"),
         "best_exploratory_candidate_id": document.get("best_exploratory_candidate_id"),
@@ -1048,6 +1088,7 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
             "probability_anchor": deepcopy(document.get("probability_anchor") or None),
             "execution_context_hash": document.get("execution_context_hash"),
             "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
+            "market_data_snapshot_id": document.get("market_data_snapshot_id"),
             "market_data_cutoff_date": document.get("market_data_cutoff_date"),
             "adoption_context_compatible": document.get("adoption_context_compatible"),
             "control_candidate_id": document.get("control_candidate_id"),
@@ -1118,7 +1159,8 @@ def start_model_tuning(
     source_strategy_profile_revision: int | None = None
     adoption_context_compatible = True
     expected_market_data_signature: str | None = None
-    market_data_signature_source = "control_candidate"
+    market_data_snapshot_id: str | None = None
+    market_data_signature_source = "frozen_campaign_snapshot"
 
     if normalized_method == PROBABILITY_METHOD and source_tuning_run_id:
         source = _source_campaign(db, source_tuning_run_id)
@@ -1133,7 +1175,8 @@ def start_model_tuning(
             raise ModelTuningConflict("The source campaign no longer references its baseline Backtest.")
         execution_context = _frozen_execution_context_from_campaign(db, source)
         expected_market_data_signature = str(execution_context.get("market_data_signature_sha256") or "").strip() or None
-        market_data_signature_source = "source_campaign"
+        market_data_snapshot_id = str(execution_context.get("market_data_snapshot_id") or "").strip().lower() or None
+        market_data_signature_source = "source_campaign_snapshot" if market_data_snapshot_id else "source_campaign_legacy_signature"
         base_values = deepcopy(anchor.get("settings") or {})
         adoption_context_compatible = False
         if str(strategy.get("id") or "") == str(source.get("strategy_profile_id") or ""):
@@ -1228,6 +1271,7 @@ def start_model_tuning(
         "generated_candidates": len(candidates),
         "completed_candidates": 0,
         "failed_candidates": 0,
+        "cancelled_candidates": 0,
         "seed": int(seed),
         "search_space": [dict(item) for item in _SEARCH_SPACE],
         "tuned_parameters": list(_TUNED_NAMES),
@@ -1250,6 +1294,7 @@ def start_model_tuning(
         "execution_request_snapshot": bson_value(execution_context["request"]),
         "execution_context_hash": execution_context.get("context_hash"),
         "expected_market_data_signature_sha256": expected_market_data_signature,
+        "market_data_snapshot_id": market_data_snapshot_id,
         "market_data_signature_source": market_data_signature_source,
         "market_data_signature_established_by_candidate_id": None,
         "market_data_cutoff_date": execution_context.get("market_data_cutoff_date"),
@@ -1286,6 +1331,65 @@ def start_model_tuning(
     return public_model_tuning_run(db, document)
 
 
+def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[str, Any]:
+    """Bind a campaign to immutable candles before the first candidate runs."""
+    run_id = str(document.get("id") or "")
+    expected = str(document.get("expected_market_data_signature_sha256") or "").strip().lower() or None
+    snapshot_id = str(document.get("market_data_snapshot_id") or "").strip().lower() or None
+
+    if snapshot_id:
+        snapshot = require_tuning_market_snapshot(db, snapshot_id)
+        actual = str(snapshot.get("signature") or snapshot.get("snapshot_id") or "").strip().lower()
+        if expected and actual != expected:
+            raise RuntimeError(
+                f"FrozenTuningSnapshotMismatch: campaign expects {expected}, but snapshot {snapshot_id} reports {actual}."
+            )
+        signature = actual
+        source = "source_campaign_snapshot" if document.get("source_tuning_run_id") else "frozen_campaign_snapshot"
+    else:
+        try:
+            snapshot = freeze_tuning_market_snapshot(
+                db,
+                deepcopy(document.get("execution_request_snapshot") or {}),
+                expected_signature=expected if document.get("source_tuning_run_id") else None,
+            )
+        except TuningMarketSnapshotMismatch:
+            raise
+        signature = str(snapshot.get("signature") or snapshot.get("snapshot_id") or "").strip().lower()
+        snapshot_id = str(snapshot.get("snapshot_id") or signature).strip().lower()
+        source = "legacy_source_recovered_snapshot" if document.get("source_tuning_run_id") else "frozen_campaign_snapshot"
+
+    request_snapshot = deepcopy(document.get("execution_request_snapshot") or {})
+    request_snapshot["research_market_data_mode"] = "database_only"
+    request_snapshot["research_market_data_snapshot_id"] = snapshot_id
+    request_snapshot["expected_market_data_signature_sha256"] = signature
+    now = utc_now()
+    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+        {"id": run_id},
+        {
+            "$set": {
+                "execution_request_snapshot": bson_value(request_snapshot),
+                "expected_market_data_signature_sha256": signature,
+                "market_data_snapshot_id": snapshot_id,
+                "market_data_signature_source": source,
+                "market_data_signature_established_by_candidate_id": None,
+                "updated_at": now,
+            }
+        },
+    )
+    document["execution_request_snapshot"] = request_snapshot
+    document["expected_market_data_signature_sha256"] = signature
+    document["market_data_snapshot_id"] = snapshot_id
+    document["market_data_signature_source"] = source
+    _append_campaign_event(
+        db,
+        run_id,
+        message=f"Frozen market-data snapshot {snapshot_id} bound to the complete tuning campaign.",
+        stage="market_data_snapshot_frozen",
+    )
+    return document
+
+
 def run_model_tuning(run_id: str) -> None:
     db = database()
     from ..api.routers.jobs import queue_backtest_job  # Lazy import avoids router/service cycles.
@@ -1299,6 +1403,7 @@ def run_model_tuning(run_id: str) -> None:
             {"$set": {"status": "running", "phase": "running", "started_at": utc_now(), "updated_at": utc_now()}},
         )
         _append_campaign_event(db, run_id, message="Integrated tuning worker started.", stage="running")
+        document = _ensure_campaign_market_snapshot(db, document)
 
         while True:
             document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or {}
@@ -1334,11 +1439,27 @@ def run_model_tuning(run_id: str) -> None:
                 continue
 
             if pending is None:
+                failed_count = int(document.get("failed_candidates") or 0)
+                cancelled_count = int(document.get("cancelled_candidates") or 0)
+                completed_count = int(document.get("completed_candidates") or 0)
+                total_count = int(document.get("total_candidates") or len(candidates))
+                if failed_count or cancelled_count or completed_count != total_count:
+                    message = (
+                        "Campaign is incomplete and cannot be certified or reused: "
+                        f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, "
+                        f"expected={total_count}. Start a new campaign."
+                    )
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {"status": "failed", "phase": "incomplete_campaign", "failure_type": "IncompleteTuningCampaign", "failure_message": message, "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
+                    )
+                    _append_campaign_event(db, run_id, message=message, level="error", stage="incomplete_campaign")
+                    return
                 db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                     {"id": run_id},
                     {"$set": {"status": "completed", "phase": "completed", "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
                 )
-                _append_campaign_event(db, run_id, message="Campaign completed.", stage="completed")
+                _append_campaign_event(db, run_id, message="Campaign completed with every candidate successful.", stage="completed")
                 return
 
             candidate_id = int(pending["candidate_id"])
@@ -1358,6 +1479,30 @@ def run_model_tuning(run_id: str) -> None:
                 db, run_id, message=f"Candidate #{candidate_id} started.",
                 stage="running_candidate", candidate_id=candidate_id,
             )
+            stop_state = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}, {"stop_requested": 1}) or {}
+            if bool(stop_state.get("stop_requested")):
+                now = utc_now()
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                    {"id": run_id, "candidates.candidate_id": candidate_id},
+                    {
+                        "$set": {
+                            "candidates.$.status": "cancelled",
+                            "candidates.$.finished_at": now,
+                            "status": "stopped",
+                            "phase": "stopped",
+                            "finished_at": now,
+                            "updated_at": now,
+                            "current_candidate_id": None,
+                            "current_job_id": None,
+                        },
+                        "$inc": {"cancelled_candidates": 1},
+                    },
+                )
+                _append_campaign_event(
+                    db, run_id, message=f"Candidate #{candidate_id} cancelled before execution because Stop was requested.",
+                    stage="candidate_cancelled", candidate_id=candidate_id,
+                )
+                return
             job_id: str | None = None
             try:
                 execution_metadata = {
@@ -1368,7 +1513,9 @@ def run_model_tuning(run_id: str) -> None:
                 }
                 candidate_request = deepcopy(document.get("execution_request_snapshot") or {})
                 expected_signature = str(document.get("expected_market_data_signature_sha256") or "").strip().lower()
+                snapshot_id = str(document.get("market_data_snapshot_id") or "").strip().lower()
                 candidate_request["expected_market_data_signature_sha256"] = expected_signature or None
+                candidate_request["research_market_data_snapshot_id"] = snapshot_id or None
                 queued = queue_backtest_job(
                     model_values_override=dict(pending["settings"]),
                     start_thread=False,
@@ -1387,8 +1534,39 @@ def run_model_tuning(run_id: str) -> None:
                     db, run_id, message=f"Backtest job {job_id} queued for candidate #{candidate_id}.",
                     stage="backtest_queued", candidate_id=candidate_id, job_id=job_id,
                 )
+                stop_state = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}, {"stop_requested": 1}) or {}
+                if bool(stop_state.get("stop_requested")):
+                    request_job_cancel(job_id, reason=f"Model tuning {run_id} stopped by user.")
                 run_job(job_id)
                 job = db[JOBS_COLLECTION].find_one({"id": job_id}) or {}
+                if str(job.get("status") or "") == "cancelled":
+                    _cleanup_job_artifacts(db, job_id)
+                    now = utc_now()
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id, "candidates.candidate_id": candidate_id},
+                        {
+                            "$set": {
+                                "candidates.$.status": "cancelled",
+                                "candidates.$.finished_at": now,
+                                "candidates.$.error": None,
+                                "candidates.$.failure_type": None,
+                                "candidates.$.failure_message": None,
+                                "status": "stopped",
+                                "phase": "stopped",
+                                "finished_at": now,
+                                "updated_at": now,
+                                "current_candidate_id": None,
+                                "current_job_id": None,
+                            },
+                            "$inc": {"cancelled_candidates": 1},
+                        },
+                    )
+                    _refresh_campaign_ranking(db, run_id)
+                    _append_campaign_event(
+                        db, run_id, message=f"Candidate #{candidate_id} cancelled and campaign stopped by user request.",
+                        stage="candidate_cancelled", candidate_id=candidate_id, job_id=job_id,
+                    )
+                    return
                 if job.get("status") != "completed":
                     raise RuntimeError("The candidate backtest did not complete successfully.")
                 metrics = _find_portfolio_metrics(db, job_id)
@@ -1414,14 +1592,14 @@ def run_model_tuning(run_id: str) -> None:
                         {
                             "$set": {
                                 "expected_market_data_signature_sha256": actual_signature,
-                                "market_data_signature_source": "control_candidate",
+                                "market_data_signature_source": "legacy_control_candidate",
                                 "market_data_signature_established_by_candidate_id": candidate_id,
                                 "updated_at": utc_now(),
                             }
                         },
                     )
                     document["expected_market_data_signature_sha256"] = actual_signature
-                    document["market_data_signature_source"] = "control_candidate"
+                    document["market_data_signature_source"] = "legacy_control_candidate"
                     document["market_data_signature_established_by_candidate_id"] = candidate_id
                     _append_campaign_event(
                         db, run_id,
@@ -1516,19 +1694,29 @@ def run_model_tuning(run_id: str) -> None:
                     or "MarketDataSignatureMissing" in str(exc)
                 )
                 control_failure = bool(pending.get("is_control"))
-                if reproducibility_failure or control_failure:
-                    terminal_type = failure_type if reproducibility_failure else "ControlCandidateFailed"
-                    terminal_phase = "reproducibility_guard_failed" if reproducibility_failure else "control_failed"
-                    terminal_message = failure_message or _sanitize_tuning_log_line(str(exc))[:500]
-                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
-                        {"id": run_id},
-                        {"$set": {"status": "failed", "phase": terminal_phase, "failure_type": terminal_type, "failure_message": terminal_message, "finished_at": utc_now(), "updated_at": utc_now()}},
-                    )
-                    _append_campaign_event(
-                        db, run_id, message=terminal_message,
-                        level="error", stage=terminal_phase, candidate_id=candidate_id, job_id=job_id,
-                    )
-                    return
+                terminal_type = (
+                    failure_type
+                    if reproducibility_failure
+                    else ("ControlCandidateFailed" if control_failure else "CandidateFailed")
+                )
+                terminal_phase = (
+                    "reproducibility_guard_failed"
+                    if reproducibility_failure
+                    else ("control_failed" if control_failure else "candidate_failed_terminal")
+                )
+                terminal_message = failure_message or _sanitize_tuning_log_line(str(exc))[:500]
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                    {"id": run_id},
+                    {"$set": {"status": "failed", "phase": terminal_phase, "failure_type": terminal_type, "failure_message": terminal_message, "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
+                )
+                _append_campaign_event(
+                    db, run_id, message=(
+                        f"Campaign invalidated after candidate #{candidate_id} failed. "
+                        "No remaining candidate will run and this campaign cannot seed CARO."
+                    ),
+                    level="error", stage=terminal_phase, candidate_id=candidate_id, job_id=job_id,
+                )
+                return
     except Exception as exc:
         failure_message = _sanitize_tuning_log_line(str(exc))[:500]
         db[MODEL_TUNING_RUNS_COLLECTION].update_one(
@@ -1542,12 +1730,11 @@ def run_model_tuning(run_id: str) -> None:
 
 
 def recover_integrated_model_tuning_runs(db: Any) -> int:
-    """Recover active in-process tuning campaigns after an API/container restart.
+    """Invalidate unfinished tuning campaigns after an API/container restart.
 
-    A candidate that was running when the process disappeared is reset to pending and
-    rerun from the campaign's immutable execution snapshot. Completed candidate
-    summaries are preserved. This favors reproducibility over attempting to reuse
-    partially written raw artifacts.
+    Integrated tuning is deliberately fail-closed: partial research is never resumed
+    and never becomes CARO evidence. The user must start a new campaign explicitly.
+    Completed historical campaigns are untouched.
     """
     documents = list(
         db[MODEL_TUNING_RUNS_COLLECTION].find(
@@ -1560,65 +1747,77 @@ def recover_integrated_model_tuning_runs(db: Any) -> int:
             }
         )
     )
-    recovered = 0
+    invalidated = 0
     for document in documents:
         run_id = str(document.get("id") or "")
         if not run_id:
             continue
         candidates = deepcopy(document.get("candidates") or [])
-        reset_jobs: list[str] = []
+        cancelled_now = 0
+        job_ids: set[str] = set()
+        current_job_id = str(document.get("current_job_id") or "").strip()
+        if current_job_id:
+            job_ids.add(current_job_id)
+
+        now = utc_now()
         for candidate in candidates:
-            if candidate.get("status") != "running":
+            status = str(candidate.get("status") or "")
+            if status not in {"pending", "running"}:
                 continue
-            job_id = str(candidate.get("job_id") or "")
+            job_id = str(candidate.get("job_id") or "").strip()
             if job_id:
-                reset_jobs.append(job_id)
-            candidate["status"] = "pending"
-            candidate["job_id"] = None
-            candidate["started_at"] = None
-            candidate["finished_at"] = None
-            candidate["error"] = None
-            candidate["retry_count"] = int(candidate.get("retry_count") or 0) + 1
-
-        for job_id in reset_jobs:
-            _cleanup_job_artifacts(db, job_id)
-
-        if bool(document.get("stop_requested")):
-            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
-                {"id": run_id},
-                {
-                    "$set": {
-                        "candidates": bson_value(candidates),
-                        "status": "stopped",
-                        "phase": "stopped_after_restart",
-                        "current_candidate_id": None,
-                        "current_job_id": None,
-                        "finished_at": utc_now(),
-                        "updated_at": utc_now(),
-                    }
-                },
+                job_ids.add(job_id)
+            candidate["status"] = "cancelled"
+            candidate["finished_at"] = now
+            candidate["failure_type"] = "CampaignRestarted"
+            candidate["failure_message"] = (
+                "Candidate invalidated because the API restarted before the campaign completed."
             )
-            recovered += 1
-            continue
+            cancelled_now += 1
+
+        for job_id in job_ids:
+            db[JOBS_COLLECTION].update_one(
+                {"id": job_id, "status": {"$in": ["queued", "running"]}},
+                {"$set": {
+                    "status": "cancelled",
+                    "stage": "Cancelled after API restart",
+                    "cancel_requested": True,
+                    "cancel_reason": f"Model tuning {run_id} invalidated after API restart.",
+                    "finished_at": now,
+                    "updated_at": now,
+                }},
+            )
+            _cleanup_job_artifacts(db, job_id)
 
         db[MODEL_TUNING_RUNS_COLLECTION].update_one(
             {"id": run_id},
             {
                 "$set": {
                     "candidates": bson_value(candidates),
-                    "status": "queued",
-                    "phase": "recovered_after_restart",
+                    "status": "stopped",
+                    "phase": "invalidated_after_restart",
+                    "failure_type": "CampaignRestarted",
+                    "failure_message": (
+                        "Unfinished tuning campaigns are not resumed after an API restart. "
+                        "Start a new campaign; no partial result will be reused."
+                    ),
                     "current_candidate_id": None,
                     "current_job_id": None,
-                    "updated_at": utc_now(),
+                    "finished_at": now,
+                    "updated_at": now,
                 },
-                "$inc": {"restart_recovery_count": 1},
+                "$inc": {"cancelled_candidates": cancelled_now, "restart_invalidation_count": 1},
             },
         )
-        threading.Thread(target=run_model_tuning, args=(run_id,), daemon=True).start()
-        recovered += 1
-    return recovered
-
+        _append_campaign_event(
+            db,
+            run_id,
+            message="Campaign invalidated after API restart. Partial results will not be resumed or reused.",
+            level="error",
+            stage="invalidated_after_restart",
+        )
+        invalidated += 1
+    return invalidated
 
 
 def request_model_tuning_stop(db: Any, run_id: str) -> dict[str, Any]:
@@ -1627,19 +1826,48 @@ def request_model_tuning_stop(db: Any, run_id: str) -> dict[str, Any]:
         raise ModelTuningNotFound("Model tuning run not found.")
     if str(document.get("status") or "") not in _ACTIVE_STATUSES:
         return public_model_tuning_run(db, document)
+
     running = any(item.get("status") == "running" for item in document.get("candidates") or [])
+    current_job_id = str(document.get("current_job_id") or "").strip()
     now = utc_now()
     if not running:
         updated = db[MODEL_TUNING_RUNS_COLLECTION].find_one_and_update(
             {"id": run_id},
-            {"$set": {"stop_requested": True, "status": "stopped", "phase": "stopped", "finished_at": now, "updated_at": now}},
+            {"$set": {
+                "stop_requested": True,
+                "status": "stopped",
+                "phase": "stopped",
+                "finished_at": now,
+                "updated_at": now,
+                "current_candidate_id": None,
+                "current_job_id": None,
+            }},
             return_document=ReturnDocument.AFTER,
         )
+        _append_campaign_event(db, run_id, message="Campaign stopped before another candidate started.", stage="stopped")
     else:
         updated = db[MODEL_TUNING_RUNS_COLLECTION].find_one_and_update(
             {"id": run_id},
-            {"$set": {"stop_requested": True, "status": "stop_requested", "phase": "finishing_active_candidates", "updated_at": now}},
+            {"$set": {
+                "stop_requested": True,
+                "status": "stop_requested",
+                "phase": "cancelling_active_candidate",
+                "updated_at": now,
+            }},
             return_document=ReturnDocument.AFTER,
+        )
+        if current_job_id:
+            request_job_cancel(current_job_id, reason=f"Model tuning {run_id} stopped by user.")
+        _append_campaign_event(
+            db, run_id,
+            message=(
+                f"Stop requested. Cancelling active candidate job {current_job_id}."
+                if current_job_id else
+                "Stop requested. The active candidate will be cancelled before execution continues."
+            ),
+            stage="cancelling_active_candidate",
+            candidate_id=document.get("current_candidate_id"),
+            job_id=current_job_id or None,
         )
     return public_model_tuning_run(db, updated or document)
 
@@ -1745,7 +1973,11 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
             current_jobs[str(job.get("id") or "")] = job
     candidates = [_public_candidate(item, current_jobs) for item in raw_candidates]
     total = max(1, int(document.get("total_candidates") or len(candidates) or 1))
-    completed = int(document.get("completed_candidates") or 0) + int(document.get("failed_candidates") or 0)
+    completed = (
+        int(document.get("completed_candidates") or 0)
+        + int(document.get("failed_candidates") or 0)
+        + int(document.get("cancelled_candidates") or 0)
+    )
     fractional_active = sum(float(job.get("progress") or 0.0) / 100.0 for job in current_jobs.values())
     progress = min(100.0, 100.0 * (completed + fractional_active) / total)
     if current_jobs and str(document.get("status") or "") in _ACTIVE_STATUSES:
@@ -1765,6 +1997,7 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "generated_candidates": int(document.get("generated_candidates") or len(candidates)),
         "completed_candidates": int(document.get("completed_candidates") or 0),
         "failed_candidates": int(document.get("failed_candidates") or 0),
+        "cancelled_candidates": int(document.get("cancelled_candidates") or 0),
         "progress": progress,
         "seed": int(document.get("seed") or DEFAULT_SEED),
         "search_space": deepcopy(document.get("search_space") or []),
@@ -1774,6 +2007,7 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "imported_observation_count": int(document.get("imported_observation_count") or 0),
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),
         "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
+        "market_data_snapshot_id": document.get("market_data_snapshot_id"),
         "execution_context_hash": document.get("execution_context_hash"),
         "adoption_context_compatible": bool(document.get("adoption_context_compatible", True)),
         "strategy_profile_id": document.get("strategy_profile_id"),

@@ -10,6 +10,7 @@ import pandas as pd
 from pydantic import ValidationError
 from pymongo import ReturnDocument
 
+from ..core.config import SWING_STRATEGY_MODES
 from ..engine.live_model_signal import build_live_model_decision
 from ..engine.market_data import load_market_bars, validate_and_clean_bars
 from ..infrastructure.persistence.mongo_repository import (
@@ -101,7 +102,7 @@ def _validated_context(
 
     if not settings.enabled:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
-    if strategy.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
+    if strategy.strategy_mode not in SWING_STRATEGY_MODES:
         raise RuntimeError("Paper trading requires the validated compound-rotation strategy contract.")
     if strategy.rotation_models != ["xgboost_utility"]:
         raise RuntimeError("The legacy strategy model marker changed unexpectedly.")
@@ -250,7 +251,7 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
     settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
     if not settings.enabled:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
-    if strategy.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
+    if strategy.strategy_mode not in SWING_STRATEGY_MODES:
         raise RuntimeError("The locked strategy is not the XGBoost swing strategy.")
 
     existing = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"})

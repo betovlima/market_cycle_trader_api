@@ -49,6 +49,7 @@ ASSET_DISCOVERY_STATE_COLLECTION = "asset_discovery_state"
 MODEL_RESEARCH_SETTINGS_COLLECTION = "model_research_settings"
 MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION = "model_research_settings_history"
 MODEL_TUNING_RUNS_COLLECTION = "model_tuning_runs"
+MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION = "model_tuning_market_snapshots"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -216,6 +217,16 @@ def ensure_database(db: Database) -> None:
     db[PARAMETER_BOOTSTRAP_RUNS_COLLECTION].create_index(
         [("finished_at", DESCENDING)],
         name="ix_parameter_bootstrap_finished",
+    )
+    db[MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION].create_index(
+        [("snapshot_id", ASCENDING), ("kind", ASCENDING)],
+        name="ix_model_tuning_snapshot_kind",
+    )
+    db[MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION].create_index(
+        [("snapshot_id", ASCENDING), ("symbol", ASCENDING)],
+        unique=True,
+        sparse=True,
+        name="uq_model_tuning_snapshot_symbol",
     )
     db[ASSET_DISCOVERY_SETTINGS_COLLECTION].create_index(
         [("updated_at", DESCENDING)],

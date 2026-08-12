@@ -7,7 +7,9 @@ import numpy as np
 import pandas as pd
 
 from .capital_rotation import (
+    SUPPORTED_ROTATION_MODES,
     _fit_xgb_models,
+    _risk_off_enabled,
     _simple_policy_growth,
     _xgb_policy,
     prepare_rotation_panel,
@@ -54,8 +56,8 @@ def build_live_xgboost_decision(
     * any position change is intended for the next regular-session open.
     """
 
-    if config.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise ValueError("Paper execution supports only COMPOUND_ROTATION_SWING_XGBOOST.")
+    if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
+        raise ValueError(f"Unsupported Paper compound-rotation strategy mode: {config.strategy_mode}.")
     if list(config.rotation_models) != ["xgboost_utility"]:
         raise ValueError("Paper execution requires rotation_models=['xgboost_utility'].")
     if config.timeframe != "1Day":
@@ -110,6 +112,19 @@ def build_live_xgboost_decision(
     )
     if fallback_reason:
         fallback_reasons.append(fallback_reason)
+    calibration_cash_edge_models = None
+    if _risk_off_enabled(config):
+        calibration_cash_edge_models, effective_device, fallback_reason = _fit_xgb_models(
+            frames,
+            symbols,
+            train_dates,
+            config,
+            effective_device,
+            phase="live_calibration_cash_edge",
+            target_column="forward_cash_edge",
+        )
+        if fallback_reason:
+            fallback_reasons.append(fallback_reason)
 
     candidates = tuple(float(value) for value in config.rotation_switch_margin_candidates)
     if not candidates:
@@ -124,6 +139,7 @@ def build_live_xgboost_decision(
             symbols,
             config,
             candidate,
+            cash_edge_models=calibration_cash_edge_models,
         )
         score = _simple_policy_growth(
             calibration_policy,
@@ -145,6 +161,19 @@ def build_live_xgboost_decision(
     )
     if fallback_reason:
         fallback_reasons.append(fallback_reason)
+    final_cash_edge_models = None
+    if _risk_off_enabled(config):
+        final_cash_edge_models, effective_device, fallback_reason = _fit_xgb_models(
+            frames,
+            symbols,
+            final_fit_dates,
+            config,
+            effective_device,
+            phase="live_final_cash_edge",
+            target_column="forward_cash_edge",
+        )
+        if fallback_reason:
+            fallback_reasons.append(fallback_reason)
 
     effective_margin = max(
         float(config.rotation_switch_margin),
@@ -174,13 +203,25 @@ def build_live_xgboost_decision(
         symbols,
         config,
         effective_margin,
+        cash_edge_models=final_cash_edge_models,
     )
     target_position, selected_utility = policy(
         decision_date,
         current_position,
         int(holding_sessions),
     )
-    raw_best_position = int(np.nanargmax(utilities_array))
+    if _risk_off_enabled(config):
+        finite_asset_positions = [
+            position
+            for position in range(1, len(utilities_array))
+            if np.isfinite(utilities_array[position])
+        ]
+        raw_best_position = max(
+            finite_asset_positions,
+            key=lambda position: float(utilities_array[position]),
+        )
+    else:
+        raw_best_position = int(np.nanargmax(utilities_array))
 
     utilities = {
         label: float(utilities_array[index])

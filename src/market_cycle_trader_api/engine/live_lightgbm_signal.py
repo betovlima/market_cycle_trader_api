@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .capital_rotation import _simple_policy_growth, _xgb_policy, prepare_rotation_panel
+from .capital_rotation import SUPPORTED_ROTATION_MODES, _risk_off_enabled, _simple_policy_growth, _xgb_policy, prepare_rotation_panel
 from .live_policy import build_live_rotation_policy, live_model_utilities
 from .research_challengers import _lightgbm_fit_models
 
@@ -45,8 +45,8 @@ def build_live_lightgbm_decision(
     fitter changes, using the immutable LightGBM settings snapshot stored in Winner.
     """
 
-    if config.strategy_mode != "COMPOUND_ROTATION_SWING_XGBOOST":
-        raise ValueError("Paper execution requires the validated compound-rotation strategy contract.")
+    if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
+        raise ValueError(f"Unsupported Paper compound-rotation strategy mode: {config.strategy_mode}.")
     if list(config.rotation_models) != ["xgboost_utility"]:
         raise ValueError("The legacy strategy model marker changed unexpectedly.")
     if config.timeframe != "1Day":
@@ -95,6 +95,16 @@ def build_live_lightgbm_decision(
         config,
         phase="live_calibration",
     )
+    calibration_cash_edge_models = None
+    if _risk_off_enabled(config):
+        calibration_cash_edge_models = _lightgbm_fit_models(
+            frames,
+            symbols,
+            train_dates,
+            config,
+            phase="live_calibration_cash_edge",
+            target_column="forward_cash_edge",
+        )
 
     candidates = tuple(float(value) for value in config.rotation_switch_margin_candidates)
     if not candidates:
@@ -109,6 +119,7 @@ def build_live_lightgbm_decision(
             symbols,
             config,
             candidate,
+            cash_edge_models=calibration_cash_edge_models,
         )
         score = _simple_policy_growth(
             calibration_policy,
@@ -128,6 +139,16 @@ def build_live_lightgbm_decision(
         config,
         phase="live_final",
     )
+    final_cash_edge_models = None
+    if _risk_off_enabled(config):
+        final_cash_edge_models = _lightgbm_fit_models(
+            frames,
+            symbols,
+            final_fit_dates,
+            config,
+            phase="live_final_cash_edge",
+            target_column="forward_cash_edge",
+        )
     effective_margin = max(float(config.rotation_switch_margin), float(best_candidate))
 
     labels = ["CASH", *symbols]
@@ -144,6 +165,7 @@ def build_live_lightgbm_decision(
         symbols,
         config,
         effective_margin,
+        cash_edge_models=final_cash_edge_models,
     )
     target_position, selected_utility = policy(
         decision_date,
@@ -158,7 +180,18 @@ def build_live_lightgbm_decision(
     )
     if not np.isfinite(utilities_array[1:]).any():
         raise ValueError("The live LightGBM models produced no finite asset utilities.")
-    raw_best_position = int(np.nanargmax(utilities_array))
+    if _risk_off_enabled(config):
+        finite_asset_positions = [
+            position
+            for position in range(1, len(utilities_array))
+            if np.isfinite(utilities_array[position])
+        ]
+        raw_best_position = max(
+            finite_asset_positions,
+            key=lambda position: float(utilities_array[position]),
+        )
+    else:
+        raw_best_position = int(np.nanargmax(utilities_array))
     utilities = {
         label: float(utilities_array[index])
         for index, label in enumerate(labels)

@@ -11,6 +11,13 @@ from threadpoolctl import threadpool_limits
 
 from .rotation_diagnostics import enrich_trade_diagnostics
 
+LEGACY_ROTATION_MODE = 'COMPOUND_ROTATION_SWING_XGBOOST'
+RISK_OFF_ROTATION_MODE = 'COMPOUND_ROTATION_SWING_RISK_OFF'
+SUPPORTED_ROTATION_MODES = frozenset({LEGACY_ROTATION_MODE, RISK_OFF_ROTATION_MODE})
+
+def _risk_off_enabled(config: Any) -> bool:
+    return str(getattr(config, 'strategy_mode', LEGACY_ROTATION_MODE)) == RISK_OFF_ROTATION_MODE
+
 ROTATION_FEATURES = [
     'return_1', 'return_2', 'return_3', 'return_5', 'return_10', 'return_20',
     'return_40', 'return_60', 'return_120',
@@ -242,6 +249,11 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     weighted_utility = np.nansum(utility_components * weights.reshape(1, -1), axis=1)
     invalid_rows = np.isnan(utility_components).any(axis=1)
     weighted_utility[invalid_rows] = np.nan
+    # Absolute opportunity versus cash. This target intentionally excludes the
+    # always-nonnegative movement/trend ranking bonuses so zero retains an
+    # economic meaning: the modeled risk-adjusted asset opportunity is no better
+    # than remaining in cash.
+    data['forward_cash_edge'] = weighted_utility
     data['forward_movement_capture'] = movement_capture
     data['forward_trend_persistence'] = trend_persistence
     data['forward_risk_adjusted_utility'] = (
@@ -389,6 +401,7 @@ def _fit_xgb_models(
     phase: str = 'training',
     progress_callback: Callable[[int, int, str], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
+    target_column: str = 'forward_risk_adjusted_utility',
 ) -> tuple[dict[str, Any], str, str | None]:
     try:
         from xgboost import XGBRegressor
@@ -415,7 +428,7 @@ def _fit_xgb_models(
         with _numeric_thread_context(config):
             for position, symbol in enumerate(symbols, start=1):
                 frame = frames[symbol].loc[train_dates].dropna(
-                    subset=['forward_risk_adjusted_utility', *ROTATION_FEATURES]
+                    subset=[target_column, *ROTATION_FEATURES]
                 )
                 if len(frame) < minimum_rows:
                     if symbol in anchor_assets:
@@ -434,7 +447,7 @@ def _fit_xgb_models(
                 technical(
                     f'phase={phase} event=model_start model={position}/{total_symbols} '
                     f'asset={symbol} rows={len(frame)} features={len(ROTATION_FEATURES)} '
-                    f'device={effective_device}'
+                    f'target={target_column} device={effective_device}'
                 )
                 model = XGBRegressor(
                     n_estimators=int(config.rotation_xgb_n_estimators),
@@ -454,7 +467,7 @@ def _fit_xgb_models(
                 )
                 model.fit(
                     frame[ROTATION_FEATURES],
-                    frame['forward_risk_adjusted_utility'],
+                    frame[target_column],
                 )
                 fitted[symbol] = model
                 duration = time.perf_counter() - model_started
@@ -525,15 +538,23 @@ def _xgb_policy(
     config: Any,
     switch_margin: float,
     *,
+    cash_edge_models: dict[str, Any] | None = None,
     decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     fold_id: int | None = None,
     calibrated_switch_margin: float | None = None,
 ) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
-    """Build the XGBoost policy and optionally record strategy-neutral diagnostics.
+    """Build the rotation policy with optional explicit risk-off semantics.
 
-    The diagnostic path observes the utilities already computed by the policy. It
-    never changes ranking, thresholds, guards or the returned action/score.
+    Legacy mode preserves the historical Winner behavior exactly. Risk-off mode
+    keeps the enriched utility model for cross-sectional ranking, but uses a
+    second model trained on ``forward_cash_edge`` to decide whether exposure is
+    economically preferable to cash. The cash edge is centered on zero because
+    it excludes the non-negative movement-capture and trend-persistence bonuses.
     """
+
+    risk_off = _risk_off_enabled(config)
+    if risk_off and cash_edge_models is None:
+        raise ValueError('Explicit risk-off mode requires cash-edge models.')
 
     def position_asset(position: int) -> str:
         return 'CASH' if position <= 0 else symbols[position - 1]
@@ -543,23 +564,54 @@ def _xgb_policy(
 
     def policy(timestamp: pd.Timestamp, current_position: int, holding_days: int) -> tuple[int, float]:
         utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
-        best = int(np.nanargmax(utilities))
-        best_value = float(utilities[best])
-        current_value = float(utilities[current_position])
-        minimum = float(config.rotation_cash_threshold)
-        required = max(float(config.rotation_switch_margin), float(switch_margin))
+        if not np.isfinite(utilities[1:]).any():
+            return (0, 0.0)
 
-        ranked_assets = sorted(
+        cash_edges = (
+            _xgb_utilities(cash_edge_models or {}, frames, symbols, timestamp, config)
+            if risk_off
+            else utilities.copy()
+        )
+        ranked_positions = sorted(
             (
-                (symbols[position - 1], float(utilities[position]))
+                position
                 for position in range(1, len(utilities))
                 if np.isfinite(utilities[position])
             ),
-            key=lambda item: (-item[1], item[0]),
+            key=lambda position: (-float(utilities[position]), symbols[position - 1]),
         )
+        if not ranked_positions:
+            return (0, 0.0)
+
+        raw_best_asset_position = ranked_positions[0]
+        legacy_best = int(np.nanargmax(utilities))
+        best = raw_best_asset_position if risk_off else legacy_best
+        best_value = float(utilities[best])
+        current_value = float(utilities[current_position])
+        current_cash_edge = float(cash_edges[current_position]) if current_position < len(cash_edges) else float('-inf')
+        minimum = float(config.rotation_cash_threshold)
+        entry_threshold = minimum + float(config.rotation_min_expected_edge)
+        required = max(float(config.rotation_switch_margin), float(switch_margin))
+
+        ranked_assets = [
+            (symbols[position - 1], float(utilities[position]))
+            for position in ranked_positions
+        ]
         best_asset, best_asset_score = ranked_assets[0] if ranked_assets else (None, None)
         second_asset, second_asset_score = (
             ranked_assets[1] if len(ranked_assets) > 1 else (None, None)
+        )
+        best_position = ranked_positions[0] if ranked_positions else 0
+        best_cash_edge = (
+            float(cash_edges[best_position])
+            if best_position > 0 and np.isfinite(cash_edges[best_position])
+            else None
+        )
+        second_position = ranked_positions[1] if len(ranked_positions) > 1 else 0
+        second_cash_edge = (
+            float(cash_edges[second_position])
+            if second_position > 0 and np.isfinite(cash_edges[second_position])
+            else None
         )
         best_vs_second_gap = (
             float(best_asset_score - second_asset_score)
@@ -625,23 +677,34 @@ def _xgb_policy(
             expected_edge_guard: bool = False,
         ) -> tuple[int, float]:
             if decision_diagnostics is not None:
-                top = ranked_assets[:3]
+                top = ranked_positions[:3]
+                final_cash_edge = (
+                    float(cash_edges[target_position])
+                    if target_position > 0 and np.isfinite(cash_edges[target_position])
+                    else 0.0
+                )
                 diagnostic = {
-                    'decision_diagnostics_schema_version': 2,
+                    'decision_diagnostics_schema_version': 3 if risk_off else 2,
                     'decision_fold_id': fold_id,
+                    'strategy_risk_off_enabled': bool(risk_off),
                     'current_asset': position_asset(current_position),
                     'current_score': finite(current_value),
+                    'current_cash_edge': finite(current_cash_edge),
                     'holding_days_at_decision': int(holding_days),
                     'raw_best_asset': position_asset(best),
                     'raw_best_score': finite(best_value),
                     'best_asset': best_asset,
                     'best_score': finite(best_asset_score) if best_asset_score is not None else None,
+                    'best_cash_edge': best_cash_edge,
                     'second_asset': second_asset,
                     'second_score': finite(second_asset_score) if second_asset_score is not None else None,
+                    'second_cash_edge': second_cash_edge,
                     'best_vs_second_gap': best_vs_second_gap,
                     'best_vs_current_gap': best_vs_current_gap,
-                    'best_vs_cash_gap': float(best_asset_score) if best_asset_score is not None else None,
+                    'best_vs_cash_gap': best_cash_edge if risk_off else (float(best_asset_score) if best_asset_score is not None else None),
                     'cash_score': 0.0,
+                    'cash_exit_threshold': minimum,
+                    'cash_entry_threshold': entry_threshold,
                     'current_asset_rank': current_asset_rank,
                     'universe_score_mean': universe_score_mean,
                     'universe_score_std': universe_score_std,
@@ -661,6 +724,7 @@ def _xgb_policy(
                     'effective_switch_margin': required,
                     'final_action_asset': position_asset(target_position),
                     'final_action_score': finite(final_score),
+                    'final_action_cash_edge': finite(final_cash_edge),
                     'decision_reason': reason,
                     'decision_is_rotation': bool(
                         current_position > 0
@@ -674,7 +738,6 @@ def _xgb_policy(
                     'cash_threshold_guard_applied': bool(cash_threshold_guard),
                     'minimum_expected_edge_guard_applied': bool(expected_edge_guard),
                     'day_trade_constraint_applied': False,
-                    # Compatibility aliases already consumed by protected analytics/exports.
                     'q_current_position': finite(current_value),
                     'q_raw_best': finite(best_value),
                     'q_final_action': finite(final_score),
@@ -687,43 +750,112 @@ def _xgb_policy(
                     'raw_action_asset': position_asset(best),
                 }
                 for rank in range(3):
-                    asset, score = top[rank] if rank < len(top) else (None, None)
+                    position = top[rank] if rank < len(top) else 0
+                    asset = symbols[position - 1] if position > 0 else None
+                    score = float(utilities[position]) if position > 0 else None
+                    edge = float(cash_edges[position]) if position > 0 and np.isfinite(cash_edges[position]) else None
                     diagnostic[f'top_{rank + 1}_asset'] = asset
                     diagnostic[f'top_{rank + 1}_score'] = finite(score) if score is not None else None
+                    diagnostic[f'top_{rank + 1}_cash_edge'] = finite(edge) if edge is not None else None
                 decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
             return (target_position, final_score)
 
-        if (
-            current_position > 0
-            and np.isfinite(current_value)
-            and holding_days < int(config.rotation_min_holding_days)
-        ):
+        if not risk_off:
+            if (
+                current_position > 0
+                and np.isfinite(current_value)
+                and holding_days < int(config.rotation_min_holding_days)
+            ):
+                return finish(
+                    current_position,
+                    current_value,
+                    'MIN_HOLD_GUARD',
+                    min_hold_guard=True,
+                )
+            if best == 0 or best_value <= minimum:
+                return finish(
+                    0,
+                    0.0,
+                    'CASH_THRESHOLD',
+                    cash_threshold_guard=True,
+                )
+            if current_position == 0:
+                if best_value >= entry_threshold:
+                    return finish(best, best_value, 'ENTER_BEST_ASSET')
+                return finish(
+                    0,
+                    0.0,
+                    'MIN_EXPECTED_EDGE_GUARD',
+                    expected_edge_guard=True,
+                )
+            if best == current_position:
+                return finish(current_position, current_value, 'HOLD_CURRENT_BEST')
+            if best_value >= current_value + required:
+                return finish(best, best_value, 'ROTATE_TO_BEST_ASSET')
+            return finish(
+                current_position,
+                current_value,
+                'SWITCH_MARGIN_GUARD',
+                switch_margin_guard=True,
+            )
+
+        def entry_candidates() -> list[int]:
+            return [
+                position
+                for position in ranked_positions
+                if np.isfinite(cash_edges[position])
+                and float(cash_edges[position]) >= entry_threshold
+            ]
+
+        if current_position == 0:
+            candidates = entry_candidates()
+            if not candidates:
+                return finish(
+                    0,
+                    0.0,
+                    'RISK_OFF_ENTRY_GUARD',
+                    expected_edge_guard=True,
+                )
+            target = candidates[0]
+            return finish(target, float(utilities[target]), 'ENTER_BEST_ASSET')
+
+        current_is_investable = (
+            np.isfinite(current_cash_edge)
+            and current_cash_edge > minimum
+        )
+        if not current_is_investable:
+            candidates = entry_candidates()
+            if candidates:
+                target = candidates[0]
+                return finish(
+                    target,
+                    float(utilities[target]),
+                    'RISK_OFF_ROTATE_TO_ELIGIBLE',
+                    cash_threshold_guard=True,
+                )
+            return finish(
+                0,
+                0.0,
+                'RISK_OFF_EXIT_TO_CASH',
+                cash_threshold_guard=True,
+            )
+
+        if holding_days < int(config.rotation_min_holding_days):
             return finish(
                 current_position,
                 current_value,
                 'MIN_HOLD_GUARD',
                 min_hold_guard=True,
             )
-        if best == 0 or best_value <= minimum:
-            return finish(
-                0,
-                0.0,
-                'CASH_THRESHOLD',
-                cash_threshold_guard=True,
-            )
-        if current_position == 0:
-            if best_value >= minimum + float(config.rotation_min_expected_edge):
-                return finish(best, best_value, 'ENTER_BEST_ASSET')
-            return finish(
-                0,
-                0.0,
-                'MIN_EXPECTED_EDGE_GUARD',
-                expected_edge_guard=True,
-            )
-        if best == current_position:
+
+        candidates = entry_candidates()
+        if not candidates:
+            return finish(current_position, current_value, 'RISK_OFF_HYSTERESIS_HOLD')
+        target = candidates[0]
+        if target == current_position:
             return finish(current_position, current_value, 'HOLD_CURRENT_BEST')
-        if best_value >= current_value + required:
-            return finish(best, best_value, 'ROTATE_TO_BEST_ASSET')
+        if float(utilities[target]) >= current_value + required:
+            return finish(target, float(utilities[target]), 'ROTATE_TO_BEST_ASSET')
         return finish(
             current_position,
             current_value,
@@ -1348,8 +1480,8 @@ def _run_xgboost_rotation_models(
     technical_log_callback: Callable[[str], None] | None = None,
 ) -> list[RotationRunResult]:
     """Run the locked XGBoost walk-forward baseline without changing its semantics."""
-    if config.strategy_mode != 'COMPOUND_ROTATION_SWING_XGBOOST':
-        raise ValueError('This version supports only COMPOUND_ROTATION_SWING_XGBOOST.')
+    if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
+        raise ValueError(f'Unsupported compound-rotation strategy mode: {config.strategy_mode}.')
     if list(config.rotation_models) != ['xgboost_utility']:
         raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
     frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
@@ -1518,6 +1650,20 @@ def _run_xgboost_rotation_models(
             )
             if fallback_reason:
                 fallback_reasons.append(fallback_reason)
+            calibration_cash_edge_models = None
+            if _risk_off_enabled(rep_config):
+                calibration_cash_edge_models, effective_device, fallback_reason = _fit_xgb_models(
+                    frames,
+                    symbols,
+                    train_dates,
+                    rep_config,
+                    effective_device,
+                    phase=f'run_{run_index}_fold_{fold_position}_calibration_cash_edge',
+                    technical_log_callback=technical_log_callback,
+                    target_column='forward_cash_edge',
+                )
+                if fallback_reason:
+                    fallback_reasons.append(fallback_reason)
 
             report(
                 fold_base + fold_span * 0.42,
@@ -1546,6 +1692,7 @@ def _run_xgboost_rotation_models(
                     symbols,
                     rep_config,
                     candidate,
+                    cash_edge_models=calibration_cash_edge_models,
                 )
                 score = _simple_policy_growth(
                     calibration_policy,
@@ -1585,6 +1732,20 @@ def _run_xgboost_rotation_models(
             )
             if fallback_reason:
                 fallback_reasons.append(fallback_reason)
+            final_cash_edge_models = None
+            if _risk_off_enabled(rep_config):
+                final_cash_edge_models, effective_device, fallback_reason = _fit_xgb_models(
+                    frames,
+                    symbols,
+                    final_fit_dates,
+                    rep_config,
+                    effective_device,
+                    phase=f'run_{run_index}_fold_{fold_position}_final_cash_edge',
+                    technical_log_callback=technical_log_callback,
+                    target_column='forward_cash_edge',
+                )
+                if fallback_reason:
+                    fallback_reasons.append(fallback_reason)
             effective_margin = max(
                 float(rep_config.rotation_switch_margin),
                 float(best_candidate),
@@ -1595,6 +1756,7 @@ def _run_xgboost_rotation_models(
                 symbols,
                 rep_config,
                 effective_margin,
+                cash_edge_models=final_cash_edge_models,
                 decision_diagnostics=decision_diagnostics,
                 fold_id=fold_id,
                 calibrated_switch_margin=float(best_candidate),

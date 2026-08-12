@@ -29,6 +29,68 @@ _NUMERIC_THREAD_ENVIRONMENT_KEYS = (
     "NUMEXPR_NUM_THREADS",
 )
 
+_ACTIVE_JOB_PROCESSES: dict[str, subprocess.Popen] = {}
+_ACTIVE_JOB_PROCESSES_LOCK = threading.Lock()
+
+
+def _register_active_process(job_id: str, process: subprocess.Popen) -> None:
+    with _ACTIVE_JOB_PROCESSES_LOCK:
+        _ACTIVE_JOB_PROCESSES[job_id] = process
+
+
+def _unregister_active_process(job_id: str, process: subprocess.Popen) -> None:
+    with _ACTIVE_JOB_PROCESSES_LOCK:
+        if _ACTIVE_JOB_PROCESSES.get(job_id) is process:
+            _ACTIVE_JOB_PROCESSES.pop(job_id, None)
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except (ProcessLookupError, OSError):
+        return
+
+    def force_kill_if_needed() -> None:
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
+    threading.Thread(target=force_kill_if_needed, daemon=True).start()
+
+
+def request_job_cancel(job_id: str, *, reason: str = "Cancellation requested.") -> bool:
+    """Request cancellation of an active local backtest subprocess.
+
+    The database flag is authoritative and survives races and API-worker routing.
+    When the subprocess is owned by this process we terminate it immediately. The
+    owner also polls the persisted flag, so cancellation still works if the Stop
+    request is handled by another API worker.
+    """
+    db = database()
+    job = db[JOBS_COLLECTION].find_one({"id": job_id}) or {}
+    status = str(job.get("status") or "").strip().lower()
+    if status not in {"queued", "running"}:
+        return False
+    db[JOBS_COLLECTION].update_one(
+        {"id": job_id},
+        {"$set": {
+            "cancel_requested": True,
+            "cancel_reason": str(reason)[:300],
+            "updated_at": utc_now(),
+        }},
+    )
+    with _ACTIVE_JOB_PROCESSES_LOCK:
+        process = _ACTIVE_JOB_PROCESSES.get(job_id)
+    if process is not None:
+        _terminate_process(process)
+    return True
+
 
 def numeric_thread_environment(request_payload: dict[str, Any]) -> dict[str, str]:
     """Build numerical thread overrides without changing winner semantics.
@@ -346,6 +408,18 @@ def run_job(job_id: str) -> None:
     load_project_environment()
     db = database()
     job_document = db[JOBS_COLLECTION].find_one({"id": job_id}) or {}
+    if bool(job_document.get("cancel_requested")):
+        db[JOBS_COLLECTION].update_one(
+            {"id": job_id},
+            {"$set": {
+                "status": "cancelled",
+                "stage": "Interrupted",
+                "finished_at": utc_now(),
+                "updated_at": utc_now(),
+                "return_code": None,
+            }, "$unset": {"process_id": ""}},
+        )
+        return
     strategy_profile_id = str(job_document.get("strategy_profile_id") or "") or None
     strategy_profile_revision = int(job_document.get("strategy_profile_revision") or 0) or None
     timeout_seconds = max(300, int(job_document.get("training_timeout_seconds") or 21_600))
@@ -411,11 +485,13 @@ def run_job(job_id: str) -> None:
             bufsize=1,
             env=child_environment,
         )
+        _register_active_process(job_id, process)
         db[JOBS_COLLECTION].update_one(
             {"id": job_id},
             {"$set": {"process_id": process.pid, "updated_at": utc_now()}},
         )
         timed_out = threading.Event()
+        cancel_watch_stop = threading.Event()
 
         def terminate_for_timeout() -> None:
             if process.poll() is None:
@@ -425,9 +501,20 @@ def run_job(job_id: str) -> None:
                 except ProcessLookupError:
                     pass
 
+        def watch_for_cancellation() -> None:
+            while not cancel_watch_stop.wait(0.25):
+                if process.poll() is not None:
+                    return
+                refreshed = db[JOBS_COLLECTION].find_one({"id": job_id}, {"cancel_requested": 1}) or {}
+                if bool(refreshed.get("cancel_requested")):
+                    _terminate_process(process)
+                    return
+
         timeout_timer = threading.Timer(timeout_seconds, terminate_for_timeout)
         timeout_timer.daemon = True
         timeout_timer.start()
+        cancel_watcher = threading.Thread(target=watch_for_cancellation, daemon=True)
+        cancel_watcher.start()
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -435,7 +522,26 @@ def run_job(job_id: str) -> None:
                 append_log(job_id, line)
             return_code = process.wait()
         finally:
+            cancel_watch_stop.set()
             timeout_timer.cancel()
+            _unregister_active_process(job_id, process)
+
+        refreshed_job = db[JOBS_COLLECTION].find_one({"id": job_id}, {"cancel_requested": 1}) or {}
+        if bool(refreshed_job.get("cancel_requested")):
+            db[JOBS_COLLECTION].update_one(
+                {"id": job_id},
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "stage": "Interrupted",
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                        "return_code": return_code,
+                    },
+                    "$unset": {"process_id": ""},
+                },
+            )
+            return
 
         if timed_out.is_set():
             append_log(job_id, "ERROR: Training exceeded the configured time limit.")

@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .model_research import ResearchModelFamily
 
-StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST"]
+StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF"]
 Timeframe = Literal["1Day"]
 MarketDataProvider = Literal["alpaca"]
 AlpacaHistoricalFeed = Literal["sip", "iex"]
@@ -244,6 +244,7 @@ class BacktestExecutionRequest(BacktestRequest):
     research_model_settings: dict[str, object] = Field(default_factory=dict)
     research_market_data_mode: ResearchMarketDataMode = "database_only"
     expected_market_data_signature_sha256: str | None = None
+    research_market_data_snapshot_id: str | None = None
 
     @field_validator("calendar_anchor_assets")
     @classmethod
@@ -275,6 +276,16 @@ class BacktestExecutionRequest(BacktestRequest):
             return None
         if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
             raise ValueError("expected_market_data_signature_sha256 must be a SHA-256 hex digest.")
+        return normalized
+
+    @field_validator("research_market_data_snapshot_id")
+    @classmethod
+    def validate_research_market_data_snapshot_id(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return None
+        if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+            raise ValueError("research_market_data_snapshot_id must be a SHA-256 hex digest.")
         return normalized
 
     @model_validator(mode="after")

@@ -9,8 +9,13 @@ import numpy as np
 import pandas as pd
 
 from ..infrastructure.market_data.alpaca import download_stock_bars
+from .market_data_snapshot import (
+    TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
+    decode_market_frame,
+)
 from ..infrastructure.persistence.mongo_repository import (
     ALPACA_MARKET_BARS_COLLECTION,
+    MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION,
     create_client,
     get_alpaca_credentials,
     get_database,
@@ -462,8 +467,57 @@ def _end_is_complete(frame: pd.DataFrame, config: Any) -> bool:
     return last.date() >= date.fromisoformat(cutoff)
 
 
+
+
+def _load_frozen_tuning_snapshot_bars(symbol: str, config: Any) -> pd.DataFrame:
+    snapshot_id = str(getattr(config, "research_market_data_snapshot_id", None) or "").strip().lower()
+    if not snapshot_id:
+        raise RuntimeError("Frozen tuning snapshot id is missing.")
+    client = create_client()
+    try:
+        db = get_database(client)
+        collection = db[MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION]
+        document = collection.find_one(
+            {
+                "snapshot_id": snapshot_id,
+                "kind": "symbol",
+                "schema_version": TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
+                "symbol": str(symbol).strip().upper(),
+                "interval": config.timeframe,
+                "feed": config.alpaca_historical_feed,
+                "adjustment": config.alpaca_adjustment,
+            },
+            {"_id": 0},
+        )
+        if document is None:
+            raise RuntimeError(
+                f"FrozenTuningMarketDataMissing: snapshot {snapshot_id} has no data for {symbol}."
+            )
+        frame = decode_market_frame(document.get("payload") or b"", list(document.get("columns") or []))
+        start = pd.Timestamp(config.start_date, tz="UTC")
+        end = inclusive_end_exclusive_boundary(effective_execution_end_date(config))
+        frame = frame.loc[frame.index >= start]
+        if end is not None:
+            frame = frame.loc[frame.index < end]
+        provenance = dict(document.get("provenance") or {})
+        provenance["research_access_path"] = "frozen_tuning_snapshot"
+        provenance["market_data_snapshot_id"] = snapshot_id
+        provenance["requested_end"] = normalize_end_date(effective_execution_end_date(config))
+        provenance["end_complete"] = _end_is_complete(frame, config)
+        frame = _attach_provenance(frame, provenance)
+        if frame.empty:
+            raise RuntimeError(
+                f"FrozenTuningMarketDataMissing: snapshot {snapshot_id} is empty for {symbol}."
+            )
+        return frame
+    finally:
+        client.close()
+
 def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
     """Load research bars from MongoDB, bootstrapping only a wholly missing asset in a normal backtest."""
+
+    if str(getattr(config, "research_market_data_snapshot_id", None) or "").strip():
+        return _load_frozen_tuning_snapshot_bars(symbol, config)
 
     if not bool(getattr(config, "mongo_cache_enabled", True)):
         raise RuntimeError(
