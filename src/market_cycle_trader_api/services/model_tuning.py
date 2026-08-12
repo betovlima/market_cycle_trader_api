@@ -31,6 +31,7 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from .jobs import _redact_sensitive_text, run_job
 from .model_research import model_values_from_snapshot
+from .reproducibility import market_data_research_signature_from_manifests
 from .model_tuning_probability import PROBABILITY_MODEL, champion_gate_evaluation, propose_champion_probability_candidate
 from .strategy_lab import (
     get_research_strategy_context,
@@ -41,7 +42,7 @@ from .strategy_lab import (
 TUNING_METHOD = "latin_hypercube"
 PROBABILITY_METHOD = "champion_probability"
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 2
+TUNING_SCHEMA_VERSION = 3
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
@@ -639,6 +640,12 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
     if metrics is None:
         raise ModelTuningConflict("The reference Backtest metrics are no longer available.")
     summary = _metric_summary(metrics)
+    signatures = metrics.get("market_data_signatures") if isinstance(metrics.get("market_data_signatures"), dict) else {}
+    stable_market_data_signature = (
+        market_data_research_signature_from_manifests(signatures)
+        if signatures
+        else summary.get("market_data_signature_sha256")
+    )
     request_snapshot = deepcopy(job["request"])
     last_timestamp = summary.get("market_data_last_timestamp")
     cutoff_date = str(last_timestamp)[:10] if last_timestamp else None
@@ -655,7 +662,7 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
         "job_id": str(job_id),
         "request": bson_value(request_snapshot),
         "context_hash": _execution_request_context_hash(request_snapshot),
-        "market_data_signature_sha256": summary.get("market_data_signature_sha256"),
+        "market_data_signature_sha256": stable_market_data_signature,
         "market_data_cutoff_date": cutoff_date,
         "strategy_profile_id": job.get("strategy_profile_id"),
         "strategy_profile_name": job.get("strategy_profile_name"),
@@ -663,6 +670,63 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
         "strategy_configuration_hash": job.get("strategy_configuration_hash"),
         "model_family": job.get("research_model_family"),
         "model_label": job.get("research_model_label") or "LightGBM Utility",
+    }
+
+
+def _frozen_execution_context_from_campaign(db: Any, document: dict[str, Any]) -> dict[str, Any]:
+    """Use the source campaign itself as the authority for derived CARO runs.
+
+    v2.0.4 campaigns persist the immutable request and stable research-data signature.
+    Older campaigns fall back to the baseline job only to reconstruct the same frozen
+    request and to derive the stable signature from its stored per-symbol manifests.
+    """
+    request_snapshot = document.get("execution_request_snapshot")
+    baseline = document.get("baseline_execution") if isinstance(document.get("baseline_execution"), dict) else {}
+    baseline_job_id = str(baseline.get("job_id") or "")
+
+    if not isinstance(request_snapshot, dict):
+        if not baseline_job_id:
+            raise ModelTuningConflict("The source campaign no longer contains a frozen execution snapshot.")
+        return _frozen_execution_context_from_job(db, baseline_job_id)
+
+    request_snapshot = deepcopy(request_snapshot)
+    request_snapshot["research_market_data_mode"] = "database_only"
+    cutoff_date = str(document.get("market_data_cutoff_date") or "").strip() or None
+    if cutoff_date:
+        request_snapshot["end_date"] = cutoff_date
+        request_snapshot["analysis_end_date"] = cutoff_date
+
+    signature = str(document.get("expected_market_data_signature_sha256") or "").strip()
+    if int(document.get("schema_version") or 0) < 3 or not signature:
+        if baseline_job_id:
+            legacy_context = _frozen_execution_context_from_job(db, baseline_job_id)
+            signature = str(legacy_context.get("market_data_signature_sha256") or "").strip()
+            cutoff_date = cutoff_date or legacy_context.get("market_data_cutoff_date")
+        else:
+            completed_signatures = {
+                str((item.get("metrics") or {}).get("market_data_signature_sha256") or "").strip()
+                for item in document.get("candidates") or []
+                if item.get("status") == "completed" and isinstance(item.get("metrics"), dict)
+            }
+            completed_signatures.discard("")
+            if len(completed_signatures) == 1:
+                signature = completed_signatures.pop()
+
+    if not signature:
+        raise ModelTuningConflict("The source campaign market-data signature cannot be reconstructed safely.")
+
+    return {
+        "job_id": baseline_job_id or None,
+        "request": bson_value(request_snapshot),
+        "context_hash": str(document.get("execution_context_hash") or "") or _execution_request_context_hash(request_snapshot),
+        "market_data_signature_sha256": signature,
+        "market_data_cutoff_date": cutoff_date,
+        "strategy_profile_id": document.get("strategy_profile_id"),
+        "strategy_profile_name": document.get("strategy_profile_name"),
+        "strategy_profile_revision": document.get("strategy_profile_revision"),
+        "strategy_configuration_hash": document.get("strategy_configuration_hash"),
+        "model_family": document.get("model_family") or TUNING_MODEL_FAMILY,
+        "model_label": document.get("model_label") or "LightGBM Utility",
     }
 
 
@@ -685,6 +749,13 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
                 "best_candidate_id": 1,
                 "candidates": 1,
                 "search_space": 1,
+                "schema_version": 1,
+                "execution_request_snapshot": 1,
+                "execution_context_hash": 1,
+                "expected_market_data_signature_sha256": 1,
+                "market_data_cutoff_date": 1,
+                "model_family": 1,
+                "model_label": 1,
             },
         )
         .sort("finished_at", -1)
@@ -714,9 +785,11 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
         baseline_job_id = str(baseline.get("job_id") or "")
         if not baseline_job_id:
             continue
-        # Only expose sources whose immutable baseline request is still present.
+        # The completed campaign is the authority for a derived CARO replay.
+        # Legacy campaigns can reconstruct their stable signature from the retained
+        # baseline per-symbol manifests without rerunning the 21 observations.
         try:
-            context = _frozen_execution_context_from_job(db, baseline_job_id)
+            context = _frozen_execution_context_from_campaign(db, document)
         except ModelTuningConflict:
             continue
         result.append(
@@ -1021,6 +1094,15 @@ def start_model_tuning(
     if active_tuning is not None:
         raise ModelTuningConflict(f"Model tuning {active_tuning.get('id', 'unknown')} is already active.")
 
+    active_backtest = db[JOBS_COLLECTION].find_one(
+        {"status": {"$in": ["queued", "running"]}, "internal_job": {"$ne": True}},
+        {"_id": 0, "id": 1},
+    )
+    if active_backtest is not None:
+        raise ModelTuningConflict(
+            f"Wait for backtest {active_backtest.get('id', 'unknown')} to finish before starting model tuning."
+        )
+
     _, strategy = get_research_strategy_context(db)
     model_snapshot = get_research_strategy_model_snapshot(db)
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
@@ -1035,6 +1117,8 @@ def start_model_tuning(
     source_strategy_profile_id: str | None = None
     source_strategy_profile_revision: int | None = None
     adoption_context_compatible = True
+    expected_market_data_signature: str | None = None
+    market_data_signature_source = "control_candidate"
 
     if normalized_method == PROBABILITY_METHOD and source_tuning_run_id:
         source = _source_campaign(db, source_tuning_run_id)
@@ -1047,7 +1131,9 @@ def start_model_tuning(
         reference_job_id = str(baseline.get("job_id") or "")
         if not reference_job_id:
             raise ModelTuningConflict("The source campaign no longer references its baseline Backtest.")
-        execution_context = _frozen_execution_context_from_job(db, reference_job_id)
+        execution_context = _frozen_execution_context_from_campaign(db, source)
+        expected_market_data_signature = str(execution_context.get("market_data_signature_sha256") or "").strip() or None
+        market_data_signature_source = "source_campaign"
         base_values = deepcopy(anchor.get("settings") or {})
         adoption_context_compatible = False
         if str(strategy.get("id") or "") == str(source.get("strategy_profile_id") or ""):
@@ -1163,7 +1249,9 @@ def start_model_tuning(
         "execution_mode": "integrated_api_worker",
         "execution_request_snapshot": bson_value(execution_context["request"]),
         "execution_context_hash": execution_context.get("context_hash"),
-        "expected_market_data_signature_sha256": execution_context.get("market_data_signature_sha256"),
+        "expected_market_data_signature_sha256": expected_market_data_signature,
+        "market_data_signature_source": market_data_signature_source,
+        "market_data_signature_established_by_candidate_id": None,
         "market_data_cutoff_date": execution_context.get("market_data_cutoff_date"),
         "adoption_context_compatible": bool(adoption_context_compatible),
         "created_at": now,
@@ -1278,13 +1366,16 @@ def run_model_tuning(run_id: str) -> None:
                     "strategy_profile_revision": (document.get("source_strategy_profile_revision") or document.get("strategy_profile_revision")),
                     "strategy_configuration_hash": (document.get("baseline_execution") or {}).get("strategy_configuration_hash") or document.get("strategy_configuration_hash"),
                 }
+                candidate_request = deepcopy(document.get("execution_request_snapshot") or {})
+                expected_signature = str(document.get("expected_market_data_signature_sha256") or "").strip().lower()
+                candidate_request["expected_market_data_signature_sha256"] = expected_signature or None
                 queued = queue_backtest_job(
                     model_values_override=dict(pending["settings"]),
                     start_thread=False,
                     certify_strategy=False,
                     tuning_run_id=run_id,
                     tuning_candidate_id=candidate_id,
-                    execution_request_override=deepcopy(document.get("execution_request_snapshot") or {}),
+                    execution_request_override=candidate_request,
                     execution_metadata_override=execution_metadata,
                 )
                 job_id = str(queued["id"])
@@ -1304,17 +1395,67 @@ def run_model_tuning(run_id: str) -> None:
                 if metrics is None:
                     raise RuntimeError("Portfolio metrics are missing for the tuning candidate.")
                 summary = _metric_summary(metrics)
-                champion_gate = (
-                    champion_gate_evaluation(document, summary)
-                    if str(document.get("method") or "") == PROBABILITY_METHOD
-                    else None
-                )
-                expected_signature = str(document.get("expected_market_data_signature_sha256") or "")
-                actual_signature = str(summary.get("market_data_signature_sha256") or "")
+                actual_signature = str(summary.get("market_data_signature_sha256") or "").strip().lower()
+                expected_signature = str(document.get("expected_market_data_signature_sha256") or "").strip().lower()
+                is_control = bool(pending.get("is_control"))
+                if not actual_signature:
+                    raise RuntimeError("MarketDataSignatureMissing: the candidate did not produce a research market-data signature.")
                 if expected_signature and actual_signature != expected_signature:
                     raise RuntimeError(
-                        f"MarketDataSignatureMismatch: expected {expected_signature}, got {actual_signature or 'missing'}"
+                        f"MarketDataSignatureMismatch: expected {expected_signature}, got {actual_signature}"
                     )
+                if not expected_signature:
+                    if not is_control:
+                        raise RuntimeError(
+                            "MarketDataSignatureMissing: only the fresh Control candidate may establish a campaign signature."
+                        )
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {
+                            "$set": {
+                                "expected_market_data_signature_sha256": actual_signature,
+                                "market_data_signature_source": "control_candidate",
+                                "market_data_signature_established_by_candidate_id": candidate_id,
+                                "updated_at": utc_now(),
+                            }
+                        },
+                    )
+                    document["expected_market_data_signature_sha256"] = actual_signature
+                    document["market_data_signature_source"] = "control_candidate"
+                    document["market_data_signature_established_by_candidate_id"] = candidate_id
+                    _append_campaign_event(
+                        db, run_id,
+                        message=f"Control candidate #{candidate_id} established the frozen research market-data signature.",
+                        stage="market_data_signature_frozen", candidate_id=candidate_id, job_id=job_id,
+                    )
+
+                # Standalone CARO starts from a fresh Control. Once that Control is
+                # complete it becomes the probability Champion anchor for all startup
+                # and adaptive candidates. Derived CARO keeps the imported LHS anchor.
+                if (
+                    is_control
+                    and str(document.get("method") or "") == PROBABILITY_METHOD
+                    and str((document.get("probability_config") or {}).get("source_mode") or "") == "standalone"
+                ):
+                    fresh_anchor = {
+                        "source": "fresh_control",
+                        "job_id": job_id,
+                        "candidate_id": candidate_id,
+                        "settings_hash": str(pending.get("settings_hash") or ""),
+                        "settings": deepcopy(pending.get("settings") or {}),
+                        "metrics": deepcopy(summary),
+                    }
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {"probability_anchor": bson_value(fresh_anchor), "updated_at": utc_now()}},
+                    )
+                    document["probability_anchor"] = fresh_anchor
+
+                champion_gate = (
+                    champion_gate_evaluation(document, summary)
+                    if str(document.get("method") or "") == PROBABILITY_METHOD and not is_control
+                    else None
+                )
                 db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                     {"id": run_id, "candidates.candidate_id": candidate_id},
                     {
@@ -1367,14 +1508,25 @@ def run_model_tuning(run_id: str) -> None:
                     message=f"Candidate #{candidate_id} failed: {failure_type}: {failure_message}",
                     level="error", stage="candidate_failed", candidate_id=candidate_id, job_id=job_id,
                 )
-                if "MarketDataSignatureMismatch" in str(exc):
+                reproducibility_failure = (
+                    failure_type in {"MarketDataSignatureMismatch", "MarketDataSignatureMissing"}
+                    or "MarketDataSignatureMismatch" in failure_message
+                    or "MarketDataSignatureMissing" in failure_message
+                    or "MarketDataSignatureMismatch" in str(exc)
+                    or "MarketDataSignatureMissing" in str(exc)
+                )
+                control_failure = bool(pending.get("is_control"))
+                if reproducibility_failure or control_failure:
+                    terminal_type = failure_type if reproducibility_failure else "ControlCandidateFailed"
+                    terminal_phase = "reproducibility_guard_failed" if reproducibility_failure else "control_failed"
+                    terminal_message = failure_message or _sanitize_tuning_log_line(str(exc))[:500]
                     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                         {"id": run_id},
-                        {"$set": {"status": "failed", "phase": "reproducibility_guard_failed", "failure_type": "MarketDataSignatureMismatch", "failure_message": _sanitize_tuning_log_line(str(exc))[:500], "finished_at": utc_now(), "updated_at": utc_now()}},
+                        {"$set": {"status": "failed", "phase": terminal_phase, "failure_type": terminal_type, "failure_message": terminal_message, "finished_at": utc_now(), "updated_at": utc_now()}},
                     )
                     _append_campaign_event(
-                        db, run_id, message=_sanitize_tuning_log_line(str(exc)),
-                        level="error", stage="reproducibility_guard_failed", candidate_id=candidate_id, job_id=job_id,
+                        db, run_id, message=terminal_message,
+                        level="error", stage=terminal_phase, candidate_id=candidate_id, job_id=job_id,
                     )
                     return
     except Exception as exc:

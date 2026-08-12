@@ -243,6 +243,7 @@ class BacktestExecutionRequest(BacktestRequest):
     research_model_family: ResearchModelFamily = "xgboost_utility"
     research_model_settings: dict[str, object] = Field(default_factory=dict)
     research_market_data_mode: ResearchMarketDataMode = "database_only"
+    expected_market_data_signature_sha256: str | None = None
 
     @field_validator("calendar_anchor_assets")
     @classmethod
@@ -265,6 +266,16 @@ class BacktestExecutionRequest(BacktestRequest):
         if value is None or not str(value).strip():
             return None
         return normalize_iso_date(value, field_name="analysis_end_date")
+
+    @field_validator("expected_market_data_signature_sha256")
+    @classmethod
+    def validate_expected_market_data_signature(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return None
+        if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+            raise ValueError("expected_market_data_signature_sha256 must be a SHA-256 hex digest.")
+        return normalized
 
     @model_validator(mode="after")
     def validate_analysis_window(self) -> "BacktestExecutionRequest":

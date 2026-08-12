@@ -325,3 +325,51 @@ def test_candidate_log_reads_retained_failed_job_and_redacts_it() -> None:
     assert "frozen snapshot mismatch" in candidate["log_text"]
     campaign = get_model_tuning_campaign_log(db, "run-1")
     assert "Control failed" in campaign["log_text"]
+
+
+def test_v204_tuning_reproducibility_contract_is_control_frozen_and_preflighted() -> None:
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    engine = (SRC / "engine" / "compound_rotation_backtest.py").read_text(encoding="utf-8")
+
+    assert 'expected_market_data_signature: str | None = None' in service
+    assert 'market_data_signature_source = "control_candidate"' in service
+    assert 'candidate_request["expected_market_data_signature_sha256"] = expected_signature or None' in service
+    assert '"market_data_signature_established_by_candidate_id": candidate_id' in service
+    assert '"source": "fresh_control"' in service
+    assert 'active_backtest = db[JOBS_COLLECTION].find_one' in service
+    assert 'missing_assets = [symbol for symbol in config.assets if symbol not in bars_by_symbol]' in engine
+    assert engine.index('expected_market_data_signature_sha256') < engine.index('results = run_rotation_models(')
+
+
+def test_derived_caro_uses_source_campaign_frozen_context() -> None:
+    from market_cycle_trader_api.services.model_tuning import _frozen_execution_context_from_campaign
+
+    digest = "a" * 64
+    source = {
+        "schema_version": 3,
+        "execution_request_snapshot": {
+            "end_date": "2026-08-11",
+            "analysis_end_date": "2026-08-11",
+            "research_market_data_mode": "database_only",
+        },
+        "execution_context_hash": "ctx-1",
+        "expected_market_data_signature_sha256": digest,
+        "market_data_cutoff_date": "2026-08-11",
+        "strategy_profile_id": "strategy-1",
+        "strategy_profile_name": "Strategy 1",
+        "strategy_profile_revision": 7,
+        "strategy_configuration_hash": "strategy-hash",
+        "model_family": "lightgbm_utility",
+        "model_label": "LightGBM Utility",
+        "baseline_execution": {"job_id": "baseline-should-not-be-read"},
+    }
+
+    class FailDb(dict):
+        def __getitem__(self, key):
+            raise AssertionError(f"Source campaign context must not read baseline collection: {key}")
+
+    context = _frozen_execution_context_from_campaign(FailDb(), source)
+    assert context["market_data_signature_sha256"] == digest
+    assert context["market_data_cutoff_date"] == "2026-08-11"
+    assert context["context_hash"] == "ctx-1"
+    assert context["request"]["research_market_data_mode"] == "database_only"

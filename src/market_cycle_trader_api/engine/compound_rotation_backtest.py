@@ -286,17 +286,28 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
-    missing_anchor_assets = [
-        symbol for symbol in config.calendar_anchor_assets if symbol not in bars_by_symbol
-    ]
-    if missing_anchor_assets:
+    missing_assets = [symbol for symbol in config.assets if symbol not in bars_by_symbol]
+    if missing_assets:
         raise ValueError(
-            "Calendar anchor market data failed to load; the Winner comparison calendar "
-            "cannot be preserved: " + ", ".join(missing_anchor_assets)
+            "Research market data failed to load for the complete configured universe: "
+            + ", ".join(missing_assets)
         )
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
+
+    # Freeze/verify market-data content before any model training. Tuning candidates
+    # receive the campaign signature through the immutable execution request, so a
+    # changed Mongo snapshot fails immediately instead of after all walk-forward folds.
     reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
+    expected_signature = str(
+        getattr(config, "expected_market_data_signature_sha256", None) or ""
+    ).strip().lower()
+    actual_signature = str(reproducibility.get("market_data_signature_sha256") or "").strip().lower()
+    if expected_signature and actual_signature != expected_signature:
+        raise RuntimeError(
+            f"MarketDataSignatureMismatch: expected {expected_signature}, got {actual_signature or 'missing'}"
+        )
+
     emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
     results = run_rotation_models(
         bars_by_symbol,

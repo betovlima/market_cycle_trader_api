@@ -8,6 +8,7 @@ import pandas as pd
 from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest, BacktestRequest
 from market_cycle_trader_api.services.reproducibility import (
     build_reproducibility_manifest,
+    market_data_research_signature_from_manifests,
     strategy_configuration_fingerprint,
 )
 
@@ -47,14 +48,49 @@ def test_manifest_is_stable_for_same_configuration_and_bars() -> None:
     assert first["deterministic_execution"] is False
     assert first["numeric_thread_limit"] == 1
     assert first["xgb_n_jobs"] == -1
-    assert first["reproducibility_schema_version"] == 2
-    assert first["api_version"] == "2.0.3"
+    assert first["reproducibility_schema_version"] == 3
+    assert first["api_version"] == "2.0.4"
     assert first["runtime_fingerprint_sha256"]
     assert first["engine_source_sha256"]
     assert first["package_source_sha256"]
     assert "xgboost_build_info" in first
     assert "numeric_thread_environment" in first
     assert "threadpool_runtime" in first
+
+
+
+
+def test_research_signature_ignores_load_path_audit_metadata() -> None:
+    first_bars = _bars([100.0, 101.0, 102.0])
+    second_bars = _bars([100.0, 101.0, 102.0])
+    first_frame = first_bars["AAPL"]
+    second_frame = second_bars["AAPL"]
+    first_frame.attrs["market_data_provenance"] = {
+        "historical_feed": "sip",
+        "adjustment": "all",
+        "initial_rows": 2666,
+        "history_backfill_rows": 0,
+        "history_backfill_provider": None,
+    }
+    second_frame.attrs["market_data_provenance"] = {
+        "historical_feed": "sip",
+        "adjustment": "all",
+        "initial_rows": 3000,
+        "history_backfill_rows": 334,
+        "history_backfill_provider": "alpaca",
+    }
+
+    first = build_reproducibility_manifest(_config(), first_bars)
+    second = build_reproducibility_manifest(_config(), second_bars)
+
+    assert first["market_data_signature_sha256"] == second["market_data_signature_sha256"]
+    assert first["market_data_audit_signature_sha256"] != second["market_data_audit_signature_sha256"]
+
+
+def test_research_signature_can_be_reconstructed_from_retained_symbol_manifests() -> None:
+    manifest = build_reproducibility_manifest(_config(), _bars([100.0, 101.0, 102.0]))
+    reconstructed = market_data_research_signature_from_manifests(manifest["market_data_signatures"])
+    assert reconstructed == manifest["market_data_signature_sha256"]
 
 
 def test_market_data_signature_changes_when_price_changes() -> None:
@@ -114,3 +150,69 @@ def test_execution_model_is_not_part_of_strategy_fingerprint() -> None:
     baseline_hash = strategy_configuration_fingerprint(base)
     assert strategy_configuration_fingerprint(lightgbm) == baseline_hash
     assert strategy_configuration_fingerprint(iqn) == baseline_hash
+
+
+def test_execution_signature_guard_accepts_only_sha256_hex() -> None:
+    base = _config()
+    common = {
+        **base.model_dump(mode="python"),
+        "analysis_start_date": base.start_date,
+        "analysis_end_date": base.end_date,
+        "calendar_anchor_assets": list(base.assets),
+    }
+    digest = "b" * 64
+    execution = BacktestExecutionRequest.model_validate({
+        **common,
+        "expected_market_data_signature_sha256": digest,
+    })
+    assert execution.expected_market_data_signature_sha256 == digest
+
+
+def test_engine_rejects_signature_mismatch_before_model_training() -> None:
+    from unittest.mock import patch
+    from market_cycle_trader_api.engine.compound_rotation_backtest import run_job
+
+    base = _config()
+    assets = ["AAPL", "MSFT"]
+    execution = BacktestExecutionRequest.model_validate({
+        **base.model_dump(mode="python"),
+        "assets": assets,
+        "analysis_start_date": base.start_date,
+        "analysis_end_date": base.end_date,
+        "calendar_anchor_assets": assets,
+        "research_reference_assets": assets,
+        "research_candidate_assets": [],
+        "expected_market_data_signature_sha256": "0" * 64,
+    })
+    aapl = next(iter(_bars([100.0, 101.0, 102.0]).values()))
+    msft = next(iter(_bars([200.0, 201.0, 202.0]).values()))
+    for frame in (aapl, msft):
+        frame.attrs["market_data_provenance"] = {
+            "historical_feed": "sip",
+            "adjustment": "all",
+            "history_complete": True,
+            "research_access_path": "mongodb_only",
+        }
+
+    with (
+        patch(
+            "market_cycle_trader_api.engine.compound_rotation_backtest.load_market_bars",
+            side_effect=[aapl, msft],
+        ),
+        patch(
+            "market_cycle_trader_api.engine.compound_rotation_backtest.validate_and_clean_bars",
+            side_effect=lambda frame, config: frame,
+        ),
+        patch(
+            "market_cycle_trader_api.engine.compound_rotation_backtest.run_rotation_models"
+        ) as trainer,
+    ):
+        try:
+            run_job("job-1", execution, object())
+            raised = False
+        except RuntimeError as exc:
+            raised = True
+            assert "MarketDataSignatureMismatch" in str(exc)
+
+    assert raised
+    trainer.assert_not_called()

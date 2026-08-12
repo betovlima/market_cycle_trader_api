@@ -187,6 +187,31 @@ def _series_timestamp(value: Any) -> str | None:
     return stamp.isoformat()
 
 
+def market_data_research_signature_from_manifests(
+    manifests: dict[str, dict[str, Any]],
+) -> str:
+    """Return the research-content signature, excluding load-path audit metadata.
+
+    The per-symbol SHA already represents the canonical timestamped bar content.
+    The campaign-level signature intentionally ignores values such as ``initial_rows``
+    and backfill/load-path counters because those can change without changing the
+    candles consumed by the model. Feed and adjustment remain part of the contract.
+    """
+    stable: dict[str, dict[str, Any]] = {}
+    for symbol in sorted(manifests):
+        item = manifests[symbol] if isinstance(manifests[symbol], dict) else {}
+        stable[symbol] = {
+            "sha256": item.get("sha256"),
+            "rows": int(item.get("rows") or 0),
+            "first_timestamp": item.get("first_timestamp"),
+            "last_timestamp": item.get("last_timestamp"),
+            "columns": list(item.get("columns") or []),
+            "historical_feed": item.get("historical_feed"),
+            "adjustment": item.get("adjustment"),
+        }
+    return _sha256_json(stable)
+
+
 def market_data_manifest(
     bars_by_symbol: dict[str, pd.DataFrame],
 ) -> tuple[str, dict[str, dict[str, Any]]]:
@@ -229,7 +254,7 @@ def market_data_manifest(
             "actual_start": provenance.get("actual_start"),
         }
 
-    return _sha256_json(manifests), manifests
+    return market_data_research_signature_from_manifests(manifests), manifests
 
 
 def build_reproducibility_manifest(
@@ -273,10 +298,12 @@ def build_reproducibility_manifest(
     if not configured_candidate_assets:
         candidate_assets = [symbol for symbol in assets if symbol not in reference_set]
     return {
-        "reproducibility_schema_version": 2,
+        "reproducibility_schema_version": 3,
         "api_version": API_VERSION,
         "strategy_configuration_sha256": strategy_configuration_fingerprint(config),
+        "market_data_signature_schema_version": 2,
         "market_data_signature_sha256": data_hash,
+        "market_data_audit_signature_sha256": _sha256_json(data_manifests),
         "market_data_signatures": data_manifests,
         "market_data_history_complete": not incomplete_assets,
         "market_data_incomplete_assets": incomplete_assets,
