@@ -1578,11 +1578,7 @@ def _assert_trader_safe_for_promotion(
     immutable Trader Winner, so every asset in the promoted snapshot participates.
     """
 
-    if _regular_market_is_open():
-        raise StrategyLabConflict(
-            "Winner promotion is allowed only while the XNYS regular market is closed. "
-            "No broker request was performed."
-        )
+    regular_market_open = _regular_market_is_open()
 
     _assert_no_active_backtest(db)
 
@@ -1633,6 +1629,7 @@ def _assert_trader_safe_for_promotion(
 
     controller = db[PAPER_MARKET_AUTOMATION_COLLECTION].find_one({"_id": "default"}) or {}
     return {
+        "regular_market_open_at_promotion": regular_market_open,
         "trader_control_mode": str(controller.get("control_mode") or "stopped").strip().lower(),
         "active_run_id": (active_run or {}).get("run_id"),
         "active_run_status": (active_run or {}).get("status"),
@@ -1785,7 +1782,7 @@ def promote_strategy_to_trader(
             "promoted_by": actor,
             "promotion_note": note,
             "promotion_mode": "metadata_only_operational_state_preserved",
-            "market_closed_confirmed": True,
+            "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
             "broker_interaction_performed": False,
             "operational_state_preserved": True,
         }
@@ -1889,7 +1886,7 @@ def promote_strategy_to_trader(
                     "note": note,
                     "promoted_at": now,
                     "promoted_by": actor,
-                    "market_closed_confirmed": True,
+                    "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
                     "broker_interaction_performed": False,
                     "operational_state_preserved": True,
                     "next_scheduled_evaluation_uses_new_winner": True,
@@ -1962,7 +1959,7 @@ def promote_strategy_to_trader(
             "control": _control_response(db, updated_control),
             "promotion": {
                 "mode": "metadata_only_operational_state_preserved",
-                "market_closed_confirmed": True,
+                "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
                 "broker_interaction_performed": False,
                 "operational_state_preserved": True,
                 "current_position_preserved": True,

@@ -34,8 +34,9 @@ from market_cycle_trader_api.services.strategy_lab import (
     update_strategy_model,
 )
 
-# Promotion tests exercise lifecycle semantics, not the wall-clock. Production
-# still enforces the XNYS regular-session boundary without calling Alpaca.
+# Keep the default audit-only market state deterministic in lifecycle tests.
+# A dedicated test below proves that a safe metadata-only promotion is also allowed
+# during the XNYS regular session.
 strategy_lab_service._regular_market_is_open = lambda: False
 
 
@@ -384,6 +385,72 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     promotion = [item for item in history if item.get("action") == "winner_promoted_preserving_operational_state"]
     assert len(promotion) == 1
     assert promotion[0]["operational_snapshot"]["managed_symbol"] == "NVDA"
+
+
+def test_promotion_is_allowed_while_regular_market_is_open_when_pipeline_is_safe() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    draft = create_strategy(
+        db,
+        name="Market-open safe promotion",
+        description="Metadata-only promotion must not depend on the regular-session clock.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[JOBS_COLLECTION].documents["job-market-open"] = {
+        "_id": "job-market-open",
+        "id": "job-market-open",
+        "status": "completed",
+        "strategy_profile_id": draft["id"],
+        "strategy_profile_revision": 1,
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=draft["id"],
+        strategy_revision=1,
+        job_id="job-market-open",
+        status="completed",
+    )
+    mark_strategy_as_candidate(
+        db,
+        draft["id"],
+        expected_strategy_revision=1,
+        note="Validated candidate.",
+        actor_email="admin@example.com",
+    )
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "enabled": True,
+        "control_mode": "active",
+        "phase": "waiting_for_premarket_analysis",
+    }
+    db[PAPER_TRADING_STATE_COLLECTION].documents["default"] = {
+        "_id": "default",
+        "strategy_cash": 10000.0,
+        "managed_symbol": None,
+        "managed_quantity": 0.0,
+        "holding_sessions": 0,
+    }
+
+    previous_market_state = strategy_lab_service._regular_market_is_open
+    strategy_lab_service._regular_market_is_open = lambda: True
+    try:
+        control_revision = int(db[STRATEGY_CONTROL_COLLECTION].documents["default"]["revision"])
+        result = promote_strategy_to_trader(
+            db,
+            draft["id"],
+            expected_control_revision=control_revision,
+            expected_strategy_revision=1,
+            note="Promote safely during the regular session.",
+            actor_email="admin@example.com",
+        )
+    finally:
+        strategy_lab_service._regular_market_is_open = previous_market_state
+
+    assert result["status"] == "promoted"
+    assert result["promotion"]["regular_market_open_at_promotion"] is True
+    assert result["promotion"]["broker_interaction_performed"] is False
+    assert result["promotion"]["operational_state_preserved"] is True
 
 
 def test_promotion_allows_multiple_historical_winners_from_same_api_release() -> None:

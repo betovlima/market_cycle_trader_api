@@ -48,7 +48,7 @@ def test_manifest_is_stable_for_same_configuration_and_bars() -> None:
     assert first["numeric_thread_limit"] == 1
     assert first["xgb_n_jobs"] == -1
     assert first["reproducibility_schema_version"] == 2
-    assert first["api_version"] == "2.0.1"
+    assert first["api_version"] == "2.0.2"
     assert first["runtime_fingerprint_sha256"]
     assert first["engine_source_sha256"]
     assert first["package_source_sha256"]

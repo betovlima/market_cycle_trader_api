@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "2.0.1"' in config
+    assert 'API_VERSION = "2.0.2"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -72,7 +72,8 @@ def test_winner_promotion_is_metadata_only_and_binds_next_plan_to_winner() -> No
     assert "broker_interaction_performed\": False" in strategy_lab
     assert "operational_state_preserved\": True" in strategy_lab
     assert "paper_state_reinitialization_required\": False" in strategy_lab
-    assert "confirm_market_closed: Literal[True]" in schema
+    assert "confirm_market_closed: Literal[True] | None = None" in schema
+    assert "Winner promotion is allowed only while the XNYS regular market is closed" not in strategy_lab
     assert "confirm_preserve_operational_state: Literal[True]" in schema
     assert "winner_strategy_id=str(winner_profile[\"id\"])" in paper
     assert "winner_assets=list(strategy.assets)" in paper
