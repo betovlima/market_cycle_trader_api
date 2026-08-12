@@ -565,7 +565,7 @@ def list_model_research_executions(db: Any, *, limit: int = 50) -> dict[str, Any
     documents = (
         db[JOBS_COLLECTION]
         .find(
-            {},
+            {"internal_job": {"$ne": True}},
             {
                 "_id": 0,
                 "id": 1,

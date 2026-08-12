@@ -13,6 +13,7 @@ from pymongo import ReturnDocument
 from ..core.config import API_VERSION
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
+    MODEL_TUNING_RUNS_COLLECTION,
     PAPER_MARKET_AUTOMATION_COLLECTION,
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
@@ -425,6 +426,10 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
             )
         ),
         "winner_api_version": document.get("winner_api_version"),
+        "source_api_version": document.get("source_api_version") or document.get("winner_api_version"),
+        "winner_sequence": document.get("winner_sequence"),
+        "historical_lifecycle_status": document.get("historical_lifecycle_status"),
+        "superseded_reason": document.get("superseded_reason"),
         "promotion_mode": document.get("promotion_mode"),
         "operational_state_preserved": document.get("operational_state_preserved"),
         "broker_interaction_performed": document.get("broker_interaction_performed"),
@@ -451,12 +456,18 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     winner_id = str(control.get("trader_winner_strategy_id") or "")
     reference_id = str(control.get("research_reference_strategy_id") or research_id)
     candidate_id = str(control.get("candidate_strategy_id") or "")
+    promoted_candidate_id = str(control.get("promoted_candidate_strategy_id") or "")
     research = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": research_id})
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
     reference = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": reference_id})
     candidate = (
         db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": candidate_id})
         if candidate_id
+        else None
+    )
+    promoted_candidate = (
+        db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": promoted_candidate_id})
+        if promoted_candidate_id
         else None
     )
     if research is None or winner is None:
@@ -466,7 +477,9 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "research_strategy_id": research_id,
         "research_reference_strategy_id": reference_id,
         "candidate_strategy_id": candidate_id or None,
+        "promoted_candidate_strategy_id": promoted_candidate_id or None,
         "trader_winner_strategy_id": winner_id,
+        "winner_sequence": int(control.get("winner_sequence") or 0),
         "research_strategy": _public_profile(research, include_configuration=False),
         "research_reference_strategy": (
             _public_profile(reference, include_configuration=False)
@@ -478,6 +491,11 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "candidate_strategy": (
             _public_profile(candidate, include_configuration=False)
             if candidate is not None
+            else None
+        ),
+        "promoted_candidate_strategy": (
+            _public_profile(promoted_candidate, include_configuration=False)
+            if promoted_candidate is not None
             else None
         ),
         "trader_winner": _public_profile(winner, include_configuration=False),
@@ -523,7 +541,7 @@ def _normalize_single_candidate_and_winner(
     db: Any,
     control: dict[str, Any],
 ) -> dict[str, Any]:
-    """Migrate older catalogs to one active Candidate and one active Winner."""
+    """Migrate catalogs to one active Candidate, one promoted Candidate and one Winner."""
     now = utc_now()
     winner_id = str(control.get("trader_winner_strategy_id") or "")
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
@@ -534,15 +552,40 @@ def _normalize_single_candidate_and_winner(
             {"_id": winner_id},
             {"$set": {"status": "winner", "locked": True, "updated_at": now}},
         )
+        winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id}) or winner
     db[STRATEGY_PROFILES_COLLECTION].update_many(
         {"_id": {"$ne": winner_id}, "status": "winner"},
         {"$set": {"status": "former_winner", "locked": True, "updated_at": now}},
     )
 
-    # v1.13.38 introduces a research reference that is independent from the
-    # Trader Winner and from the currently selected editable strategy. Existing
-    # catalogs snapshot the strategy selected for research at migration time;
-    # later selection or edits do not silently change the reference universe.
+    winner_snapshots = list(
+        db[STRATEGY_PROFILES_COLLECTION].find(
+            {"status": {"$in": ["winner", "former_winner"]}}
+        )
+    )
+    observed_sequences = [
+        int(item.get("winner_sequence") or 0)
+        for item in winner_snapshots
+        if int(item.get("winner_sequence") or 0) > 0
+    ]
+    normalized_winner_sequence = max(
+        [int(control.get("winner_sequence") or 0), len(winner_snapshots), *observed_sequences]
+    )
+    if int(control.get("winner_sequence") or 0) != normalized_winner_sequence:
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": CONTROL_ID},
+            {
+                "$set": {
+                    "winner_sequence": normalized_winner_sequence,
+                    "updated_at": now,
+                }
+            },
+        )
+        control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
+
+    # The research reference is independent from the Trader Winner and the
+    # currently selected editable strategy. Existing catalogs snapshot the
+    # selected research universe at migration time.
     reference_assets = list(control.get("research_reference_assets") or [])
     if len(reference_assets) < 2:
         fallback_reference_id = str(control.get("research_strategy_id") or winner_id)
@@ -579,9 +622,7 @@ def _normalize_single_candidate_and_winner(
         if candidate_id
         else None
     )
-    candidates = list(
-        db[STRATEGY_PROFILES_COLLECTION].find({"status": "candidate"})
-    )
+    candidates = list(db[STRATEGY_PROFILES_COLLECTION].find({"status": "candidate"}))
     if candidate is None:
         candidate_id = ""
     if candidate is None and candidates:
@@ -605,6 +646,7 @@ def _normalize_single_candidate_and_winner(
                         "locked": True,
                         "superseded_at": now,
                         "superseded_by_strategy_id": candidate_id or None,
+                        "superseded_reason": "candidate_replaced",
                         "updated_at": now,
                     }
                 },
@@ -617,6 +659,84 @@ def _normalize_single_candidate_and_winner(
             {
                 "$set": {
                     "candidate_strategy_id": normalized_candidate_id,
+                    "updated_at": now,
+                }
+            },
+        )
+        control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
+
+    # A promoted Candidate is an active lifecycle role, not a permanent badge.
+    # Prefer the source Strategy of the active Winner, then the explicit control
+    # pointer, and preserve all older promoted Candidates as immutable history.
+    winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id}) or winner
+    winner_source_id = str((winner or {}).get("source_strategy_id") or "")
+    promoted_id = str(control.get("promoted_candidate_strategy_id") or "")
+    promoted = (
+        db[STRATEGY_PROFILES_COLLECTION].find_one(
+            {"_id": promoted_id, "status": "promoted_candidate"}
+        )
+        if promoted_id
+        else None
+    )
+
+    if winner_source_id:
+        winner_source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_source_id})
+        if winner_source is not None and str(winner_source.get("last_promoted_winner_strategy_id") or "") == winner_id:
+            if str(winner_source.get("status") or "") != "promoted_candidate":
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": winner_source_id},
+                    {
+                        "$set": {
+                            "status": "promoted_candidate",
+                            "locked": True,
+                            "superseded_at": None,
+                            "superseded_by_strategy_id": None,
+                            "superseded_reason": None,
+                            "updated_at": now,
+                        }
+                    },
+                )
+            promoted_id = winner_source_id
+            promoted = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_source_id})
+
+    promoted_candidates = list(
+        db[STRATEGY_PROFILES_COLLECTION].find({"status": "promoted_candidate"})
+    )
+    if promoted is None and promoted_candidates:
+        promoted_candidates.sort(
+            key=lambda item: str(
+                item.get("last_promoted_at") or item.get("updated_at") or item.get("created_at") or ""
+            ),
+            reverse=True,
+        )
+        promoted = promoted_candidates[0]
+        promoted_id = str(promoted.get("_id") or "")
+
+    for profile in promoted_candidates:
+        profile_id = str(profile.get("_id") or "")
+        if profile_id and profile_id != promoted_id:
+            db[STRATEGY_PROFILES_COLLECTION].update_one(
+                {"_id": profile_id, "status": "promoted_candidate"},
+                {
+                    "$set": {
+                        "status": "superseded_candidate",
+                        "locked": True,
+                        "superseded_at": now,
+                        "superseded_by_strategy_id": promoted_id or None,
+                        "superseded_reason": "promoted_candidate_replaced",
+                        "historical_lifecycle_status": "promoted_candidate",
+                        "updated_at": now,
+                    }
+                },
+            )
+
+    normalized_promoted_id = promoted_id or None
+    if control.get("promoted_candidate_strategy_id") != normalized_promoted_id:
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": CONTROL_ID},
+            {
+                "$set": {
+                    "promoted_candidate_strategy_id": normalized_promoted_id,
                     "updated_at": now,
                 }
             },
@@ -687,7 +807,9 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
         "research_reference_configuration_hash": configuration_hash,
         "research_reference_assets": list(configuration.assets),
         "candidate_strategy_id": None,
+        "promoted_candidate_strategy_id": None,
         "trader_winner_strategy_id": strategy_id,
+        "winner_sequence": 1,
         "created_at": now,
         "updated_at": now,
         "updated_by": None,
@@ -752,7 +874,9 @@ def synchronize_bundled_winner_installation(
         "research_reference_configuration_hash": configuration_hash,
         "research_reference_assets": list(configuration.assets),
         "candidate_strategy_id": None,
+        "promoted_candidate_strategy_id": None,
         "trader_winner_strategy_id": BUNDLED_WINNER_ID,
+        "winner_sequence": 1,
         "created_at": now,
         "updated_at": now,
         "updated_by": None,
@@ -928,6 +1052,20 @@ def create_strategy(
     return _public_profile(profile)
 
 
+def _assert_strategy_not_under_model_tuning(db: Any, strategy_id: str) -> None:
+    active = db[MODEL_TUNING_RUNS_COLLECTION].find_one(
+        {
+            "status": {"$in": ["queued", "running", "stop_requested"]},
+            "strategy_profile_id": strategy_id,
+        },
+        {"_id": 0, "id": 1},
+    )
+    if active is not None:
+        raise StrategyLabConflict(
+            f"Wait for model tuning {active.get('id', 'unknown')} to finish before changing this Strategy."
+        )
+
+
 def update_strategy(
     db: Any,
     strategy_id: str,
@@ -940,6 +1078,7 @@ def update_strategy(
     actor_email: str | None,
 ) -> dict[str, Any]:
     ensure_strategy_catalog(db)
+    _assert_strategy_not_under_model_tuning(db, strategy_id)
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
         raise StrategyLabNotFound("Strategy profile not found.")
@@ -1036,6 +1175,7 @@ def _matching_completed_model_job(
         db[JOBS_COLLECTION].find(
             {
                 "status": "completed",
+                "tuning_summary_only": {"$ne": True},
                 "strategy_profile_id": str(strategy_document.get("_id") or ""),
                 "strategy_profile_revision": int(strategy_document.get("revision") or 1),
             }
@@ -1070,6 +1210,7 @@ def update_strategy_model(
     pre-v1.13.43 completed job be adopted when its exact model values already match.
     """
     ensure_strategy_catalog(db)
+    _assert_strategy_not_under_model_tuning(db, strategy_id)
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
         raise StrategyLabNotFound("Strategy profile not found.")
@@ -1172,6 +1313,14 @@ def _assert_no_active_backtest(db: Any) -> None:
         raise StrategyLabConflict(
             f"Wait for backtest {active.get('id', 'unknown')} to finish before changing strategy selection."
         )
+    active_tuning = db[MODEL_TUNING_RUNS_COLLECTION].find_one(
+        {"status": {"$in": ["queued", "running", "stop_requested"]}},
+        {"_id": 0, "id": 1},
+    )
+    if active_tuning is not None:
+        raise StrategyLabConflict(
+            f"Wait for model tuning {active_tuning.get('id', 'unknown')} to finish before changing strategy selection or Trader lifecycle."
+        )
 
 
 def select_research_strategy(
@@ -1221,6 +1370,7 @@ def mark_strategy_as_candidate(
     actor_email: str | None,
 ) -> dict[str, Any]:
     control = ensure_strategy_catalog(db)
+    _assert_strategy_not_under_model_tuning(db, strategy_id)
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
@@ -1584,20 +1734,8 @@ def promote_strategy_to_trader(
             "Candidate backtest hash does not match the configuration being promoted."
         )
 
-    winner_name = f"Winner v{API_VERSION}"
-    # A research Candidate is allowed to use the same display name as the Winner
-    # snapshot that will be created for this API release. Release uniqueness is
-    # defined by immutable Winner metadata, not by a mutable profile name.
-    existing_release_winner = db[STRATEGY_PROFILES_COLLECTION].find_one(
-        {
-            "winner_api_version": API_VERSION,
-            "status": {"$in": ["winner", "former_winner"]},
-        }
-    )
-    if existing_release_winner is not None:
-        raise StrategyLabConflict(
-            f"{winner_name} already exists. Each API release can officialize only one Winner snapshot."
-        )
+    next_winner_sequence = int(control.get("winner_sequence") or 0) + 1
+    winner_name = f"Winner #{next_winner_sequence}"
 
     actor = (actor_email or "").strip().lower() or None
     _acquire_winner_promotion_lock(
@@ -1608,7 +1746,9 @@ def promote_strategy_to_trader(
     winner_id: str | None = None
     promotion_history_id: str | None = None
     previous_winner_id: str | None = None
+    previous_promoted_candidate_id: str | None = None
     previous_transitioned = False
+    previous_promoted_transitioned = False
     source_transitioned = False
     promotion_completed = False
     try:
@@ -1618,7 +1758,7 @@ def promote_strategy_to_trader(
         )
         now = utc_now()
         winner_id = (
-            f"winner-v{API_VERSION.replace('.', '-')}-"
+            f"winner-{next_winner_sequence:04d}-"
             f"{configuration_hash[:8]}-{uuid.uuid4().hex[:6]}"
         )
         winner = {
@@ -1636,6 +1776,8 @@ def promote_strategy_to_trader(
             "research_model_snapshot": bson_value(winner_model_snapshot),
             "winner_model_snapshot": bson_value(winner_model_snapshot),
             "winner_api_version": API_VERSION,
+            "source_api_version": API_VERSION,
+            "winner_sequence": next_winner_sequence,
             "research_reference_assets": list(configuration.assets),
             "created_at": now,
             "updated_at": now,
@@ -1663,6 +1805,35 @@ def promote_strategy_to_trader(
             },
         )
         previous_transitioned = previous_updated.matched_count == 1
+
+        previous_promoted_candidate_id = str(
+            control.get("promoted_candidate_strategy_id") or ""
+        ) or None
+        if previous_promoted_candidate_id:
+            previous_promoted = db[STRATEGY_PROFILES_COLLECTION].update_one(
+                {
+                    "_id": previous_promoted_candidate_id,
+                    "status": "promoted_candidate",
+                },
+                {
+                    "$set": {
+                        "status": "superseded_candidate",
+                        "locked": True,
+                        "superseded_at": now,
+                        "superseded_by_strategy_id": strategy_id,
+                        "superseded_reason": "promoted_candidate_replaced",
+                        "historical_lifecycle_status": "promoted_candidate",
+                        "updated_at": now,
+                        "updated_by": actor,
+                    }
+                },
+            )
+            previous_promoted_transitioned = previous_promoted.matched_count == 1
+            if not previous_promoted_transitioned:
+                raise StrategyLabConflict(
+                    "The active promoted Candidate changed before promotion could be committed."
+                )
+
         source_updated = db[STRATEGY_PROFILES_COLLECTION].update_one(
             {
                 "_id": strategy_id,
@@ -1673,6 +1844,10 @@ def promote_strategy_to_trader(
                 "$set": {
                     "status": "promoted_candidate",
                     "locked": True,
+                    "superseded_at": None,
+                    "superseded_by_strategy_id": None,
+                    "superseded_reason": None,
+                    "historical_lifecycle_status": None,
                     "last_promoted_winner_strategy_id": winner_id,
                     "last_promoted_at": now,
                     "last_promoted_by": actor,
@@ -1697,7 +1872,11 @@ def promote_strategy_to_trader(
                     "previous_winner_strategy_id": previous_winner_id,
                     "new_winner_strategy_id": winner_id,
                     "new_winner_name": winner_name,
+                    "winner_sequence": next_winner_sequence,
                     "winner_api_version": API_VERSION,
+                    "source_api_version": API_VERSION,
+                    "previous_promoted_candidate_strategy_id": previous_promoted_candidate_id,
+                    "new_promoted_candidate_strategy_id": strategy_id,
                     "source_strategy_id": strategy_id,
                     "source_strategy_revision": source_revision,
                     "candidate_backtest_id": candidate_backtest_id,
@@ -1728,7 +1907,9 @@ def promote_strategy_to_trader(
             {
                 "$set": {
                     "candidate_strategy_id": None,
+                    "promoted_candidate_strategy_id": strategy_id,
                     "trader_winner_strategy_id": winner_id,
+                    "winner_sequence": next_winner_sequence,
                     "research_reference_strategy_id": winner_id,
                     "research_reference_configuration_hash": configuration_hash,
                     "research_reference_assets": list(configuration.assets),
@@ -1789,6 +1970,9 @@ def promote_strategy_to_trader(
                 "next_scheduled_evaluation_uses_new_winner": True,
                 "next_scheduled_evaluation_assets_count": len(configuration.assets),
                 "winner_model": public_model_snapshot(winner_model_snapshot),
+                "promoted_candidate_strategy_id": strategy_id,
+                "previous_promoted_candidate_strategy_id": previous_promoted_candidate_id,
+                "winner_sequence": next_winner_sequence,
                 **operational_snapshot,
             },
         }
@@ -1803,6 +1987,21 @@ def promote_strategy_to_trader(
                             "locked": True,
                             "updated_at": utc_now(),
                             "superseded_by_winner_strategy_id": None,
+                        }
+                    },
+                )
+            if previous_promoted_transitioned and previous_promoted_candidate_id:
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": previous_promoted_candidate_id},
+                    {
+                        "$set": {
+                            "status": "promoted_candidate",
+                            "locked": True,
+                            "superseded_at": None,
+                            "superseded_by_strategy_id": None,
+                            "superseded_reason": None,
+                            "historical_lifecycle_status": None,
+                            "updated_at": utc_now(),
                         }
                     },
                 )

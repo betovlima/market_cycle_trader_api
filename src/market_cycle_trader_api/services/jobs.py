@@ -361,6 +361,7 @@ def run_job(job_id: str) -> None:
         else {}
     )
     certifies_strategy = research_model_family in {"xgboost_utility", "lightgbm_utility"}
+    certifies_strategy = certifies_strategy and bool(job_document.get("certifies_strategy", True))
     db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0, "progress_detail": {}}})
     python_path = str(SOURCE_ROOT)
     existing_python_path = os.environ.get("PYTHONPATH", "")
@@ -368,6 +369,10 @@ def run_job(job_id: str) -> None:
         python_path = python_path + os.pathsep + existing_python_path
     command = [sys.executable, "-u", "-m", ENGINE_MODULE, "--job-id", job_id]
     numeric_environment = numeric_thread_environment(request_payload)
+    runtime_thread_limit = int(job_document.get("runtime_thread_limit") or 0)
+    if runtime_thread_limit > 0:
+        numeric_environment = {key: str(runtime_thread_limit) for key in _NUMERIC_THREAD_ENVIRONMENT_KEYS}
+        numeric_environment["MCT_MODEL_THREADS_OVERRIDE"] = str(runtime_thread_limit)
     child_environment = build_subprocess_environment({
         "PYTHONPATH": python_path,
         **numeric_environment,

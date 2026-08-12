@@ -1,0 +1,42 @@
+Market Cycle Trader API v1.13.42 validation
+============================================
+
+Scope
+-----
+Model-aware Candidate/Winner lifecycle and protected LightGBM live Trader support.
+
+Validated behavior
+------------------
+- Candidate certification binds the exact Strategy revision and selected research model family.
+- Existing completed LightGBM jobs can be selected as Candidate without rerunning the backtest.
+- New Winner snapshots freeze Strategy configuration plus model family, profile, settings revision, settings SHA-256 and complete protected model settings.
+- Legacy Winner documents without a model snapshot remain compatible and resolve as Strategy-owned XGBoost.
+- IQN remains Research-only and cannot be promoted because no protected IQN live engine exists.
+- Paper Trader dispatches live decisions from the immutable Winner model snapshot: XGBoost or LightGBM.
+- Current editable Model Research settings cannot silently alter a promoted Winner.
+- Prepared Paper plans bind both Winner Strategy hash and Winner model-settings hash; stale plans are rejected after Winner/model changes.
+- Live XGBoost and LightGBM inference no longer depends on an unknown next-session OHLC row; the final live decision uses the latest completed session only.
+- Backtest chronology and backtest tradability checks remain unchanged.
+
+Automated validation
+--------------------
+- Python compileall: PASS.
+- Unresolved-global scan: PASS.
+- API automated test suite: PASS — 150/150 tests.
+- Model snapshot hash/profile/revision contract tests: PASS.
+- LightGBM Candidate -> Winner immutable snapshot test: PASS.
+- IQN non-promotable contract test: PASS.
+- XGBoost/LightGBM live dispatcher contract tests: PASS.
+- Live inference regression test confirming no future-session bar is required: PASS.
+- Numerical smoke test: XGBoost and LightGBM produced finite live utilities and a non-CASH selection on synthetic historical data.
+
+Validation environment note
+---------------------------
+The execution environment used for this release does not provide the project's installed pymongo/bson runtime packages and has no package-registry connectivity. Test-only pymongo/bson shims were therefore injected through PYTHONPATH outside the project solely to execute the isolated automated suite. No shim file is included in the release artifacts and no project dependency/version was changed to accommodate the validation environment.
+
+Operational limitations
+-----------------------
+- No live MongoDB mutation was performed.
+- No live Alpaca order was submitted.
+- No Railway deployment was performed.
+- Promotion remains guarded by the existing safe Trader/Paper state checks and the XNYS regular-market-closed requirement.

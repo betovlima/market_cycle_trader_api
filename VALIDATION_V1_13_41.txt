@@ -1,0 +1,44 @@
+Market Cycle Trader validation
+Frontend v1.12.110 / API v1.13.41
+
+Scope
+-----
+Independent model parameterization and Selected Strategy UI consolidation.
+
+API validation
+--------------
+- Python compileall: PASS.
+- Complete automated API suite: 145/145 PASS.
+- Tests executed with temporary pymongo/bson import shims because pymongo is unavailable in this execution container; shims are NOT packaged.
+- Unresolved-global scan: PASS.
+- XGBoost, LightGBM and IQN each expose independent validated model profiles: PASS.
+- Same-named parameters are independent per model profile: PASS.
+- repetitions, seed_step and random_state are independent per model profile: PASS.
+- XGBoost model profile maps into legacy engine fields only inside the immutable research execution snapshot: PASS.
+- Persisted Strategy and Trader Winner documents are not rewritten by model-profile selection: PASS by contract/tests.
+- Model Research jobs with an independent profile do not certify the legacy Strategy lifecycle automatically: PASS.
+- Legacy XGBoost Strategy execution remains available for backward compatibility: PASS by contract.
+- Model-owned legacy XGBoost fields are removed from visible Strategy parameter groups while remaining in the persisted schema for compatibility: PASS.
+
+Frontend validation
+-------------------
+- 42 JS/JSX source files parsed/transpiled with TypeScript parser: PASS (0 syntax errors).
+- CSS structural brace validation: PASS.
+- Frontend VERSION/package.json/FRONT_VERSION = 1.12.110: PASS.
+- Model parameter selector is embedded inside SELECTED STRATEGY: PASS.
+- Separate Model Research settings box removed from System Settings: PASS.
+- XGBoost / LightGBM / IQN fields are rendered dynamically from the Administrator API: PASS.
+- No model hyperparameter defaults were added to React: PASS.
+- Configuration-owner row removed to simplify the UI: PASS.
+
+Safety / compatibility
+----------------------
+- Trader Winner remains unchanged by this release.
+- Strategy/experiment rules remain separate from model-owned hyperparameters.
+- Existing v1.13.40 model settings migrate additively to schema v3; LightGBM/IQN stored values are preserved and XGBoost receives its independent baseline profile.
+- No destructive MongoDB migration is required.
+- Running jobs are immutable and are not changed by model-setting edits.
+
+Build limitation
+----------------
+- A full Vite dependency build was not run because project node_modules are not installed in this environment. Static TypeScript JSX parsing and CSS validation passed.

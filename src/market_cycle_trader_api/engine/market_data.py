@@ -41,6 +41,21 @@ def normalize_end_date(value: str | None) -> str | None:
     return parsed.strftime("%Y-%m-%d")
 
 
+def inclusive_end_exclusive_boundary(value: str | None) -> pd.Timestamp | None:
+    """Convert an inclusive user-facing end date into an exclusive UTC boundary.
+
+    A historical end_date of 2026-08-11 means that the completed daily session
+    on 2026-08-11 belongs to the experiment.  Mongo and Alpaca range queries use
+    an exclusive right-hand boundary, so the internal boundary must be midnight
+    at the start of the following calendar day.
+    """
+
+    normalized = normalize_end_date(value)
+    if normalized is None:
+        return None
+    return pd.Timestamp(normalized, tz="UTC") + pd.Timedelta(days=1)
+
+
 def _utc_timestamp(value: Any) -> pd.Timestamp:
     stamp = pd.Timestamp(value)
     if pd.isna(stamp):
@@ -78,9 +93,8 @@ def trim_downloaded_range(
     result = frame.copy()
     start = _utc_timestamp(requested_start)
     result = result.loc[result.index >= start]
-    normalized_end = normalize_end_date(requested_end)
-    if normalized_end is not None:
-        end = pd.Timestamp(normalized_end, tz="UTC")
+    end = inclusive_end_exclusive_boundary(requested_end)
+    if end is not None:
         result = result.loc[result.index < end]
     return filter_non_trading_rows(result, timeframe)
 
@@ -305,19 +319,24 @@ def _download_alpaca_bars(
 ) -> pd.DataFrame:
     """Download the requested range from Alpaca in bounded date chunks.
 
-    Chunking avoids relying on one large SDK request and makes the historical
-    bootstrap deterministic for long ranges while still using Alpaca as the
-    only market-data provider.
+    The application contract treats a historical ``end_date`` as inclusive.
+    Alpaca receives timestamps, and daily-bar boundary handling can otherwise
+    omit the final requested session at midnight boundaries.  For explicit
+    daily cutoffs we therefore fetch one extra calendar day beyond the normal
+    exclusive boundary and always trim the returned frame back to the exact
+    inclusive cutoff before it can reach the backtest.  This makes frozen CARO
+    replays deterministic without allowing the safety look-ahead into results.
     """
 
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
-    normalized_end = normalize_end_date(end_date)
-    requested_end = (
-        pd.Timestamp(normalized_end, tz="UTC")
-        if normalized_end
-        else pd.Timestamp(date.today(), tz="UTC")
-    )
+    trim_end = inclusive_end_exclusive_boundary(end_date)
+    if trim_end is None:
+        requested_end = pd.Timestamp(date.today(), tz="UTC")
+    else:
+        requested_end = trim_end
+        if config.timeframe == "1Day":
+            requested_end = requested_end + pd.Timedelta(days=1)
     if requested_end <= requested_start:
         return pd.DataFrame()
 
@@ -359,8 +378,7 @@ def _download_alpaca_bars(
 def load_alpaca_bars(symbol: str, config: Any) -> pd.DataFrame:
     start = pd.Timestamp(config.start_date, tz="UTC")
     execution_end = effective_execution_end_date(config)
-    normalized_end = normalize_end_date(execution_end)
-    end = pd.Timestamp(normalized_end, tz="UTC") if normalized_end else None
+    end = inclusive_end_exclusive_boundary(execution_end)
 
     if not config.mongo_cache_enabled:
         downloaded = _download_alpaca_bars(

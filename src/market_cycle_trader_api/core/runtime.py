@@ -60,37 +60,43 @@ def refresh_locked_configuration_status() -> bool:
     return True
 
 
-def initialize_mongo() -> None:
+def initialize_mongo(*, role: str = "api") -> None:
     global _MONGO_CLIENT, _MONGO_DB, MONGO_STATUS
     try:
         client = create_client()
         db = get_database(client)
         ensure_database(db)
-        db[JOBS_COLLECTION].update_many(
-            {"status": {"$in": ["queued", "running"]}},
-            {
-                "$set": {
-                    "status": "interrupted",
-                    "stage": "The API was restarted before the run finished.",
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
+        normalized_role = str(role or "api").strip().lower()
+        if normalized_role == "api":
+            # The API owns both normal backtests and the integrated tuning worker.
+            # Any in-flight child process is gone after a container restart, so mark
+            # every queued/running job interrupted. Tuning recovery will safely rerun
+            # its current candidate from the frozen campaign snapshot.
+            db[JOBS_COLLECTION].update_many(
+                {"status": {"$in": ["queued", "running"]}},
+                {
+                    "$set": {
+                        "status": "interrupted",
+                        "stage": "The API was restarted before the run finished.",
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                    },
+                    "$unset": {"process_id": ""},
                 },
-                "$unset": {"process_id": ""},
-            },
-        )
-        db[ASSET_DISCOVERY_RUNS_COLLECTION].update_many(
-            {"status": {"$in": ["queued", "running", "stopping"]}},
-            {
-                "$set": {
-                    "status": "interrupted",
-                    "phase": "interrupted",
-                    "last_message": "The API was restarted before Asset Discovery finished.",
-                    "finished_at": utc_now(),
-                    "updated_at": utc_now(),
+            )
+            db[ASSET_DISCOVERY_RUNS_COLLECTION].update_many(
+                {"status": {"$in": ["queued", "running", "stopping"]}},
+                {
+                    "$set": {
+                        "status": "interrupted",
+                        "phase": "interrupted",
+                        "last_message": "The API was restarted before Asset Discovery finished.",
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                    },
+                    "$unset": {"active_key": ""},
                 },
-                "$unset": {"active_key": ""},
-            },
-        )
+            )
 
         configuration_available = True
         configuration_message = "Research strategy and Trader winner are valid."

@@ -48,6 +48,7 @@ ASSET_DISCOVERY_RUNS_COLLECTION = "asset_discovery_runs"
 ASSET_DISCOVERY_STATE_COLLECTION = "asset_discovery_state"
 MODEL_RESEARCH_SETTINGS_COLLECTION = "model_research_settings"
 MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION = "model_research_settings_history"
+MODEL_TUNING_RUNS_COLLECTION = "model_tuning_runs"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -255,6 +256,15 @@ def ensure_database(db: Database) -> None:
         [("settings_id", ASCENDING), ("updated_at", DESCENDING)],
         name="ix_model_research_settings_history",
     )
+    db[MODEL_TUNING_RUNS_COLLECTION].create_index(
+        [("status", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_model_tuning_status_created",
+    )
+    db[MODEL_TUNING_RUNS_COLLECTION].create_index(
+        [("strategy_profile_id", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_model_tuning_strategy_created",
+    )
+
 
 
 

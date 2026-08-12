@@ -167,20 +167,21 @@ def _selected_backtest_strategy_name(db: Any) -> str | None:
 
 def dashboard_summary(db: Any, *, limit: int = 10) -> dict[str, Any]:
     safe_limit = max(1, min(50, int(limit)))
-    total_backtests = int(db[JOBS_COLLECTION].count_documents({}))
-    completed_backtests = int(db[JOBS_COLLECTION].count_documents({"status": "completed"}))
-    failed_backtests = int(db[JOBS_COLLECTION].count_documents({"status": "failed"}))
-    interrupted_backtests = int(db[JOBS_COLLECTION].count_documents({"status": "interrupted"}))
+    public_job_filter = {"internal_job": {"$ne": True}}
+    total_backtests = int(db[JOBS_COLLECTION].count_documents(public_job_filter))
+    completed_backtests = int(db[JOBS_COLLECTION].count_documents({**public_job_filter, "status": "completed"}))
+    failed_backtests = int(db[JOBS_COLLECTION].count_documents({**public_job_filter, "status": "failed"}))
+    interrupted_backtests = int(db[JOBS_COLLECTION].count_documents({**public_job_filter, "status": "interrupted"}))
 
     recent_jobs = list(
         db[JOBS_COLLECTION]
-        .find({}, _PUBLIC_JOB_PROJECTION)
+        .find(public_job_filter, _PUBLIC_JOB_PROJECTION)
         .sort("created_at", -1)
         .limit(safe_limit)
     )
     completed_jobs = list(
         db[JOBS_COLLECTION]
-        .find({"status": "completed"}, _PUBLIC_JOB_PROJECTION)
+        .find({**public_job_filter, "status": "completed"}, _PUBLIC_JOB_PROJECTION)
         .sort("created_at", -1)
     )
 

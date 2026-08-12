@@ -25,6 +25,7 @@ from .api.routers import (
     health,
     jobs,
     model_research,
+    model_tuning,
     paper_market,
     public_paper_portfolio,
     parameter_bootstrap,
@@ -36,7 +37,7 @@ from .core.config import API_VERSION, cors_origins
 from .auth.config import get_auth_settings
 from .auth.security import require_admin_session, require_portfolio_session, require_trader_session
 from .auth.access_service import get_access_service
-from .core.runtime import close_mongo, initialize_mongo
+from .core.runtime import MONGO_STATUS, close_mongo, database, initialize_mongo
 from .services.paper_market_scheduler import (
     start_paper_market_scheduler,
     stop_paper_market_scheduler,
@@ -45,11 +46,14 @@ from .services.asset_discovery_scheduler import (
     start_asset_discovery_scheduler,
     stop_asset_discovery_scheduler,
 )
+from .services.model_tuning import recover_integrated_model_tuning_runs
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     initialize_mongo()
+    if bool(MONGO_STATUS.get("available")):
+        recover_integrated_model_tuning_runs(database())
     get_auth_settings().validate_runtime()
     get_access_service().ensure_storage()
     start_paper_market_scheduler()
@@ -90,6 +94,7 @@ def create_app() -> FastAPI:
     application.include_router(dashboard.router, dependencies=viewer_required)
     application.include_router(jobs.router, dependencies=viewer_required)
     application.include_router(model_research.router, dependencies=admin_required)
+    application.include_router(model_tuning.router, dependencies=admin_required)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)
     application.include_router(paper_market.router, dependencies=admin_required)
