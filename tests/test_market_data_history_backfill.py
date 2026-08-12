@@ -10,6 +10,8 @@ import pytest
 from market_cycle_trader_api.engine.market_data import (
     _download_alpaca_bars,
     complete_market_history,
+    inclusive_end_exclusive_boundary,
+    trim_downloaded_range,
 )
 from market_cycle_trader_api.schemas.requests import BacktestRequest
 
@@ -106,3 +108,47 @@ def test_long_alpaca_history_is_downloaded_in_date_chunks() -> None:
         assert call.kwargs["feed"] == config.alpaca_historical_feed
         assert call.kwargs["adjustment"] == config.alpaca_adjustment
         assert call.kwargs["symbol"] == "NVDA"
+
+
+def test_historical_end_date_is_inclusive_for_daily_bars() -> None:
+    frame = _frame("2024-01-08", 3, 100.0)
+
+    result = trim_downloaded_range(
+        frame,
+        requested_start="2024-01-08",
+        requested_end="2024-01-09",
+        timeframe="1Day",
+    )
+
+    assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-08", "2024-01-09"]
+    assert inclusive_end_exclusive_boundary("2024-01-09") == pd.Timestamp("2024-01-10", tz="UTC")
+
+
+def test_alpaca_download_uses_day_after_inclusive_historical_end() -> None:
+    config = _config()
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return _frame("2024-01-09", 1, 100.0)
+
+    with (
+        patch(
+            "market_cycle_trader_api.engine.market_data.get_alpaca_credentials",
+            return_value={"api_key_id": "key", "secret_key": "secret"},
+        ),
+        patch(
+            "market_cycle_trader_api.engine.market_data.download_stock_bars",
+            side_effect=fake_download,
+        ),
+    ):
+        result = _download_alpaca_bars(
+            "NVDA",
+            config,
+            "2024-01-08",
+            "2024-01-09",
+        )
+
+    assert calls
+    assert pd.Timestamp(calls[-1]["end"]) == pd.Timestamp("2024-01-10", tz="UTC")
+    assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-09"]

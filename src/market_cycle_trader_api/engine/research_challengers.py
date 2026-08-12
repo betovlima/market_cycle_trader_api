@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
+import os
 import time
 from typing import Any, Callable
 
@@ -22,6 +23,18 @@ from .capital_rotation import (
     _xgb_policy,
     prepare_rotation_panel,
 )
+
+
+def _effective_n_jobs(configured: int) -> int:
+    raw = str(os.getenv("MCT_MODEL_THREADS_OVERRIDE") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return int(configured)
 
 
 def _research_settings(config: Any) -> dict[str, Any]:
@@ -147,7 +160,7 @@ def _lightgbm_fit_models(
             reg_lambda=float(settings["reg_lambda"]),
             max_bin=int(settings["max_bin"]),
             random_state=int(config.random_state),
-            n_jobs=int(settings["n_jobs"]),
+            n_jobs=_effective_n_jobs(int(settings["n_jobs"])),
             deterministic=bool(config.deterministic_execution),
             force_col_wise=bool(config.deterministic_execution),
             verbosity=-1,

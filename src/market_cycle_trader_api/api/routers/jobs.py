@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from ...core.config import strategy_lifecycle
 from ...core.runtime import database
 from ...infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
+    MODEL_TUNING_RUNS_COLLECTION,
     bson_value,
     get_alpaca_credentials,
     utc_now,
@@ -26,92 +28,164 @@ from ...services.strategy_lab import (
     get_trader_winner_context,
 )
 from ...services.results import build_results
-from ...services.model_research import apply_execution_profile, model_execution_snapshot, model_label
+from ...services.model_research import (
+    apply_execution_profile,
+    execution_settings_from_values,
+    model_execution_snapshot,
+    model_label,
+)
 
 router = APIRouter(tags=["jobs"])
 
 
-def queue_backtest_job() -> dict[str, Any]:
-    """Queue the model already saved with the selected Strategy revision."""
+def queue_backtest_job(
+    *,
+    model_values_override: dict[str, Any] | None = None,
+    start_thread: bool = True,
+    certify_strategy: bool = True,
+    tuning_run_id: str | None = None,
+    tuning_candidate_id: int | None = None,
+    runtime_thread_limit: int | None = None,
+    execution_worker_id: str | None = None,
+    execution_request_override: dict[str, Any] | None = None,
+    execution_metadata_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Queue the model saved with the selected Strategy, optionally with an isolated tuning snapshot.
+
+    Tuning overrides are immutable execution-only values. They never mutate the selected
+    Strategy and never certify it unless the user later adopts a completed candidate.
+    """
     db = database()
     runtime_settings = get_system_settings(db)
     training_settings = runtime_settings["training"]
     if not bool(training_settings["enabled"]):
         raise HTTPException(status_code=409, detail="Model training is disabled in System Settings.")
-    active_jobs = db[JOBS_COLLECTION].count_documents({"status": {"$in": ["queued", "running"]}})
-    if active_jobs >= 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Wait for the active backtest to finish before starting another one.",
+    if tuning_run_id is None:
+        # User-facing backtests remain serialized. Integrated model tuning is also
+        # serialized against normal Simulation Backtests so both workloads cannot
+        # compete for the same CPU/RAM or mutate the experiment context mid-run.
+        active_jobs = db[JOBS_COLLECTION].count_documents(
+            {"status": {"$in": ["queued", "running"]}, "internal_job": {"$ne": True}}
         )
+        if active_jobs >= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Wait for the active backtest to finish before starting another one.",
+            )
+        active_tuning = db[MODEL_TUNING_RUNS_COLLECTION].find_one(
+            {"status": {"$in": ["queued", "running", "stop_requested"]}},
+            {"_id": 0, "id": 1},
+        )
+        if active_tuning is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Wait for model tuning {active_tuning.get('id', 'unknown')} to finish before starting a backtest.",
+            )
 
     try:
-        selected_configuration, selected_strategy = get_research_strategy_context(db)
-        selected_model_snapshot = get_research_strategy_model_snapshot(db)
-        research_model_family = str(selected_model_snapshot["family"])
-        research_model_settings = (
-            dict(selected_model_snapshot.get("settings_snapshot") or {})
-            if isinstance(selected_model_snapshot.get("settings_snapshot"), dict)
-            else {}
-        )
-        reference_assets_snapshot, reference_profile = get_research_reference_context(db)
-        winner_configuration, winner_profile = get_trader_winner_context(db)
-        locked_configuration = apply_training_runtime_settings(
-            db,
-            selected_configuration,
-        )
-        locked_configuration = apply_execution_profile(
-            locked_configuration,
-            research_model_family,
-            research_model_settings,
-        )
-        selected_assets = set(locked_configuration.assets)
-        calendar_anchor_assets = [
-            symbol for symbol in winner_configuration.assets if symbol in selected_assets
-        ]
-        if len(calendar_anchor_assets) < 2:
-            calendar_anchor_assets = list(locked_configuration.assets)
-        research_reference_assets = [
-            symbol for symbol in reference_assets_snapshot if symbol in selected_assets
-        ]
-        if len(research_reference_assets) < 2:
-            research_reference_assets = list(locked_configuration.assets)
-        research_reference_set = set(research_reference_assets)
-        research_candidate_assets = [
-            symbol
-            for symbol in locked_configuration.assets
-            if symbol not in research_reference_set
-        ]
+        if execution_request_override is not None:
+            if tuning_run_id is None or model_values_override is None:
+                raise RuntimeError("An immutable execution snapshot is valid only for an internal tuning candidate.")
+            request_payload = deepcopy(execution_request_override)
+            research_model_family = str(request_payload.get("research_model_family") or "")
+            if research_model_family not in {"xgboost_utility", "lightgbm_utility", "iqn"}:
+                raise RuntimeError("The immutable tuning snapshot has an unsupported research model family.")
+            research_model_settings = execution_settings_from_values(
+                research_model_family,
+                model_values_override,
+                settings_revision=1,
+                profile_id=f"tuning-{tuning_run_id}-{tuning_candidate_id}",
+            )
+            request_payload["research_model_family"] = research_model_family
+            request_payload["research_model_settings"] = research_model_settings
+            # These generic execution fields are model-owned and remain frozen across
+            # the campaign except when an explicitly supplied candidate changes them.
+            if "repetitions" in model_values_override:
+                request_payload["rotation_xgb_repetitions"] = int(model_values_override["repetitions"])
+            if "seed_step" in model_values_override:
+                request_payload["rotation_seed_step"] = int(model_values_override["seed_step"])
+            if "random_state" in model_values_override:
+                request_payload["random_state"] = int(model_values_override["random_state"])
+            request = BacktestExecutionRequest.model_validate(request_payload)
+            selected_model_snapshot = model_execution_snapshot(research_model_family, research_model_settings)
+            metadata = dict(execution_metadata_override or {})
+            selected_strategy = {
+                "id": str(metadata.get("strategy_profile_id") or "tuning-snapshot"),
+                "name": str(metadata.get("strategy_profile_name") or "Tuning Snapshot"),
+                "revision": int(metadata.get("strategy_profile_revision") or 0),
+                "configuration_hash": metadata.get("strategy_configuration_hash"),
+            }
+            try:
+                _, reference_profile = get_research_reference_context(db)
+            except Exception:
+                reference_profile = {}
+            try:
+                _, winner_profile = get_trader_winner_context(db)
+            except Exception:
+                winner_profile = {}
+            research_reference_assets = list(request.research_reference_assets)
+            research_candidate_assets = list(request.research_candidate_assets)
+        else:
+            selected_configuration, selected_strategy = get_research_strategy_context(db)
+            selected_model_snapshot = get_research_strategy_model_snapshot(db)
+            research_model_family = str(selected_model_snapshot["family"])
+            research_model_settings = (
+                dict(selected_model_snapshot.get("settings_snapshot") or {})
+                if isinstance(selected_model_snapshot.get("settings_snapshot"), dict)
+                else {}
+            )
+            if model_values_override is not None:
+                research_model_settings = execution_settings_from_values(
+                    research_model_family,
+                    model_values_override,
+                    settings_revision=int(selected_model_snapshot.get("settings_revision") or 1),
+                    profile_id=(
+                        f"tuning-{tuning_run_id}-{tuning_candidate_id}"
+                        if tuning_run_id is not None and tuning_candidate_id is not None
+                        else "isolated-research"
+                    ),
+                )
+                selected_model_snapshot = model_execution_snapshot(
+                    research_model_family,
+                    research_model_settings,
+                )
+            reference_assets_snapshot, reference_profile = get_research_reference_context(db)
+            winner_configuration, winner_profile = get_trader_winner_context(db)
+            locked_configuration = apply_training_runtime_settings(db, selected_configuration)
+            locked_configuration = apply_execution_profile(
+                locked_configuration,
+                research_model_family,
+                research_model_settings,
+            )
+            selected_assets = set(locked_configuration.assets)
+            calendar_anchor_assets = [symbol for symbol in winner_configuration.assets if symbol in selected_assets]
+            if len(calendar_anchor_assets) < 2:
+                calendar_anchor_assets = list(locked_configuration.assets)
+            research_reference_assets = [symbol for symbol in reference_assets_snapshot if symbol in selected_assets]
+            if len(research_reference_assets) < 2:
+                research_reference_assets = list(locked_configuration.assets)
+            research_reference_set = set(research_reference_assets)
+            research_candidate_assets = [symbol for symbol in locked_configuration.assets if symbol not in research_reference_set]
+            request = BacktestExecutionRequest.model_validate(
+                {
+                    **locked_configuration.model_dump(mode="python"),
+                    "analysis_start_date": locked_configuration.start_date,
+                    "analysis_end_date": locked_configuration.end_date,
+                    "calendar_anchor_assets": calendar_anchor_assets,
+                    "research_reference_assets": research_reference_assets,
+                    "research_candidate_assets": research_candidate_assets,
+                    "research_model_family": research_model_family,
+                    "research_model_settings": dict(research_model_settings or {}),
+                }
+            )
     except (RuntimeError, ValidationError) as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Selected backtest strategy is invalid: {exc}",
-        ) from exc
+        raise HTTPException(status_code=500, detail=f"Selected backtest strategy is invalid: {exc}") from exc
 
-    if locked_configuration.market_data_provider == "alpaca":
+    if request.market_data_provider == "alpaca":
         try:
             get_alpaca_credentials()
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    try:
-        request = BacktestExecutionRequest.model_validate(
-            {
-                **locked_configuration.model_dump(mode="python"),
-                "analysis_start_date": locked_configuration.start_date,
-                "analysis_end_date": locked_configuration.end_date,
-                "calendar_anchor_assets": calendar_anchor_assets,
-                "research_reference_assets": research_reference_assets,
-                "research_candidate_assets": research_candidate_assets,
-                "research_model_family": research_model_family,
-                "research_model_settings": dict(research_model_settings or {}),
-            }
-        )
-    except ValidationError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Locked execution period is invalid: {exc}",
-        ) from exc
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     request_payload = request.model_dump(mode="python")
@@ -160,9 +234,17 @@ def queue_backtest_job() -> dict[str, Any]:
         "research_reference_configuration_hash_at_queue": reference_profile.get("configuration_hash"),
         "research_reference_assets": research_reference_assets,
         "research_candidate_assets": research_candidate_assets,
+        "certifies_strategy": bool(certify_strategy),
+        "internal_job": tuning_run_id is not None,
+        "tuning_summary_only": tuning_run_id is not None,
+        "tuning_run_id": tuning_run_id,
+        "tuning_candidate_id": tuning_candidate_id,
+        "runtime_thread_limit": max(1, int(runtime_thread_limit)) if runtime_thread_limit else None,
+        "execution_worker_id": str(execution_worker_id or "").strip() or None,
     }
     db[JOBS_COLLECTION].insert_one(job)
-    threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
+    if start_thread:
+        threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
     return public_job(job) or {}
 
 
@@ -174,7 +256,7 @@ def create_job() -> dict[str, Any]:
 
 @router.get("/api/jobs/latest")
 def get_latest_job() -> dict[str, Any] | None:
-    return public_job(database()[JOBS_COLLECTION].find_one({}, sort=[("created_at", -1)]))
+    return public_job(database()[JOBS_COLLECTION].find_one({"internal_job": {"$ne": True}}, sort=[("created_at", -1)]))
 
 
 @router.get("/api/jobs/{job_id}")

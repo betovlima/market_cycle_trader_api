@@ -358,7 +358,8 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     )
 
     assert result["status"] == "promoted"
-    assert result["winner"]["name"] == f"Winner v{strategy_lab_service.API_VERSION}"
+    assert result["winner"]["name"] == "Winner #2"
+    assert result["winner"]["winner_sequence"] == 2
     assert result["winner"]["locked"] is True
     assert result["winner"]["source_strategy_id"] == draft["id"]
     assert result["promotion"]["broker_interaction_performed"] is False
@@ -373,6 +374,8 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["status"] == "promoted_candidate"
     assert db[STRATEGY_PROFILES_COLLECTION].documents[draft["id"]]["locked"] is True
     assert result["control"]["candidate_strategy_id"] is None
+    assert result["control"]["promoted_candidate_strategy_id"] == draft["id"]
+    assert result["control"]["promoted_candidate_strategy"]["id"] == draft["id"]
     assert result["control"]["paper_state_reinitialization_required"] is False
     assert db[PAPER_TRADING_STATE_COLLECTION].documents["default"] == state_before
     assert db[PAPER_MARKET_AUTOMATION_COLLECTION].documents["default"] == automation_before
@@ -383,19 +386,19 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     assert promotion[0]["operational_snapshot"]["managed_symbol"] == "NVDA"
 
 
-def test_promotion_blocks_only_when_official_winner_snapshot_exists_for_release() -> None:
+def test_promotion_allows_multiple_historical_winners_from_same_api_release() -> None:
     db = _Database()
     install_winner_strategy_configuration(db, note="Install winner.", source="test")
     draft = create_strategy(
         db,
         name=f"Winner v{strategy_lab_service.API_VERSION}",
-        description="Candidate name alone must not define release uniqueness.",
+        description="Winner identity must be independent from the API release.",
         clone_from_strategy_id="winner-v1-13-2",
         actor_email="admin@example.com",
     )
-    db[JOBS_COLLECTION].documents["job-release-guard"] = {
-        "_id": "job-release-guard",
-        "id": "job-release-guard",
+    db[JOBS_COLLECTION].documents["job-release-independent"] = {
+        "_id": "job-release-independent",
+        "id": "job-release-independent",
         "status": "completed",
         "strategy_profile_id": draft["id"],
         "strategy_profile_revision": 1,
@@ -404,7 +407,7 @@ def test_promotion_blocks_only_when_official_winner_snapshot_exists_for_release(
         db,
         strategy_id=draft["id"],
         strategy_revision=1,
-        job_id="job-release-guard",
+        job_id="job-release-independent",
         status="completed",
     )
     mark_strategy_as_candidate(
@@ -417,27 +420,33 @@ def test_promotion_blocks_only_when_official_winner_snapshot_exists_for_release(
 
     db[STRATEGY_PROFILES_COLLECTION].documents["former-release-winner"] = {
         "_id": "former-release-winner",
-        "name": f"Winner v{strategy_lab_service.API_VERSION}",
+        "name": f"Legacy winner from API {strategy_lab_service.API_VERSION}",
         "status": "former_winner",
         "locked": True,
         "revision": 1,
         "winner_api_version": strategy_lab_service.API_VERSION,
     }
 
-    try:
-        promote_strategy_to_trader(
-            db,
-            draft["id"],
-            expected_control_revision=2,
-            expected_strategy_revision=1,
-            note="Must be blocked because this release already officialized a Winner.",
-            actor_email="admin@example.com",
-        )
-    except Exception as exc:
-        assert "already exists" in str(exc).lower()
-        assert "one winner snapshot" in str(exc).lower()
-    else:
-        raise AssertionError("A second official Winner snapshot for the same API release must be blocked.")
+    control_revision = int(db[STRATEGY_CONTROL_COLLECTION].documents["default"]["revision"])
+    result = promote_strategy_to_trader(
+        db,
+        draft["id"],
+        expected_control_revision=control_revision,
+        expected_strategy_revision=1,
+        note="Promote even though this API release already has historical Winner snapshots.",
+        actor_email="admin@example.com",
+    )
+
+    assert result["status"] == "promoted"
+    assert result["winner"]["winner_api_version"] == strategy_lab_service.API_VERSION
+    assert result["winner"]["name"].startswith("Winner #")
+    active_winners = [
+        item for item in db[STRATEGY_PROFILES_COLLECTION].documents.values()
+        if item.get("status") == "winner"
+    ]
+    assert len(active_winners) == 1
+    assert active_winners[0]["_id"] == result["winner"]["id"]
+    assert db[STRATEGY_PROFILES_COLLECTION].documents["former-release-winner"]["status"] == "former_winner"
 
 
 def test_promotion_blocks_after_premarket_plan_exists_without_changing_state() -> None:
@@ -1058,3 +1067,130 @@ def test_lightgbm_candidate_and_winner_freeze_exact_model_snapshot() -> None:
     stored = db[STRATEGY_PROFILES_COLLECTION].documents[result["winner"]["id"]]
     assert stored["winner_model_snapshot"]["family"] == "lightgbm_utility"
     assert stored["winner_model_snapshot"]["settings_snapshot"]["lightgbm"]["num_leaves"] == 8
+
+
+def test_only_one_promoted_candidate_remains_active_across_winner_promotions() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+
+    def validated_candidate(name: str, job_id: str) -> dict[str, Any]:
+        draft = create_strategy(
+            db,
+            name=name,
+            description="Lifecycle promotion test.",
+            clone_from_strategy_id=str(db[STRATEGY_CONTROL_COLLECTION].documents["default"]["trader_winner_strategy_id"]),
+            actor_email="admin@example.com",
+        )
+        db[JOBS_COLLECTION].documents[job_id] = {
+            "_id": job_id,
+            "id": job_id,
+            "status": "completed",
+            "strategy_profile_id": draft["id"],
+            "strategy_profile_revision": 1,
+        }
+        mark_strategy_backtest(
+            db,
+            strategy_id=draft["id"],
+            strategy_revision=1,
+            job_id=job_id,
+            status="completed",
+        )
+        return mark_strategy_as_candidate(
+            db,
+            draft["id"],
+            expected_strategy_revision=1,
+            note=f"Validate {name}.",
+            actor_email="admin@example.com",
+        )
+
+    first = validated_candidate("First promoted candidate", "job-first-promoted")
+    first_control_revision = int(db[STRATEGY_CONTROL_COLLECTION].documents["default"]["revision"])
+    first_promotion = promote_strategy_to_trader(
+        db,
+        first["id"],
+        expected_control_revision=first_control_revision,
+        expected_strategy_revision=1,
+        note="First promotion.",
+        actor_email="admin@example.com",
+    )
+    assert first_promotion["control"]["promoted_candidate_strategy_id"] == first["id"]
+    assert db[STRATEGY_PROFILES_COLLECTION].documents[first["id"]]["status"] == "promoted_candidate"
+
+    second = validated_candidate("Second promoted candidate", "job-second-promoted")
+    second_control_revision = int(db[STRATEGY_CONTROL_COLLECTION].documents["default"]["revision"])
+    second_promotion = promote_strategy_to_trader(
+        db,
+        second["id"],
+        expected_control_revision=second_control_revision,
+        expected_strategy_revision=1,
+        note="Second promotion replaces promoted-candidate role.",
+        actor_email="admin@example.com",
+    )
+
+    first_profile = db[STRATEGY_PROFILES_COLLECTION].documents[first["id"]]
+    second_profile = db[STRATEGY_PROFILES_COLLECTION].documents[second["id"]]
+    assert first_profile["status"] == "superseded_candidate"
+    assert first_profile["historical_lifecycle_status"] == "promoted_candidate"
+    assert first_profile["superseded_by_strategy_id"] == second["id"]
+    assert second_profile["status"] == "promoted_candidate"
+    assert second_promotion["control"]["promoted_candidate_strategy_id"] == second["id"]
+    active_promoted = [
+        item for item in db[STRATEGY_PROFILES_COLLECTION].documents.values()
+        if item.get("status") == "promoted_candidate"
+    ]
+    assert len(active_promoted) == 1
+    assert active_promoted[0]["_id"] == second["id"]
+    active_winners = [
+        item for item in db[STRATEGY_PROFILES_COLLECTION].documents.values()
+        if item.get("status") == "winner"
+    ]
+    assert len(active_winners) == 1
+    former_winners = [
+        item for item in db[STRATEGY_PROFILES_COLLECTION].documents.values()
+        if item.get("status") == "former_winner"
+    ]
+    assert len(former_winners) >= 2
+
+
+def test_catalog_normalization_keeps_only_active_winner_source_as_promoted_candidate() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    control = db[STRATEGY_CONTROL_COLLECTION].documents["default"]
+    winner_id = str(control["trader_winner_strategy_id"])
+
+    db[STRATEGY_PROFILES_COLLECTION].documents["old-promoted"] = {
+        "_id": "old-promoted",
+        "name": "Old promoted candidate",
+        "status": "promoted_candidate",
+        "locked": True,
+        "revision": 1,
+        "last_promoted_winner_strategy_id": "old-winner",
+        "last_promoted_at": "2026-08-01T10:00:00+00:00",
+        "configuration": copy.deepcopy(db[STRATEGY_PROFILES_COLLECTION].documents[winner_id]["configuration"]),
+        "configuration_hash": db[STRATEGY_PROFILES_COLLECTION].documents[winner_id]["configuration_hash"],
+    }
+    db[STRATEGY_PROFILES_COLLECTION].documents["active-source"] = {
+        "_id": "active-source",
+        "name": "Active winner source",
+        "status": "promoted_candidate",
+        "locked": True,
+        "revision": 1,
+        "last_promoted_winner_strategy_id": winner_id,
+        "last_promoted_at": "2026-08-02T10:00:00+00:00",
+        "configuration": copy.deepcopy(db[STRATEGY_PROFILES_COLLECTION].documents[winner_id]["configuration"]),
+        "configuration_hash": db[STRATEGY_PROFILES_COLLECTION].documents[winner_id]["configuration_hash"],
+    }
+    db[STRATEGY_PROFILES_COLLECTION].documents[winner_id]["source_strategy_id"] = "active-source"
+    control.pop("promoted_candidate_strategy_id", None)
+
+    catalog = list_strategies(db)
+
+    assert catalog["control"]["promoted_candidate_strategy_id"] == "active-source"
+    assert db[STRATEGY_PROFILES_COLLECTION].documents["active-source"]["status"] == "promoted_candidate"
+    assert db[STRATEGY_PROFILES_COLLECTION].documents["old-promoted"]["status"] == "superseded_candidate"
+    assert db[STRATEGY_PROFILES_COLLECTION].documents["old-promoted"]["historical_lifecycle_status"] == "promoted_candidate"
+    active_promoted = [
+        item for item in db[STRATEGY_PROFILES_COLLECTION].documents.values()
+        if item.get("status") == "promoted_candidate"
+    ]
+    assert len(active_promoted) == 1
