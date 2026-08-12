@@ -19,6 +19,7 @@ class LiveLightGBMDecision:
     raw_best_asset: str
     selected_utility: float
     utilities: dict[str, float]
+    cash_edges: dict[str, float]
     effective_switch_margin: float
     calibrated_candidate_margin: float
     calibration_score: float
@@ -196,6 +197,19 @@ def build_live_lightgbm_decision(
         label: float(utilities_array[index])
         for index, label in enumerate(labels)
     }
+    cash_edges: dict[str, float] = {}
+    if _risk_off_enabled(config) and final_cash_edge_models is not None:
+        cash_edge_array = live_model_utilities(
+            final_cash_edge_models,
+            frames,
+            symbols,
+            decision_date,
+        )
+        cash_edges = {
+            label: float(cash_edge_array[index])
+            for index, label in enumerate(labels)
+            if np.isfinite(cash_edge_array[index])
+        }
 
     return LiveLightGBMDecision(
         decision_date=decision_date,
@@ -204,6 +218,7 @@ def build_live_lightgbm_decision(
         raw_best_asset=labels[raw_best_position],
         selected_utility=float(selected_utility),
         utilities=utilities,
+        cash_edges=cash_edges,
         effective_switch_margin=float(effective_margin),
         calibrated_candidate_margin=float(best_candidate),
         calibration_score=float(best_score),

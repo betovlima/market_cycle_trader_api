@@ -111,6 +111,7 @@ class PaperTradePlan(BaseModel):
     calibration_score: float
     selected_utility: float
     utilities: dict[str, float]
+    cash_edges: dict[str, float] = Field(default_factory=dict)
     training_end: str
     calibration_start: str
     calibration_end: str

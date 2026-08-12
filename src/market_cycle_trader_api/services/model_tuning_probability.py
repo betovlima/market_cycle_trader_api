@@ -11,13 +11,18 @@ from scipy.stats import qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
-PROBABILITY_MODEL = "gaussian_process_constrained_ei_v1"
+PROBABILITY_MODEL = "gaussian_process_adaptive_trust_region_cei_v2"
 _METRIC_COUNT = 4
 _MONTE_CARLO_SCENARIOS = 512
-_GLOBAL_POOL_FRACTION = 0.35
-_ANCHOR_LOCAL_FRACTION = 0.35
-_LOCAL_SCALE = 0.12
-_TOP_REGION_SCALE = 0.15
+_TRUST_REGION_INITIAL = 0.20
+_TRUST_REGION_MIN = 0.04
+_TRUST_REGION_MAX = 0.40
+_TRUST_REGION_SUCCESS_EXPANSION = 1.25
+_TRUST_REGION_FAILURE_CONTRACTION = 0.70
+_TRUST_REGION_FAILURE_TOLERANCE = 3
+_GLOBAL_POOL_FRACTION_INITIAL = 0.30
+_GLOBAL_POOL_FRACTION_MIN = 0.15
+_ANCHOR_LOCAL_FRACTION = 0.50
 
 
 def _settings_hash(values: dict[str, Any]) -> str:
@@ -163,17 +168,106 @@ def _top_observation_centers(
     return np.asarray(centers, dtype=float)
 
 
+def _probability_state(document: dict[str, Any]) -> dict[str, Any]:
+    raw = document.get("probability_state") if isinstance(document.get("probability_state"), dict) else {}
+    radius = float(raw.get("trust_region_radius") or _TRUST_REGION_INITIAL)
+    return {
+        "trust_region_radius": max(_TRUST_REGION_MIN, min(radius, _TRUST_REGION_MAX)),
+        "success_streak": max(0, int(raw.get("success_streak") or 0)),
+        "failure_streak": max(0, int(raw.get("failure_streak") or 0)),
+        "no_improvement_streak": max(0, int(raw.get("no_improvement_streak") or 0)),
+        "adaptive_trials_completed": max(0, int(raw.get("adaptive_trials_completed") or 0)),
+        "champion_revision": max(0, int(raw.get("champion_revision") or 0)),
+        "last_champion_candidate_id": raw.get("last_champion_candidate_id"),
+    }
+
+
+def initial_probability_state() -> dict[str, Any]:
+    return _probability_state({})
+
+
+def evolve_probability_search(
+    document: dict[str, Any],
+    candidate: dict[str, Any],
+    metrics: dict[str, Any],
+    champion_gate: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Advance the sequential CARO state after one observed candidate.
+
+    A candidate that clears the current Champion-relative gate becomes the new
+    research Champion. Adaptive CARO trials expand their local trust region after
+    success and contract it after repeated misses, while startup LHS observations
+    can advance the Champion without changing the trust-region radius.
+    """
+    state = _probability_state(document)
+    kind = str(candidate.get("kind") or "")
+    adaptive = kind == "champion_probability"
+    promoted = bool(champion_gate and champion_gate.get("passed"))
+    next_anchor = None
+
+    if promoted:
+        next_anchor = {
+            "source": "adaptive_candidate" if adaptive else "startup_candidate",
+            "candidate_id": int(candidate.get("candidate_id") or 0),
+            "job_id": candidate.get("job_id"),
+            "settings_hash": str(candidate.get("settings_hash") or ""),
+            "settings": deepcopy(candidate.get("settings") or {}),
+            "metrics": deepcopy(metrics),
+        }
+        state["champion_revision"] += 1
+        state["last_champion_candidate_id"] = int(candidate.get("candidate_id") or 0)
+        state["no_improvement_streak"] = 0
+
+    if adaptive:
+        state["adaptive_trials_completed"] += 1
+        if promoted:
+            state["success_streak"] += 1
+            state["failure_streak"] = 0
+            state["trust_region_radius"] = min(
+                _TRUST_REGION_MAX,
+                float(state["trust_region_radius"]) * _TRUST_REGION_SUCCESS_EXPANSION,
+            )
+        else:
+            state["success_streak"] = 0
+            state["failure_streak"] += 1
+            state["no_improvement_streak"] += 1
+            if state["failure_streak"] >= _TRUST_REGION_FAILURE_TOLERANCE:
+                state["trust_region_radius"] = max(
+                    _TRUST_REGION_MIN,
+                    float(state["trust_region_radius"]) * _TRUST_REGION_FAILURE_CONTRACTION,
+                )
+                state["failure_streak"] = 0
+
+    return {
+        "state": state,
+        "champion_promoted": promoted,
+        "probability_anchor": next_anchor,
+    }
+
+
 def _candidate_unit_pool(
     document: dict[str, Any],
     *,
     pool_size: int,
     seed: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict[str, float]]:
     search_space = list(document.get("search_space") or [])
     dimensions = len(search_space)
     rng = np.random.default_rng(seed)
-    global_count = max(1, int(round(pool_size * _GLOBAL_POOL_FRACTION)))
-    anchor_count = max(1, int(round(pool_size * _ANCHOR_LOCAL_FRACTION)))
+    state = _probability_state(document)
+    radius = float(state["trust_region_radius"])
+    adaptive_trials = int(state["adaptive_trials_completed"])
+    global_fraction = max(
+        _GLOBAL_POOL_FRACTION_MIN,
+        _GLOBAL_POOL_FRACTION_INITIAL - 0.01 * adaptive_trials,
+    )
+    anchor_fraction = _ANCHOR_LOCAL_FRACTION
+    if global_fraction + anchor_fraction > 0.90:
+        anchor_fraction = 0.90 - global_fraction
+    top_fraction = 1.0 - global_fraction - anchor_fraction
+
+    global_count = max(1, int(round(pool_size * global_fraction)))
+    anchor_count = max(1, int(round(pool_size * anchor_fraction)))
     top_count = max(1, pool_size - global_count - anchor_count)
 
     global_points = qmc.LatinHypercube(d=dimensions, seed=seed + 17).random(n=global_count)
@@ -181,19 +275,26 @@ def _candidate_unit_pool(
     anchor_settings = anchor.get("settings") if isinstance(anchor.get("settings"), dict) else document.get("base_model_values")
     anchor_vector = np.asarray(_normalized_vector(dict(anchor_settings or {}), search_space), dtype=float)
     anchor_points = np.clip(
-        anchor_vector + rng.normal(0.0, _LOCAL_SCALE, size=(anchor_count, dimensions)),
+        anchor_vector + rng.uniform(-radius, radius, size=(anchor_count, dimensions)),
         0.0,
         1.0,
     )
 
     centers = _top_observation_centers(document, search_space)
     center_indices = rng.integers(0, len(centers), size=top_count)
+    top_radius = min(_TRUST_REGION_MAX, radius * 1.35)
     top_points = np.clip(
-        centers[center_indices] + rng.normal(0.0, _TOP_REGION_SCALE, size=(top_count, dimensions)),
+        centers[center_indices] + rng.uniform(-top_radius, top_radius, size=(top_count, dimensions)),
         0.0,
         1.0,
     )
-    return np.vstack([global_points, anchor_points, top_points])
+    metadata = {
+        "trust_region_radius": radius,
+        "global_fraction": global_fraction,
+        "anchor_fraction": anchor_fraction,
+        "top_regions_fraction": top_fraction,
+    }
+    return np.vstack([global_points, anchor_points, top_points]), metadata
 
 
 def _fit_gaussian_processes(
@@ -319,7 +420,7 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
         for item in all_observations
         if item.get("settings_hash")
     }
-    raw_points = _candidate_unit_pool(document, pool_size=pool_size, seed=seed + next_id * 7919)
+    raw_points, pool_metadata = _candidate_unit_pool(document, pool_size=pool_size, seed=seed + next_id * 7919)
     proposal_settings: list[dict[str, Any]] = []
     proposal_vectors: list[list[float]] = []
     proposal_hashes: list[str] = []
@@ -393,10 +494,13 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
             "exploration_weight": exploration_weight,
             "monte_carlo_scenarios": _MONTE_CARLO_SCENARIOS,
             "pool_composition": {
-                "global_fraction": _GLOBAL_POOL_FRACTION,
-                "anchor_local_fraction": _ANCHOR_LOCAL_FRACTION,
-                "top_regions_fraction": round(1.0 - _GLOBAL_POOL_FRACTION - _ANCHOR_LOCAL_FRACTION, 6),
+                "global_fraction": float(pool_metadata["global_fraction"]),
+                "anchor_local_fraction": float(pool_metadata["anchor_fraction"]),
+                "top_regions_fraction": float(pool_metadata["top_regions_fraction"]),
             },
+            "trust_region_radius": float(pool_metadata["trust_region_radius"]),
+            "champion_revision": int(_probability_state(document)["champion_revision"]),
+            "champion_candidate_id": (document.get("probability_anchor") or {}).get("candidate_id"),
             "promising_region": promising_region,
             "promising_region_probability_mean": float(probability[top_indices].mean()),
             "promising_region_expected_improvement_mean": float(constrained_expected_improvement[top_indices].mean()),

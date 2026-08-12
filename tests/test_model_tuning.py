@@ -17,6 +17,8 @@ from market_cycle_trader_api.services.model_tuning import (
 )
 from market_cycle_trader_api.services.model_tuning_probability import (
     PROBABILITY_MODEL,
+    evolve_probability_search,
+    initial_probability_state,
     propose_champion_probability_candidate,
 )
 
@@ -47,7 +49,7 @@ BASE_LIGHTGBM = {
 
 def test_tuning_request_bounds_candidate_count_and_prior_campaign_contract() -> None:
     default = ModelTuningStartRequest()
-    assert default.method == "latin_hypercube"
+    assert default.method == "champion_probability"
     assert default.candidate_count == 20
     assert default.baseline_job_id is None
     probability = ModelTuningStartRequest(method="champion_probability", candidate_count=20)
@@ -160,6 +162,9 @@ def test_tuning_catalog_declares_integrated_worker_prior_reuse_and_reproducibili
     assert catalog["prior_campaign_reuse"] is True
     assert catalog["reproducibility_guard"] == "frozen_execution_snapshot_and_market_data_signature"
     assert catalog["probability"]["probability_model"] == PROBABILITY_MODEL
+    assert catalog["recommended_method"] == "champion_probability"
+    assert catalog["probability"]["default_startup_trials"] == 6
+    assert catalog["probability"]["search_policy"] == "small_lhs_warmup_then_sequential_adaptive_trust_region"
     assert len(catalog["search_space"]) == 8
 
 
@@ -195,6 +200,93 @@ def test_champion_probability_uses_prior_observations_and_explicit_anchor() -> N
     assert proposal["promising_region"]
 
 
+
+def test_adaptive_caro_promotes_observed_champion_and_contracts_after_repeated_misses() -> None:
+    catalog = tuning_catalog()
+    base = _synthetic_observations(count=5)[0]
+    anchor = {
+        "source": "fresh_control",
+        "candidate_id": 0,
+        "settings": base["settings"],
+        "metrics": {
+            "ending_capital": 300_000.0,
+            "sharpe": 1.50,
+            "maximum_drawdown": -0.50,
+            "worst_fold_return": 0.10,
+            "risk_adjusted_compound_score": 1.0,
+        },
+    }
+    document = {
+        "search_space": catalog["search_space"],
+        "base_model_values": base["settings"],
+        "probability_anchor": anchor,
+        "probability_state": initial_probability_state(),
+        "probability_config": {
+            "min_capital_improvement": 0.03,
+            "sharpe_tolerance": 0.05,
+            "drawdown_tolerance": 0.03,
+            "min_worst_fold_return": 0.0,
+        },
+    }
+    candidate = {
+        "candidate_id": 7,
+        "kind": "champion_probability",
+        "settings": base["settings"],
+        "settings_hash": "candidate-7",
+        "job_id": "job-7",
+    }
+    winning_metrics = {
+        "ending_capital": 315_000.0,
+        "sharpe": 1.55,
+        "maximum_drawdown": -0.49,
+        "worst_fold_return": 0.12,
+        "risk_adjusted_compound_score": 1.2,
+    }
+    gate = {"passed": True}
+    evolved = evolve_probability_search(document, candidate, winning_metrics, gate)
+    assert evolved["champion_promoted"] is True
+    assert evolved["probability_anchor"]["candidate_id"] == 7
+    assert evolved["state"]["champion_revision"] == 1
+    assert evolved["state"]["trust_region_radius"] > initial_probability_state()["trust_region_radius"]
+
+    miss_document = dict(document)
+    miss_document["probability_state"] = initial_probability_state()
+    radius_before = miss_document["probability_state"]["trust_region_radius"]
+    for candidate_id in (8, 9, 10):
+        miss = dict(candidate, candidate_id=candidate_id, settings_hash=f"candidate-{candidate_id}")
+        result = evolve_probability_search(miss_document, miss, winning_metrics, {"passed": False})
+        miss_document["probability_state"] = result["state"]
+    assert miss_document["probability_state"]["trust_region_radius"] < radius_before
+    assert miss_document["probability_state"]["no_improvement_streak"] == 3
+
+
+def test_adaptive_caro_proposal_reports_dynamic_trust_region() -> None:
+    catalog = tuning_catalog()
+    prior = _synthetic_observations()
+    anchor = max(prior, key=lambda item: item["metrics"]["ending_capital"])
+    document = {
+        "seed": 42,
+        "search_space": catalog["search_space"],
+        "base_model_values": anchor["settings"],
+        "prior_observations": prior,
+        "candidates": [],
+        "probability_anchor": {"candidate_id": anchor["candidate_id"], "settings": anchor["settings"], "metrics": anchor["metrics"]},
+        "probability_state": {**initial_probability_state(), "trust_region_radius": 0.11, "adaptive_trials_completed": 5},
+        "probability_config": {
+            "min_capital_improvement": 0.03,
+            "sharpe_tolerance": 0.05,
+            "drawdown_tolerance": 0.03,
+            "min_worst_fold_return": 0.0,
+            "candidate_pool_size": 512,
+            "exploration_weight": 0.15,
+        },
+    }
+    proposed = propose_champion_probability_candidate(document)
+    assert proposed["proposal"]["trust_region_radius"] == pytest.approx(0.11)
+    assert proposed["proposal"]["champion_candidate_id"] == anchor["candidate_id"]
+    assert proposed["proposal"]["pool_composition"]["global_fraction"] < 0.30
+
+
 def test_tuning_routes_and_integrated_execution_contract() -> None:
     main = (SRC / "main.py").read_text(encoding="utf-8")
     router = (SRC / "api" / "routers" / "model_tuning.py").read_text(encoding="utf-8")
@@ -222,7 +314,9 @@ def test_frontend_reuses_prior_exploration_without_hardcoding_search_space() -> 
     assert "/admin/model-tuning/sources?limit=20" in panel
     assert "source_tuning_run_id" in panel
     assert "anchor_candidate_id" in panel
-    assert "nextMethod === PROBABILITY_METHOD && !sourceRunId && sources.length" in panel
+    assert "useState(PROBABILITY_METHOD)" in panel
+    assert "setSourceRunId(sources[0].run_id)" not in panel
+    assert "Start Adaptive CARO" in panel
     assert "Imported observations" in panel
     assert "Frozen data through" in panel
     assert "catalog.search_space.map" in panel
@@ -248,6 +342,8 @@ def test_export_contains_caro_prior_evidence_and_anchor_metadata() -> None:
     assert "model_tuning_prior_observations.csv" in service
     assert '"prior_observations"' in service
     assert '"probability_anchor"' in service
+    assert '"probability_state"' in service
+    assert '"probability_champion_history"' in service
     assert '"market_data_cutoff_date"' in service
     assert '"expected_market_data_signature_sha256"' in service
 
@@ -388,7 +484,7 @@ def test_v206_model_tuning_stop_cancels_active_candidate_and_front_is_explicit()
     assert '"cancel_requested": True' in jobs
     assert '"status": "cancelled"' in jobs
     assert "Start Latin Hypercube" in panel
-    assert "Start CARO Probability" in panel
+    assert "Start Adaptive CARO" in panel
     assert "Stopping…" in panel
     assert "The active tuning candidate is being cancelled" in panel
     assert "Active candidates will finish safely" not in panel

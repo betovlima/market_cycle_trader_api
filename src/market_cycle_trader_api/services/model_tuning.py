@@ -32,13 +32,20 @@ from ..infrastructure.persistence.mongo_repository import (
 from .jobs import _redact_sensitive_text, request_job_cancel, run_job
 from .model_research import model_values_from_snapshot
 from .reproducibility import market_data_research_signature_from_manifests
-from .model_tuning_probability import PROBABILITY_MODEL, champion_gate_evaluation, propose_champion_probability_candidate
+from .model_tuning_probability import (
+    PROBABILITY_MODEL,
+    champion_gate_evaluation,
+    evolve_probability_search,
+    initial_probability_state,
+    propose_champion_probability_candidate,
+)
 from .model_tuning_market_snapshot import (
     TuningMarketSnapshotMismatch,
     freeze_tuning_market_snapshot,
     market_snapshot_exists,
     require_tuning_market_snapshot,
 )
+from .serialization import downsample_documents, iso_value
 from .strategy_lab import (
     get_research_strategy_context,
     get_research_strategy_model_snapshot,
@@ -48,7 +55,7 @@ from .strategy_lab import (
 TUNING_METHOD = "latin_hypercube"
 PROBABILITY_METHOD = "champion_probability"
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 4
+TUNING_SCHEMA_VERSION = 5
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
@@ -290,19 +297,20 @@ def get_model_tuning_candidate_log(db: Any, run_id: str, candidate_id: int) -> d
 def tuning_catalog() -> dict[str, Any]:
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
-        "method": TUNING_METHOD,
+        "method": PROBABILITY_METHOD,
         "methods": [
             {
                 "id": TUNING_METHOD,
-                "label": "Latin Hypercube",
-                "description": "Static space-filling exploration. Candidates are evaluated against one immutable historical execution snapshot.",
+                "label": "Latin Hypercube — exploration only",
+                "description": "Static space-filling design for diagnostics and sensitivity analysis. It does not learn from previous candidate results.",
             },
             {
                 "id": PROBABILITY_METHOD,
-                "label": "CARO Probability",
-                "description": "Optional champion-anchored probabilistic search. It can start independently or reuse a completed Latin Hypercube campaign as prior observations, then proposes adaptive candidates one by one.",
+                "label": "Adaptive CARO — recommended",
+                "description": "Fresh Control + small Latin Hypercube warm-up + sequential Champion-anchored probabilistic optimization. Every adaptive candidate is proposed only after learning from all completed observations.",
             },
         ],
+        "recommended_method": PROBABILITY_METHOD,
         "model_family": TUNING_MODEL_FAMILY,
         "model_label": "LightGBM Utility",
         "default_candidate_count": DEFAULT_CANDIDATE_COUNT,
@@ -324,18 +332,20 @@ def tuning_catalog() -> dict[str, Any]:
         "market_data_access": "database_only",
         "prior_campaign_reuse": True,
         "reproducibility_guard": "frozen_execution_snapshot_and_market_data_signature",
-        "restart_recovery": "rerun_current_candidate_from_frozen_snapshot",
+        "restart_recovery": "invalidate_unfinished_campaign_after_restart",
         "probability": {
-            "label": "CARO Probability",
+            "label": "Adaptive CARO",
             "probability_model": PROBABILITY_MODEL,
-            "default_startup_trials": 8,
+            "default_startup_trials": 6,
+            "search_policy": "small_lhs_warmup_then_sequential_adaptive_trust_region",
+            "champion_policy": "promote_only_after_observed_champion_gate_pass",
             "default_min_capital_improvement": 0.03,
             "default_sharpe_tolerance": 0.05,
             "default_drawdown_tolerance": 0.03,
             "default_min_worst_fold_return": 0.0,
             "default_candidate_pool_size": 2048,
             "default_exploration_weight": 0.15,
-            "interpretation": "Estimated probability of outperforming the research Champion under the validation protocol; not a probability of future market profit.",
+            "interpretation": "Estimated probability of outperforming the current research Champion under the frozen validation protocol; not a probability of future market profit.",
         },
     }
 
@@ -472,6 +482,63 @@ def _metric_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "worst_fold_return": min(fold_returns) if fold_returns else None,
         "eligible": eligible,
     }
+
+
+def _candidate_equity_preview(db: Any, job_id: str) -> list[dict[str, Any]]:
+    """Persist a compact visual trace before raw tuning artifacts are discarded."""
+
+    run = db[RUNS_COLLECTION].find_one(
+        {"job_id": job_id, "symbol": "PORTFOLIO"},
+        {"_id": 0, "symbol": 1, "backend": 1},
+    )
+    if run is None:
+        run = db[RUNS_COLLECTION].find_one(
+            {"job_id": job_id},
+            {"_id": 0, "symbol": 1, "backend": 1},
+        )
+    if run is None:
+        return []
+
+    query = {
+        "job_id": job_id,
+        "symbol": run.get("symbol"),
+        "backend": run.get("backend"),
+    }
+    rows = list(
+        db[PREDICTIONS_COLLECTION]
+        .find(
+            query,
+            {
+                "_id": 0,
+                "timestamp": 1,
+                "strategy_equity": 1,
+                "buy_hold_equity": 1,
+                "selected_asset": 1,
+                "trade_action": 1,
+                "final_action_cash_edge": 1,
+            },
+        )
+        .sort("timestamp", 1)
+    )
+    preview = []
+    for row in downsample_documents(rows, maximum_points=500):
+        preview.append({
+            "timestamp": iso_value(row.get("timestamp")),
+            "simulation_equity": _as_finite_float(row.get("strategy_equity")),
+            "reference_equity": _as_finite_float(row.get("buy_hold_equity")),
+            "selected_asset": str(row.get("selected_asset") or "") or None,
+            "trade_action": str(row.get("trade_action") or "") or None,
+            "cash_edge": _as_finite_float(row.get("final_action_cash_edge")),
+        })
+    return preview
+
+
+def _as_finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _cleanup_job_artifacts(db: Any, job_id: str) -> None:
@@ -1086,6 +1153,8 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
             "prior_observations": deepcopy(document.get("prior_observations") or []),
             "imported_observation_count": document.get("imported_observation_count"),
             "probability_anchor": deepcopy(document.get("probability_anchor") or None),
+            "probability_state": deepcopy(document.get("probability_state") or None),
+            "probability_champion_history": deepcopy(document.get("probability_champion_history") or []),
             "execution_context_hash": document.get("execution_context_hash"),
             "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
             "market_data_snapshot_id": document.get("market_data_snapshot_id"),
@@ -1223,7 +1292,7 @@ def start_model_tuning(
         base_values = model_values_from_snapshot(model_snapshot)
 
         if normalized_method == PROBABILITY_METHOD:
-            startup_trials = max(4, int(probability.get("startup_trials") or 8))
+            startup_trials = max(4, int(probability.get("startup_trials") or 6))
             if startup_trials >= int(candidate_count):
                 raise ModelTuningConflict("Probabilistic startup trials must be smaller than the total candidate count.")
             candidates = generate_latin_hypercube_candidates(base_values, candidate_count=startup_trials, seed=seed)
@@ -1285,6 +1354,8 @@ def start_model_tuning(
         "baseline_execution": bson_value(baseline),
         "probability_config": bson_value(probability),
         "probability_anchor": bson_value(probability_anchor) if probability_anchor else None,
+        "probability_state": bson_value(initial_probability_state()) if normalized_method == PROBABILITY_METHOD else None,
+        "probability_champion_history": [],
         "source_tuning_run_id": source_run_id,
         "source_strategy_profile_id": source_strategy_profile_id,
         "source_strategy_profile_revision": source_strategy_profile_revision,
@@ -1468,7 +1539,13 @@ def run_model_tuning(run_id: str) -> None:
                 {
                     "$set": {
                         "current_candidate_id": candidate_id,
-                        "phase": "running_candidate",
+                        "phase": (
+                            "startup_exploration"
+                            if str(pending.get("kind") or "") == "probability_startup"
+                            else "adaptive_refinement"
+                            if str(pending.get("kind") or "") == "champion_probability"
+                            else "running_candidate"
+                        ),
                         "updated_at": utc_now(),
                         "candidates.$.status": "running",
                         "candidates.$.started_at": utc_now(),
@@ -1573,6 +1650,7 @@ def run_model_tuning(run_id: str) -> None:
                 if metrics is None:
                     raise RuntimeError("Portfolio metrics are missing for the tuning candidate.")
                 summary = _metric_summary(metrics)
+                equity_preview = _candidate_equity_preview(db, job_id)
                 actual_signature = str(summary.get("market_data_signature_sha256") or "").strip().lower()
                 expected_signature = str(document.get("expected_market_data_signature_sha256") or "").strip().lower()
                 is_control = bool(pending.get("is_control"))
@@ -1634,12 +1712,17 @@ def run_model_tuning(run_id: str) -> None:
                     if str(document.get("method") or "") == PROBABILITY_METHOD and not is_control
                     else None
                 )
+                probability_evolution = None
+                if str(document.get("method") or "") == PROBABILITY_METHOD and not is_control:
+                    probability_evolution = evolve_probability_search(document, {**pending, "job_id": job_id}, summary, champion_gate)
+
                 db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                     {"id": run_id, "candidates.candidate_id": candidate_id},
                     {
                         "$set": {
                             "candidates.$.status": "completed",
                             "candidates.$.metrics": bson_value(summary),
+                            "candidates.$.equity_preview": bson_value(equity_preview),
                             "candidates.$.champion_gate_passed": (bool(champion_gate.get("passed")) if champion_gate else None),
                             "candidates.$.champion_gate": bson_value(champion_gate) if champion_gate else None,
                             "candidates.$.finished_at": utc_now(),
@@ -1651,6 +1734,35 @@ def run_model_tuning(run_id: str) -> None:
                         "$inc": {"completed_candidates": 1},
                     },
                 )
+                if probability_evolution is not None:
+                    probability_update: dict[str, Any] = {
+                        "probability_state": bson_value(probability_evolution["state"]),
+                        "updated_at": utc_now(),
+                    }
+                    next_anchor = probability_evolution.get("probability_anchor")
+                    if next_anchor is not None:
+                        probability_update["probability_anchor"] = bson_value(next_anchor)
+                    update_document: dict[str, Any] = {"$set": probability_update}
+                    if next_anchor is not None:
+                        update_document["$push"] = {
+                            "probability_champion_history": bson_value({
+                                "at": utc_now(),
+                                "candidate_id": candidate_id,
+                                "settings_hash": pending.get("settings_hash"),
+                                "metrics": summary,
+                            })
+                        }
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one({"id": run_id}, update_document)
+                    if next_anchor is not None:
+                        _append_campaign_event(
+                            db, run_id,
+                            message=(
+                                f"Candidate #{candidate_id} became the new research Champion; "
+                                f"future CARO proposals will optimize against this observed result."
+                            ),
+                            stage="champion_promoted", candidate_id=candidate_id, job_id=job_id,
+                        )
+
                 _cleanup_job_artifacts(db, job_id)
                 _refresh_campaign_ranking(db, run_id)
                 _append_campaign_event(
@@ -2003,6 +2115,8 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "search_space": deepcopy(document.get("search_space") or []),
         "probability_config": deepcopy(document.get("probability_config") or {}),
         "probability_anchor": deepcopy(document.get("probability_anchor") or None),
+        "probability_state": deepcopy(document.get("probability_state") or None),
+        "probability_champion_history": deepcopy(document.get("probability_champion_history") or []),
         "source_tuning_run_id": document.get("source_tuning_run_id"),
         "imported_observation_count": int(document.get("imported_observation_count") or 0),
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),

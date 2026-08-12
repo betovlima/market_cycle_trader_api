@@ -9,12 +9,17 @@ from fastapi import HTTPException
 from ..infrastructure.persistence.mongo_repository import (
     COMPARISONS_COLLECTION,
     JOBS_COLLECTION,
+    MODEL_TUNING_RUNS_COLLECTION,
+    PAPER_TRADE_PLANS_COLLECTION,
     PREDICTIONS_COLLECTION,
     RUNS_COLLECTION,
     STRATEGY_CONTROL_COLLECTION,
     STRATEGY_PROFILES_COLLECTION,
+    bson_value,
 )
+from .model_tuning import public_model_tuning_run
 from .serialization import downsample_documents, iso_value
+from .strategy_lab import get_strategy
 
 
 _PUBLIC_JOB_PROJECTION = {
@@ -337,3 +342,306 @@ def dashboard_job_detail(db: Any, job_id: str) -> dict[str, Any]:
         **_public_job_summary(job, metrics),
         "series": _public_series(db, job_id, comparison),
     }
+
+
+_STRATEGY_DECISION_FIELDS = (
+    "decision_date",
+    "selected_asset",
+    "previous_asset",
+    "trade_action",
+    "decision_score",
+    "strategy_risk_off_enabled",
+    "current_asset",
+    "current_score",
+    "current_cash_edge",
+    "holding_days_at_decision",
+    "raw_best_asset",
+    "raw_best_score",
+    "best_asset",
+    "best_score",
+    "best_cash_edge",
+    "second_asset",
+    "second_score",
+    "second_cash_edge",
+    "best_vs_second_gap",
+    "best_vs_current_gap",
+    "best_vs_cash_gap",
+    "cash_score",
+    "cash_exit_threshold",
+    "cash_entry_threshold",
+    "rotation_cash_threshold",
+    "rotation_min_expected_edge",
+    "base_switch_margin",
+    "calibrated_switch_margin",
+    "effective_switch_margin",
+    "final_action_asset",
+    "final_action_score",
+    "final_action_cash_edge",
+    "decision_reason",
+    "decision_is_rotation",
+    "decision_is_entry",
+    "decision_is_exit_to_cash",
+    "min_hold_guard_applied",
+    "switch_margin_guard_applied",
+    "cash_threshold_guard_applied",
+    "minimum_expected_edge_guard_applied",
+    "top_1_asset",
+    "top_1_score",
+    "top_1_cash_edge",
+    "top_2_asset",
+    "top_2_score",
+    "top_2_cash_edge",
+    "top_3_asset",
+    "top_3_score",
+    "top_3_cash_edge",
+    "current_asset_rank",
+    "universe_score_mean",
+    "universe_score_std",
+    "current_score_zscore",
+    "best_score_zscore",
+    "best_vs_second_zscore",
+    "positive_score_count",
+    "finite_score_count",
+)
+
+
+def _strategy_profile_detail(db: Any, strategy_id: str | None) -> dict[str, Any] | None:
+    if not strategy_id:
+        return None
+    try:
+        return get_strategy(db, str(strategy_id))
+    except Exception:
+        return None
+
+
+def _strategy_control_ids(db: Any) -> tuple[str | None, str | None]:
+    control = db[STRATEGY_CONTROL_COLLECTION].find_one(
+        {"_id": "default"},
+        {"_id": 0, "research_strategy_id": 1, "trader_winner_strategy_id": 1},
+    ) or {}
+    research_id = str(control.get("research_strategy_id") or "").strip() or None
+    winner_id = str(control.get("trader_winner_strategy_id") or "").strip() or None
+    return research_id, winner_id
+
+
+def _latest_strategy_forecast(db: Any, winner_strategy: dict[str, Any] | None) -> dict[str, Any] | None:
+    query: dict[str, Any] = {"status": {"$in": ["prepared", "executing", "executed"]}}
+    winner_id = str((winner_strategy or {}).get("id") or "").strip()
+    if winner_id:
+        query["winner_strategy_id"] = winner_id
+    plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+        query,
+        sort=[("created_at", -1)],
+    )
+    if plan is None:
+        return None
+
+    utilities = plan.get("utilities") if isinstance(plan.get("utilities"), dict) else {}
+    cash_edges = plan.get("cash_edges") if isinstance(plan.get("cash_edges"), dict) else {}
+    assets = list(dict.fromkeys([
+        *[str(item).upper() for item in plan.get("winner_assets") or []],
+        *[str(item).upper() for item in utilities if str(item).upper() != "CASH"],
+        *[str(item).upper() for item in cash_edges if str(item).upper() != "CASH"],
+    ]))
+    ranked = sorted(
+        assets,
+        key=lambda asset: -(_as_float(utilities.get(asset)) if _as_float(utilities.get(asset)) is not None else float("-inf")),
+    )
+    asset_rows = []
+    for rank, asset in enumerate(ranked, start=1):
+        asset_rows.append({
+            "asset": asset,
+            "rank": rank,
+            "ranking_utility": _as_float(utilities.get(asset)),
+            "cash_edge": _as_float(cash_edges.get(asset)),
+            "is_raw_best": asset == str(plan.get("raw_best_asset") or "").upper(),
+            "is_target": asset == str(plan.get("target_asset") or "").upper(),
+            "is_current": asset == str(plan.get("current_asset") or "").upper(),
+        })
+
+    winner_config = (winner_strategy or {}).get("configuration") if isinstance(winner_strategy, dict) else {}
+    cash_exit_threshold = _as_float((winner_config or {}).get("rotation_cash_threshold"))
+    minimum_edge = _as_float((winner_config or {}).get("rotation_min_expected_edge"))
+    cash_entry_threshold = (
+        cash_exit_threshold + minimum_edge
+        if cash_exit_threshold is not None and minimum_edge is not None
+        else None
+    )
+    return bson_value({
+        "source": "paper_next_open_plan",
+        "plan_id": plan.get("plan_id"),
+        "status": plan.get("status"),
+        "strategy_id": plan.get("winner_strategy_id"),
+        "strategy_name": plan.get("winner_strategy_name"),
+        "strategy_revision": plan.get("winner_strategy_revision"),
+        "model_family": plan.get("winner_model_family"),
+        "decision_date": plan.get("decision_date"),
+        "expected_market_open": plan.get("expected_market_open"),
+        "execution_session": plan.get("execution_session"),
+        "current_asset": plan.get("current_asset"),
+        "target_asset": plan.get("target_asset"),
+        "raw_best_asset": plan.get("raw_best_asset"),
+        "action": plan.get("action"),
+        "selected_utility": _as_float(plan.get("selected_utility")),
+        "utilities": {str(key): _as_float(value) for key, value in utilities.items()},
+        "cash_edges": {str(key): _as_float(value) for key, value in cash_edges.items()},
+        "asset_forecast": asset_rows,
+        "cash_exit_threshold": cash_exit_threshold,
+        "cash_entry_threshold": cash_entry_threshold,
+        "minimum_expected_edge": minimum_edge,
+        "effective_switch_margin": _as_float(plan.get("effective_switch_margin")),
+        "calibrated_candidate_margin": _as_float(plan.get("calibrated_candidate_margin")),
+        "calibration_score": _as_float(plan.get("calibration_score")),
+        "random_state": plan.get("random_state"),
+        "training_end": plan.get("training_end"),
+        "calibration_start": plan.get("calibration_start"),
+        "calibration_end": plan.get("calibration_end"),
+        "final_fit_end": plan.get("final_fit_end"),
+        "created_at": plan.get("created_at"),
+    })
+
+
+def _strategy_decision_history(db: Any, job_id: str | None) -> dict[str, Any] | None:
+    if not job_id:
+        return None
+    job = db[JOBS_COLLECTION].find_one(
+        {"id": str(job_id)},
+        {"_id": 0, "id": 1, "status": 1, "strategy_profile_name": 1, "strategy_profile_id": 1},
+    )
+    if job is None:
+        return None
+    comparison = db[COMPARISONS_COLLECTION].find_one(
+        {"job_id": str(job_id)},
+        {"_id": 0, "job_id": 1, "results": 1},
+    )
+    selected = _selected_internal_row(comparison)
+    if selected is None:
+        return {"job_id": str(job_id), "rows": [], "metrics": None}
+    backend = str(selected.get("backend") or "").strip()
+    run_filter: dict[str, Any] = {"job_id": str(job_id)}
+    if backend:
+        run_filter["backend"] = backend
+    run = db[RUNS_COLLECTION].find_one(
+        {**run_filter, "symbol": "PORTFOLIO"},
+        {"_id": 0, "symbol": 1, "backend": 1},
+    )
+    if run is None:
+        run = db[RUNS_COLLECTION].find_one(
+            run_filter,
+            {"_id": 0, "symbol": 1, "backend": 1},
+        )
+    if run is None:
+        return {"job_id": str(job_id), "rows": [], "metrics": bson_value(selected)}
+
+    projection = {
+        "_id": 0,
+        "timestamp": 1,
+        "strategy_equity": 1,
+        "buy_hold_equity": 1,
+    }
+    projection.update({field: 1 for field in _STRATEGY_DECISION_FIELDS})
+    rows = list(
+        db[PREDICTIONS_COLLECTION]
+        .find(
+            {
+                "job_id": str(job_id),
+                "symbol": run.get("symbol"),
+                "backend": run.get("backend"),
+            },
+            projection,
+        )
+        .sort("timestamp", 1)
+    )
+    result_rows: list[dict[str, Any]] = []
+    for row in downsample_documents(rows, maximum_points=800):
+        item: dict[str, Any] = {
+            "timestamp": iso_value(row.get("timestamp")),
+            "simulation_equity": _as_float(row.get("strategy_equity")),
+            "reference_equity": _as_float(row.get("buy_hold_equity")),
+        }
+        for field in _STRATEGY_DECISION_FIELDS:
+            value = row.get(field)
+            if field == "decision_date":
+                item[field] = iso_value(value)
+            else:
+                item[field] = bson_value(value)
+        result_rows.append(item)
+    return {
+        "job_id": str(job_id),
+        "status": job.get("status"),
+        "strategy_profile_id": job.get("strategy_profile_id"),
+        "strategy_profile_name": job.get("strategy_profile_name"),
+        "metrics": bson_value(selected),
+        "rows": result_rows,
+    }
+
+
+def _latest_tuning_for_strategy(db: Any, strategy_id: str | None) -> dict[str, Any] | None:
+    if not strategy_id:
+        return None
+    document = db[MODEL_TUNING_RUNS_COLLECTION].find_one(
+        {"strategy_profile_id": str(strategy_id)},
+        sort=[("created_at", -1)],
+    )
+    return public_model_tuning_run(db, document)
+
+
+def dashboard_strategy_intelligence(
+    db: Any,
+    *,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    """Return protected strategy intelligence using MongoDB only.
+
+    This endpoint intentionally performs no market-data refresh and never contacts Alpaca.
+    """
+
+    research_id, winner_id = _strategy_control_ids(db)
+    research_strategy = _strategy_profile_detail(db, research_id)
+    winner_strategy = _strategy_profile_detail(db, winner_id)
+    if job_id is None and isinstance(research_strategy, dict):
+        job_id = str(research_strategy.get("last_backtest_id") or "").strip() or None
+    return {
+        "research_strategy": research_strategy,
+        "winner_strategy": winner_strategy,
+        "forecast": _latest_strategy_forecast(db, winner_strategy),
+        "decision_history": _strategy_decision_history(db, job_id),
+        "tuning": _latest_tuning_for_strategy(db, research_id),
+    }
+
+
+def dashboard_tuning_candidate_detail(
+    db: Any,
+    run_id: str,
+    candidate_id: int,
+) -> dict[str, Any]:
+    document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": str(run_id)})
+    if document is None:
+        raise HTTPException(status_code=404, detail="Model tuning campaign not found.")
+    candidate = next(
+        (
+            item for item in document.get("candidates") or []
+            if int(item.get("candidate_id") if item.get("candidate_id") is not None else -1) == int(candidate_id)
+        ),
+        None,
+    )
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Model tuning candidate not found.")
+    return bson_value({
+        "run_id": str(run_id),
+        "candidate_id": int(candidate_id),
+        "kind": candidate.get("kind"),
+        "is_control": bool(candidate.get("is_control")),
+        "status": candidate.get("status"),
+        "rank": candidate.get("rank"),
+        "settings": candidate.get("settings") or {},
+        "settings_hash": candidate.get("settings_hash"),
+        "metrics": candidate.get("metrics") or None,
+        "proposal": candidate.get("proposal") or None,
+        "champion_gate": candidate.get("champion_gate") or None,
+        "champion_gate_passed": candidate.get("champion_gate_passed"),
+        "job_id": candidate.get("job_id"),
+        "equity_preview": candidate.get("equity_preview") or [],
+        "started_at": candidate.get("started_at"),
+        "finished_at": candidate.get("finished_at"),
+    })

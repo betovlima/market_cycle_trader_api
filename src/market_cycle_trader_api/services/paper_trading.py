@@ -409,6 +409,7 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         calibration_score=decision.calibration_score,
         selected_utility=decision.selected_utility,
         utilities=decision.utilities,
+        cash_edges=decision.cash_edges,
         training_end=_et_date(decision.training_end),
         calibration_start=_et_date(decision.calibration_start),
         calibration_end=_et_date(decision.calibration_end),

@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class ChampionProbabilityConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    startup_trials: int = Field(default=8, ge=4, le=24)
+    startup_trials: int = Field(default=6, ge=4, le=24)
     min_capital_improvement: float = Field(default=0.03, ge=0.0, le=1.0)
     sharpe_tolerance: float = Field(default=0.05, ge=0.0, le=2.0)
     drawdown_tolerance: float = Field(default=0.03, ge=0.0, le=1.0)
@@ -20,7 +20,7 @@ class ChampionProbabilityConfig(BaseModel):
 class ModelTuningStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    method: Literal["latin_hypercube", "champion_probability"] = "latin_hypercube"
+    method: Literal["latin_hypercube", "champion_probability"] = "champion_probability"
     candidate_count: int = Field(default=20, ge=4, le=60)
     seed: int = Field(default=42, ge=0, le=2_147_483_647)
     baseline_job_id: str | None = Field(default=None, min_length=1, max_length=128)
