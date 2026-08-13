@@ -138,7 +138,7 @@ def build_run_payload(run: dict[str, Any]) -> dict[str, Any]:
             trades,
             run.get("metrics", {}),
         )
-    except Exception as exc:  # Diagnostics must never hide a completed backtest.
+    except Exception as exc:  
         LOGGER.exception(
             "Performance diagnostics failed for %s/%s/%s",
             job_id,

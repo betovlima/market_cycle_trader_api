@@ -47,13 +47,13 @@ def freeze_tuning_market_snapshot(
     *,
     expected_signature: str | None = None,
 ) -> dict[str, Any]:
-    """Persist one content-addressed immutable candle snapshot for tuning.
+    
 
-    The shared Alpaca cache is mutable operational storage. Latin Hypercube and CARO
-    must compare candidates over identical bytes, so each distinct research dataset is
-    stored once under its research-content SHA-256 and reused by every campaign that
-    references that signature.
-    """
+
+
+
+
+
     payload = deepcopy(request_payload)
     payload["research_market_data_mode"] = "database_only"
     payload["research_market_data_snapshot_id"] = None
@@ -90,7 +90,7 @@ def freeze_tuning_market_snapshot(
     if existing is not None:
         return dict(existing)
 
-    # Remove an interrupted partial write for the same content id before recreating it.
+    
     collection.delete_many({"snapshot_id": signature})
     total_rows = 0
     now = utc_now()

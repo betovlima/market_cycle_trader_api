@@ -387,7 +387,7 @@ def _create_next_session_run(db: Any) -> dict[str, Any]:
 
 
 def arm_next_session(db: Any) -> dict[str, Any]:
-    """Enable the continuous Paper robot and ensure the next session is armed."""
+    
 
     active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
     now = utc_now()
@@ -428,7 +428,7 @@ def arm_next_session(db: Any) -> dict[str, Any]:
 
 
 def stop_continuous_robot(db: Any, *, cancel_pending_run: bool = True) -> dict[str, Any]:
-    """Disable future sessions and safely cancel a non-executing active run."""
+    
 
     now = utc_now()
     _update_automation(
@@ -1022,8 +1022,8 @@ def _ensure_continuous_run(db: Any) -> dict[str, Any] | None:
     controller = _automation_document(db)
     active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
 
-    # Upgrade an already active one-shot run to the continuous controller on first
-    # startup. Legacy prepared plans are revalidated by the mandatory pre-market policy.
+    
+    
     if controller is None and active is not None:
         _update_automation(
             db,

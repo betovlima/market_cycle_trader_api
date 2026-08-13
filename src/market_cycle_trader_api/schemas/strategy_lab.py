@@ -44,9 +44,9 @@ class StrategyUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_strategy_configuration(self) -> "StrategyUpdateRequest":
-        # Validate the effective configuration only after the API has constructed
-        # the canonical assets list from plain text. Old clients that still send
-        # configuration.assets remain compatible while the new UI no longer does.
+        
+        
+        
         self.build_configuration()
         return self
 

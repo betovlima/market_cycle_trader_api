@@ -249,10 +249,10 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     weighted_utility = np.nansum(utility_components * weights.reshape(1, -1), axis=1)
     invalid_rows = np.isnan(utility_components).any(axis=1)
     weighted_utility[invalid_rows] = np.nan
-    # Absolute opportunity versus cash. This target intentionally excludes the
-    # always-nonnegative movement/trend ranking bonuses so zero retains an
-    # economic meaning: the modeled risk-adjusted asset opportunity is no better
-    # than remaining in cash.
+    
+    
+    
+    
     data['forward_cash_edge'] = weighted_utility
     data['forward_movement_capture'] = movement_capture
     data['forward_trend_persistence'] = trend_persistence
@@ -268,14 +268,14 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     return data
 
 def prepare_rotation_panel(bars_by_symbol: dict[str, pd.DataFrame], config: Any) -> tuple[dict[str, pd.DataFrame], pd.DatetimeIndex]:
-    """Build a stable portfolio calendar without letting younger candidates move it.
+    
 
-    The promoted Winner assets are carried in ``calendar_anchor_assets`` on the
-    immutable execution request. Their intersection defines the walk-forward
-    calendar. Research-only assets are reindexed onto that calendar and remain
-    unavailable until their own features exist. This keeps the Winner fold
-    boundaries stable when a newer candidate is added to a research universe.
-    """
+
+
+
+
+
+
 
     frames = {
         symbol: build_rotation_frame(frame, config)
@@ -383,9 +383,9 @@ def _curve_risk_adjusted_score(curve: pd.Series, config: Any) -> float:
     return float(score)
 
 def _numeric_thread_context(config: Any):
-    # Winner compatibility contract from API v1.13.16:
-    # numeric thread limiting is applied only for deterministic execution.
-    # Non-deterministic winner runs must inherit the host numerical runtime.
+    
+    
+    
     if not bool(config.deterministic_execution):
         return nullcontext()
     return threadpool_limits(limits=int(config.numeric_thread_limit))
@@ -501,7 +501,7 @@ def _fit_xgb_models(
         return (fit_on_device('cpu'), 'cpu', fallback_reason)
 
 def _xgb_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], timestamp: pd.Timestamp, config: Any) -> np.ndarray:
-    """Return utilities while treating not-yet-model-ready candidates as unavailable."""
+    
 
     values = [0.0]
     for symbol in symbols:
@@ -543,14 +543,14 @@ def _xgb_policy(
     fold_id: int | None = None,
     calibrated_switch_margin: float | None = None,
 ) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
-    """Build the rotation policy with optional explicit risk-off semantics.
+    
 
-    Legacy mode preserves the historical Winner behavior exactly. Risk-off mode
-    keeps the enriched utility model for cross-sectional ranking, but uses a
-    second model trained on ``forward_cash_edge`` to decide whether exposure is
-    economically preferable to cash. The cash edge is centered on zero because
-    it excludes the non-negative movement-capture and trend-persistence bonuses.
-    """
+
+
+
+
+
+
 
     risk_off = _risk_off_enabled(config)
     if risk_off and cash_edge_models is None:
@@ -961,11 +961,11 @@ def _precompute_market_regime_diagnostics(
     symbols: list[str],
     decision_dates: pd.DatetimeIndex,
 ) -> dict[pd.Timestamp, dict[str, Any]]:
-    """Compute point-in-time market context for diagnostics only.
+    
 
-    Every value uses closes available on or before the decision timestamp. The
-    result is observational and never feeds the rotation policy.
-    """
+
+
+
     if len(decision_dates) == 0:
         return {}
 
@@ -1332,13 +1332,13 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
-    """Build the validated champion folds independently of the locked execution window.
+    
 
-    The internal ``analysis_start_date`` is derived from the locked winner configuration.
-    It must never move the train/calibration/purge boundaries, because doing so
-    creates a different model and makes an overlapping date range incomparable
-    with the validated champion run.
-    """
+
+
+
+
+
 
     purge = max(int(config.rotation_purge_days), max(int(item) for item in config.rotation_target_horizons))
     calibration_days = int(config.rotation_walk_forward_calibration_days)
@@ -1386,12 +1386,12 @@ def _analysis_decision_dates(
     folds: list[dict[str, Any]],
     config: Any,
 ) -> pd.DatetimeIndex:
-    """Return decision/execution dates for the locked winner window.
+    
 
-    Fold policies are trained on the fixed champion schedule. The locked
-    analysis start only selects the first execution session and resets the
-    simulated account to ``initial_capital`` in cash.
-    """
+
+
+
+
 
     if not folds:
         raise ValueError('No walk-forward fold is available for the analysis window.')
@@ -1418,8 +1418,8 @@ def _analysis_decision_dates(
     if execution_start >= champion_oos_end:
         raise ValueError('The requested analysis interval contains no executable session.')
 
-    # One session before execution_start is required to calculate the signal
-    # at the close and execute it at the next session open.
+    
+    
     return common_dates[execution_start - 1:champion_oos_end]
 
 def _scheduled_policy(policies: dict[int, Callable[[pd.Timestamp, int, int], tuple[int, float]]], decision_to_fold: dict[pd.Timestamp, int]) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
@@ -1479,7 +1479,7 @@ def _run_xgboost_rotation_models(
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
 ) -> list[RotationRunResult]:
-    """Run the locked XGBoost walk-forward baseline without changing its semantics."""
+    
     if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
         raise ValueError(f'Unsupported compound-rotation strategy mode: {config.strategy_mode}.')
     if list(config.rotation_models) != ['xgboost_utility']:
@@ -1929,11 +1929,11 @@ def run_rotation_models(
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
 ) -> list[RotationRunResult]:
-    """Dispatch an execution-only model challenger over the locked research snapshot.
+    
 
-    The stored strategy remains XGBoost-only and the Trader Winner is untouched.
-    ``research_model_family`` exists only on the immutable execution request.
-    """
+
+
+
     model_family = str(getattr(config, 'research_model_family', 'xgboost_utility'))
     if model_family == 'xgboost_utility':
         return _run_xgboost_rotation_models(

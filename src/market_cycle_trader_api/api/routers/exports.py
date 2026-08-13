@@ -420,7 +420,7 @@ def export_zip(job_id: str) -> Response:
                     trades,
                     metrics,
                 )
-            except Exception as exc:  # Export must remain available even if an optional diagnostic fails.
+            except Exception as exc:  
                 diagnostics = {}
                 diagnostics_error = f"{type(exc).__name__}: {exc}"
 

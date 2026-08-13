@@ -24,15 +24,15 @@ EASTERN = ZoneInfo("America/New_York")
 
 
 class NoRecentMarketData(RuntimeError):
-    """Expected discovery outcome: the symbol has no usable recent daily bars."""
+    pass
 
 
 class NoHistoricalMarketData(RuntimeError):
-    """Expected discovery outcome: recent data exists but no usable history was loaded."""
+    pass
 
 
 class MarketDataAccessBlocked(RuntimeError):
-    """Global Alpaca market-data access problem that should stop the whole batch."""
+    pass
 
 
 def _alpaca_headers(credentials: dict[str, str]) -> dict[str, str]:
@@ -61,7 +61,7 @@ def _session_close_utc(session: dict[str, Any]) -> datetime | None:
 
 
 def _latest_safe_completed_session_end(credentials: dict[str, str]) -> datetime:
-    """Return a completed regular-session close that is also outside Basic SIP's recent window."""
+    
 
     now = datetime.now(timezone.utc)
     sip_cutoff = now - timedelta(minutes=SIP_DELAY_BUFFER_MINUTES)
@@ -168,7 +168,7 @@ def _recent_market_frame(symbol: str, config: Any, *, end: datetime) -> pd.DataF
 
 
 def _behavior_market_frame(symbol: str, config: Any, *, end: datetime, settings: dict[str, Any]) -> pd.DataFrame:
-    """Load a bounded non-cached behavior window before paying for full-history cache."""
+    
 
     credentials = get_alpaca_credentials()
     lookback_days = int(settings.get("behavior_lookback_days", BEHAVIOR_PREFILTER_DAYS))
@@ -247,10 +247,10 @@ def _history_profile(frame: pd.DataFrame, config: Any) -> tuple[str, bool]:
 
 
 def _available_history(symbol: str, config: Any) -> pd.DataFrame:
-    # Discovery deliberately relaxes only the requirement that a symbol must
-    # reach the Winner's locked historical start. The Winner/backtest config is
-    # not changed. This lets an IPO/new listing keep every session that actually
-    # exists while preserving the same Alpaca cache and incremental refresh.
+    
+    
+    
+    
     discovery_config = config.model_copy(
         update={
             "end_date": None,
@@ -299,10 +299,10 @@ def market_quality_snapshot(
             "reason_codes": reason_codes,
         }
 
-    # Before paying the one-time cost of caching the complete available history,
-    # inspect a bounded multi-year window for structural behavior that is more
-    # extreme than the Discovery policy allows. This gate does NOT use Winner
-    # P/L, model rankings, fold outcomes, or any future result.
+    
+    
+    
+    
     behavior_frame = _behavior_market_frame(symbol, config, end=recent_end, settings=settings)
     behavior = behavior_risk_profile(behavior_frame, settings)
     if behavior.get("sample_ready") and not behavior.get("passed"):
@@ -321,10 +321,10 @@ def market_quality_snapshot(
             "reason_codes": reason_codes + list(behavior.get("reason_codes") or []),
         }
 
-    # Only symbols that pass both cheap gates pay the one-time cost of loading
-    # their complete available history into the shared incremental cache. A newer
-    # listing is NOT rejected merely for failing to reach the locked research
-    # start; every available session is kept instead.
+    
+    
+    
+    
     frame = _available_history(symbol, config)
     history_profile, model_ready = _history_profile(frame, config)
     status = "candidate" if model_ready else "watchlist"

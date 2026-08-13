@@ -22,12 +22,12 @@ def _safe_order(order: dict[str, Any]) -> dict[str, Any]:
 
 
 def public_paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
-    """Return a read-only, sanitized Paper portfolio snapshot.
+    
 
-    Existing protected Paper endpoints remain unchanged. This projection omits
-    run metadata, plan identifiers, client order identifiers and all strategy
-    configuration details.
-    """
+
+
+
+
 
     source = paper_portfolio_snapshot(db)
     allowed = (

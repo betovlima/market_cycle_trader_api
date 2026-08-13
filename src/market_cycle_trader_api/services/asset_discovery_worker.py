@@ -37,7 +37,7 @@ def _aware_utc(value: Any) -> datetime | None:
 
 
 def cleanup_non_analytical_candidate_records(db: Any) -> None:
-    """Keep the Candidate Pool analytical: operational/no-data outcomes are not candidates."""
+    
 
     db[ASSET_DISCOVERY_CANDIDATES_COLLECTION].delete_many(
         {"status": {"$in": ["failed", "skipped"]}}
@@ -121,14 +121,14 @@ def evaluate_symbol(
         )
         return "skipped"
     except MarketDataAccessBlocked:
-        # A subscription/auth/feed error is global, not a property of this symbol.
-        # Persisting it as a candidate would pollute the Candidate Pool, so let
-        # the worker abort the batch and keep the diagnostic only in the run.
+        
+        
+        
         raise
     except Exception as exc:
-        # Technical failures are operational diagnostics, not candidate states.
-        # Preserve any prior analytical record for the symbol and store the error
-        # only in the bounded run log/counter.
+        
+        
+        
         message = str(exc)[:1000]
         append_run_update(
             db,

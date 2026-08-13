@@ -46,16 +46,16 @@ def build_live_xgboost_decision(
     current_asset: str | None,
     holding_sessions: int,
 ) -> LiveXGBoostDecision:
-    """Train the validated live fold and decide the next-open target.
+    
 
-    This mirrors the backtest's expanding walk-forward convention for a decision
-    made after the latest completed daily close:
 
-    * a purge separates training labels from calibration;
-    * a second purge separates final fitting from the live decision;
-    * the model reads features from the latest completed session;
-    * any position change is intended for the next regular-session open.
-    """
+
+
+
+
+
+
+
 
     if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
         raise ValueError(f"Unsupported Paper compound-rotation strategy mode: {config.strategy_mode}.")
@@ -76,8 +76,8 @@ def build_live_xgboost_decision(
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     minimum_training_rows = int(config.rotation_minimum_training_rows)
 
-    # A live decision occurs after common_dates[-1], so the unseen execution
-    # session would start at index len(common_dates).
+    
+    
     live_test_start = len(common_dates)
     calibration_end_index = live_test_start - purge
     calibration_start_index = calibration_end_index - calibration_days

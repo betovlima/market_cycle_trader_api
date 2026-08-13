@@ -38,12 +38,12 @@ def normalize_assets(value: list[str]) -> list[str]:
 
 
 def normalize_assets_input(value: str) -> list[str]:
-    """Build the canonical asset list from administrator-entered plain text.
+    
 
-    The UI sends text, never a JSON array. Commas, semicolons, pipes, whitespace and
-    line breaks are accepted as separators. Brackets and quotes are tolerated only
-    to make pasting legacy JSON-style values safe during migration.
-    """
+
+
+
+
 
     text = str(value or "").strip()
     if not text:
@@ -69,11 +69,11 @@ def normalize_iso_date(value: str, *, field_name: str) -> str:
 
 
 class BacktestRequest(BaseModel):
-    """Complete XGBoost-only configuration loaded from MongoDB.
+    
 
-    Operational values intentionally have no Python defaults. Missing or unknown
-    MongoDB fields are configuration errors instead of being silently replaced.
-    """
+
+
+
 
     model_config = ConfigDict(extra="forbid")
 
@@ -233,7 +233,7 @@ class BacktestRequest(BaseModel):
 
 
 class BacktestExecutionRequest(BacktestRequest):
-    """Immutable execution snapshot derived entirely from the locked MongoDB configuration."""
+    
 
     analysis_start_date: str
     analysis_end_date: str | None

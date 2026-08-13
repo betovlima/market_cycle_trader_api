@@ -57,11 +57,11 @@ def start_next_session(
     _: StartNextSessionRequest,
     __: Annotated[None, Depends(require_paper_market_token)],
 ) -> dict[str, Any]:
-    """Enable the continuous Paper robot and ensure the next session is armed.
+    
 
-    The robot remains enabled across API restarts and automatically schedules a
-    new run for every regular Alpaca session until an administrator stops it.
-    """
+
+
+
 
     try:
         return arm_next_session(database())

@@ -151,7 +151,7 @@ def _comparison_map(db: Any, job_ids: list[str]) -> dict[str, dict[str, Any]]:
 
 
 def _selected_backtest_strategy_name(db: Any) -> str | None:
-    """Return only the public display name of the strategy selected for backtests."""
+    
     try:
         control = db[STRATEGY_CONTROL_COLLECTION].find_one(
             {"_id": "default"},
@@ -591,14 +591,23 @@ def dashboard_strategy_intelligence(
     *,
     job_id: str | None = None,
 ) -> dict[str, Any]:
-    """Return protected strategy intelligence using MongoDB only.
+    
 
-    This endpoint intentionally performs no market-data refresh and never contacts Alpaca.
-    """
+
+
 
     research_id, winner_id = _strategy_control_ids(db)
     research_strategy = _strategy_profile_detail(db, research_id)
     winner_strategy = _strategy_profile_detail(db, winner_id)
+    control = db[STRATEGY_CONTROL_COLLECTION].find_one(
+        {"_id": "default"},
+        {"_id": 0, "candidate_strategy_id": 1, "promoted_candidate_strategy_id": 1},
+    ) or {}
+    tuning_strategy_id = (
+        str(control.get("candidate_strategy_id") or "").strip()
+        or str(control.get("promoted_candidate_strategy_id") or "").strip()
+        or research_id
+    )
     if job_id is None and isinstance(research_strategy, dict):
         job_id = str(research_strategy.get("last_backtest_id") or "").strip() or None
     return {
@@ -606,7 +615,7 @@ def dashboard_strategy_intelligence(
         "winner_strategy": winner_strategy,
         "forecast": _latest_strategy_forecast(db, winner_strategy),
         "decision_history": _strategy_decision_history(db, job_id),
-        "tuning": _latest_tuning_for_strategy(db, research_id),
+        "tuning": _latest_tuning_for_strategy(db, tuning_strategy_id),
     }
 
 

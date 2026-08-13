@@ -26,7 +26,7 @@ REQUIRED_BAR_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
 def effective_execution_end_date(config: Any) -> str | None:
-    """Return the runtime analysis end without changing the locked history start."""
+    
 
     analysis_end = getattr(config, "analysis_end_date", None)
     if analysis_end:
@@ -39,7 +39,7 @@ EASTERN = ZoneInfo("America/New_York")
 
 
 def normalize_end_date(value: str | None) -> str | None:
-    """Normalize an already-resolved research cutoff without applying wall-clock policy."""
+    
 
     if not value:
         return None
@@ -52,7 +52,7 @@ def normalize_end_date(value: str | None) -> str | None:
 
 
 def inclusive_end_exclusive_boundary(value: str | None) -> pd.Timestamp | None:
-    """Convert an inclusive session date into an exclusive UTC storage boundary."""
+    
 
     normalized = normalize_end_date(value)
     if normalized is None:
@@ -61,7 +61,7 @@ def inclusive_end_exclusive_boundary(value: str | None) -> pd.Timestamp | None:
 
 
 def latest_completed_xnys_session(now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
-    """Return the latest XNYS regular session whose official close has already passed."""
+    
 
     stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
     stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
@@ -101,13 +101,13 @@ def resolve_backtest_analysis_end_date(
     *,
     now: datetime | pd.Timestamp | None = None,
 ) -> str:
-    """Resolve one immutable daily research cutoff before a normal backtest is queued.
+    
 
-    The current open XNYS session is never eligible.  After today's close, today's
-    session is used only when every configured asset identity is already present for
-    that session in MongoDB; otherwise the previous completed session is used.  A
-    missing asset can then be bootstrapped once by the normal backtest path.
-    """
+
+
+
+
+
 
     calendar = xcals.get_calendar("XNYS")
     latest_closed = latest_completed_xnys_session(now)
@@ -364,7 +364,7 @@ def complete_market_history(
     initial_rows: int | None = None,
     history_backfill_rows: int = 0,
 ) -> pd.DataFrame:
-    """Validate that the MongoDB research cache reaches the locked historical start."""
+    
 
     effective_frame = filter_non_trading_rows(frame, config.timeframe)
     effective_frame = effective_frame[
@@ -400,12 +400,12 @@ def _download_alpaca_bars(
     start_date: str,
     end_date: str | None,
 ) -> pd.DataFrame:
-    """Bootstrap one completely missing asset identity from Alpaca.
+    
 
-    This function is never used by tuning/optimization.  For daily research it
-    stops at the official close of the already-resolved completed XNYS session;
-    it never extends the request into the current open session.
-    """
+
+
+
+
 
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
@@ -514,7 +514,7 @@ def _load_frozen_tuning_snapshot_bars(symbol: str, config: Any) -> pd.DataFrame:
         client.close()
 
 def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
-    """Load research bars from MongoDB, bootstrapping only a wholly missing asset in a normal backtest."""
+    
 
     if str(getattr(config, "research_market_data_snapshot_id", None) or "").strip():
         return _load_frozen_tuning_snapshot_bars(symbol, config)

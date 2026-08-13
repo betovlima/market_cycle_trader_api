@@ -633,7 +633,7 @@ def portfolio_analytics(db: Any) -> dict[str, Any]:
             "message": "Alpaca Paper connection is available.",
             "configured": True,
         }
-    except Exception as exc:  # Historical analytics must remain available during broker outages.
+    except Exception as exc:  
         message = str(exc).lower()
         if "unauthorized" in message or "401" in message:
             reason = "Alpaca Paper rejected the configured credentials."

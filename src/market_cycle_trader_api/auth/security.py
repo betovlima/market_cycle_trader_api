@@ -48,7 +48,7 @@ class SessionManager:
         return bool(expected) and hmac.compare_digest(expected, submitted)
 
     def create_admin_identity(self) -> SessionIdentity:
-        """Create the legacy password administrator used only as a recovery path."""
+        
         return SessionIdentity(
             subject="trader-admin",
             role="admin",

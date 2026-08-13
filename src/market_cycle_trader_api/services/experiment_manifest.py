@@ -9,7 +9,7 @@ def build_experiment_manifest(
     job: dict[str, Any],
     runs: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build an Administrator-only manifest for controlled research comparisons."""
+    
 
     primary_run = runs[0] if runs else {}
     metrics = dict(primary_run.get("metrics") or {})

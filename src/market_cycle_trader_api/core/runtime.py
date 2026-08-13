@@ -37,7 +37,7 @@ def database() -> Database:
 
 
 def refresh_locked_configuration_status() -> bool:
-    """Revalidate the active locked configuration without restarting the API."""
+    
 
     if _MONGO_DB is None:
         MONGO_STATUS["configuration_available"] = False
@@ -68,10 +68,10 @@ def initialize_mongo(*, role: str = "api") -> None:
         ensure_database(db)
         normalized_role = str(role or "api").strip().lower()
         if normalized_role == "api":
-            # The API owns both normal backtests and the integrated tuning worker.
-            # Any in-flight child process is gone after a container restart, so mark
-            # every queued/running job interrupted. Tuning recovery will safely rerun
-            # its current candidate from the frozen campaign snapshot.
+            
+            
+            
+            
             db[JOBS_COLLECTION].update_many(
                 {"status": {"$in": ["queued", "running"]}},
                 {

@@ -315,8 +315,8 @@ def _resolved_strategy_model_snapshot(db: Any, document: dict[str, Any]) -> dict
     if isinstance(stored, dict):
         return _validated_model_snapshot(stored)
 
-    # Migration path for profiles created before model ownership moved into the
-    # Strategy. Prefer the exact model already certified/run for this revision.
+    
+    
     for field in ("candidate_model_snapshot", "last_backtest_model_snapshot", "winner_model_snapshot"):
         candidate = document.get(field)
         if not isinstance(candidate, dict):
@@ -541,7 +541,7 @@ def _normalize_single_candidate_and_winner(
     db: Any,
     control: dict[str, Any],
 ) -> dict[str, Any]:
-    """Migrate catalogs to one active Candidate, one promoted Candidate and one Winner."""
+    
     now = utc_now()
     winner_id = str(control.get("trader_winner_strategy_id") or "")
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
@@ -583,9 +583,9 @@ def _normalize_single_candidate_and_winner(
         )
         control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
 
-    # The research reference is independent from the Trader Winner and the
-    # currently selected editable strategy. Existing catalogs snapshot the
-    # selected research universe at migration time.
+    
+    
+    
     reference_assets = list(control.get("research_reference_assets") or [])
     if len(reference_assets) < 2:
         fallback_reference_id = str(control.get("research_strategy_id") or winner_id)
@@ -665,9 +665,9 @@ def _normalize_single_candidate_and_winner(
         )
         control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
 
-    # A promoted Candidate is an active lifecycle role, not a permanent badge.
-    # Prefer the source Strategy of the active Winner, then the explicit control
-    # pointer, and preserve all older promoted Candidates as immutable history.
+    
+    
+    
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id}) or winner
     winner_source_id = str((winner or {}).get("source_strategy_id") or "")
     promoted_id = str(control.get("promoted_candidate_strategy_id") or "")
@@ -758,9 +758,9 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
             _ensure_strategy_model_bindings(db)
             return normalized_control
 
-    # First migration from API v1.13.16: preserve the production winner exactly
-    # as it exists in backtest_settings/default. The catalog is additive and does
-    # not rewrite or rename that historical document.
+    
+    
+    
     legacy = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
     if legacy is None:
         raise StrategyLabNotFound(
@@ -944,6 +944,14 @@ def get_research_strategy_model_snapshot(db: Any) -> dict[str, Any]:
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Selected backtest strategy does not exist.")
+    return _resolved_strategy_model_snapshot(db, profile)
+
+
+def get_strategy_model_snapshot(db: Any, strategy_id: str) -> dict[str, Any]:
+    ensure_strategy_catalog(db)
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": str(strategy_id)})
+    if profile is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
     return _resolved_strategy_model_snapshot(db, profile)
 
 
@@ -1202,13 +1210,13 @@ def update_strategy_model(
     expected_strategy_revision: int,
     actor_email: str | None,
 ) -> dict[str, Any]:
-    """Bind one algorithm + parameter set to the Strategy used by Backtest.
+    
 
-    The shared Strategy revision is intentionally not incremented here. Strategy
-    parameters and model parameters have independent identities: Backtest jobs bind
-    the Strategy revision *and* the immutable model settings hash. This also lets a
-    pre-v1.13.43 completed job be adopted when its exact model values already match.
-    """
+
+
+
+
+
     ensure_strategy_catalog(db)
     _assert_strategy_not_under_model_tuning(db, strategy_id)
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
@@ -1555,7 +1563,7 @@ def _release_winner_promotion_lock(
 
 
 def _regular_market_is_open() -> bool:
-    """Return XNYS regular-session state without contacting the broker."""
+    
 
     stamp = pd.Timestamp(utc_now())
     if stamp.tzinfo is None:
@@ -1571,12 +1579,12 @@ def _assert_trader_safe_for_promotion(
     *,
     candidate_assets: list[str],
 ) -> dict[str, Any]:
-    """Validate a metadata-only Winner handoff without contacting Alpaca.
+    
 
-    An armed run that is only waiting for the configured pre-market analysis window
-    is intentionally preserved. The next preparation cycle loads the then-current
-    immutable Trader Winner, so every asset in the promoted snapshot participates.
-    """
+
+
+
+
 
     regular_market_open = _regular_market_is_open()
 
@@ -1934,9 +1942,9 @@ def promote_strategy_to_trader(
                 "Winner selection changed before the metadata-only promotion completed."
             )
 
-        # The compare-and-set above is the logical commit point. From this line on,
-        # operational state and broker state remain untouched and the new immutable
-        # Winner is authoritative for the next scheduled model cycle.
+        
+        
+        
         promotion_completed = True
         try:
             db[STRATEGY_PROMOTION_HISTORY_COLLECTION].update_one(
@@ -1950,8 +1958,8 @@ def promote_strategy_to_trader(
                 },
             )
         except Exception:
-            # The control pointer has already committed. Keep the pending audit row
-            # instead of reporting a false promotion failure after a successful handoff.
+            
+            
             pass
         return {
             "status": "promoted",
@@ -2123,9 +2131,9 @@ def mark_strategy_backtest(
     model_snapshot = model_execution_snapshot(
         research_model_family, research_model_settings or {}
     )
-    # Update only the exact revision that produced the job. If an Administrator
-    # edits the draft while the backtest is running, the old result must not
-    # certify the newer revision for Trader promotion.
+    
+    
+    
     db[STRATEGY_PROFILES_COLLECTION].update_one(
         {"_id": strategy_id, "revision": int(strategy_revision)},
         {

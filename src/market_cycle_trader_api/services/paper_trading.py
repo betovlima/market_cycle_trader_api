@@ -133,7 +133,7 @@ def _validated_context(
 
 
 def paper_market_readiness(db: Any) -> dict[str, Any]:
-    """Validate every dependency required to arm next-session paper execution."""
+    
 
     strategy, settings, state, winner_profile, winner_model = _validated_context(db)
     client = create_paper_trading_client(db)
@@ -169,8 +169,8 @@ def _trim_incomplete_daily_session(
     next_open = pd.Timestamp(clock["next_open"])
     next_open = next_open.tz_localize("UTC") if next_open.tzinfo is None else next_open.tz_convert("UTC")
 
-    # During regular hours, and before today's open, today's daily candle is not
-    # a completed decision candle and must never be used by the model.
+    
+    
     incomplete_session: str | None = None
     if bool(clock["is_open"]) or timestamp.tz_convert(EASTERN).date() == next_open.tz_convert(EASTERN).date():
         incomplete_session = timestamp.tz_convert(EASTERN).date().isoformat()

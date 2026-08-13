@@ -88,7 +88,7 @@ def _database() -> FakeDatabase:
         "session_win_rate": 0.57,
         "capital_rotations": 42,
         "average_holding_days": 8.5,
-        # These internal values must never leave the new dashboard contract.
+        
         "assets": ["PRIVATE"],
         "random_seed": 42,
         "model_family": "private-model",

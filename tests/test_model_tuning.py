@@ -10,6 +10,8 @@ from market_cycle_trader_api.services.model_tuning import (
     _sanitize_tuning_log_line,
     _source_anchor,
     _source_observations,
+    _tuning_target_allows_locked_strategy,
+    _tuning_target_strategy,
     generate_latin_hypercube_candidates,
     get_model_tuning_campaign_log,
     get_model_tuning_candidate_log,
@@ -309,16 +311,18 @@ def test_tuning_routes_and_integrated_execution_contract() -> None:
     assert '"tuning_summary_only": {"$ne": True}' in strategy_lab
 
 
-def test_frontend_reuses_prior_exploration_without_hardcoding_search_space() -> None:
+def test_frontend_uses_candidate_directly_without_clone_or_prior_campaign_controls() -> None:
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
-    assert "/admin/model-tuning/sources?limit=20" in panel
-    assert "source_tuning_run_id" in panel
-    assert "anchor_candidate_id" in panel
+    assert "control?.candidate_strategy_id || control?.promoted_candidate_strategy_id || control?.research_strategy_id" in panel
+    assert "/admin/model-tuning/sources?limit=20" not in panel
+    assert "source_tuning_run_id" not in panel
+    assert "anchor_candidate_id" not in panel
+    assert "Clone the protected Strategy before starting model tuning." not in panel
+    assert "Automatic baseline" in panel
+    assert "No clone, baseline selection or prior tuning campaign is required." in panel
+    assert "Advanced CARO settings" in panel
     assert "useState(PROBABILITY_METHOD)" in panel
-    assert "setSourceRunId(sources[0].run_id)" not in panel
     assert "Start Adaptive CARO" in panel
-    assert "Imported observations" in panel
-    assert "Frozen data through" in panel
     assert "catalog.search_space.map" in panel
     assert "/admin/model-tuning/workers" not in panel
     for protected_key in (
@@ -326,6 +330,39 @@ def test_frontend_reuses_prior_exploration_without_hardcoding_search_space() -> 
         "min_child_samples", "colsample_bytree", "reg_alpha", "reg_lambda",
     ):
         assert protected_key not in panel
+
+
+def test_tuning_target_prefers_active_candidate_and_allows_promoted_candidate_lock(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "market_cycle_trader_api.services.model_tuning.get_strategy_control",
+        lambda _db: {
+            "candidate_strategy_id": "candidate-1",
+            "promoted_candidate_strategy_id": "promoted-1",
+            "research_strategy_id": "research-1",
+        },
+    )
+    monkeypatch.setattr(
+        "market_cycle_trader_api.services.model_tuning.get_strategy",
+        lambda _db, strategy_id: {"id": strategy_id, "status": "candidate", "locked": False},
+    )
+    monkeypatch.setattr(
+        "market_cycle_trader_api.services.model_tuning.get_strategy_model_snapshot",
+        lambda _db, strategy_id: {"family": "lightgbm_utility", "profile_id": strategy_id},
+    )
+    strategy, snapshot, source = _tuning_target_strategy(object())
+    assert strategy["id"] == "candidate-1"
+    assert snapshot["profile_id"] == "candidate-1"
+    assert source == "candidate"
+    assert _tuning_target_allows_locked_strategy({"status": "promoted_candidate", "locked": True}) is True
+    assert _tuning_target_allows_locked_strategy({"status": "winner", "locked": True}) is False
+
+
+def test_tuning_adoption_preserves_certified_candidate_by_creating_working_strategy() -> None:
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    assert 'source_status in {"candidate", "promoted_candidate"}' in service
+    assert "created = create_strategy(" in service
+    assert "select_research_strategy(" in service
+    assert '"source_strategy_preserved": bool(derived_strategy_created)' in service
 
 
 def test_tuning_workspace_is_not_rendered_inside_model_settings() -> None:

@@ -68,8 +68,8 @@ def get_model_research_executions(limit: int = Query(default=50, ge=1, le=100)) 
 
 @router.post("/jobs", status_code=202)
 def create_model_research_job(request: ModelResearchJobRequest) -> dict[str, Any]:
-    # Backward-compatible admin route: the request may no longer override the
-    # model saved with the selected Strategy. The Backtest workspace uses /api/jobs.
+    
+    
     db = database()
     bound = get_research_strategy_model_snapshot(db)
     if request.model_family != bound["family"]:

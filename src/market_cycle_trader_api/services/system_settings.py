@@ -60,8 +60,8 @@ def _normalized_training(raw: Any) -> dict[str, Any]:
         "automatic_training_enabled": bool(merged["automatic_training_enabled"]),
         "model_threads": max(1, min(64, int(merged["model_threads"]))),
         "numeric_threads": max(1, min(64, int(merged["numeric_threads"]))),
-        # Backtests are intentionally serialized. Strategy cloning and editing
-        # remain available while a job runs, but another job cannot start.
+        
+        
         "max_concurrent_jobs": 1,
         "timeout_seconds": max(300, min(86_400, int(merged["timeout_seconds"]))),
     }
@@ -189,13 +189,13 @@ def apply_training_runtime_settings(
     db: Any,
     configuration: ConfigurationModel,
 ) -> ConfigurationModel:
-    """Return an exact validated copy of the locked winner configuration.
+    
 
-    The Administrator System Settings control orchestration only: whether jobs may
-    start, automatic scheduling, concurrency, and timeout. They must never replace
-    model or numerical execution fields stored in the installed winner. The ``db``
-    argument remains part of the function signature for backward compatibility.
-    """
+
+
+
+
+
 
     del db
     return type(configuration).model_validate(

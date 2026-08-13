@@ -26,11 +26,11 @@ def normalize_email(value: str) -> str:
 
 
 class ProductionGoogleIdentityVerifier:
-    """Verify Google Identity Services ID tokens on the API server.
+    
 
-    Imports are intentionally lazy so source-contract and unit tests that inject
-    a fake verifier do not require outbound certificate retrieval.
-    """
+
+
+
 
     def verify(self, credential: str) -> VerifiedGoogleIdentity:
         token = str(credential or "").strip()

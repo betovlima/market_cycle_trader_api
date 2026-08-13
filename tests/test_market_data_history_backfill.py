@@ -202,7 +202,7 @@ def test_alpaca_bootstrap_stops_at_resolved_session_close_without_safety_lookahe
 
 
 def test_latest_completed_session_never_uses_current_open_session() -> None:
-    # 15:00 UTC = 11:00 New York on 2026-08-12, during regular trading.
+    
     result = latest_completed_xnys_session(datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc))
     assert result.date().isoformat() == "2026-08-11"
 
@@ -224,7 +224,7 @@ def test_normal_backtest_bootstraps_only_a_completely_missing_asset_then_reads_m
     config = _execution_config(mode="backtest_bootstrap_missing")
     collection = _FakeCollection(first=None)
     downloaded = _frame("2016-01-04", 2092, 100.0)
-    # Force the final cached row to the frozen cutoff used by the execution.
+    
     downloaded = downloaded.loc[downloaded.index < pd.Timestamp("2024-01-10", tz="UTC")]
 
     with (

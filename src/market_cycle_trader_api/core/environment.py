@@ -41,12 +41,12 @@ def _candidate_environment_files(
 def load_project_environment(
     explicit_path: str | os.PathLike[str] | None = None,
 ) -> tuple[Path, ...]:
-    """Load the first project .env while preserving real non-empty variables.
+    
 
-    Windows launchers can create empty variables. Empty or missing values are
-    therefore filled from the local file, while non-empty system and Railway
-    values remain authoritative.
-    """
+
+
+
+
 
     loaded: list[Path] = []
     for candidate in _candidate_environment_files(explicit_path):
@@ -71,7 +71,7 @@ def load_project_environment(
 def build_subprocess_environment(
     extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build a child-process environment after refreshing the project .env."""
+    
 
     load_project_environment()
     child_environment = dict(os.environ)

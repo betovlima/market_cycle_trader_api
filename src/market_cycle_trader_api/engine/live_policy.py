@@ -14,12 +14,12 @@ def live_model_utilities(
     symbols: list[str],
     timestamp: pd.Timestamp,
 ) -> np.ndarray:
-    """Predict utilities after the latest completed close for next-open execution.
+    
 
-    Unlike the backtest utility helper, live inference must not require the next
-    session's OHLC row: that session is exactly where the prepared order will be
-    executed and is unknown at decision time.
-    """
+
+
+
+
 
     values = [0.0]
     for symbol in symbols:
@@ -45,7 +45,7 @@ def build_live_rotation_policy(
     *,
     cash_edge_models: dict[str, Any] | None = None,
 ) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
-    """Mirror the validated rotation guards using live-safe model utilities."""
+    
 
     risk_off = _risk_off_enabled(config)
     if risk_off and cash_edge_models is None:

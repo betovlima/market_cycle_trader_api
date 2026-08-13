@@ -50,20 +50,20 @@ def queue_backtest_job(
     execution_request_override: dict[str, Any] | None = None,
     execution_metadata_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Queue the model saved with the selected Strategy, optionally with an isolated tuning snapshot.
+    
 
-    Tuning overrides are immutable execution-only values. They never mutate the selected
-    Strategy and never certify it unless the user later adopts a completed candidate.
-    """
+
+
+
     db = database()
     runtime_settings = get_system_settings(db)
     training_settings = runtime_settings["training"]
     if not bool(training_settings["enabled"]):
         raise HTTPException(status_code=409, detail="Model training is disabled in System Settings.")
     if tuning_run_id is None:
-        # User-facing backtests remain serialized. Integrated model tuning is also
-        # serialized against normal Simulation Backtests so both workloads cannot
-        # compete for the same CPU/RAM or mutate the experiment context mid-run.
+        
+        
+        
         active_jobs = db[JOBS_COLLECTION].count_documents(
             {"status": {"$in": ["queued", "running"]}, "internal_job": {"$ne": True}}
         )
@@ -98,11 +98,11 @@ def queue_backtest_job(
             )
             request_payload["research_model_family"] = research_model_family
             request_payload["research_model_settings"] = research_model_settings
-            # Tuning/optimization is strictly database-only. A campaign may never
-            # mutate its market-data snapshot by downloading or refreshing assets.
+            
+            
             request_payload["research_market_data_mode"] = "database_only"
-            # These generic execution fields are model-owned and remain frozen across
-            # the campaign except when an explicitly supplied candidate changes them.
+            
+            
             if "repetitions" in model_values_override:
                 request_payload["rotation_xgb_repetitions"] = int(model_values_override["repetitions"])
             if "seed_step" in model_values_override:
@@ -249,7 +249,7 @@ def queue_backtest_job(
 
 @router.post("/api/jobs", status_code=202)
 def create_job() -> dict[str, Any]:
-    """Queue the immutable model saved with the selected research Strategy."""
+    
     return queue_backtest_job()
 
 

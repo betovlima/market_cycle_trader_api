@@ -115,7 +115,7 @@ def bson_value(value: Any) -> Any:
 
 
 def ensure_database(db: Database) -> None:
-    """Create storage indexes without mutating the locked strategy document."""
+    
 
     db[JOBS_COLLECTION].create_index(
         [("status", ASCENDING), ("created_at", DESCENDING)],
@@ -298,7 +298,7 @@ def mask_api_key(value: str | None) -> str | None:
 
 
 def get_alpaca_integration_status(db: Database | None = None) -> dict[str, Any]:
-    """Return non-secret Alpaca status from environment variables only."""
+    
 
     del db
     api_key_id = _environment_value("ALPACA_API_KEY_ID", "APCA_API_KEY_ID")
@@ -316,7 +316,7 @@ def get_alpaca_integration_status(db: Database | None = None) -> dict[str, Any]:
 
 
 def get_alpaca_credentials(db: Database | None = None) -> dict[str, str]:
-    """Read Alpaca credentials exclusively from the process environment."""
+    
 
     del db
     api_key_id = _environment_value("ALPACA_API_KEY_ID", "APCA_API_KEY_ID")
@@ -353,7 +353,7 @@ def delete_alpaca_credentials(db: Database) -> None:
 
 
 def get_settings(db: Database) -> dict[str, Any]:
-    """Return the complete locked document without applying code defaults."""
+    
 
     document = db[SETTINGS_COLLECTION].find_one({"_id": "default"})
     if document is None:

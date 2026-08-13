@@ -8,7 +8,7 @@ from .requests import BacktestRequest
 
 
 class StrategyConfigurationPatchRequest(BaseModel):
-    """Apply a validated partial update to the active strategy configuration."""
+    
 
     model_config = ConfigDict(extra="forbid")
 
@@ -37,7 +37,7 @@ class StrategyConfigurationPatchRequest(BaseModel):
 
 
 class StrategyConfigurationReplaceRequest(BaseModel):
-    """Replace the complete active strategy configuration after validation."""
+    
 
     model_config = ConfigDict(extra="forbid")
 
@@ -53,7 +53,7 @@ class StrategyConfigurationReplaceRequest(BaseModel):
 
 
 class StrategyWinnerInstallRequest(BaseModel):
-    """Delete old strategy configuration data and install winner-v1.13.2."""
+    
 
     model_config = ConfigDict(extra="forbid")
 
@@ -74,7 +74,7 @@ class StrategyWinnerInstallRequest(BaseModel):
 
 
 class StrategyConfigurationResetRequest(BaseModel):
-    """Restore the bundled canonical configuration."""
+    
 
     model_config = ConfigDict(extra="forbid")
 
@@ -93,7 +93,7 @@ class StrategyConfigurationResetRequest(BaseModel):
 
 
 class StrategyConfigurationRestoreRequest(BaseModel):
-    """Restore a previously archived strategy configuration."""
+    
 
     model_config = ConfigDict(extra="forbid")
 

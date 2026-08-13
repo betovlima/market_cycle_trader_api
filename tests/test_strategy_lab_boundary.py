@@ -34,9 +34,9 @@ from market_cycle_trader_api.services.strategy_lab import (
     update_strategy_model,
 )
 
-# Keep the default audit-only market state deterministic in lifecycle tests.
-# A dedicated test below proves that a safe metadata-only promotion is also allowed
-# during the XNYS regular session.
+
+
+
 strategy_lab_service._regular_market_is_open = lambda: False
 
 
@@ -208,8 +208,8 @@ def test_research_strategy_changes_do_not_change_trader_winner() -> None:
     assert research.rotation_xgb_n_estimators == 350
     assert trader.rotation_xgb_n_estimators == 300
     assert winner_profile["locked"] is True
-    # The legacy production winner document remains untouched. Research profiles
-    # live only in the additive strategy catalog.
+    
+    
     assert db[SETTINGS_COLLECTION].documents["default"]["rotation_xgb_n_estimators"] == 300
     assert updated["last_backtest_status"] is None
 
@@ -244,8 +244,8 @@ def test_research_reference_is_snapshotted_from_selected_strategy_and_does_not_f
         actor_email="admin@example.com",
     )
 
-    # Simulate a catalog created before v1.13.38, which did not persist a
-    # separate research-reference snapshot in strategy_control/default.
+    
+    
     control = db[STRATEGY_CONTROL_COLLECTION].documents["default"]
     control.pop("research_reference_strategy_id", None)
     control.pop("research_reference_configuration_hash", None)

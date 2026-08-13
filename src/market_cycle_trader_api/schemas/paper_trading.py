@@ -7,12 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class PaperTradingSettings(BaseModel):
-    """Administrative paper-execution settings stored in MongoDB.
+    
 
-    Strategy/model parameters are intentionally not repeated here. The paper
-    trader always consumes the locked Strategy and model snapshots from
-    the immutable Trader Winner so research and execution cannot drift silently.
-    """
+
+
+
+
 
     model_config = ConfigDict(extra="forbid")
 
@@ -46,12 +46,12 @@ class PaperTradingSettings(BaseModel):
 
 
 class PaperTradingState(BaseModel):
-    """Persistent strategy sleeve state.
+    
 
-    The Alpaca paper account can contain much more cash than the strategy. This
-    state isolates the strategy's own cash/position so it starts with the same
-    locked initial capital used by the backtest and reinvests only its own P&L.
-    """
+
+
+
+
 
     model_config = ConfigDict(extra="forbid")
 

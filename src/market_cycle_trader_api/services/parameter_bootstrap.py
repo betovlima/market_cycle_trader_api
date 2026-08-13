@@ -346,7 +346,7 @@ def bootstrap_missing_parameterizations(
     *,
     source: str,
 ) -> dict[str, Any]:
-    """Create missing documents, repair invalid schemas, and preserve valid API changes."""
+    
 
     ensure_database(db)
     started_at = _utc_now()

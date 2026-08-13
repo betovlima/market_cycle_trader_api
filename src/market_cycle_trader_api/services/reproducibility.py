@@ -190,13 +190,13 @@ def _series_timestamp(value: Any) -> str | None:
 def market_data_research_signature_from_manifests(
     manifests: dict[str, dict[str, Any]],
 ) -> str:
-    """Return the research-content signature, excluding load-path audit metadata.
+    
 
-    The per-symbol SHA already represents the canonical timestamped bar content.
-    The campaign-level signature intentionally ignores values such as ``initial_rows``
-    and backfill/load-path counters because those can change without changing the
-    candles consumed by the model. Feed and adjustment remain part of the contract.
-    """
+
+
+
+
+
     stable: dict[str, dict[str, Any]] = {}
     for symbol in sorted(manifests):
         item = manifests[symbol] if isinstance(manifests[symbol], dict) else {}
@@ -215,12 +215,12 @@ def market_data_research_signature_from_manifests(
 def market_data_manifest(
     bars_by_symbol: dict[str, pd.DataFrame],
 ) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Build the immutable research-input signature plus a broader audit manifest.
+    
 
-    The rotation models consume OHLCV only. Optional provider fields such as VWAP and
-    trade_count remain in the audit fingerprint, but they must not invalidate a tuning
-    campaign when the model inputs themselves are byte-identical.
-    """
+
+
+
+
     manifests: dict[str, dict[str, Any]] = {}
     research_columns_order = ("open", "high", "low", "close", "volume")
     audit_columns_order = (*research_columns_order, "vwap", "trade_count")
@@ -234,7 +234,7 @@ def market_data_manifest(
         canonical = canonical.loc[~canonical.index.isna()]
         try:
             canonical.index = canonical.index.as_unit("ns")
-        except AttributeError:  # pandas < 2.0 compatibility
+        except AttributeError:  
             canonical.index = pd.DatetimeIndex(
                 canonical.index.to_numpy(dtype="datetime64[ns]"),
                 tz="UTC",
@@ -253,7 +253,7 @@ def market_data_manifest(
         audit = audit.loc[~audit.index.isna()]
         try:
             audit.index = audit.index.as_unit("ns")
-        except AttributeError:  # pandas < 2.0 compatibility
+        except AttributeError:  
             audit.index = pd.DatetimeIndex(
                 audit.index.to_numpy(dtype="datetime64[ns]"),
                 tz="UTC",

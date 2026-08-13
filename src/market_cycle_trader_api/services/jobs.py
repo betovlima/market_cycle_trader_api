@@ -65,13 +65,13 @@ def _terminate_process(process: subprocess.Popen) -> None:
 
 
 def request_job_cancel(job_id: str, *, reason: str = "Cancellation requested.") -> bool:
-    """Request cancellation of an active local backtest subprocess.
+    
 
-    The database flag is authoritative and survives races and API-worker routing.
-    When the subprocess is owned by this process we terminate it immediately. The
-    owner also polls the persisted flag, so cancellation still works if the Stop
-    request is handled by another API worker.
-    """
+
+
+
+
+
     db = database()
     job = db[JOBS_COLLECTION].find_one({"id": job_id}) or {}
     status = str(job.get("status") or "").strip().lower()
@@ -93,12 +93,12 @@ def request_job_cancel(job_id: str, *, reason: str = "Cancellation requested.") 
 
 
 def numeric_thread_environment(request_payload: dict[str, Any]) -> dict[str, str]:
-    """Build numerical thread overrides without changing winner semantics.
+    
 
-    API v1.13.16 applied ``numeric_thread_limit`` only when deterministic
-    execution was enabled. The protected winner uses non-deterministic
-    execution, so its subprocess must inherit the host numerical runtime.
-    """
+
+
+
+
 
     if not bool(request_payload.get("deterministic_execution")):
         return {}
@@ -403,8 +403,8 @@ def _write_child_line_to_console(job_id: str, raw_line: str) -> None:
 
 
 def run_job(job_id: str) -> None:
-    # Refresh local .env values before creating the engine subprocess. This is
-    # harmless on Railway and ensures local secrets are inherited by the child.
+    
+    
     load_project_environment()
     db = database()
     job_document = db[JOBS_COLLECTION].find_one({"id": job_id}) or {}

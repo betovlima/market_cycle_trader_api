@@ -349,7 +349,7 @@ def install_winner_strategy_configuration(
     note: str,
     source: str,
 ) -> dict[str, Any]:
-    """Replace all stored strategy configuration data with winner-v1.13.2."""
+    
 
     _assert_no_active_strategy_execution(db)
     configuration, winner_hash = _winner_configuration()

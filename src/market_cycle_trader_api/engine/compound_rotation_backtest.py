@@ -12,9 +12,9 @@ import pandas as pd
 
 from ..core.environment import load_project_environment
 
-# The backtest engine runs in a separate Python process. Load the API .env in
-# this process as well instead of relying only on environment inheritance from
-# Uvicorn. Real system/Railway variables keep priority because override=False.
+
+
+
 load_project_environment()
 
 from ..infrastructure.persistence.mongo_repository import (
@@ -295,9 +295,9 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
 
-    # Freeze/verify market-data content before any model training. Tuning candidates
-    # receive the campaign signature through the immutable execution request, so a
-    # changed Mongo snapshot fails immediately instead of after all walk-forward folds.
+    
+    
+    
     reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
     expected_signature = str(
         getattr(config, "expected_market_data_signature_sha256", None) or ""

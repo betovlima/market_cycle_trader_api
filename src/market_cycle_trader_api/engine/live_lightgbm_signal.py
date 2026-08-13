@@ -39,12 +39,12 @@ def build_live_lightgbm_decision(
     current_asset: str | None,
     holding_sessions: int,
 ) -> LiveLightGBMDecision:
-    """Train the Winner LightGBM fold and decide the next-open target.
+    
 
-    The chronology, calibration window, purge, utility target and rotation policy
-    are intentionally identical to the validated XGBoost live path. Only the model
-    fitter changes, using the immutable LightGBM settings snapshot stored in Winner.
-    """
+
+
+
+
 
     if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
         raise ValueError(f"Unsupported Paper compound-rotation strategy mode: {config.strategy_mode}.")

@@ -121,12 +121,12 @@ def enrich_trade_diagnostics(
     frames: dict[str, pd.DataFrame],
     symbols: Iterable[str],
 ) -> list[dict[str, Any]]:
-    """Attach retrospective, strategy-neutral rotation diagnostics.
+    
 
-    These fields never affect model decisions. They are computed only after the
-    simulated trades are known, using market prices to explain execution quality
-    without exposing protected XGBoost scores, features or thresholds.
-    """
+
+
+
+
 
     rows = [dict(row) for row in records]
     universe = [str(symbol) for symbol in symbols]

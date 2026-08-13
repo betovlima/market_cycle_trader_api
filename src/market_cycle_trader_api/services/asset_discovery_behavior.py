@@ -21,13 +21,13 @@ def _series_quantile(series: pd.Series, quantile: float) -> float:
 
 
 def behavior_risk_profile(frame: pd.DataFrame, settings: dict[str, Any]) -> dict[str, Any]:
-    """Measure candidate price-path risk without using Winner/model outcomes.
+    
 
-    The gate intentionally uses only market behavior that was observable in the
-    candidate's own price history. It does not use candidate backtest P/L, model
-    ranking, future folds, or any Winner result, which keeps Discovery from
-    learning from the answer it is later supposed to validate.
-    """
+
+
+
+
+
 
     if frame is None or frame.empty:
         return {

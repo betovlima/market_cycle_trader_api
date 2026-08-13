@@ -75,7 +75,7 @@ def _classify_relative_episode(
 
 
 def _empty_market_series() -> pd.Series:
-    """Return an empty price series with the index type used by market data."""
+    
     return pd.Series(
         data=[],
         index=pd.DatetimeIndex([], tz="UTC"),
@@ -155,13 +155,13 @@ def _future_market_prices(
     prices: pd.Series | None,
     sold_at: Any,
 ) -> pd.Series:
-    """Return prices strictly after an exit timestamp without index errors.
+    
 
-    Diagnostics may legitimately have no future bars for exits close to the
-    latest cached market session. In that case, or when a malformed series is
-    received, this helper returns a typed empty series instead of comparing a
-    RangeIndex with a pandas Timestamp.
-    """
+
+
+
+
+
     if prices is None or prices.empty:
         return _empty_market_series()
 

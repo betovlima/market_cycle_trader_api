@@ -81,9 +81,9 @@ def test_position_risk_diagnostics_observe_path_without_changing_trades() -> Non
     msft = _frame(dates, 199.0, 1.0)
     spy = _frame(dates, 399.0, 1.0)
 
-    # The first execution buys AAPL at 100. On the same session AAPL reaches 104,
-    # trades down to 98 and closes at 102. Those values are all known by that
-    # day's close and therefore are valid diagnostics for the next policy check.
+    
+    
+    
     aapl.loc[dates[1], ["open", "high", "low", "close"]] = [100.0, 104.0, 98.0, 102.0]
     frames = {"AAPL": aapl, "MSFT": msft, "SPY": spy}
     symbols = list(frames)
@@ -180,8 +180,8 @@ def test_position_risk_diagnostics_observe_path_without_changing_trades() -> Non
     assert observed["days_current_not_top1"] == 1
     assert observed["consecutive_days_current_not_top1"] == 1
 
-    # The diagnostic path must not create additional trades or alter the planned
-    # AAPL -> MSFT sequence.
+    
+    
     assert result.trades["action"].tolist() == ["BUY", "SELL", "BUY", "FINAL_SELL"]
     assert result.trades["asset"].tolist() == ["AAPL", "AAPL", "MSFT", "MSFT"]
     exit_row = result.trades.loc[result.trades["action"] == "SELL"].iloc[0]

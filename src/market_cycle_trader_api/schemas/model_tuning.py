@@ -35,8 +35,8 @@ class ModelTuningStartRequest(BaseModel):
                 raise ValueError("A prior tuning campaign and anchor candidate are only valid for CARO Probability.")
             return self
         config = self.probability or ChampionProbabilityConfig()
-        # When a completed exploration campaign is imported, its observations replace
-        # the standalone startup design and candidate_count means new adaptive trials.
+        
+        
         if self.source_tuning_run_id is None and config.startup_trials >= self.candidate_count:
             raise ValueError("Probabilistic startup trials must be smaller than the total candidate count.")
         if self.anchor_candidate_id is not None and self.source_tuning_run_id is None:

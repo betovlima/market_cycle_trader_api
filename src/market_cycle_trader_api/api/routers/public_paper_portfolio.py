@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/paper-market", tags=["paper-market-public"])
 
 @router.get("/public-portfolio")
 def public_paper_market_portfolio() -> dict[str, Any]:
-    """Read-only sanitized portfolio data for the public frontend."""
+    
 
     try:
         return public_paper_portfolio_snapshot(database())
@@ -26,6 +26,6 @@ def public_paper_market_portfolio() -> dict[str, Any]:
 
 @router.get("/public-robot-status")
 def public_robot_status() -> dict[str, Any]:
-    """Sanitized continuous-robot status for Trader and Administrator portfolios."""
+    
 
     return paper_market_robot_status(database(), public=True)

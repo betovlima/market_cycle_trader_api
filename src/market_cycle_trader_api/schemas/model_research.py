@@ -12,7 +12,7 @@ class ModelResearchJobRequest(BaseModel):
 
 
 class XGBoostResearchSettings(BaseModel):
-    """Server-side XGBoost hyperparameters for isolated model research."""
+    
 
     model_config = ConfigDict(extra="forbid")
 
@@ -37,7 +37,7 @@ class XGBoostResearchSettings(BaseModel):
 
 
 class LightGBMResearchSettings(BaseModel):
-    """Server-side LightGBM hyperparameters for challenger research only."""
+    
 
     model_config = ConfigDict(extra="forbid")
 
@@ -68,7 +68,7 @@ class LightGBMResearchSettings(BaseModel):
 
 
 class IQNResearchSettings(BaseModel):
-    """Server-side IQN training settings stored in MongoDB, never supplied by the backtest UI."""
+    
 
     model_config = ConfigDict(extra="forbid")
 

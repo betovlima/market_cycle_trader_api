@@ -47,8 +47,11 @@ from .model_tuning_market_snapshot import (
 )
 from .serialization import downsample_documents, iso_value
 from .strategy_lab import (
-    get_research_strategy_context,
-    get_research_strategy_model_snapshot,
+    create_strategy,
+    get_strategy,
+    get_strategy_control,
+    get_strategy_model_snapshot,
+    select_research_strategy,
     update_strategy_model,
 )
 
@@ -59,8 +62,8 @@ TUNING_SCHEMA_VERSION = 5
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
-# Search ranges are server-owned research metadata. They are returned only through
-# the admin tuning API and are never embedded in the public frontend source.
+
+
 _SEARCH_SPACE: tuple[dict[str, Any], ...] = (
     {"name": "n_estimators", "type": "integer", "min": 220, "max": 380},
     {"name": "learning_rate", "type": "number", "min": 0.020, "max": 0.050, "precision": 6},
@@ -86,6 +89,27 @@ class ModelTuningConflict(RuntimeError):
 
 class ModelTuningNotFound(RuntimeError):
     pass
+
+
+def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
+    control = get_strategy_control(db)
+    candidates = (
+        ("candidate", control.get("candidate_strategy_id")),
+        ("promoted_candidate", control.get("promoted_candidate_strategy_id")),
+        ("selected_strategy", control.get("research_strategy_id")),
+    )
+    for source, raw_id in candidates:
+        strategy_id = str(raw_id or "").strip()
+        if not strategy_id:
+            continue
+        strategy = get_strategy(db, strategy_id)
+        model_snapshot = get_strategy_model_snapshot(db, strategy_id)
+        return strategy, model_snapshot, source
+    raise ModelTuningConflict("No Strategy is available for model tuning.")
+
+
+def _tuning_target_allows_locked_strategy(strategy: dict[str, Any]) -> bool:
+    return str(strategy.get("status") or "") in {"candidate", "promoted_candidate"}
 
 
 def _sanitize_tuning_log_line(raw_line: Any) -> str:
@@ -370,7 +394,7 @@ def generate_latin_hypercube_candidates(
     candidate_count: int = DEFAULT_CANDIDATE_COUNT,
     seed: int = DEFAULT_SEED,
 ) -> list[dict[str, Any]]:
-    """Return control + unique LHS configurations without mutating the Strategy."""
+    
     if candidate_count < 1:
         raise ValueError("candidate_count must be positive.")
     if not base_values:
@@ -415,13 +439,13 @@ def generate_latin_hypercube_candidates(
                 }
             )
 
-    # The primary design contains exactly candidate_count points so each tuned
-    # dimension is stratified into candidate_count equally probable intervals.
+    
+    
     add_points(qmc.LatinHypercube(d=len(_SEARCH_SPACE), seed=seed).random(n=candidate_count))
 
-    # Integer rounding plus the depth/leaves structural constraint can, rarely,
-    # collapse two points into the same full configuration. Fill only those gaps
-    # with deterministic auxiliary LHS batches while preserving uniqueness.
+    
+    
+    
     attempt = 1
     while len(candidates) < candidate_count + 1 and attempt <= 8:
         missing = candidate_count + 1 - len(candidates)
@@ -485,7 +509,7 @@ def _metric_summary(metrics: dict[str, Any]) -> dict[str, Any]:
 
 
 def _candidate_equity_preview(db: Any, job_id: str) -> list[dict[str, Any]]:
-    """Persist a compact visual trace before raw tuning artifacts are discarded."""
+    
 
     run = db[RUNS_COLLECTION].find_one(
         {"job_id": job_id, "symbol": "PORTFOLIO"},
@@ -542,7 +566,7 @@ def _as_finite_float(value: Any) -> float | None:
 
 
 def _cleanup_job_artifacts(db: Any, job_id: str) -> None:
-    """Keep tuning summaries compact; candidate jobs are not certification runs."""
+    
     db[PREDICTIONS_COLLECTION].delete_many({"job_id": job_id})
     db[TRADES_COLLECTION].delete_many({"job_id": job_id})
     db[RUNS_COLLECTION].delete_many({"job_id": job_id})
@@ -603,12 +627,11 @@ def _refresh_campaign_ranking(db: Any, run_id: str) -> None:
 
 
 def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
-    """Return completed normal backtests compatible with the currently saved LightGBM Strategy snapshot."""
-    _, strategy = get_research_strategy_context(db)
-    model_snapshot = get_research_strategy_model_snapshot(db)
+    strategy, model_snapshot, target_source = _tuning_target_strategy(db)
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
         return []
 
+    preferred_job_id = str(strategy.get("candidate_backtest_id") or strategy.get("last_backtest_id") or "")
     query = {
         "status": "completed",
         "internal_job": {"$ne": True},
@@ -617,6 +640,8 @@ def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, A
         "research_model_family": TUNING_MODEL_FAMILY,
         "research_model_settings_hash": model_snapshot.get("settings_hash"),
     }
+    if str(strategy.get("status") or "") in {"candidate", "promoted_candidate"} and preferred_job_id:
+        query["id"] = preferred_job_id
     jobs = list(
         db[JOBS_COLLECTION]
         .find(
@@ -662,9 +687,18 @@ def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, A
                     "model_settings_hash": job.get("research_model_settings_hash"),
                     "model_settings_revision": job.get("research_model_settings_revision"),
                     "metrics": _metric_summary(metrics),
+                    "tuning_target_source": target_source,
+                    "certified_candidate_baseline": bool(preferred_job_id and job_id == preferred_job_id),
                 }
             )
         )
+    if preferred_job_id:
+        preferred = [item for item in result if item.get("job_id") == preferred_job_id]
+        others = [item for item in result if item.get("job_id") != preferred_job_id]
+        others.sort(key=lambda item: str(item.get("finished_at") or item.get("created_at") or ""), reverse=True)
+        result = preferred + others
+    else:
+        result.sort(key=lambda item: str(item.get("finished_at") or item.get("created_at") or ""), reverse=True)
     return result
 
 
@@ -685,7 +719,7 @@ def _baseline_by_job_id(db: Any, job_id: str) -> dict[str, Any]:
 
 
 def _execution_request_context_hash(request_payload: dict[str, Any]) -> str:
-    """Hash the immutable research context while ignoring the model hyperparameter payload."""
+    
     context = deepcopy(request_payload)
     context.pop("research_model_settings", None)
     context.pop("expected_market_data_signature_sha256", None)
@@ -725,13 +759,13 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
     last_timestamp = summary.get("market_data_last_timestamp")
     cutoff_date = str(last_timestamp)[:10] if last_timestamp else None
     if cutoff_date:
-        # A tuning campaign must not move its right-hand time boundary while it runs.
-        # Freezing both fields makes all candidates consume the same historical sessions.
+        
+        
         request_snapshot["end_date"] = cutoff_date
         request_snapshot["analysis_end_date"] = cutoff_date
-    # Optimization is a pure replay over MongoDB. It must never download, refresh
-    # or backfill market data, even when the baseline was a normal backtest that
-    # was allowed to bootstrap a completely missing asset before analysis.
+    
+    
+    
     request_snapshot["research_market_data_mode"] = "database_only"
     return {
         "job_id": str(job_id),
@@ -749,12 +783,12 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
 
 
 def _frozen_execution_context_from_campaign(db: Any, document: dict[str, Any]) -> dict[str, Any]:
-    """Use the source campaign itself as the authority for derived CARO runs.
+    
 
-    v2.0.4 campaigns persist the immutable request and stable research-data signature.
-    Older campaigns fall back to the baseline job only to reconstruct the same frozen
-    request and to derive the stable signature from its stored per-symbol manifests.
-    """
+
+
+
+
     request_snapshot = document.get("execution_request_snapshot")
     baseline = document.get("baseline_execution") if isinstance(document.get("baseline_execution"), dict) else {}
     baseline_job_id = str(baseline.get("job_id") or "")
@@ -807,12 +841,12 @@ def _frozen_execution_context_from_campaign(db: Any, document: dict[str, Any]) -
 
 
 def _is_pristine_completed_latin_campaign(document: dict[str, Any]) -> bool:
-    """Return True only when every expected LHS candidate completed successfully.
+    
 
-    Failed, cancelled, stopped, interrupted, or partially completed campaigns are
-    never valid CARO evidence. A new research run must start fresh instead of
-    inheriting observations from an incomplete campaign.
-    """
+
+
+
+
     if str(document.get("status") or "") != "completed":
         return False
     if str(document.get("method") or "") != TUNING_METHOD:
@@ -830,7 +864,7 @@ def _is_pristine_completed_latin_campaign(document: dict[str, Any]) -> bool:
 
 
 def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
-    """Return completed Latin Hypercube campaigns that can seed CARO without rerunning them."""
+    
     documents = list(
         db[MODEL_TUNING_RUNS_COLLECTION]
         .find(
@@ -887,9 +921,9 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
         baseline_job_id = str(baseline.get("job_id") or "")
         if not baseline_job_id:
             continue
-        # The completed campaign is the authority for a derived CARO replay.
-        # Legacy campaigns can reconstruct their stable signature from the retained
-        # baseline per-symbol manifests without rerunning the 21 observations.
+        
+        
+        
         try:
             context = _frozen_execution_context_from_campaign(db, document)
         except ModelTuningConflict:
@@ -1213,12 +1247,11 @@ def start_model_tuning(
             f"Wait for backtest {active_backtest.get('id', 'unknown')} to finish before starting model tuning."
         )
 
-    _, strategy = get_research_strategy_context(db)
-    model_snapshot = get_research_strategy_model_snapshot(db)
+    strategy, model_snapshot, tuning_target_source = _tuning_target_strategy(db)
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
-        raise ModelTuningConflict("Save LightGBM on the selected Strategy before starting model tuning.")
-    if bool(strategy.get("locked")):
-        raise ModelTuningConflict("Clone the protected Strategy before starting model tuning.")
+        raise ModelTuningConflict("The current tuning target must use LightGBM before model tuning can start.")
+    if bool(strategy.get("locked")) and not _tuning_target_allows_locked_strategy(strategy):
+        raise ModelTuningConflict("The current protected Strategy is not a Candidate tuning target.")
 
     probability = dict(probability_config or {})
     prior_observations: list[dict[str, Any]] = []
@@ -1347,6 +1380,8 @@ def start_model_tuning(
         "strategy_profile_id": strategy["id"],
         "strategy_profile_name": strategy["name"],
         "strategy_profile_revision": int(strategy["revision"]),
+        "strategy_profile_status": str(strategy.get("status") or "draft"),
+        "tuning_target_source": tuning_target_source,
         "strategy_configuration_hash": strategy.get("configuration_hash"),
         "base_model_settings_hash": model_snapshot.get("settings_hash"),
         "base_model_settings_revision": int(model_snapshot.get("settings_revision") or 0),
@@ -1403,7 +1438,7 @@ def start_model_tuning(
 
 
 def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[str, Any]:
-    """Bind a campaign to immutable candles before the first candidate runs."""
+    
     run_id = str(document.get("id") or "")
     expected = str(document.get("expected_market_data_signature_sha256") or "").strip().lower() or None
     snapshot_id = str(document.get("market_data_snapshot_id") or "").strip().lower() or None
@@ -1463,7 +1498,7 @@ def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[
 
 def run_model_tuning(run_id: str) -> None:
     db = database()
-    from ..api.routers.jobs import queue_backtest_job  # Lazy import avoids router/service cycles.
+    from ..api.routers.jobs import queue_backtest_job  
 
     try:
         document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
@@ -1685,9 +1720,9 @@ def run_model_tuning(run_id: str) -> None:
                         stage="market_data_signature_frozen", candidate_id=candidate_id, job_id=job_id,
                     )
 
-                # Standalone CARO starts from a fresh Control. Once that Control is
-                # complete it becomes the probability Champion anchor for all startup
-                # and adaptive candidates. Derived CARO keeps the imported LHS anchor.
+                
+                
+                
                 if (
                     is_control
                     and str(document.get("method") or "") == PROBABILITY_METHOD
@@ -1842,12 +1877,12 @@ def run_model_tuning(run_id: str) -> None:
 
 
 def recover_integrated_model_tuning_runs(db: Any) -> int:
-    """Invalidate unfinished tuning campaigns after an API/container restart.
+    
 
-    Integrated tuning is deliberately fail-closed: partial research is never resumed
-    and never becomes CARO evidence. The user must start a new campaign explicitly.
-    Completed historical campaigns are untouched.
-    """
+
+
+
+
     documents = list(
         db[MODEL_TUNING_RUNS_COLLECTION].find(
             {
@@ -2010,28 +2045,71 @@ def adopt_model_tuning_candidate(
         gate = champion_gate_evaluation(document, metrics)
         if not bool(gate.get("passed")):
             raise ModelTuningConflict("This CARO candidate did not beat the configured Champion robustness gate and cannot be adopted.")
-    _, current_strategy = get_research_strategy_context(db)
-    if str(current_strategy.get("id")) != str(document.get("strategy_profile_id")):
-        raise ModelTuningConflict("The selected Strategy changed after this tuning campaign started.")
-    if int(current_strategy.get("revision") or 0) != int(document.get("strategy_profile_revision") or -1):
-        raise ModelTuningConflict("The selected Strategy revision changed after this tuning campaign started.")
 
-    updated_strategy = update_strategy_model(
-        db,
-        str(document["strategy_profile_id"]),
-        model_family=TUNING_MODEL_FAMILY,
-        values=dict(candidate["settings"]),
-        note=reason,
-        expected_strategy_revision=int(document["strategy_profile_revision"]),
-        actor_email=actor_email,
-    )
+    source_strategy = get_strategy(db, str(document["strategy_profile_id"]))
+    if int(source_strategy.get("revision") or 0) != int(document.get("strategy_profile_revision") or -1):
+        raise ModelTuningConflict("The tuning source Strategy revision changed after this campaign started.")
+
+    source_status = str(source_strategy.get("status") or "draft")
+    derived_strategy_created = source_status in {"candidate", "promoted_candidate"}
+    if derived_strategy_created:
+        suffix = f" Tuned C{int(candidate_id)} {str(run_id)[-8:]}"
+        source_name = str(source_strategy.get("name") or "Strategy")
+        derived_name = f"{source_name[:max(3, 120 - len(suffix))]}{suffix}"
+        created = create_strategy(
+            db,
+            name=derived_name,
+            description=str(source_strategy.get("description") or ""),
+            clone_from_strategy_id=str(source_strategy["id"]),
+            actor_email=actor_email,
+        )
+        updated_strategy = update_strategy_model(
+            db,
+            str(created["id"]),
+            model_family=TUNING_MODEL_FAMILY,
+            values=dict(candidate["settings"]),
+            note=reason,
+            expected_strategy_revision=int(created["revision"]),
+            actor_email=actor_email,
+        )
+        control = get_strategy_control(db)
+        select_research_strategy(
+            db,
+            str(updated_strategy["id"]),
+            expected_control_revision=int(control["revision"]),
+            note=reason,
+            actor_email=actor_email,
+        )
+        updated_strategy = get_strategy(db, str(updated_strategy["id"]))
+    else:
+        if bool(source_strategy.get("locked")):
+            raise ModelTuningConflict("The tuning source Strategy is protected and cannot receive adopted settings.")
+        updated_strategy = update_strategy_model(
+            db,
+            str(document["strategy_profile_id"]),
+            model_family=TUNING_MODEL_FAMILY,
+            values=dict(candidate["settings"]),
+            note=reason,
+            expected_strategy_revision=int(document["strategy_profile_revision"]),
+            actor_email=actor_email,
+        )
+
     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
         {"id": run_id},
-        {"$set": {"adopted_candidate_id": int(candidate_id), "adopted_at": utc_now(), "adopted_by": (actor_email or "").strip().lower() or None, "updated_at": utc_now()}},
+        {"$set": {
+            "adopted_candidate_id": int(candidate_id),
+            "adopted_strategy_id": str(updated_strategy.get("id") or ""),
+            "derived_strategy_created": bool(derived_strategy_created),
+            "adopted_at": utc_now(),
+            "adopted_by": (actor_email or "").strip().lower() or None,
+            "updated_at": utc_now(),
+        }},
     )
     return {
         "strategy": updated_strategy,
         "candidate_id": int(candidate_id),
+        "derived_strategy_created": bool(derived_strategy_created),
+        "source_strategy_preserved": bool(derived_strategy_created),
         "final_backtest_required": True,
         "source_context_confirmation_required": not bool(document.get("adoption_context_compatible", True)),
     }
@@ -2127,6 +2205,8 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "strategy_profile_id": document.get("strategy_profile_id"),
         "strategy_profile_name": document.get("strategy_profile_name"),
         "strategy_profile_revision": int(document.get("strategy_profile_revision") or 0),
+        "strategy_profile_status": document.get("strategy_profile_status"),
+        "tuning_target_source": document.get("tuning_target_source"),
         "created_at": document.get("created_at"),
         "started_at": document.get("started_at"),
         "finished_at": document.get("finished_at"),
@@ -2157,7 +2237,7 @@ def get_model_tuning_run(db: Any, run_id: str) -> dict[str, Any]:
 
 def get_latest_model_tuning_run(db: Any) -> dict[str, Any] | None:
     try:
-        _, strategy = get_research_strategy_context(db)
+        strategy, _, _ = _tuning_target_strategy(db)
         strategy_id = str(strategy["id"])
     except Exception:
         return None

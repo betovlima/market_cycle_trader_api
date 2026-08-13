@@ -13,7 +13,7 @@ def _build_day_trade_diagnostics(
     trade_frame: pd.DataFrame,
     metrics: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Build V1.9.3 diagnostics without changing the learned policy."""
+    
     output: dict[str, Any] = {
         "rotation_summary": {},
         "rotation_diagnostics": [],

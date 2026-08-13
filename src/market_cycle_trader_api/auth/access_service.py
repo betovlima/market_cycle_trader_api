@@ -49,12 +49,12 @@ def _new_access_token() -> str:
 
 
 def token_digest(token: str, invitation_id: str | None = None) -> str:
-    """Return a keyed digest bound to one invitation identifier.
+    
 
-    v1.13.13 invitation digests include the invitation UUID, so a token cannot
-    be moved to another access record and cannot be accepted by the legacy
-    token-only v1.13.12 login after a rollback.
-    """
+
+
+
+
     settings = get_settings()
     normalized = str(token or "").strip().upper()
     material = f"{invitation_id}:{normalized}" if invitation_id else normalized

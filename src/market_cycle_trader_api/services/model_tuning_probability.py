@@ -123,7 +123,7 @@ def _baseline_thresholds(document: dict[str, Any]) -> dict[str, float]:
 
 
 def champion_gate_evaluation(document: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate an observed candidate against the configured Champion-relative gate."""
+    
     thresholds = _baseline_thresholds(document)
     ending_capital = float(metrics.get("ending_capital") or 0.0)
     sharpe = float(metrics.get("sharpe") or 0.0)
@@ -192,13 +192,13 @@ def evolve_probability_search(
     metrics: dict[str, Any],
     champion_gate: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Advance the sequential CARO state after one observed candidate.
+    
 
-    A candidate that clears the current Champion-relative gate becomes the new
-    research Champion. Adaptive CARO trials expand their local trust region after
-    success and contract it after repeated misses, while startup LHS observations
-    can advance the Champion without changing the trust-region radius.
-    """
+
+
+
+
+
     state = _probability_state(document)
     kind = str(candidate.get("kind") or "")
     adaptive = kind == "champion_probability"
@@ -334,9 +334,9 @@ def _outcome_correlation(y_train: np.ndarray) -> np.ndarray:
     correlation = np.corrcoef(y_train[:, :_METRIC_COUNT], rowvar=False)
     if correlation.shape != (_METRIC_COUNT, _METRIC_COUNT) or not np.all(np.isfinite(correlation)):
         return np.eye(_METRIC_COUNT, dtype=float)
-    # Shrink the empirical correlation toward independence because the sample of
-    # expensive backtests is intentionally small. Then project to a positive-
-    # definite matrix so deterministic Monte Carlo sampling is numerically stable.
+    
+    
+    
     correlation = 0.5 * correlation + 0.5 * np.eye(_METRIC_COUNT, dtype=float)
     eigenvalues, eigenvectors = np.linalg.eigh(correlation)
     eigenvalues = np.clip(eigenvalues, 1e-6, None)
@@ -380,9 +380,9 @@ def _probabilistic_acquisition(
         expected_improvement[start:stop] = (positive * risk_ok).mean(axis=0)
 
     normalized_uncertainty = stds[:, 0] / thresholds["baseline_capital"]
-    # Constrained Expected Improvement already rewards useful uncertainty. The extra
-    # exploration term is feasibility-weighted so a wildly uncertain but clearly
-    # unsafe region cannot dominate a plausible Champion-beating neighborhood.
+    
+    
+    
     feasibility_weight = 0.25 + 0.75 * probability
     acquisition = (
         expected_improvement
@@ -393,11 +393,11 @@ def _probabilistic_acquisition(
 
 
 def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str, Any]:
-    """Propose one adaptive CARO candidate using Champion-anchored Gaussian processes.
+    
 
-    The probability is a surrogate research estimate under the frozen validation
-    protocol. It is deliberately not presented as a probability of future profit.
-    """
+
+
+
     search_space = list(document.get("search_space") or [])
     base_values = dict(document.get("base_model_values") or {})
     if not search_space or not base_values:

@@ -42,9 +42,9 @@ _XGBOOST_DEFAULTS: dict[str, Any] = {
     "random_state": 42,
 }
 
-# The LightGBM baseline intentionally reproduces the v1.13.39 challenger setup
-# that was initially derived from the champion XGBoost values. From v1.13.41
-# forward it is an independent model profile and no longer follows strategy edits.
+
+
+
 _LIGHTGBM_DEFAULTS: dict[str, Any] = {
     "n_estimators": 300,
     "learning_rate": 0.035,
@@ -194,8 +194,8 @@ def _normalized_document(document: dict[str, Any]) -> dict[str, Any]:
     normalized["schema_version"] = _SETTINGS_SCHEMA_VERSION
     normalized["revision"] = max(1, int(normalized.get("revision") or 1))
 
-    # v1.13.39 stored the IQN baseline directly at document.iqn. Preserve those
-    # exact values while migrating into model-specific profiles.
+    
+    
     legacy_iqn = normalized.get("iqn") if isinstance(normalized.get("iqn"), dict) else {}
     raw_profiles = normalized.get("profiles") if isinstance(normalized.get("profiles"), dict) else {}
 
@@ -270,7 +270,7 @@ def execution_settings_from_values(
     settings_revision: int,
     profile_id: str = "strategy",
 ) -> dict[str, Any]:
-    """Build a validated immutable settings payload owned by one Strategy revision."""
+    
     if model_family not in {"xgboost_utility", "lightgbm_utility", "iqn"}:
         raise ValueError(f"Unsupported research model: {model_family}")
     validated = _validate_values(model_family, values).model_dump(mode="python")
@@ -296,13 +296,13 @@ def model_execution_snapshot(
     model_family: str,
     settings_snapshot: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Return the immutable model identity bound to one execution/Winner.
+    
 
-    Legacy XGBoost jobs may predate independent Model Research profiles. They
-    remain valid by explicitly recording that the model values are owned by the
-    Strategy snapshot. New XGBoost and LightGBM jobs bind the exact model profile
-    payload already frozen in the immutable execution request.
-    """
+
+
+
+
+
 
     if model_family not in {"xgboost_utility", "lightgbm_utility", "iqn"}:
         raise ValueError(f"Unsupported research model: {model_family}")
@@ -314,7 +314,7 @@ def model_execution_snapshot(
         raw[key] = validated
         source = "model_research_profile"
     elif model_family == "xgboost_utility":
-        # Backward-compatible Winner path for historical validated XGBoost jobs.
+        
         raw = {}
         source = "legacy_strategy_owned"
     else:
@@ -349,11 +349,11 @@ def public_model_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def apply_execution_profile(config: Any, model_family: str, settings_snapshot: dict[str, Any] | None) -> Any:
-    """Apply only model-owned execution values to an immutable research request.
+    
 
-    The persisted Strategy remains unchanged. This compatibility layer maps the
-    selected model profile onto legacy engine fields only inside the job snapshot.
-    """
+
+
+
     snapshot = settings_snapshot if isinstance(settings_snapshot, dict) else {}
     key = {"xgboost_utility": "xgboost", "lightgbm_utility": "lightgbm", "iqn": "iqn"}.get(model_family)
     values = snapshot.get(key) if key and isinstance(snapshot.get(key), dict) else {}
@@ -560,7 +560,7 @@ def list_model_research_settings_history(db: Any, *, limit: int = 50) -> dict[st
 
 
 def list_model_research_executions(db: Any, *, limit: int = 50) -> dict[str, Any]:
-    """Return model identity only inside the Administrator research boundary."""
+    
     safe_limit = max(1, min(100, int(limit)))
     documents = (
         db[JOBS_COLLECTION]
