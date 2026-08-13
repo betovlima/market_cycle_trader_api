@@ -350,7 +350,7 @@ def tuning_catalog() -> dict[str, Any]:
         "eligibility_gate": "all_walk_forward_folds_positive",
         "search_space": [dict(item) for item in _SEARCH_SPACE],
         "raw_artifacts": "summary_only",
-        "adoption_requires_final_backtest": True,
+        "adoption_requires_final_backtest": False,
         "dedicated_worker": False,
         "execution_mode": "integrated_api_worker",
         "market_data_access": "database_only",
@@ -2024,32 +2024,23 @@ def adopt_model_tuning_candidate(
     run_id: str,
     candidate_id: int,
     *,
-    reason: str,
+    reason: str | None,
     actor_email: str | None,
 ) -> dict[str, Any]:
     document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
     if document is None:
         raise ModelTuningNotFound("Model tuning run not found.")
-    if str(document.get("status") or "") not in {"completed", "stopped"}:
-        raise ModelTuningConflict("Wait for the tuning campaign to finish before adopting a candidate.")
     candidate = next(
         (item for item in document.get("candidates") or [] if int(item.get("candidate_id") if item.get("candidate_id") is not None else -1) == int(candidate_id)),
         None,
     )
     if candidate is None or candidate.get("status") != "completed":
         raise ModelTuningConflict("Only a completed tuning candidate can be adopted.")
-    metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
-    if not bool(metrics.get("eligible")):
-        raise ModelTuningConflict("This candidate failed the positive-fold robustness gate and cannot be adopted.")
-    if str(document.get("method") or "") == PROBABILITY_METHOD:
-        gate = champion_gate_evaluation(document, metrics)
-        if not bool(gate.get("passed")):
-            raise ModelTuningConflict("This CARO candidate did not beat the configured Champion robustness gate and cannot be adopted.")
-
     source_strategy = get_strategy(db, str(document["strategy_profile_id"]))
     if int(source_strategy.get("revision") or 0) != int(document.get("strategy_profile_revision") or -1):
         raise ModelTuningConflict("The tuning source Strategy revision changed after this campaign started.")
 
+    adoption_note = (reason or f"Use tuning candidate #{int(candidate_id)} from {run_id} in Backtest.").strip()
     source_status = str(source_strategy.get("status") or "draft")
     derived_strategy_created = source_status in {"candidate", "promoted_candidate"}
     if derived_strategy_created:
@@ -2068,7 +2059,7 @@ def adopt_model_tuning_candidate(
             str(created["id"]),
             model_family=TUNING_MODEL_FAMILY,
             values=dict(candidate["settings"]),
-            note=reason,
+            note=adoption_note,
             expected_strategy_revision=int(created["revision"]),
             actor_email=actor_email,
         )
@@ -2077,7 +2068,7 @@ def adopt_model_tuning_candidate(
             db,
             str(updated_strategy["id"]),
             expected_control_revision=int(control["revision"]),
-            note=reason,
+            note=adoption_note,
             actor_email=actor_email,
         )
         updated_strategy = get_strategy(db, str(updated_strategy["id"]))
@@ -2089,7 +2080,7 @@ def adopt_model_tuning_candidate(
             str(document["strategy_profile_id"]),
             model_family=TUNING_MODEL_FAMILY,
             values=dict(candidate["settings"]),
-            note=reason,
+            note=adoption_note,
             expected_strategy_revision=int(document["strategy_profile_revision"]),
             actor_email=actor_email,
         )
@@ -2110,8 +2101,7 @@ def adopt_model_tuning_candidate(
         "candidate_id": int(candidate_id),
         "derived_strategy_created": bool(derived_strategy_created),
         "source_strategy_preserved": bool(derived_strategy_created),
-        "final_backtest_required": True,
-        "source_context_confirmation_required": not bool(document.get("adoption_context_compatible", True)),
+        "ready_for_backtest": True,
     }
 
 

@@ -15,6 +15,7 @@ from market_cycle_trader_api.engine.market_data import (
     inclusive_end_exclusive_boundary,
     latest_completed_xnys_session,
     load_mongo_market_bars,
+    resolve_backtest_analysis_end_date,
     trim_downloaded_range,
 )
 from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest, BacktestRequest
@@ -74,6 +75,63 @@ class _FakeCollection:
 
     def find_one(self, *args, **kwargs):
         return self.first
+
+
+
+
+class _SessionCollection:
+    def __init__(self, documents):
+        self.documents = list(documents)
+
+    def find_one(self, query, projection=None, sort=None):
+        matches = []
+        for document in self.documents:
+            matched = True
+            for key, expected in query.items():
+                actual = document.get(key)
+                if key == "timestamp" and isinstance(expected, dict):
+                    if "$gte" in expected and not (actual >= expected["$gte"]):
+                        matched = False
+                    if "$lt" in expected and not (actual < expected["$lt"]):
+                        matched = False
+                elif actual != expected:
+                    matched = False
+                if not matched:
+                    break
+            if matched:
+                matches.append(document)
+        if sort and matches:
+            key, direction = sort[0]
+            matches.sort(key=lambda item: item[key], reverse=direction < 0)
+        if not matches:
+            return None
+        result = dict(matches[0])
+        if projection is not None:
+            included = {key for key, value in projection.items() if value and key != "_id"}
+            if included:
+                result = {key: value for key, value in result.items() if key in included}
+        return result
+
+
+def _session_config(assets):
+    return SimpleNamespace(
+        assets=list(assets),
+        timeframe="1Day",
+        alpaca_historical_feed="sip",
+        alpaca_adjustment="all",
+        start_date="2016-01-01",
+        end_date=None,
+    )
+
+
+def _session_document(symbol: str, day: str):
+    return {
+        "symbol": symbol,
+        "interval": "1Day",
+        "feed": "sip",
+        "adjustment": "all",
+        "timestamp": pd.Timestamp(day, tz="UTC").to_pydatetime(),
+    }
 
 
 class _FakeClient:
@@ -199,6 +257,63 @@ def test_alpaca_bootstrap_stops_at_resolved_session_close_without_safety_lookahe
     assert calls
     assert pd.Timestamp(calls[-1]["end"]) == pd.Timestamp("2024-01-09T21:00:00Z")
     assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-09"]
+
+
+
+
+def test_backtest_cutoff_falls_back_to_latest_common_cached_session() -> None:
+    config = _session_config(["NVDA", "AAPL"])
+    collection = _SessionCollection(
+        [
+            _session_document("NVDA", "2026-08-11"),
+            _session_document("AAPL", "2026-08-11"),
+        ]
+    )
+    with (
+        patch("market_cycle_trader_api.engine.market_data.create_client", return_value=_FakeClient()),
+        patch("market_cycle_trader_api.engine.market_data.get_database", return_value=_FakeDatabase(collection)),
+    ):
+        result = resolve_backtest_analysis_end_date(
+            config,
+            now=datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc),
+        )
+
+    assert result == "2026-08-11"
+
+
+def test_backtest_cutoff_keeps_latest_closed_session_when_cache_is_current() -> None:
+    config = _session_config(["NVDA", "AAPL"])
+    collection = _SessionCollection(
+        [
+            _session_document("NVDA", "2026-08-12"),
+            _session_document("AAPL", "2026-08-12"),
+        ]
+    )
+    with (
+        patch("market_cycle_trader_api.engine.market_data.create_client", return_value=_FakeClient()),
+        patch("market_cycle_trader_api.engine.market_data.get_database", return_value=_FakeDatabase(collection)),
+    ):
+        result = resolve_backtest_analysis_end_date(
+            config,
+            now=datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc),
+        )
+
+    assert result == "2026-08-12"
+
+
+def test_backtest_cutoff_does_not_let_a_new_missing_asset_force_the_cutoff_back() -> None:
+    config = _session_config(["NVDA", "NEW"])
+    collection = _SessionCollection([_session_document("NVDA", "2026-08-11")])
+    with (
+        patch("market_cycle_trader_api.engine.market_data.create_client", return_value=_FakeClient()),
+        patch("market_cycle_trader_api.engine.market_data.get_database", return_value=_FakeDatabase(collection)),
+    ):
+        result = resolve_backtest_analysis_end_date(
+            config,
+            now=datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc),
+        )
+
+    assert result == "2026-08-11"
 
 
 def test_latest_completed_session_never_uses_current_open_session() -> None:

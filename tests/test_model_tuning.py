@@ -744,3 +744,26 @@ def test_v209_failure_is_terminal_and_incomplete_campaign_cannot_complete() -> N
     recovery = service[service.index("def recover_integrated_model_tuning_runs"):service.index("def request_model_tuning_stop")]
     assert "threading.Thread(target=run_model_tuning" not in recovery
     assert '"invalidated_after_restart"' in recovery
+
+
+def test_tuning_completed_candidate_can_be_used_without_research_gates() -> None:
+    from market_cycle_trader_api.schemas.model_tuning import ModelTuningAdoptRequest
+
+    request = ModelTuningAdoptRequest()
+    assert request.reason is None
+
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    adoption = service[service.index("def adopt_model_tuning_candidate"):service.index("def _public_candidate")]
+    assert "Only a completed tuning candidate can be adopted." in adoption
+    assert "positive-fold robustness gate" not in adoption
+    assert "Champion robustness gate" not in adoption
+    assert "Wait for the tuning campaign to finish before adopting" not in adoption
+    assert '"ready_for_backtest": True' in adoption
+    assert '"adoption_requires_final_backtest": False' in service
+
+    panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
+    assert "Use in Backtest" in panel
+    assert "const [reason, setReason]" not in panel
+    assert "metrics.eligible &&" not in panel
+    assert "candidate.champion_gate_passed === true" not in panel
+    assert "Champion Gate and fold eligibility are informational" in panel

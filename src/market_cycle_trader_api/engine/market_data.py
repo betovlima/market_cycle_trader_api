@@ -96,19 +96,76 @@ def _cache_has_session(collection: Any, identity: dict[str, Any], session: pd.Ti
     ) is not None
 
 
+def _cache_has_identity(collection: Any, identity: dict[str, Any]) -> bool:
+    return collection.find_one(identity, {"_id": 1}) is not None
+
+
+def _latest_cached_session_on_or_before(
+    collection: Any,
+    identity: dict[str, Any],
+    session: pd.Timestamp,
+    calendar: Any,
+) -> pd.Timestamp | None:
+    boundary = pd.Timestamp(session.date(), tz="UTC") + pd.Timedelta(days=1)
+    document = collection.find_one(
+        {**identity, "timestamp": {"$lt": boundary.to_pydatetime()}},
+        {"timestamp": 1, "_id": 0},
+        sort=[("timestamp", -1)],
+    )
+    if not document or document.get("timestamp") is None:
+        return None
+    timestamp = _utc_timestamp(document["timestamp"])
+    return pd.Timestamp(
+        calendar.date_to_session(pd.Timestamp(timestamp.date()), direction="previous")
+    )
+
+
+def _latest_common_cached_session(
+    collection: Any,
+    config: Any,
+    target: pd.Timestamp,
+    calendar: Any,
+) -> pd.Timestamp:
+    identities = [
+        _market_data_identity(symbol, config)
+        for symbol in list(getattr(config, "assets", []) or [])
+    ]
+    existing = [identity for identity in identities if _cache_has_identity(collection, identity)]
+    if not existing:
+        return target
+
+    candidate = target
+    start_date = normalize_end_date(getattr(config, "start_date", None))
+    minimum_session = (
+        pd.Timestamp(calendar.date_to_session(pd.Timestamp(start_date), direction="next"))
+        if start_date
+        else None
+    )
+
+    while True:
+        latest_sessions = [
+            _latest_cached_session_on_or_before(collection, identity, candidate, calendar)
+            for identity in existing
+        ]
+        if any(session is None for session in latest_sessions):
+            raise RuntimeError(
+                "MongoDB has no common cached market session inside the configured backtest window."
+            )
+        candidate = min([candidate, *latest_sessions])
+        if minimum_session is not None and candidate < minimum_session:
+            raise RuntimeError(
+                "MongoDB has no common cached market session inside the configured backtest window."
+            )
+        if all(_cache_has_session(collection, identity, candidate) for identity in existing):
+            return candidate
+        candidate = pd.Timestamp(calendar.previous_session(candidate))
+
+
 def resolve_backtest_analysis_end_date(
     config: Any,
     *,
     now: datetime | pd.Timestamp | None = None,
 ) -> str:
-    
-
-
-
-
-
-
-
     calendar = xcals.get_calendar("XNYS")
     latest_closed = latest_completed_xnys_session(now)
     requested = normalize_end_date(getattr(config, "end_date", None))
@@ -120,21 +177,12 @@ def resolve_backtest_analysis_end_date(
     else:
         target = latest_closed
 
-    stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
-    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
-    local_today = stamp.tz_convert(EASTERN).date()
-    if target.date() == local_today and calendar.is_session(pd.Timestamp(local_today)):
-        client = create_client()
-        try:
-            collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
-            available = all(
-                _cache_has_session(collection, _market_data_identity(symbol, config), target)
-                for symbol in list(getattr(config, "assets", []) or [])
-            )
-        finally:
-            client.close()
-        if not available:
-            target = pd.Timestamp(calendar.previous_session(target))
+    client = create_client()
+    try:
+        collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
+        target = _latest_common_cached_session(collection, config, target, calendar)
+    finally:
+        client.close()
 
     return target.date().isoformat()
 

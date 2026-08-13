@@ -47,12 +47,12 @@ class ModelTuningStartRequest(BaseModel):
 class ModelTuningAdoptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: str = Field(min_length=3, max_length=500)
+    reason: str | None = Field(default=None, max_length=500)
 
     @field_validator("reason")
     @classmethod
-    def normalize_reason(cls, value: str) -> str:
+    def normalize_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.strip()
-        if len(normalized) < 3:
-            raise ValueError("A change reason is required.")
-        return normalized
+        return normalized or None
