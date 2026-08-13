@@ -400,6 +400,10 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "candidate_note": document.get("candidate_note"),
         "candidate_revision": document.get("candidate_revision"),
         "candidate_backtest_id": document.get("candidate_backtest_id"),
+        "auto_candidate_after_backtest": bool(document.get("auto_candidate_after_backtest")),
+        "tuning_source_run_id": document.get("tuning_source_run_id"),
+        "tuning_source_candidate_id": document.get("tuning_source_candidate_id"),
+        "tuning_result_metrics": bson_value(document.get("tuning_result_metrics") or None),
         "superseded_at": bson_value(document.get("superseded_at")),
         "superseded_by_strategy_id": document.get("superseded_by_strategy_id"),
         "supersession_note": document.get("supersession_note"),
@@ -1313,6 +1317,165 @@ def update_strategy_model(
     return _public_profile(updated)
 
 
+def prepare_strategy_for_backtest_candidate(
+    db: Any,
+    strategy_id: str,
+    *,
+    expected_strategy_revision: int,
+    tuning_run_id: str,
+    tuning_candidate_id: int,
+    tuning_metrics: dict[str, Any],
+    actor_email: str | None,
+) -> dict[str, Any]:
+    ensure_strategy_catalog(db)
+    current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+    if current is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
+    if bool(current.get("locked")):
+        raise StrategyLabConflict("Protected lifecycle snapshots cannot be prepared for Backtest.")
+    current_revision = int(current.get("revision") or 1)
+    if current_revision != int(expected_strategy_revision):
+        raise StrategyLabConflict(
+            f"Expected strategy revision {expected_strategy_revision}, current revision {current_revision}."
+        )
+    now = utc_now()
+    actor = (actor_email or "").strip().lower() or None
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {"_id": strategy_id, "revision": current_revision, "locked": {"$ne": True}},
+        {
+            "$set": {
+                "status": "backtest",
+                "auto_candidate_after_backtest": True,
+                "tuning_source_run_id": str(tuning_run_id),
+                "tuning_source_candidate_id": int(tuning_candidate_id),
+                "tuning_result_metrics": bson_value(tuning_metrics),
+                "backtest_candidate_requested_at": now,
+                "backtest_candidate_requested_by": actor,
+                "updated_at": now,
+                "updated_by": actor,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise StrategyLabConflict("Strategy changed before Backtest status was applied.")
+    return _public_profile(updated)
+
+
+def _auto_mark_prepared_strategy_as_candidate(
+    db: Any,
+    profile: dict[str, Any],
+    *,
+    job_id: str,
+    model_snapshot: dict[str, Any],
+) -> None:
+    strategy_id = str(profile.get("_id") or "")
+    strategy_revision = int(profile.get("revision") or 1)
+    if not strategy_id:
+        return
+    control = ensure_strategy_catalog(db)
+    current_candidate_id = str(control.get("candidate_strategy_id") or "")
+    now = utc_now()
+    actor = str(profile.get("backtest_candidate_requested_by") or "").strip().lower() or None
+    tuning_run_id = str(profile.get("tuning_source_run_id") or "").strip()
+    tuning_candidate_id = profile.get("tuning_source_candidate_id")
+    note = f"Successful Backtest {job_id} automatically marked this CARO Strategy as Candidate."
+    control_revision = int(control.get("revision") or 1)
+    updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {"_id": CONTROL_ID, "revision": control_revision},
+        {
+            "$set": {
+                "candidate_strategy_id": strategy_id,
+                "updated_at": now,
+                "updated_by": actor,
+                "last_candidate_note": note,
+            },
+            "$inc": {"revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated_control is None:
+        raise StrategyLabConflict("Candidate selection changed before automatic Backtest promotion was applied.")
+
+    db[STRATEGY_PROFILES_COLLECTION].update_many(
+        {"_id": {"$ne": strategy_id}, "status": "candidate"},
+        {
+            "$set": {
+                "status": "superseded_candidate",
+                "locked": True,
+                "superseded_at": now,
+                "superseded_by_strategy_id": strategy_id,
+                "superseded_by": actor,
+                "supersession_note": note,
+                "updated_at": now,
+                "updated_by": actor,
+            }
+        },
+    )
+
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {
+            "_id": strategy_id,
+            "revision": strategy_revision,
+            "status": "backtest",
+            "auto_candidate_after_backtest": True,
+            "locked": {"$ne": True},
+        },
+        {
+            "$set": {
+                "status": "candidate",
+                "candidate_at": now,
+                "candidate_by": actor,
+                "candidate_note": note,
+                "candidate_revision": strategy_revision,
+                "candidate_backtest_id": job_id,
+                "candidate_model_snapshot": bson_value(model_snapshot),
+                "auto_candidate_after_backtest": False,
+                "updated_at": now,
+                "updated_by": actor,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {
+                "_id": CONTROL_ID,
+                "revision": control_revision + 1,
+                "candidate_strategy_id": strategy_id,
+            },
+            {
+                "$set": {
+                    "candidate_strategy_id": current_candidate_id or None,
+                    "updated_at": utc_now(),
+                },
+                "$inc": {"revision": 1},
+            },
+        )
+        raise StrategyLabConflict("Strategy changed before automatic Candidate status was applied.")
+
+    db[STRATEGY_PROMOTION_HISTORY_COLLECTION].insert_one(
+        bson_value(
+            {
+                "action": "candidate_auto_marked_from_tuning",
+                "previous_candidate_strategy_id": current_candidate_id or None,
+                "new_candidate_strategy_id": strategy_id,
+                "strategy_revision": strategy_revision,
+                "backtest_id": job_id,
+                "model_family": model_snapshot.get("family"),
+                "model_profile_id": model_snapshot.get("profile_id"),
+                "model_settings_revision": model_snapshot.get("settings_revision"),
+                "model_settings_hash": model_snapshot.get("settings_hash"),
+                "tuning_run_id": tuning_run_id or None,
+                "tuning_candidate_id": int(tuning_candidate_id) if tuning_candidate_id is not None else None,
+                "note": note,
+                "created_at": now,
+                "actor_email": actor,
+            }
+        )
+    )
+
+
 def _assert_no_active_backtest(db: Any) -> None:
     active = db[JOBS_COLLECTION].find_one(
         {"status": {"$in": ["queued", "running"]}}, {"_id": 0, "id": 1}
@@ -2131,9 +2294,9 @@ def mark_strategy_backtest(
     model_snapshot = model_execution_snapshot(
         research_model_family, research_model_settings or {}
     )
-    
-    
-    
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one(
+        {"_id": strategy_id, "revision": int(strategy_revision)}
+    )
     db[STRATEGY_PROFILES_COLLECTION].update_one(
         {"_id": strategy_id, "revision": int(strategy_revision)},
         {
@@ -2146,4 +2309,16 @@ def mark_strategy_backtest(
             }
         },
     )
+    if (
+        status == "completed"
+        and isinstance(profile, dict)
+        and str(profile.get("status") or "") == "backtest"
+        and bool(profile.get("auto_candidate_after_backtest"))
+    ):
+        _auto_mark_prepared_strategy_as_candidate(
+            db,
+            profile,
+            job_id=job_id,
+            model_snapshot=model_snapshot,
+        )
 

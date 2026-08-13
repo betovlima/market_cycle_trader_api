@@ -51,6 +51,7 @@ from .strategy_lab import (
     get_strategy,
     get_strategy_control,
     get_strategy_model_snapshot,
+    prepare_strategy_for_backtest_candidate,
     select_research_strategy,
     update_strategy_model,
 )
@@ -2019,6 +2020,46 @@ def request_model_tuning_stop(db: Any, run_id: str) -> dict[str, Any]:
     return public_model_tuning_run(db, updated or document)
 
 
+def _format_adopted_strategy_description(
+    document: dict[str, Any],
+    candidate: dict[str, Any],
+    source_strategy: dict[str, Any],
+) -> str:
+    metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+    method_label = "Adaptive CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "Latin Hypercube"
+    parts = [
+        f"{method_label} campaign {document.get('id')} candidate #{int(candidate.get('candidate_id') or 0)}.",
+        f"Source: {source_strategy.get('name') or 'Strategy'} rev {int(source_strategy.get('revision') or 1)}.",
+        f"Model: {document.get('model_label') or 'LightGBM Utility'}.",
+    ]
+    ending_capital = _as_finite_float(metrics.get("ending_capital"))
+    strategy_return = _as_finite_float(metrics.get("strategy_return"))
+    cagr = _as_finite_float(metrics.get("cagr"))
+    sharpe = _as_finite_float(metrics.get("sharpe"))
+    maximum_drawdown = _as_finite_float(metrics.get("maximum_drawdown"))
+    worst_fold_return = _as_finite_float(metrics.get("worst_fold_return"))
+    result_parts = []
+    if ending_capital is not None:
+        result_parts.append(f"capital ${ending_capital:,.2f}")
+    if strategy_return is not None:
+        result_parts.append(f"return {strategy_return * 100:+.2f}%")
+    if cagr is not None:
+        result_parts.append(f"CAGR {cagr * 100:+.2f}%")
+    if sharpe is not None:
+        result_parts.append(f"Sharpe {sharpe:.3f}")
+    if maximum_drawdown is not None:
+        result_parts.append(f"Max DD {maximum_drawdown * 100:+.2f}%")
+    if worst_fold_return is not None:
+        result_parts.append(f"Worst Fold {worst_fold_return * 100:+.2f}%")
+    if result_parts:
+        parts.append("Tuning result: " + "; ".join(result_parts) + ".")
+    cutoff = str(document.get("market_data_cutoff_date") or "").strip()
+    if cutoff:
+        parts.append(f"Market cutoff: {cutoff}.")
+    parts.append("Created automatically for Backtest; a successful Backtest moves it to Candidate.")
+    return " ".join(parts)[:500]
+
+
 def adopt_model_tuning_candidate(
     db: Any,
     run_id: str,
@@ -2041,56 +2082,52 @@ def adopt_model_tuning_candidate(
         raise ModelTuningConflict("The tuning source Strategy revision changed after this campaign started.")
 
     adoption_note = (reason or f"Use tuning candidate #{int(candidate_id)} from {run_id} in Backtest.").strip()
-    source_status = str(source_strategy.get("status") or "draft")
-    derived_strategy_created = source_status in {"candidate", "promoted_candidate"}
-    if derived_strategy_created:
-        suffix = f" Tuned C{int(candidate_id)} {str(run_id)[-8:]}"
-        source_name = str(source_strategy.get("name") or "Strategy")
-        derived_name = f"{source_name[:max(3, 120 - len(suffix))]}{suffix}"
-        created = create_strategy(
-            db,
-            name=derived_name,
-            description=str(source_strategy.get("description") or ""),
-            clone_from_strategy_id=str(source_strategy["id"]),
-            actor_email=actor_email,
-        )
-        updated_strategy = update_strategy_model(
-            db,
-            str(created["id"]),
-            model_family=TUNING_MODEL_FAMILY,
-            values=dict(candidate["settings"]),
-            note=adoption_note,
-            expected_strategy_revision=int(created["revision"]),
-            actor_email=actor_email,
-        )
-        control = get_strategy_control(db)
-        select_research_strategy(
-            db,
-            str(updated_strategy["id"]),
-            expected_control_revision=int(control["revision"]),
-            note=adoption_note,
-            actor_email=actor_email,
-        )
-        updated_strategy = get_strategy(db, str(updated_strategy["id"]))
-    else:
-        if bool(source_strategy.get("locked")):
-            raise ModelTuningConflict("The tuning source Strategy is protected and cannot receive adopted settings.")
-        updated_strategy = update_strategy_model(
-            db,
-            str(document["strategy_profile_id"]),
-            model_family=TUNING_MODEL_FAMILY,
-            values=dict(candidate["settings"]),
-            note=adoption_note,
-            expected_strategy_revision=int(document["strategy_profile_revision"]),
-            actor_email=actor_email,
-        )
+    method_tag = "CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "LHS"
+    suffix = f" {method_tag} C{int(candidate_id)} {str(run_id)[-8:]}"
+    source_name = str(source_strategy.get("name") or "Strategy")
+    derived_name = f"{source_name[:max(3, 120 - len(suffix))]}{suffix}"
+    description = _format_adopted_strategy_description(document, candidate, source_strategy)
+    created = create_strategy(
+        db,
+        name=derived_name,
+        description=description,
+        clone_from_strategy_id=str(source_strategy["id"]),
+        actor_email=actor_email,
+    )
+    updated_strategy = update_strategy_model(
+        db,
+        str(created["id"]),
+        model_family=TUNING_MODEL_FAMILY,
+        values=dict(candidate["settings"]),
+        note=adoption_note,
+        expected_strategy_revision=int(created["revision"]),
+        actor_email=actor_email,
+    )
+    updated_strategy = prepare_strategy_for_backtest_candidate(
+        db,
+        str(updated_strategy["id"]),
+        expected_strategy_revision=int(updated_strategy["revision"]),
+        tuning_run_id=run_id,
+        tuning_candidate_id=int(candidate_id),
+        tuning_metrics=dict(candidate.get("metrics") or {}),
+        actor_email=actor_email,
+    )
+    control = get_strategy_control(db)
+    select_research_strategy(
+        db,
+        str(updated_strategy["id"]),
+        expected_control_revision=int(control["revision"]),
+        note=adoption_note,
+        actor_email=actor_email,
+    )
+    updated_strategy = get_strategy(db, str(updated_strategy["id"]))
 
     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
         {"id": run_id},
         {"$set": {
             "adopted_candidate_id": int(candidate_id),
             "adopted_strategy_id": str(updated_strategy.get("id") or ""),
-            "derived_strategy_created": bool(derived_strategy_created),
+            "derived_strategy_created": True,
             "adopted_at": utc_now(),
             "adopted_by": (actor_email or "").strip().lower() or None,
             "updated_at": utc_now(),
@@ -2099,11 +2136,11 @@ def adopt_model_tuning_candidate(
     return {
         "strategy": updated_strategy,
         "candidate_id": int(candidate_id),
-        "derived_strategy_created": bool(derived_strategy_created),
-        "source_strategy_preserved": bool(derived_strategy_created),
+        "derived_strategy_created": True,
+        "source_strategy_preserved": True,
         "ready_for_backtest": True,
+        "auto_candidate_after_backtest": True,
     }
-
 
 def _public_candidate(candidate: dict[str, Any], current_jobs: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     payload = {

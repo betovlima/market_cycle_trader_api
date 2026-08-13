@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from market_cycle_trader_api.schemas.model_tuning import ModelTuningStartRequest
 from market_cycle_trader_api.services.model_tuning import (
+    _format_adopted_strategy_description,
     _sanitize_tuning_log_line,
     _source_anchor,
     _source_observations,
@@ -357,12 +358,14 @@ def test_tuning_target_prefers_active_candidate_and_allows_promoted_candidate_lo
     assert _tuning_target_allows_locked_strategy({"status": "winner", "locked": True}) is False
 
 
-def test_tuning_adoption_preserves_certified_candidate_by_creating_working_strategy() -> None:
+def test_tuning_adoption_always_preserves_source_by_creating_working_strategy() -> None:
     service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
-    assert 'source_status in {"candidate", "promoted_candidate"}' in service
-    assert "created = create_strategy(" in service
-    assert "select_research_strategy(" in service
-    assert '"source_strategy_preserved": bool(derived_strategy_created)' in service
+    adoption = service[service.index("def adopt_model_tuning_candidate"):service.index("def _public_candidate")]
+    assert "source_status" not in adoption
+    assert "created = create_strategy(" in adoption
+    assert "prepare_strategy_for_backtest_candidate(" in adoption
+    assert "select_research_strategy(" in adoption
+    assert '"source_strategy_preserved": True' in adoption
 
 
 def test_tuning_workspace_is_not_rendered_inside_model_settings() -> None:
@@ -767,3 +770,49 @@ def test_tuning_completed_candidate_can_be_used_without_research_gates() -> None
     assert "metrics.eligible &&" not in panel
     assert "candidate.champion_gate_passed === true" not in panel
     assert "Champion Gate and fold eligibility are informational" in panel
+
+
+def test_adopted_strategy_description_uses_tuning_metrics_without_user_text() -> None:
+    description = _format_adopted_strategy_description(
+        {
+            "id": "20260813T143142-tune-56941ff2",
+            "method": "champion_probability",
+            "model_label": "LightGBM Utility",
+            "market_data_cutoff_date": "2026-08-11",
+        },
+        {
+            "candidate_id": 20,
+            "metrics": {
+                "ending_capital": 757587.1075783046,
+                "strategy_return": 74.75871075783046,
+                "cagr": 1.046691911885945,
+                "sharpe": 1.828050331421643,
+                "maximum_drawdown": -0.33834821699534,
+                "worst_fold_return": 1.0360870631508035,
+            },
+        },
+        {"name": "Current Champion", "revision": 4},
+    )
+    assert "candidate #20" in description
+    assert "capital $757,587.11" in description
+    assert "CAGR +104.67%" in description
+    assert "Sharpe 1.828" in description
+    assert "Max DD -33.83%" in description
+    assert "Worst Fold +103.61%" in description
+    assert "2026-08-11" in description
+    assert len(description) <= 500
+
+
+def test_use_in_backtest_always_creates_a_new_strategy_catalog_entry() -> None:
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    adoption = service[service.index("def adopt_model_tuning_candidate"):service.index("def _public_candidate")]
+    assert "source_status" not in adoption
+    assert "create_strategy(" in adoption
+    assert "prepare_strategy_for_backtest_candidate(" in adoption
+    assert '"derived_strategy_created": True' in adoption
+    assert '"source_strategy_preserved": True' in adoption
+    assert '"auto_candidate_after_backtest": True' in adoption
+
+    panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
+    assert "selected as BACKTEST" in panel
+    assert "becomes the active CANDIDATE automatically" in panel

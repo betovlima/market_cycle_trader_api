@@ -28,6 +28,7 @@ from market_cycle_trader_api.services.strategy_lab import (
     get_trader_winner_context,
     mark_strategy_as_candidate,
     mark_strategy_backtest,
+    prepare_strategy_for_backtest_candidate,
     promote_strategy_to_trader,
     select_research_strategy,
     update_strategy,
@@ -1261,3 +1262,114 @@ def test_catalog_normalization_keeps_only_active_winner_source_as_promoted_candi
         if item.get("status") == "promoted_candidate"
     ]
     assert len(active_promoted) == 1
+
+
+def test_tuning_strategy_moves_from_backtest_to_candidate_after_success() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    previous = create_strategy(
+        db,
+        name="Previous candidate",
+        description="Previous validated candidate.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    db[JOBS_COLLECTION].documents["previous-job"] = {
+        "_id": "previous-job",
+        "id": "previous-job",
+        "status": "completed",
+        "strategy_profile_id": previous["id"],
+        "strategy_profile_revision": previous["revision"],
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=previous["id"],
+        strategy_revision=previous["revision"],
+        job_id="previous-job",
+        status="completed",
+    )
+    previous = mark_strategy_as_candidate(
+        db,
+        previous["id"],
+        expected_strategy_revision=previous["revision"],
+        note="Previous candidate.",
+        actor_email="admin@example.com",
+    )
+
+    created = create_strategy(
+        db,
+        name="CARO C20",
+        description="Generated tuning description.",
+        clone_from_strategy_id=previous["id"],
+        actor_email="admin@example.com",
+    )
+    prepared = prepare_strategy_for_backtest_candidate(
+        db,
+        created["id"],
+        expected_strategy_revision=created["revision"],
+        tuning_run_id="tune-20",
+        tuning_candidate_id=20,
+        tuning_metrics={"ending_capital": 757587.10},
+        actor_email="admin@example.com",
+    )
+    assert prepared["status"] == "backtest"
+    assert prepared["auto_candidate_after_backtest"] is True
+    assert prepared["tuning_source_run_id"] == "tune-20"
+    assert prepared["tuning_source_candidate_id"] == 20
+
+    db[JOBS_COLLECTION].documents["caro-job"] = {
+        "_id": "caro-job",
+        "id": "caro-job",
+        "status": "completed",
+        "strategy_profile_id": created["id"],
+        "strategy_profile_revision": created["revision"],
+        "research_model_family": "xgboost_utility",
+    }
+    mark_strategy_backtest(
+        db,
+        strategy_id=created["id"],
+        strategy_revision=created["revision"],
+        job_id="caro-job",
+        status="completed",
+    )
+
+    promoted = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": created["id"]})
+    old = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": previous["id"]})
+    control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"})
+    assert promoted["status"] == "candidate"
+    assert promoted["candidate_backtest_id"] == "caro-job"
+    assert promoted["auto_candidate_after_backtest"] is False
+    assert old["status"] == "superseded_candidate"
+    assert control["candidate_strategy_id"] == created["id"]
+
+
+def test_failed_backtest_keeps_tuning_strategy_in_backtest_status() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    created = create_strategy(
+        db,
+        name="CARO pending",
+        description="Generated tuning description.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    prepare_strategy_for_backtest_candidate(
+        db,
+        created["id"],
+        expected_strategy_revision=created["revision"],
+        tuning_run_id="tune-failed",
+        tuning_candidate_id=9,
+        tuning_metrics={},
+        actor_email="admin@example.com",
+    )
+    mark_strategy_backtest(
+        db,
+        strategy_id=created["id"],
+        strategy_revision=created["revision"],
+        job_id="failed-job",
+        status="failed",
+    )
+    stored = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": created["id"]})
+    assert stored["status"] == "backtest"
+    assert stored["last_backtest_status"] == "failed"
+    assert stored["auto_candidate_after_backtest"] is True
