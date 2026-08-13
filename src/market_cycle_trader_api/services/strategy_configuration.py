@@ -52,8 +52,20 @@ def _operational_document(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _configuration_hash(configuration: dict[str, Any]) -> str:
+    canonical = dict(configuration)
+    if str(canonical.get("strategy_mode") or "") != "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION":
+        for field in (
+            "allocation_lookback_days",
+            "allocation_max_asset_weight",
+            "allocation_cvar_confidence",
+            "allocation_cvar_penalty",
+            "allocation_turnover_penalty",
+            "allocation_minimum_utility",
+            "allocation_signal_scale",
+        ):
+            canonical.pop(field, None)
     encoded = json.dumps(
-        bson_value(configuration),
+        bson_value(canonical),
         sort_keys=True,
         separators=(",", ":"),
         default=str,

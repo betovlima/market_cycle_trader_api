@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-API_VERSION = "2.0.17"
+API_VERSION = "3.0.0"
 ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PACKAGE_DIR.parent
@@ -13,6 +13,8 @@ ENGINE_PATH = PACKAGE_DIR / "engine" / "compound_rotation_backtest.py"
 STRATEGY_LABELS = {
     "COMPOUND_ROTATION_SWING_XGBOOST": "Compound Capital Rotation — XGBoost",
     "COMPOUND_ROTATION_SWING_RISK_OFF": "Compound Capital Rotation — Explicit Risk-Off",
+    "COMPOUND_ROTATION_SWING_SELECTIVE": "Compound Capital Rotation — Selective Opportunity",
+    "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION": "Compound Capital Rotation — Optimized Allocation",
 }
 SWING_STRATEGY_MODES = frozenset(STRATEGY_LABELS)
 

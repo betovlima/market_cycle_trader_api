@@ -29,7 +29,7 @@ def test_model_research_request_accepts_all_supported_models() -> None:
 def test_persisted_strategy_contract_keeps_xgboost_model_marker_and_adds_risk_off_mode() -> None:
     source = (SRC / "schemas" / "requests.py").read_text(encoding="utf-8")
     assert 'RotationModel = Literal["xgboost_utility"]' in source
-    assert 'StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF"]' in source
+    assert 'StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION"]' in source
 
 
 def test_model_jobs_are_admin_only_and_only_live_capable_models_certify_strategy() -> None:

@@ -112,6 +112,10 @@ class PaperTradePlan(BaseModel):
     selected_utility: float
     utilities: dict[str, float]
     cash_edges: dict[str, float] = Field(default_factory=dict)
+    opportunity_probability: float | None = Field(default=None, ge=0.0, le=1.0)
+    opportunity_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    opportunity_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    opportunity_accepted: bool | None = None
     training_end: str
     calibration_start: str
     calibration_end: str

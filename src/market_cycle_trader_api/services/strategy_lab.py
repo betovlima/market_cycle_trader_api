@@ -98,6 +98,19 @@ STRATEGY_PARAMETER_GROUPS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "id": "allocation",
+        "label": "Optimized allocation",
+        "fields": (
+            "allocation_lookback_days",
+            "allocation_max_asset_weight",
+            "allocation_cvar_confidence",
+            "allocation_cvar_penalty",
+            "allocation_turnover_penalty",
+            "allocation_minimum_utility",
+            "allocation_signal_scale",
+        ),
+    },
+    {
         "id": "model",
         "label": "XGBoost",
         "fields": (
@@ -186,6 +199,13 @@ STRATEGY_PARAMETER_DESCRIPTIONS: dict[str, str] = {
     'rotation_cash_threshold': 'Decision threshold used when comparing an investable opportunity with remaining in cash.',
     'rotation_switch_margin': 'Additional advantage required before replacing the currently selected asset with another candidate.',
     'rotation_switch_margin_candidates': 'Candidate switch-margin values evaluated during calibration to select the operating margin.',
+    'allocation_lookback_days': 'Number of historical trading sessions, ending at the current decision timestamp, used to build empirical return scenarios for portfolio-risk optimization.',
+    'allocation_max_asset_weight': 'Maximum fraction of portfolio capital the optimizer may allocate to any single risky asset. CASH is not subject to this cap.',
+    'allocation_cvar_confidence': 'Confidence level used by the empirical Conditional Value at Risk objective. For example, 0.95 evaluates losses in the worst five percent of historical scenarios.',
+    'allocation_cvar_penalty': 'Penalty applied to portfolio Conditional Value at Risk when the optimizer balances modeled utility against downside-tail risk.',
+    'allocation_turnover_penalty': 'Penalty applied to absolute changes between current and target portfolio weights, discouraging unnecessary rebalancing.',
+    'allocation_minimum_utility': 'Minimum predicted Ranking Utility required for an asset to be eligible for a positive optimized portfolio weight.',
+    'allocation_signal_scale': 'Scaling factor applied to predicted Ranking Utility inside the allocation objective before risk and turnover penalties are applied.',
     'rotation_models': 'Model family enabled for the rotation stage. This release accepts only the model family supported by the backend.',
     'rotation_xgb_n_estimators': 'Maximum number of boosting trees configured for the rotation XGBoost model.',
     'rotation_xgb_learning_rate': 'Boosting step size controlling how strongly each new XGBoost tree contributes to the model.',
@@ -239,8 +259,20 @@ class StrategyLabNotFound(StrategyLabError):
 
 
 def _configuration_hash(configuration: dict[str, Any]) -> str:
+    canonical = dict(configuration)
+    if str(canonical.get("strategy_mode") or "") != "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION":
+        for field in (
+            "allocation_lookback_days",
+            "allocation_max_asset_weight",
+            "allocation_cvar_confidence",
+            "allocation_cvar_penalty",
+            "allocation_turnover_penalty",
+            "allocation_minimum_utility",
+            "allocation_signal_scale",
+        ):
+            canonical.pop(field, None)
     encoded = json.dumps(
-        bson_value(configuration),
+        bson_value(canonical),
         sort_keys=True,
         separators=(",", ":"),
         default=str,

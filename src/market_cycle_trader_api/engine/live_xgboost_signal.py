@@ -12,10 +12,12 @@ from .capital_rotation import (
     _risk_off_enabled,
     _simple_policy_growth,
     _xgb_policy,
+    _xgb_utilities,
     prepare_rotation_panel,
     resolve_xgboost_compute_plan,
 )
 from .live_policy import build_live_rotation_policy, live_model_utilities
+from .selective_opportunity import evaluate_opportunity, fit_selective_opportunity_gate, selective_opportunity_enabled
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,10 @@ class LiveXGBoostDecision:
     selected_utility: float
     utilities: dict[str, float]
     cash_edges: dict[str, float]
+    opportunity_probability: float | None
+    opportunity_confidence: float | None
+    opportunity_threshold: float | None
+    opportunity_accepted: bool | None
     effective_switch_margin: float
     calibrated_candidate_margin: float
     calibration_score: float
@@ -126,6 +132,17 @@ def build_live_xgboost_decision(
         )
         if fallback_reason:
             fallback_reasons.append(fallback_reason)
+    opportunity_gate = None
+    if selective_opportunity_enabled(config):
+        opportunity_gate = fit_selective_opportunity_gate(
+            calibration_models,
+            frames,
+            symbols,
+            calibration_dates,
+            lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, config),
+            random_state=int(config.random_state),
+            label_horizon=max(int(item) for item in config.rotation_target_horizons),
+        )
 
     candidates = tuple(float(value) for value in config.rotation_switch_margin_candidates)
     if not candidates:
@@ -133,12 +150,17 @@ def build_live_xgboost_decision(
 
     best_candidate = candidates[0]
     best_score = float("-inf")
+    margin_config = (
+        config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
+        if selective_opportunity_enabled(config)
+        else config
+    )
     for candidate in candidates:
         calibration_policy = _xgb_policy(
             calibration_models,
             frames,
             symbols,
-            config,
+            margin_config,
             candidate,
             cash_edge_models=calibration_cash_edge_models,
         )
@@ -197,6 +219,11 @@ def build_live_xgboost_decision(
     )
     if not np.isfinite(utilities_array[1:]).any():
         raise ValueError("The live XGBoost models produced no finite asset utilities.")
+    opportunity_result = (
+        evaluate_opportunity(opportunity_gate, utilities_array, frames, symbols, decision_date)
+        if opportunity_gate is not None
+        else None
+    )
 
     policy = build_live_rotation_policy(
         final_models,
@@ -205,6 +232,7 @@ def build_live_xgboost_decision(
         config,
         effective_margin,
         cash_edge_models=final_cash_edge_models,
+        opportunity_gate=opportunity_gate,
     )
     target_position, selected_utility = policy(
         decision_date,
@@ -250,6 +278,10 @@ def build_live_xgboost_decision(
         selected_utility=float(selected_utility),
         utilities=utilities,
         cash_edges=cash_edges,
+        opportunity_probability=float(opportunity_result.probability) if opportunity_result is not None else None,
+        opportunity_confidence=float(opportunity_result.confidence) if opportunity_result is not None else None,
+        opportunity_threshold=float(opportunity_gate.threshold) if opportunity_gate is not None else None,
+        opportunity_accepted=bool(opportunity_result.accepted) if opportunity_result is not None else None,
         effective_switch_margin=float(effective_margin),
         calibrated_candidate_margin=float(best_candidate),
         calibration_score=float(best_score),

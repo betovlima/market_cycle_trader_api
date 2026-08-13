@@ -104,6 +104,10 @@ def test_protected_dashboard_exposes_strategy_forecast_and_risk_off_diagnostics(
                 "selected_utility": 0.27,
                 "utilities": {"CASH": 0.0, "NVDA": 0.22, "MSFT": 0.27},
                 "cash_edges": {"NVDA": -0.015, "MSFT": -0.006},
+                "opportunity_probability": 0.72,
+                "opportunity_confidence": 0.84,
+                "opportunity_threshold": 0.61,
+                "opportunity_accepted": True,
                 "effective_switch_margin": 0.02,
                 "calibrated_candidate_margin": 0.02,
                 "calibration_score": 1.4,
@@ -194,6 +198,10 @@ def test_protected_dashboard_exposes_strategy_forecast_and_risk_off_diagnostics(
     assert payload["forecast"]["asset_forecast"][0]["cash_edge"] == -0.006
     assert payload["forecast"]["cash_exit_threshold"] == 0.0
     assert payload["forecast"]["cash_entry_threshold"] == 0.01
+    assert payload["forecast"]["opportunity_probability"] == 0.72
+    assert payload["forecast"]["opportunity_confidence"] == 0.84
+    assert payload["forecast"]["opportunity_threshold"] == 0.61
+    assert payload["forecast"]["opportunity_accepted"] is True
     row = payload["decision_history"]["rows"][0]
     assert row["current_cash_edge"] == -0.015
     assert row["best_cash_edge"] == -0.006

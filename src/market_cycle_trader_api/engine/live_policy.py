@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .capital_rotation import ROTATION_FEATURES, _risk_off_enabled
+from .selective_opportunity import SelectiveOpportunityGate, evaluate_opportunity, selective_opportunity_enabled
 
 
 def live_model_utilities(
@@ -44,17 +45,32 @@ def build_live_rotation_policy(
     switch_margin: float,
     *,
     cash_edge_models: dict[str, Any] | None = None,
+    opportunity_gate: SelectiveOpportunityGate | None = None,
 ) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
     
 
     risk_off = _risk_off_enabled(config)
+    selective = selective_opportunity_enabled(config)
     if risk_off and cash_edge_models is None:
         raise ValueError("Explicit risk-off mode requires live cash-edge models.")
+    if selective and opportunity_gate is None:
+        raise ValueError("Selective Opportunity mode requires a calibrated live opportunity gate.")
 
     def policy(timestamp: pd.Timestamp, current_position: int, holding_days: int) -> tuple[int, float]:
         utilities = live_model_utilities(models, frames, symbols, timestamp)
         if not np.isfinite(utilities[1:]).any():
             return (0, 0.0)
+
+        if selective and opportunity_gate is not None:
+            opportunity = evaluate_opportunity(
+                opportunity_gate,
+                utilities,
+                frames,
+                symbols,
+                timestamp,
+            )
+            if opportunity is None or not bool(opportunity.accepted):
+                return (0, 0.0)
 
         if not risk_off:
             best = int(np.nanargmax(utilities))

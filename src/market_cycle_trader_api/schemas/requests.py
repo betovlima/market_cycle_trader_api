@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .model_research import ResearchModelFamily
 
-StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF"]
+StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION"]
 Timeframe = Literal["1Day"]
 MarketDataProvider = Literal["alpaca"]
 AlpacaHistoricalFeed = Literal["sip", "iex"]
@@ -110,6 +110,14 @@ class BacktestRequest(BaseModel):
     rotation_cash_threshold: float = Field(ge=-0.50, le=0.50)
     rotation_switch_margin: float = Field(ge=0, le=0.50)
     rotation_switch_margin_candidates: list[float]
+
+    allocation_lookback_days: int = Field(default=126, ge=40, le=1_000)
+    allocation_max_asset_weight: float = Field(default=0.35, gt=0, le=1)
+    allocation_cvar_confidence: float = Field(default=0.95, ge=0.80, lt=1)
+    allocation_cvar_penalty: float = Field(default=1.0, ge=0, le=100)
+    allocation_turnover_penalty: float = Field(default=0.0025, ge=0, le=10)
+    allocation_minimum_utility: float = Field(default=0.0, ge=-10, le=10)
+    allocation_signal_scale: float = Field(default=1.0, gt=0, le=100)
     rotation_xgb_n_estimators: int = Field(ge=10, le=100_000)
     rotation_xgb_learning_rate: float = Field(gt=0, le=1)
     rotation_xgb_max_depth: int = Field(ge=1, le=20)

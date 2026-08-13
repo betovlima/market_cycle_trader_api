@@ -14,6 +14,9 @@ from .capital_rotation import (
     SUPPORTED_ROTATION_MODES,
     RotationRunResult,
     _analysis_decision_dates,
+    _optimized_policy,
+    _scheduled_allocation_policy,
+    _simulate_optimized_allocation,
     _build_walk_forward_folds,
     _fold_performance,
     _risk_adjusted_reward,
@@ -23,8 +26,11 @@ from .capital_rotation import (
     _simulate_exact,
     _training_transition_log_return,
     _xgb_policy,
+    _xgb_utilities,
     prepare_rotation_panel,
 )
+from .optimized_allocation import optimized_allocation_enabled
+from .selective_opportunity import fit_selective_opportunity_gate, selective_opportunity_enabled
 
 
 def _effective_n_jobs(configured: int) -> int:
@@ -291,15 +297,31 @@ def _run_lightgbm(
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
                 )
+            opportunity_gate = None
+            if selective_opportunity_enabled(rep_config):
+                opportunity_gate = fit_selective_opportunity_gate(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    random_state=int(rep_config.random_state),
+                    label_horizon=max(int(item) for item in rep_config.rotation_target_horizons),
+                )
             candidate_margins = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
             best_candidate = candidate_margins[0]
             best_score = float("-inf")
+            margin_config = (
+                rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
+                if selective_opportunity_enabled(rep_config)
+                else rep_config
+            )
             for candidate in candidate_margins:
                 calibration_policy = _xgb_policy(
                     calibration_models,
                     frames,
                     symbols,
-                    rep_config,
+                    margin_config,
                     candidate,
                     cash_edge_models=calibration_cash_edge_models,
                 )
@@ -345,25 +367,48 @@ def _run_lightgbm(
                     target_column="forward_cash_edge",
                 )
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
-            policies[fold_id] = _xgb_policy(
-                final_models,
-                frames,
-                symbols,
-                rep_config,
-                effective_margin,
-                cash_edge_models=final_cash_edge_models,
-                decision_diagnostics=diagnostics,
-                fold_id=fold_id,
-                calibrated_switch_margin=float(best_candidate),
-            )
-            margin_details.append(
-                {
-                    "fold_id": fold_id,
-                    "calibrated_candidate_margin": float(best_candidate),
-                    "effective_switch_margin": float(effective_margin),
-                    "calibration_risk_adjusted_score": float(best_score),
-                }
-            )
+            if optimized_allocation_enabled(rep_config):
+                policies[fold_id] = _optimized_policy(
+                    final_models,
+                    frames,
+                    symbols,
+                    rep_config,
+                    opportunity_gate=opportunity_gate,
+                    decision_diagnostics=diagnostics,
+                    fold_id=fold_id,
+                )
+            else:
+                policies[fold_id] = _xgb_policy(
+                    final_models,
+                    frames,
+                    symbols,
+                    rep_config,
+                    effective_margin,
+                    cash_edge_models=final_cash_edge_models,
+                    opportunity_gate=opportunity_gate,
+                    decision_diagnostics=diagnostics,
+                    fold_id=fold_id,
+                    calibrated_switch_margin=float(best_candidate),
+                )
+            margin_detail = {
+                "fold_id": fold_id,
+                "calibrated_candidate_margin": float(best_candidate),
+                "effective_switch_margin": float(effective_margin),
+                "calibration_risk_adjusted_score": float(best_score),
+            }
+            if opportunity_gate is not None:
+                margin_detail.update(
+                    {
+                        "opportunity_threshold": float(opportunity_gate.threshold),
+                        "opportunity_training_rows": int(opportunity_gate.training_rows),
+                        "opportunity_positive_rate": float(opportunity_gate.positive_rate),
+                        "opportunity_threshold_validation_rows": int(opportunity_gate.threshold_validation_rows),
+                        "opportunity_threshold_validation_score": float(opportunity_gate.threshold_validation_score),
+                        "opportunity_threshold_validation_accepted": int(opportunity_gate.threshold_validation_accepted),
+                        "opportunity_calibration_method": str(opportunity_gate.calibration_method),
+                    }
+                )
+            margin_details.append(margin_detail)
             report(
                 fold_base + fold_span,
                 f"Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} completed",
@@ -375,7 +420,11 @@ def _run_lightgbm(
             f"Run {run_index}/{repetitions} — simulating out-of-sample portfolio",
             repetition,
         )
-        scheduled = _scheduled_policy(policies, decision_to_fold)
+        scheduled = (
+            _scheduled_allocation_policy(policies, decision_to_fold)
+            if optimized_allocation_enabled(rep_config)
+            else _scheduled_policy(policies, decision_to_fold)
+        )
 
         wrapped_trade_callback = None
         if trade_callback is not None:
@@ -391,7 +440,8 @@ def _run_lightgbm(
                 )
                 trade_callback(payload)
 
-        result = _simulate_exact(
+        simulator = _simulate_optimized_allocation if optimized_allocation_enabled(rep_config) else _simulate_exact
+        result = simulator(
             "lightgbm_utility",
             scheduled,
             frames,
@@ -427,7 +477,7 @@ def _run_lightgbm(
                 "effective_compute_device": "cpu",
                 "deterministic_execution": bool(rep_config.deterministic_execution),
                 "numeric_thread_limit": int(rep_config.numeric_thread_limit),
-                "decision_diagnostics_schema_version": 2,
+                "decision_diagnostics_schema_version": 6 if optimized_allocation_enabled(rep_config) else (5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2)),
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
@@ -1224,7 +1274,7 @@ def _run_iqn(
                 "iqn_training_details": training_details,
                 "iqn_settings_revision": _research_settings(config).get("settings_revision"),
                 "iqn_profile_id": _research_settings(config).get("profile_id"),
-                "decision_diagnostics_schema_version": 2,
+                "decision_diagnostics_schema_version": 5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2),
                 "decision_diagnostics_rows": len(diagnostics),
             }
         )
@@ -1263,6 +1313,8 @@ def run_research_challenger(
             technical_log_callback=technical_log_callback,
         )
     if model_family == "iqn":
+        if optimized_allocation_enabled(config):
+            raise ValueError("Optimized Allocation v3.0.0 supports Ranking Utility models (XGBoost/LightGBM); IQN allocation is not enabled in this release.")
         return _run_iqn(
             bars_by_symbol,
             config,

@@ -10,10 +10,23 @@ import pandas as pd
 from threadpoolctl import threadpool_limits
 
 from .rotation_diagnostics import enrich_trade_diagnostics
+from .optimized_allocation import (
+    OPTIMIZED_ALLOCATION_MODE,
+    AllocationDecision,
+    optimize_allocation,
+    optimized_allocation_enabled,
+)
+from .selective_opportunity import (
+    SELECTIVE_ROTATION_MODE,
+    SelectiveOpportunityGate,
+    evaluate_opportunity,
+    fit_selective_opportunity_gate,
+    selective_opportunity_enabled,
+)
 
 LEGACY_ROTATION_MODE = 'COMPOUND_ROTATION_SWING_XGBOOST'
 RISK_OFF_ROTATION_MODE = 'COMPOUND_ROTATION_SWING_RISK_OFF'
-SUPPORTED_ROTATION_MODES = frozenset({LEGACY_ROTATION_MODE, RISK_OFF_ROTATION_MODE})
+SUPPORTED_ROTATION_MODES = frozenset({LEGACY_ROTATION_MODE, RISK_OFF_ROTATION_MODE, SELECTIVE_ROTATION_MODE, OPTIMIZED_ALLOCATION_MODE})
 
 def _risk_off_enabled(config: Any) -> bool:
     return str(getattr(config, 'strategy_mode', LEGACY_ROTATION_MODE)) == RISK_OFF_ROTATION_MODE
@@ -208,6 +221,7 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     closes = close.to_numpy(dtype=float)
     opens = open_price.to_numpy(dtype=float)
     utility_components = np.full((len(data), len(horizons)), np.nan, dtype=float)
+    net_return_components = np.full((len(data), len(horizons)), np.nan, dtype=float)
     movement_capture = np.full(len(data), np.nan, dtype=float)
     trend_persistence = np.full(len(data), np.nan, dtype=float)
 
@@ -239,20 +253,24 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
             running_peak = np.maximum.accumulate(path)
             drawdowns = 1.0 - np.divide(path, running_peak, out=np.ones_like(path), where=running_peak > 0)
             path_drawdown = max(0.0, float(np.nanmax(drawdowns)))
+            net_log_return = gross_log_return + net_cost_log
+            net_return_components[idx, component_idx] = net_log_return
             utility_components[idx, component_idx] = (
-                gross_log_return
-                + net_cost_log
+                net_log_return
                 - float(config.rotation_downside_penalty) * downside
                 - float(config.rotation_drawdown_penalty) * path_drawdown
             )
 
     weighted_utility = np.nansum(utility_components * weights.reshape(1, -1), axis=1)
+    weighted_net_log_return = np.nansum(net_return_components * weights.reshape(1, -1), axis=1)
     invalid_rows = np.isnan(utility_components).any(axis=1)
     weighted_utility[invalid_rows] = np.nan
+    weighted_net_log_return[invalid_rows] = np.nan
     
     
     
     
+    data['forward_net_log_return'] = weighted_net_log_return
     data['forward_cash_edge'] = weighted_utility
     data['forward_movement_capture'] = movement_capture
     data['forward_trend_persistence'] = trend_persistence
@@ -539,6 +557,7 @@ def _xgb_policy(
     switch_margin: float,
     *,
     cash_edge_models: dict[str, Any] | None = None,
+    opportunity_gate: SelectiveOpportunityGate | None = None,
     decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     fold_id: int | None = None,
     calibrated_switch_margin: float | None = None,
@@ -553,8 +572,11 @@ def _xgb_policy(
 
 
     risk_off = _risk_off_enabled(config)
+    selective = selective_opportunity_enabled(config)
     if risk_off and cash_edge_models is None:
         raise ValueError('Explicit risk-off mode requires cash-edge models.')
+    if selective and opportunity_gate is None:
+        raise ValueError('Selective Opportunity mode requires a calibrated opportunity gate.')
 
     def position_asset(position: int) -> str:
         return 'CASH' if position <= 0 else symbols[position - 1]
@@ -572,6 +594,14 @@ def _xgb_policy(
             if risk_off
             else utilities.copy()
         )
+        opportunity = (
+            evaluate_opportunity(opportunity_gate, utilities, frames, symbols, timestamp)
+            if selective and opportunity_gate is not None
+            else None
+        )
+        opportunity_probability = float(opportunity.probability) if opportunity is not None else None
+        opportunity_confidence = float(opportunity.confidence) if opportunity is not None else None
+        opportunity_accepted = bool(opportunity.accepted) if opportunity is not None else None
         ranked_positions = sorted(
             (
                 position
@@ -684,9 +714,14 @@ def _xgb_policy(
                     else 0.0
                 )
                 diagnostic = {
-                    'decision_diagnostics_schema_version': 3 if risk_off else 2,
+                    'decision_diagnostics_schema_version': 5 if selective else (3 if risk_off else 2),
                     'decision_fold_id': fold_id,
                     'strategy_risk_off_enabled': bool(risk_off),
+                    'strategy_selective_opportunity_enabled': bool(selective),
+                    'opportunity_probability': opportunity_probability,
+                    'opportunity_confidence': opportunity_confidence,
+                    'opportunity_threshold': float(opportunity_gate.threshold) if selective and opportunity_gate is not None else None,
+                    'opportunity_accepted': opportunity_accepted,
                     'current_asset': position_asset(current_position),
                     'current_score': finite(current_value),
                     'current_cash_edge': finite(current_cash_edge),
@@ -759,6 +794,14 @@ def _xgb_policy(
                     diagnostic[f'top_{rank + 1}_cash_edge'] = finite(edge) if edge is not None else None
                 decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
             return (target_position, final_score)
+
+        if selective and opportunity_accepted is False:
+            return finish(
+                0,
+                0.0,
+                'SELECTIVE_OPPORTUNITY_REJECT',
+                cash_threshold_guard=True,
+            )
 
         if not risk_off:
             if (
@@ -1017,6 +1060,469 @@ def _precompute_market_regime_diagnostics(
             'universe_breadth_20_valid_assets': int(valid_20.get(timestamp)) if pd.notna(valid_20.get(timestamp)) else 0,
         }
     return output
+
+
+
+def _optimized_policy(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    *,
+    opportunity_gate: SelectiveOpportunityGate | None = None,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+    fold_id: int | None = None,
+) -> Callable[[pd.Timestamp, dict[str, float]], AllocationDecision]:
+    if not optimized_allocation_enabled(config):
+        raise ValueError("Optimized allocation policy requires COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION.")
+    if opportunity_gate is None:
+        raise ValueError("Optimized allocation requires a calibrated Selective Opportunity gate.")
+
+    def policy(timestamp: pd.Timestamp, current_weights: dict[str, float]) -> AllocationDecision:
+        utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
+        opportunity = evaluate_opportunity(opportunity_gate, utilities, frames, symbols, timestamp)
+        decision = optimize_allocation(
+            utilities,
+            frames,
+            symbols,
+            timestamp,
+            current_weights,
+            config,
+            opportunity=opportunity,
+            opportunity_threshold=float(opportunity_gate.threshold),
+        )
+        if decision_diagnostics is not None:
+            finite_scores = [
+                (symbols[position - 1], float(utilities[position]))
+                for position in range(1, len(utilities))
+                if np.isfinite(utilities[position])
+            ]
+            finite_scores.sort(key=lambda item: (-item[1], item[0]))
+            top = finite_scores[:3]
+            target_weights = {symbol: float(decision.weights.get(symbol, 0.0)) for symbol in symbols}
+            diagnostic = {
+                "decision_diagnostics_schema_version": 6,
+                "decision_fold_id": fold_id,
+                "strategy_risk_off_enabled": False,
+                "strategy_selective_opportunity_enabled": True,
+                "strategy_optimized_allocation_enabled": True,
+                "opportunity_probability": decision.opportunity_probability,
+                "opportunity_confidence": decision.opportunity_confidence,
+                "opportunity_threshold": decision.opportunity_threshold,
+                "opportunity_accepted": decision.opportunity_accepted,
+                "allocation_weights": target_weights,
+                "allocation_cash_weight": float(decision.cash_weight),
+                "allocation_expected_utility": float(decision.expected_utility),
+                "allocation_estimated_cvar": decision.estimated_cvar,
+                "allocation_turnover": float(decision.turnover),
+                "allocation_objective_value": decision.objective_value,
+                "allocation_eligible_assets": list(decision.eligible_assets),
+                "allocation_eligible_asset_count": int(len(decision.eligible_assets)),
+                "allocation_optimizer_status": str(decision.optimizer_status),
+                "top_1_asset": top[0][0] if len(top) > 0 else None,
+                "top_1_score": top[0][1] if len(top) > 0 else None,
+                "top_2_asset": top[1][0] if len(top) > 1 else None,
+                "top_2_score": top[1][1] if len(top) > 1 else None,
+                "top_3_asset": top[2][0] if len(top) > 2 else None,
+                "top_3_score": top[2][1] if len(top) > 2 else None,
+            }
+            decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
+        return decision
+
+    return policy
+
+
+def _scheduled_allocation_policy(
+    policies: dict[int, Callable[[pd.Timestamp, dict[str, float]], AllocationDecision]],
+    decision_to_fold: dict[pd.Timestamp, int],
+) -> Callable[[pd.Timestamp, dict[str, float]], AllocationDecision]:
+    def policy(timestamp: pd.Timestamp, current_weights: dict[str, float]) -> AllocationDecision:
+        key = pd.Timestamp(timestamp)
+        fold_id = decision_to_fold.get(key)
+        if fold_id is None:
+            raise KeyError(f"No walk-forward allocation policy is assigned to {key}.")
+        return policies[int(fold_id)](timestamp, current_weights)
+    return policy
+
+
+def _simulate_optimized_allocation(
+    backend: str,
+    policy: Callable[[pd.Timestamp, dict[str, float]], AllocationDecision],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    decision_dates: pd.DatetimeIndex,
+    config: Any,
+    fee_calculator: Callable,
+    slippage: Callable,
+    decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None = None,
+    policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+    trade_callback: Callable[[dict[str, Any]], None] | None = None,
+    *,
+    model_label: str = "XGBoost Utility",
+    method_line: str | None = None,
+) -> RotationRunResult:
+    if len(decision_dates) < 2:
+        raise ValueError("The final-test interval is too short.")
+    execution_dates = decision_dates[1:]
+    benchmark = _equal_weight_benchmark(
+        frames,
+        symbols,
+        execution_dates,
+        float(config.initial_capital),
+        config,
+        fee_calculator,
+        slippage,
+    )
+    cash = float(config.initial_capital)
+    shares = {symbol: 0.0 for symbol in symbols}
+    total_fees = 0.0
+    turnover = 0.0
+    rebalance_count = 0
+    records: list[dict[str, Any]] = []
+    prediction_rows: list[dict[str, Any]] = []
+
+    def emit(trade: dict[str, Any]) -> None:
+        records.append(trade)
+        if trade_callback is not None:
+            trade_callback({**trade, "backend": backend, "model": model_label})
+
+    def marked_equity(timestamp: pd.Timestamp, price_field: str) -> float:
+        value = cash
+        for symbol in symbols:
+            qty = float(shares[symbol])
+            if qty <= 0:
+                continue
+            price = float(frames[symbol].loc[timestamp, price_field])
+            if np.isfinite(price) and price > 0:
+                value += qty * price
+        return float(value)
+
+    def current_weights(timestamp: pd.Timestamp) -> dict[str, float]:
+        equity = marked_equity(timestamp, "close")
+        if equity <= 0:
+            return {**{symbol: 0.0 for symbol in symbols}, "CASH": 1.0}
+        output = {
+            symbol: float(shares[symbol] * float(frames[symbol].loc[timestamp, "close"]) / equity)
+            for symbol in symbols
+        }
+        output["CASH"] = float(max(0.0, cash / equity))
+        return output
+
+    for idx in range(len(decision_dates) - 1):
+        decision_date = pd.Timestamp(decision_dates[idx])
+        execution_date = pd.Timestamp(decision_dates[idx + 1])
+        metadata = (decision_metadata or {}).get(decision_date, {})
+        fold_id = metadata.get("fold_id")
+        before_weights = current_weights(decision_date)
+        allocation = policy(decision_date, before_weights)
+        diag = dict((policy_decision_diagnostics or {}).get(decision_date, {}))
+
+        equity_open = cash
+        open_prices: dict[str, float] = {}
+        for symbol in symbols:
+            raw_open = float(frames[symbol].loc[execution_date, "open"])
+            open_prices[symbol] = raw_open
+            equity_open += float(shares[symbol]) * raw_open
+        if not np.isfinite(equity_open) or equity_open <= 0:
+            raise ValueError(f"Invalid optimized-allocation equity at {execution_date}.")
+
+        target_values = {
+            symbol: equity_open * max(0.0, float(allocation.weights.get(symbol, 0.0)))
+            for symbol in symbols
+        }
+        day_turnover = 0.0
+        day_actions: list[str] = []
+
+        for symbol in symbols:
+            qty = float(shares[symbol])
+            if qty <= 0:
+                continue
+            raw_open = open_prices[symbol]
+            current_value = qty * raw_open
+            desired_value = target_values[symbol]
+            if current_value <= desired_value + max(0.01, equity_open * 1e-7):
+                continue
+            execution_price = float(slippage(raw_open, "SELL", config))
+            sell_qty = (current_value - desired_value) / max(execution_price, 1e-12)
+            sell_qty = min(qty, sell_qty)
+            if bool(config.whole_shares):
+                sell_qty = float(math.floor(sell_qty + 1e-12))
+            if sell_qty <= 0:
+                continue
+            fees = fee_calculator("SELL", sell_qty, execution_price, config)
+            gross = sell_qty * execution_price
+            cash += gross - float(fees["total_fee"])
+            shares[symbol] = max(0.0, qty - sell_qty)
+            total_fees += float(fees["total_fee"])
+            turnover += gross
+            day_turnover += gross
+            day_actions.append("SELL")
+            emit({
+                "timestamp": execution_date,
+                "decision_timestamp": decision_date,
+                "action": "SELL",
+                "asset": symbol,
+                "reason": "OPTIMIZED_REBALANCE",
+                "execution_price": execution_price,
+                "quantity": sell_qty,
+                "gross_trade_value": gross,
+                **fees,
+                "cash_after_trade": cash,
+                "shares_after_trade": shares[symbol],
+                "walk_forward_fold": fold_id,
+                "allocation_target_weight": float(allocation.weights.get(symbol, 0.0)),
+                "allocation_cash_weight": float(allocation.cash_weight),
+                "allocation_optimizer_status": allocation.optimizer_status,
+            })
+
+        buy_needs: list[tuple[str, float]] = []
+        for symbol in symbols:
+            raw_open = open_prices[symbol]
+            current_value = float(shares[symbol]) * raw_open
+            desired_value = target_values[symbol]
+            if desired_value > current_value + max(0.01, equity_open * 1e-7):
+                buy_needs.append((symbol, desired_value - current_value))
+        buy_needs.sort(key=lambda item: (-item[1], item[0]))
+
+        desired_cash_reserve = max(0.0, equity_open * float(allocation.cash_weight))
+        spendable = max(0.0, cash - desired_cash_reserve)
+        for symbol, desired_gross in buy_needs:
+            if spendable <= 0:
+                break
+            raw_open = open_prices[symbol]
+            execution_price = float(slippage(raw_open, "BUY", config))
+            gross_budget = min(desired_gross, spendable)
+            buy_qty = gross_budget / max(execution_price, 1e-12)
+            if bool(config.whole_shares):
+                buy_qty = float(math.floor(buy_qty + 1e-12))
+            if buy_qty <= 0:
+                continue
+            fees = fee_calculator("BUY", buy_qty, execution_price, config)
+            gross = buy_qty * execution_price
+            total_cost = gross + float(fees["total_fee"])
+            if total_cost > spendable + 1e-9:
+                affordable = spendable / max(execution_price * (1.0 + float(config.commission_rate)), 1e-12)
+                buy_qty = float(math.floor(affordable)) if bool(config.whole_shares) else float(affordable)
+                if buy_qty <= 0:
+                    continue
+                fees = fee_calculator("BUY", buy_qty, execution_price, config)
+                gross = buy_qty * execution_price
+                total_cost = gross + float(fees["total_fee"])
+            if total_cost > cash + 1e-7:
+                continue
+            cash -= total_cost
+            shares[symbol] += buy_qty
+            total_fees += float(fees["total_fee"])
+            turnover += gross
+            day_turnover += gross
+            spendable = max(0.0, cash - desired_cash_reserve)
+            day_actions.append("BUY")
+            emit({
+                "timestamp": execution_date,
+                "decision_timestamp": decision_date,
+                "action": "BUY",
+                "asset": symbol,
+                "reason": "OPTIMIZED_REBALANCE",
+                "execution_price": execution_price,
+                "quantity": buy_qty,
+                "gross_trade_value": gross,
+                **fees,
+                "cash_after_trade": cash,
+                "shares_after_trade": shares[symbol],
+                "walk_forward_fold": fold_id,
+                "allocation_target_weight": float(allocation.weights.get(symbol, 0.0)),
+                "allocation_cash_weight": float(allocation.cash_weight),
+                "allocation_optimizer_status": allocation.optimizer_status,
+            })
+
+        if day_turnover > max(0.01, equity_open * 1e-7):
+            rebalance_count += 1
+
+        equity_close = marked_equity(execution_date, "close")
+        actual_weights = current_weights(execution_date)
+        risky_weight = float(sum(actual_weights.get(symbol, 0.0) for symbol in symbols))
+        held_assets = [symbol for symbol in symbols if actual_weights.get(symbol, 0.0) > 1e-6]
+        selected_asset = max(held_assets, key=lambda symbol: actual_weights[symbol]) if held_assets else "CASH"
+        prediction_rows.append({
+            "timestamp": execution_date,
+            "decision_timestamp": decision_date,
+            "selected_asset": selected_asset,
+            "selected_score": float(allocation.expected_utility),
+            "strategy_equity": float(equity_close),
+            "buy_hold_equity": float(benchmark.loc[execution_date]),
+            "trade_action": "+".join(sorted(set(day_actions))) if day_actions else None,
+            "trade_reason": "OPTIMIZED_REBALANCE" if day_actions else "OPTIMIZED_HOLD",
+            "walk_forward_fold": fold_id,
+            "portfolio_weights": {symbol: float(actual_weights.get(symbol, 0.0)) for symbol in symbols},
+            "cash_weight": float(actual_weights.get("CASH", 0.0)),
+            "market_exposure_weight": risky_weight,
+            "assets_held": int(len(held_assets)),
+            "allocation_expected_utility": float(allocation.expected_utility),
+            "allocation_estimated_cvar": allocation.estimated_cvar,
+            "allocation_target_turnover": float(allocation.turnover),
+            "allocation_objective_value": allocation.objective_value,
+            "allocation_optimizer_status": allocation.optimizer_status,
+            "allocation_eligible_asset_count": int(len(allocation.eligible_assets)),
+            "opportunity_probability": allocation.opportunity_probability,
+            "opportunity_confidence": allocation.opportunity_confidence,
+            "opportunity_threshold": allocation.opportunity_threshold,
+            "opportunity_accepted": allocation.opportunity_accepted,
+            **diag,
+        })
+
+    final_date = pd.Timestamp(execution_dates[-1])
+    if any(float(shares[symbol]) > 0 for symbol in symbols):
+        for symbol in symbols:
+            qty = float(shares[symbol])
+            if qty <= 0:
+                continue
+            raw_close = float(frames[symbol].loc[final_date, "close"])
+            execution_price = float(slippage(raw_close, "SELL", config))
+            fees = fee_calculator("SELL", qty, execution_price, config)
+            gross = qty * execution_price
+            cash += gross - float(fees["total_fee"])
+            total_fees += float(fees["total_fee"])
+            turnover += gross
+            shares[symbol] = 0.0
+            emit({
+                "timestamp": final_date,
+                "decision_timestamp": final_date,
+                "action": "FINAL_SELL",
+                "asset": symbol,
+                "reason": "FINAL_LIQUIDATION",
+                "execution_price": execution_price,
+                "quantity": qty,
+                "gross_trade_value": gross,
+                **fees,
+                "cash_after_trade": cash,
+                "shares_after_trade": 0.0,
+                "walk_forward_fold": prediction_rows[-1].get("walk_forward_fold") if prediction_rows else None,
+            })
+        if prediction_rows:
+            prediction_rows[-1]["strategy_equity"] = float(cash)
+            prediction_rows[-1]["portfolio_weights"] = {symbol: 0.0 for symbol in symbols}
+            prediction_rows[-1]["cash_weight"] = 1.0
+            prediction_rows[-1]["market_exposure_weight"] = 0.0
+            prediction_rows[-1]["assets_held"] = 0
+            prediction_rows[-1]["trade_action"] = prediction_rows[-1].get("trade_action") or "FINAL_SELL"
+
+    predictions = pd.DataFrame(prediction_rows).set_index("timestamp")
+    predictions.index = pd.to_datetime(predictions.index, utc=True)
+    predictions.index.name = "timestamp"
+    trades = pd.DataFrame(records)
+    if not trades.empty:
+        trades["timestamp"] = pd.to_datetime(trades["timestamp"], utc=True)
+        trades = trades.sort_values(["timestamp", "action", "asset"]).reset_index(drop=True)
+
+    strategy_curve = predictions["strategy_equity"].astype(float)
+    benchmark_curve = predictions["buy_hold_equity"].astype(float)
+    initial = float(config.initial_capital)
+    ending = float(strategy_curve.iloc[-1])
+    benchmark_ending = float(benchmark_curve.iloc[-1])
+    days = max(1, (predictions.index[-1] - predictions.index[0]).days)
+    years = max(days / 365.25, 1 / 365.25)
+    exposure_series = predictions["market_exposure_weight"].astype(float)
+    cash_weight_series = predictions["cash_weight"].astype(float)
+    opportunity_rows = predictions.loc[predictions["opportunity_probability"].notna()] if "opportunity_probability" in predictions else pd.DataFrame()
+    opportunity_accepted = int((opportunity_rows["opportunity_accepted"] == True).sum()) if not opportunity_rows.empty else 0
+    opportunity_rejected = int((opportunity_rows["opportunity_accepted"] == False).sum()) if not opportunity_rows.empty else 0
+    buys = int((trades["action"] == "BUY").sum()) if not trades.empty else 0
+    sells = int(trades["action"].isin(["SELL", "FINAL_SELL"]).sum()) if not trades.empty else 0
+
+    metrics = {
+        "portfolio_rotation": True,
+        "optimized_allocation_enabled": True,
+        "strategy_mode": config.strategy_mode,
+        "strategy_label": model_label,
+        "symbol": "PORTFOLIO",
+        "backend": backend,
+        "assets": symbols,
+        "timeframe": "1Day",
+        "initial_capital": initial,
+        "strategy_ending_capital": ending,
+        "strategy_return": ending / initial - 1.0,
+        "strategy_cagr": _cagr(strategy_curve),
+        "strategy_sharpe": _annualized_sharpe(strategy_curve, 252.0),
+        "strategy_maximum_drawdown": _maximum_drawdown(strategy_curve),
+        "compound_log_growth": float(math.log(max(ending / initial, 1e-12))),
+        "risk_adjusted_compound_score": _curve_risk_adjusted_score(strategy_curve, config),
+        "buy_hold_ending_capital": benchmark_ending,
+        "buy_hold_return": benchmark_ending / initial - 1.0,
+        "buy_hold_cagr": _cagr(benchmark_curve),
+        "buy_hold_sharpe": _annualized_sharpe(benchmark_curve, 252.0),
+        "buy_hold_maximum_drawdown": _maximum_drawdown(benchmark_curve),
+        "excess_return": ending / initial - benchmark_ending / initial,
+        "market_exposure": float(exposure_series.mean()),
+        "average_cash_weight": float(cash_weight_series.mean()),
+        "cash_days": int((cash_weight_series >= 0.999).sum()),
+        "average_assets_held": float(predictions["assets_held"].astype(float).mean()),
+        "maximum_assets_held": int(predictions["assets_held"].max()),
+        "allocation_rebalances": int(rebalance_count),
+        "allocation_lookback_days": int(config.allocation_lookback_days),
+        "allocation_max_asset_weight": float(config.allocation_max_asset_weight),
+        "allocation_cvar_confidence": float(config.allocation_cvar_confidence),
+        "allocation_cvar_penalty": float(config.allocation_cvar_penalty),
+        "allocation_turnover_penalty": float(config.allocation_turnover_penalty),
+        "allocation_minimum_utility": float(config.allocation_minimum_utility),
+        "allocation_signal_scale": float(config.allocation_signal_scale),
+        "selective_opportunity_enabled": True,
+        "opportunity_gate_decisions": int(len(opportunity_rows)),
+        "opportunity_gate_accepted": opportunity_accepted,
+        "opportunity_gate_rejected": opportunity_rejected,
+        "opportunity_gate_acceptance_rate": float(opportunity_accepted / len(opportunity_rows)) if len(opportunity_rows) else None,
+        "simulated_buys": buys,
+        "simulated_sells": sells,
+        "capital_rotations": int(rebalance_count),
+        "cycles_per_year": float(rebalance_count / years),
+        "total_transaction_fees": float(total_fees),
+        "turnover_ratio": float(turnover / max(initial, 1e-9)),
+        "test_start": predictions.index[0],
+        "test_end": predictions.index[-1],
+        "test_calendar_years": years,
+        "walk_forward_enabled": bool(config.rotation_walk_forward_enabled),
+        "walk_forward_purge_days": int(config.rotation_purge_days),
+        "walk_forward_calibration_days": int(config.rotation_walk_forward_calibration_days),
+        "walk_forward_test_days": int(config.rotation_walk_forward_test_days),
+        "downside_penalty": float(config.rotation_downside_penalty),
+        "drawdown_penalty": float(config.rotation_drawdown_penalty),
+        "decision_horizon_days": int(config.rotation_horizon_days),
+        "decision_horizon_label": f"{int(config.rotation_horizon_days)} trading sessions",
+        "benchmark_name": "Equal-weight buy-and-hold across continuously available assets",
+    }
+    summary = "\n".join([
+        "COMPOUND CAPITAL ROTATION — OPTIMIZED ALLOCATION",
+        "",
+        f"Model: {model_label}",
+        f"Assets: {', '.join(symbols)}",
+        "Allocation: long-only multi-asset portfolio plus CASH",
+        f"Maximum weight per asset: {float(config.allocation_max_asset_weight):.2%}",
+        f"CVaR confidence: {float(config.allocation_cvar_confidence):.2%}",
+        f"CVaR penalty: {float(config.allocation_cvar_penalty):.4f}",
+        f"Turnover penalty: {float(config.allocation_turnover_penalty):.6f}",
+        f"Risk lookback: {int(config.allocation_lookback_days)} sessions",
+        "",
+        "OUT-OF-SAMPLE WALK-FORWARD",
+        f"Initial capital: ${initial:,.2f}",
+        f"Ending capital: ${ending:,.2f}",
+        f"Total return: {metrics['strategy_return']:.2%}",
+        f"CAGR: {metrics['strategy_cagr']:.2%}",
+        f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}",
+        f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}",
+        f"Average market exposure: {metrics['market_exposure']:.2%}",
+        f"Average CASH weight: {metrics['average_cash_weight']:.2%}",
+        f"Average risky assets held: {metrics['average_assets_held']:.2f}",
+        f"Rebalances: {rebalance_count}",
+        f"Transaction fees: ${total_fees:,.2f}",
+        "",
+        "METHOD",
+        (method_line or "- Ranking Utility supplies the cross-sectional opportunity signal."),
+        "- Selective Opportunity can abstain completely when the top opportunity is not accepted.",
+        "- A linear CVaR optimizer allocates capital across eligible assets and CASH.",
+        "- Historical risk scenarios contain only returns observed through the current decision close.",
+        "- Turnover and estimated transaction costs penalize unnecessary movement of capital.",
+        "- Position changes execute at the next daily open.",
+    ])
+    return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 
 def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None, *, model_label: str='XGBoost Utility', method_line: str | None=None) -> RotationRunResult:
@@ -1314,6 +1820,9 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     sells = int(trades['action'].isin(['SELL', 'FINAL_SELL']).sum()) if not trades.empty else 0
     cash_days = int(sum((row['selected_asset'] == 'CASH' for row in prediction_rows)))
     exposure = 1.0 - cash_days / max(1, len(prediction_rows))
+    opportunity_rows = [row for row in prediction_rows if row.get('opportunity_probability') is not None]
+    opportunity_accepted = int(sum(row.get('opportunity_accepted') is True for row in opportunity_rows))
+    opportunity_rejected = int(sum(row.get('opportunity_accepted') is False for row in opportunity_rows))
     completed_sells = trades.loc[trades['action'].isin(['SELL', 'FINAL_SELL'])] if not trades.empty else pd.DataFrame()
     avg_holding = float(pd.to_numeric(completed_sells['holding_bars']).mean()) if not completed_sells.empty else float('nan')
     days = max(1, (pd.Timestamp(execution_dates[-1]) - pd.Timestamp(execution_dates[0])).days)
@@ -1327,7 +1836,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     candidate_assets = [symbol for symbol in getattr(config, 'research_candidate_assets', []) if symbol in symbols and symbol not in reference_set]
     if not getattr(config, 'research_candidate_assets', None):
         candidate_assets = [symbol for symbol in symbols if symbol not in reference_set]
-    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
+    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
     summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
@@ -1664,6 +2173,17 @@ def _run_xgboost_rotation_models(
                 )
                 if fallback_reason:
                     fallback_reasons.append(fallback_reason)
+            opportunity_gate = None
+            if selective_opportunity_enabled(rep_config):
+                opportunity_gate = fit_selective_opportunity_gate(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    random_state=int(rep_config.random_state),
+                    label_horizon=max(int(item) for item in rep_config.rotation_target_horizons),
+                )
 
             report(
                 fold_base + fold_span * 0.42,
@@ -1685,12 +2205,17 @@ def _run_xgboost_rotation_models(
             )
             best_candidate = candidate_margins[0]
             best_score = float('-inf')
+            margin_config = (
+                rep_config.model_copy(update={'strategy_mode': LEGACY_ROTATION_MODE})
+                if selective_opportunity_enabled(rep_config)
+                else rep_config
+            )
             for candidate in candidate_margins:
                 calibration_policy = _xgb_policy(
                     calibration_models,
                     frames,
                     symbols,
-                    rep_config,
+                    margin_config,
                     candidate,
                     cash_edge_models=calibration_cash_edge_models,
                 )
@@ -1750,23 +2275,46 @@ def _run_xgboost_rotation_models(
                 float(rep_config.rotation_switch_margin),
                 float(best_candidate),
             )
-            policies[fold_id] = _xgb_policy(
-                final_models,
-                frames,
-                symbols,
-                rep_config,
-                effective_margin,
-                cash_edge_models=final_cash_edge_models,
-                decision_diagnostics=decision_diagnostics,
-                fold_id=fold_id,
-                calibrated_switch_margin=float(best_candidate),
-            )
-            margin_details.append({
+            if optimized_allocation_enabled(rep_config):
+                policies[fold_id] = _optimized_policy(
+                    final_models,
+                    frames,
+                    symbols,
+                    rep_config,
+                    opportunity_gate=opportunity_gate,
+                    decision_diagnostics=decision_diagnostics,
+                    fold_id=fold_id,
+                )
+            else:
+                policies[fold_id] = _xgb_policy(
+                    final_models,
+                    frames,
+                    symbols,
+                    rep_config,
+                    effective_margin,
+                    cash_edge_models=final_cash_edge_models,
+                    opportunity_gate=opportunity_gate,
+                    decision_diagnostics=decision_diagnostics,
+                    fold_id=fold_id,
+                    calibrated_switch_margin=float(best_candidate),
+                )
+            margin_detail = {
                 'fold_id': fold_id,
                 'calibrated_candidate_margin': float(best_candidate),
                 'effective_switch_margin': float(effective_margin),
                 'calibration_risk_adjusted_score': float(best_score),
-            })
+            }
+            if opportunity_gate is not None:
+                margin_detail.update({
+                    'opportunity_threshold': float(opportunity_gate.threshold),
+                    'opportunity_training_rows': int(opportunity_gate.training_rows),
+                    'opportunity_positive_rate': float(opportunity_gate.positive_rate),
+                    'opportunity_threshold_validation_rows': int(opportunity_gate.threshold_validation_rows),
+                    'opportunity_threshold_validation_score': float(opportunity_gate.threshold_validation_score),
+                    'opportunity_threshold_validation_accepted': int(opportunity_gate.threshold_validation_accepted),
+                    'opportunity_calibration_method': str(opportunity_gate.calibration_method),
+                })
+            margin_details.append(margin_detail)
             report(
                 fold_base + fold_span,
                 f'Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} completed',
@@ -1807,20 +2355,36 @@ def _run_xgboost_rotation_models(
             f'event=simulation_start run={run_index}/{repetitions} '
             f'decision_sessions={max(0, len(all_decision_dates) - 1)}'
         )
-        scheduled = _scheduled_policy(policies, decision_to_fold)
-        result = _simulate_exact(
-            'xgboost_utility',
-            scheduled,
-            frames,
-            symbols,
-            all_decision_dates,
-            rep_config,
-            fee_calculator,
-            slippage,
-            decision_metadata=decision_metadata,
-            policy_decision_diagnostics=decision_diagnostics,
-            trade_callback=trade_wrapper(seed, run_index),
-        )
+        if optimized_allocation_enabled(rep_config):
+            scheduled = _scheduled_allocation_policy(policies, decision_to_fold)
+            result = _simulate_optimized_allocation(
+                'xgboost_utility',
+                scheduled,
+                frames,
+                symbols,
+                all_decision_dates,
+                rep_config,
+                fee_calculator,
+                slippage,
+                decision_metadata=decision_metadata,
+                policy_decision_diagnostics=decision_diagnostics,
+                trade_callback=trade_wrapper(seed, run_index),
+            )
+        else:
+            scheduled = _scheduled_policy(policies, decision_to_fold)
+            result = _simulate_exact(
+                'xgboost_utility',
+                scheduled,
+                frames,
+                symbols,
+                all_decision_dates,
+                rep_config,
+                fee_calculator,
+                slippage,
+                decision_metadata=decision_metadata,
+                policy_decision_diagnostics=decision_diagnostics,
+                trade_callback=trade_wrapper(seed, run_index),
+            )
         unique_backend = backend_id(seed)
         result.backend = unique_backend
         result.metrics['backend'] = unique_backend
@@ -1867,7 +2431,7 @@ def _run_xgboost_rotation_models(
             'deterministic_execution': bool(rep_config.deterministic_execution),
             'numeric_thread_limit': int(rep_config.numeric_thread_limit),
             'xgb_n_jobs': int(rep_config.xgb_n_jobs),
-            'decision_diagnostics_schema_version': 2,
+            'decision_diagnostics_schema_version': 6 if optimized_allocation_enabled(rep_config) else (5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2)),
             'position_risk_diagnostics_schema_version': 1,
             'market_regime_diagnostics_schema_version': 1,
             'decision_diagnostics_rows': int(len(decision_diagnostics)),

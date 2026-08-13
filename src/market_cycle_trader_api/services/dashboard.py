@@ -51,6 +51,10 @@ _METRIC_KEYS = {
     "session_win_rate": "session_win_rate",
     "position_changes": "capital_rotations",
     "average_holding_days": "average_holding_days",
+    "average_cash_weight": "average_cash_weight",
+    "average_assets_held": "average_assets_held",
+    "maximum_assets_held": "maximum_assets_held",
+    "allocation_rebalances": "allocation_rebalances",
 }
 
 
@@ -351,6 +355,11 @@ _STRATEGY_DECISION_FIELDS = (
     "trade_action",
     "decision_score",
     "strategy_risk_off_enabled",
+    "strategy_selective_opportunity_enabled",
+    "opportunity_probability",
+    "opportunity_confidence",
+    "opportunity_threshold",
+    "opportunity_accepted",
     "current_asset",
     "current_score",
     "current_cash_edge",
@@ -485,6 +494,10 @@ def _latest_strategy_forecast(db: Any, winner_strategy: dict[str, Any] | None) -
         "selected_utility": _as_float(plan.get("selected_utility")),
         "utilities": {str(key): _as_float(value) for key, value in utilities.items()},
         "cash_edges": {str(key): _as_float(value) for key, value in cash_edges.items()},
+        "opportunity_probability": _as_float(plan.get("opportunity_probability")),
+        "opportunity_confidence": _as_float(plan.get("opportunity_confidence")),
+        "opportunity_threshold": _as_float(plan.get("opportunity_threshold")),
+        "opportunity_accepted": plan.get("opportunity_accepted"),
         "asset_forecast": asset_rows,
         "cash_exit_threshold": cash_exit_threshold,
         "cash_entry_threshold": cash_entry_threshold,

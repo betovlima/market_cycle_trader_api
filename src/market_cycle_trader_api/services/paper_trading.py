@@ -104,6 +104,8 @@ def _validated_context(
         raise RuntimeError("Paper trading is disabled in MongoDB.")
     if strategy.strategy_mode not in SWING_STRATEGY_MODES:
         raise RuntimeError("Paper trading requires the validated compound-rotation strategy contract.")
+    if strategy.strategy_mode == "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION":
+        raise RuntimeError("Optimized Allocation v3.0.0 is research/backtest-only until the multi-asset Paper executor is enabled.")
     if strategy.rotation_models != ["xgboost_utility"]:
         raise RuntimeError("The legacy strategy model marker changed unexpectedly.")
     if winner_model["family"] not in {"xgboost_utility", "lightgbm_utility"}:
@@ -253,6 +255,8 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
     if strategy.strategy_mode not in SWING_STRATEGY_MODES:
         raise RuntimeError("The locked strategy is not the XGBoost swing strategy.")
+    if strategy.strategy_mode == "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION":
+        raise RuntimeError("Optimized Allocation v3.0.0 is research/backtest-only until the multi-asset Paper executor is enabled.")
 
     existing = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"})
     if existing is not None and not replace:
@@ -410,6 +414,10 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         selected_utility=decision.selected_utility,
         utilities=decision.utilities,
         cash_edges=decision.cash_edges,
+        opportunity_probability=decision.opportunity_probability,
+        opportunity_confidence=decision.opportunity_confidence,
+        opportunity_threshold=decision.opportunity_threshold,
+        opportunity_accepted=decision.opportunity_accepted,
         training_end=_et_date(decision.training_end),
         calibration_start=_et_date(decision.calibration_start),
         calibration_end=_et_date(decision.calibration_end),
