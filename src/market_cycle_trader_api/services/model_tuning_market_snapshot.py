@@ -70,11 +70,11 @@ def freeze_tuning_market_snapshot(
     expected = str(expected_signature or "").strip().lower()
     if expected and signature != expected:
         raise TuningMarketSnapshotMismatch(
-            "SourceMarketDataSnapshotMismatch: the selected Latin Hypercube campaign "
-            f"was evaluated on market-data signature {expected}, but the mutable MongoDB "
-            f"cache currently resolves to {signature}. The old candles cannot be reconstructed "
-            "safely from hashes alone. Re-run Latin Hypercube once with API v2.0.10+ so its "
-            "physical frozen snapshot can be reused by CARO."
+            "SourceMarketDataSnapshotMismatch: the certified research reference "
+            f"was evaluated on market-data signature {expected}, but the current MongoDB "
+            f"research data resolves to {signature}. The tuning campaign cannot safely reuse "
+            "the certified Control against a different market-data snapshot. Run a new certified "
+            "Simulation Backtest before starting another tuning campaign."
         )
 
     collection = db[MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION]

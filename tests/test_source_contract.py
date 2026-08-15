@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "3.0.0"' in config
+    assert 'API_VERSION = "3.12.3"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -153,3 +153,15 @@ def test_model_estimator_metadata_does_not_reject_valid_intermediate_integers() 
     service = (SRC / "services" / "model_research.py").read_text(encoding="utf-8")
     assert service.count('"n_estimators": {"label": "Estimators", "step": 1') == 2
     assert '"n_estimators": {"label": "Estimators", "step": 10' not in service
+
+
+def test_save_test_strategy_change_reason_is_optional() -> None:
+    panel = (ROOT.parent / "market_cycle_trader" / "src" / "features" / "StrategySettingsPanel.jsx").read_text(encoding="utf-8")
+    config = (ROOT.parent / "market_cycle_trader" / "src" / "features" / "strategySettings" / "strategySettingsConfig.js").read_text(encoding="utf-8")
+
+    assert "const note = changeNote.trim() || null" in panel
+    assert "Enter a change reason for the strategy revision." not in panel
+    assert 'label={tr("Change reason (optional)")}' in panel
+    assert "maxLength={500} placeholder={tr('Optional audit note')}" in panel
+    assert "maxLength={500} required" not in panel
+    assert "Saving an editable draft revision does not require a note" in config

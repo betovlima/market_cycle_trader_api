@@ -98,8 +98,16 @@ STRATEGY_PARAMETER_GROUPS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "id": "exposure",
+        "label": "Market exposure gate",
+        "fields": (
+            "opportunity_utility_entry_threshold",
+            "opportunity_utility_exit_threshold",
+        ),
+    },
+    {
         "id": "allocation",
-        "label": "Optimized allocation",
+        "label": "Portfolio allocation",
         "fields": (
             "allocation_lookback_days",
             "allocation_max_asset_weight",
@@ -199,13 +207,15 @@ STRATEGY_PARAMETER_DESCRIPTIONS: dict[str, str] = {
     'rotation_cash_threshold': 'Decision threshold used when comparing an investable opportunity with remaining in cash.',
     'rotation_switch_margin': 'Additional advantage required before replacing the currently selected asset with another candidate.',
     'rotation_switch_margin_candidates': 'Candidate switch-margin values evaluated during calibration to select the operating margin.',
-    'allocation_lookback_days': 'Number of historical trading sessions, ending at the current decision timestamp, used to build empirical return scenarios for portfolio-risk optimization.',
-    'allocation_max_asset_weight': 'Maximum fraction of portfolio capital the optimizer may allocate to any single risky asset. CASH is not subject to this cap.',
+    'opportunity_utility_entry_threshold': 'Absolute Top-1 Utility required to enter the market from CASH in the Absolute Utility Cash Gate. This is a research parameter intended to be explored by probabilistic Model Tuning.',
+    'opportunity_utility_exit_threshold': 'Absolute Top-1 Utility floor used while already invested. It must be less than or equal to the entry threshold so the gate has hysteresis and avoids unnecessary CASH churn.',
+    'allocation_lookback_days': 'Historical trading-session lookback used by allocation risk models. Compound Risk Overlay uses at least 252 sessions for current Top-1 CVaR and a longer history for the selected asset\'s own risk reference; no unrelated asset can change that reference.',
+    'allocation_max_asset_weight': 'Safety ceiling for one risky asset. The default 1.00 allows Compound Risk Overlay to preserve 100% of current compounded capital in the asset selected by the original rotation policy; lower values remain available as an explicit concentration cap.',
     'allocation_cvar_confidence': 'Confidence level used by the empirical Conditional Value at Risk objective. For example, 0.95 evaluates losses in the worst five percent of historical scenarios.',
-    'allocation_cvar_penalty': 'Penalty applied to portfolio Conditional Value at Risk when the optimizer balances modeled utility against downside-tail risk.',
-    'allocation_turnover_penalty': 'Penalty applied to absolute changes between current and target portfolio weights, discouraging unnecessary rebalancing.',
-    'allocation_minimum_utility': 'Minimum predicted Ranking Utility required for an asset to be eligible for a positive optimized portfolio weight.',
-    'allocation_signal_scale': 'Scaling factor applied to predicted Ranking Utility inside the allocation objective before risk and turnover penalties are applied.',
+    'allocation_cvar_penalty': 'Risk-aversion coefficient applied to normalized CVaR. Compound Risk Overlay compares the selected asset\'s current CVaR with that same asset\'s longer-run CVaR reference and penalizes 0.5 × normalized-CVaR²; Opportunity Confidence is not used to reduce Top-1 reward.',
+    'allocation_turnover_penalty': 'Penalty applied to risky-asset turnover. CASH is the financing leg and is not counted a second time, so CASH→Top-1 counts as one unit of risky turnover while Top-1→another asset counts both sell and buy legs.',
+    'allocation_minimum_utility': 'Backward-compatible allocation parameter used by the older multi-asset allocation modes. Compound Risk Overlay does not use it because the original rotation policy alone chooses the asset and the overlay sizes only that asset versus CASH.',
+    'allocation_signal_scale': 'Scaling factor for the Compound Risk Overlay base reward. The asset selected by the original rotation policy receives this reward without multiplication by Opportunity Confidence or calibrated relative alpha; CVaR, turnover and costs determine how much compounded capital remains exposed.',
     'rotation_models': 'Model family enabled for the rotation stage. This release accepts only the model family supported by the backend.',
     'rotation_xgb_n_estimators': 'Maximum number of boosting trees configured for the rotation XGBoost model.',
     'rotation_xgb_learning_rate': 'Boosting step size controlling how strongly each new XGBoost tree contributes to the model.',
@@ -260,7 +270,11 @@ class StrategyLabNotFound(StrategyLabError):
 
 def _configuration_hash(configuration: dict[str, Any]) -> str:
     canonical = dict(configuration)
-    if str(canonical.get("strategy_mode") or "") != "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION":
+    mode = str(canonical.get("strategy_mode") or "")
+    if mode != "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE":
+        canonical.pop("opportunity_utility_entry_threshold", None)
+        canonical.pop("opportunity_utility_exit_threshold", None)
+    if mode not in {"COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"}:
         for field in (
             "allocation_lookback_days",
             "allocation_max_asset_weight",
@@ -1117,7 +1131,7 @@ def update_strategy(
     configuration: BacktestRequest,
     name: str,
     description: str,
-    note: str,
+    note: str | None,
     expected_revision: int,
     actor_email: str | None,
 ) -> dict[str, Any]:
@@ -1135,7 +1149,16 @@ def update_strategy(
         raise StrategyLabConflict(
             f"Expected strategy revision {expected_revision}, current revision {current_revision}."
         )
-    payload = configuration.model_dump(mode="json")
+    current_configuration = BacktestRequest.model_validate(current.get("configuration") or {})
+    normalized_configuration = configuration
+    if (
+        str(current_configuration.strategy_mode) not in {"COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"}
+        and str(configuration.strategy_mode) in {"COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"}
+        and abs(float(current_configuration.allocation_max_asset_weight) - 0.35) <= 1e-12
+        and abs(float(configuration.allocation_max_asset_weight) - 0.35) <= 1e-12
+    ):
+        normalized_configuration = configuration.model_copy(update={"allocation_max_asset_weight": 1.0})
+    payload = normalized_configuration.model_dump(mode="json")
     now = utc_now()
     updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
         {"_id": strategy_id, "revision": current_revision, "locked": {"$ne": True}},
@@ -1148,7 +1171,7 @@ def update_strategy(
                 "status": "draft",
                 "updated_at": now,
                 "updated_by": (actor_email or "").strip().lower() or None,
-                "last_change_note": note,
+                "last_change_note": note or None,
                 "last_backtest_id": None,
                 "last_backtest_status": None,
                 "last_backtest_at": None,
@@ -2233,6 +2256,63 @@ def promote_strategy_to_trader(
                 expected_control_revision=control_revision,
             )
 
+def _strategy_delete_control_updates(
+    db: Any,
+    control: dict[str, Any],
+    strategy_id: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Return control pointer updates required before deleting an unprotected strategy."""
+    winner_id = str(control.get("trader_winner_strategy_id") or "")
+    research_id = str(control.get("research_strategy_id") or "")
+    reference_id = str(control.get("research_reference_strategy_id") or research_id)
+    promoted_candidate_id = str(control.get("promoted_candidate_strategy_id") or "")
+
+    updates: dict[str, Any] = {}
+    cleared_roles: list[str] = []
+
+    if research_id == strategy_id:
+        # The catalog requires a valid selected backtest strategy. Falling back to
+        # the immutable Trader winner keeps the catalog usable without protecting
+        # ordinary research strategies from deletion.
+        updates["research_strategy_id"] = winner_id
+        research_id = winner_id
+        cleared_roles.append("backtest_selection")
+
+    if reference_id == strategy_id:
+        fallback_reference_id = research_id or winner_id
+        fallback_reference = db[STRATEGY_PROFILES_COLLECTION].find_one(
+            {"_id": fallback_reference_id}
+        )
+        if fallback_reference is None and fallback_reference_id != winner_id:
+            fallback_reference_id = winner_id
+            fallback_reference = db[STRATEGY_PROFILES_COLLECTION].find_one(
+                {"_id": winner_id}
+            )
+        if fallback_reference is None:
+            raise StrategyLabConflict(
+                "A safe research-reference fallback could not be resolved before deletion."
+            )
+        fallback_configuration = BacktestRequest.model_validate(
+            fallback_reference.get("configuration") or {}
+        )
+        updates.update(
+            {
+                "research_reference_strategy_id": fallback_reference_id,
+                "research_reference_configuration_hash": str(
+                    fallback_reference.get("configuration_hash") or ""
+                ),
+                "research_reference_assets": list(fallback_configuration.assets),
+            }
+        )
+        cleared_roles.append("research_reference")
+
+    if promoted_candidate_id == strategy_id:
+        updates["promoted_candidate_strategy_id"] = None
+        cleared_roles.append("promoted_candidate")
+
+    return updates, cleared_roles
+
+
 def delete_strategy(
     db: Any,
     strategy_id: str,
@@ -2241,23 +2321,25 @@ def delete_strategy(
     actor_email: str | None,
 ) -> dict[str, Any]:
     control = ensure_strategy_catalog(db)
-    if strategy_id in {
-        str(control.get("research_strategy_id")),
-        str(control.get("research_reference_strategy_id")),
-        str(control.get("trader_winner_strategy_id")),
-    }:
+    winner_id = str(control.get("trader_winner_strategy_id") or "")
+    candidate_id = str(control.get("candidate_strategy_id") or "")
+
+    if strategy_id == winner_id:
         raise StrategyLabConflict(
-            "A selected backtest strategy, research reference, or Trader winner cannot be deleted."
+            "The current Trader winner cannot be deleted. Promote another Strategy before deleting this one."
         )
+    if strategy_id == candidate_id:
+        raise StrategyLabConflict(
+            "The current Candidate cannot be deleted. Replace the Candidate before deleting this Strategy."
+        )
+
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    if bool(profile.get("locked")):
-        raise StrategyLabConflict("Protected lifecycle snapshots cannot be deleted.")
-    if str(profile.get("status") or "draft") != "draft":
-        raise StrategyLabConflict(
-            "Only draft strategies can be deleted. Candidate and winner history is preserved for audit."
-        )
+
+    # Runtime safety is independent from lifecycle retention: historical/draft
+    # strategies are deletable, but the exact strategy of an in-flight backtest
+    # must remain available until that execution finishes.
     active_job = db[JOBS_COLLECTION].find_one(
         {
             "status": {"$in": ["queued", "running"]},
@@ -2269,6 +2351,25 @@ def delete_strategy(
         raise StrategyLabConflict(
             f"Wait for backtest {active_job.get('id', 'unknown')} to finish before deleting this strategy."
         )
+
+    control_updates, cleared_roles = _strategy_delete_control_updates(
+        db, control, strategy_id
+    )
+    now = utc_now()
+    actor = (actor_email or "").strip().lower() or None
+    if control_updates:
+        control_updates.update(
+            {
+                "updated_at": now,
+                "updated_by": actor,
+                "last_strategy_deletion_note": note,
+            }
+        )
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": CONTROL_ID},
+            {"$set": control_updates, "$inc": {"revision": 1}},
+        )
+
     result = db[STRATEGY_PROFILES_COLLECTION].delete_one({"_id": strategy_id})
     if result.deleted_count != 1:
         raise StrategyLabConflict("Strategy was not deleted.")
@@ -2279,13 +2380,18 @@ def delete_strategy(
                 "strategy_status": profile.get("status") or "draft",
                 "strategy_id": strategy_id,
                 "strategy_name": profile.get("name"),
+                "cleared_control_roles": cleared_roles,
                 "note": note,
-                "created_at": utc_now(),
-                "actor_email": (actor_email or "").strip().lower() or None,
+                "created_at": now,
+                "actor_email": actor,
             }
         )
     )
-    return {"status": "deleted", "strategy_id": strategy_id}
+    return {
+        "status": "deleted",
+        "strategy_id": strategy_id,
+        "cleared_control_roles": cleared_roles,
+    }
 
 
 def trader_winner_requires_state_reinitialization(db: Any) -> bool:

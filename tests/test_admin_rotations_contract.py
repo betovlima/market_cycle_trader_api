@@ -129,6 +129,9 @@ def test_admin_rotation_payload_is_useful_and_strategy_neutral() -> None:
     payload = admin_job_rotations(_database(), "job-1")
 
     assert payload["summary"]["total_rotations"] == 1
+    assert payload["summary"]["asset_to_asset_rotations"] == 1
+    assert payload["summary"]["market_to_cash_moves"] == 0
+    assert payload["summary"]["cash_to_market_moves"] == 0
     assert payload["summary"]["profitable_rotations"] == 1
     assert payload["summary"]["total_realized_pnl"] == 120.0
     assert payload["summary"]["total_transaction_fees"] == 3.0
@@ -169,3 +172,36 @@ def test_admin_rotation_payload_is_useful_and_strategy_neutral() -> None:
         "effective_config",
     }
     assert not (_all_keys(payload) & forbidden)
+
+
+def test_admin_rotation_payload_includes_cash_transitions_and_reconstructs_legacy_ids() -> None:
+    db = _database()
+    at_exit = datetime(2026, 8, 4, 15, 30, tzinfo=timezone.utc)
+    at_entry = datetime(2026, 8, 5, 15, 30, tzinfo=timezone.utc)
+    backend = "private-seed-backend"
+    db["backtest_trades"].rows.extend([
+        {
+            "job_id": "job-1", "symbol": "PORTFOLIO", "backend": backend,
+            "timestamp": at_exit, "sequence": 3, "action": "SELL", "asset": "NVDA",
+            "reason": "MOVE_TO_CASH", "holding_bars": 4, "position_return": -0.03,
+            "realized_pnl": -30.0, "total_fee": 0.50,
+        },
+        {
+            "job_id": "job-1", "symbol": "PORTFOLIO", "backend": backend,
+            "timestamp": at_entry, "sequence": 4, "action": "BUY", "asset": "MSFT",
+            "reason": "BEST_CAPITAL_UTILITY", "holding_bars": 0, "position_return": 0.0,
+            "realized_pnl": 0.0, "total_fee": 0.40,
+        },
+    ])
+
+    payload = admin_job_rotations(db, "job-1")
+    assert payload["summary"]["total_rotations"] == 3
+    assert payload["summary"]["asset_to_asset_rotations"] == 1
+    assert payload["summary"]["market_to_cash_moves"] == 1
+    assert payload["summary"]["cash_to_market_moves"] == 1
+    assert [(row["from_asset"], row["to_asset"]) for row in payload["rotations"]] == [
+        ("AAPL", "NVDA"),
+        ("NVDA", "CASH"),
+        ("CASH", "MSFT"),
+    ]
+    assert payload["rotations"][-1]["realized_pnl"] is None

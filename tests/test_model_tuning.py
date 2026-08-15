@@ -11,11 +11,14 @@ from market_cycle_trader_api.services.model_tuning import (
     _sanitize_tuning_log_line,
     _source_anchor,
     _source_observations,
+    _rank_candidates,
+    _tuning_plan,
     _tuning_target_allows_locked_strategy,
     _tuning_target_strategy,
     generate_latin_hypercube_candidates,
     get_model_tuning_campaign_log,
     get_model_tuning_candidate_log,
+    list_model_tuning_history,
     tuning_catalog,
 )
 from market_cycle_trader_api.services.model_tuning_probability import (
@@ -23,6 +26,8 @@ from market_cycle_trader_api.services.model_tuning_probability import (
     evolve_probability_search,
     initial_probability_state,
     propose_champion_probability_candidate,
+    propose_unified_space_filling_candidate,
+    unified_caro_next_mode,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,8 +75,8 @@ def test_tuning_request_bounds_candidate_count_and_prior_campaign_contract() -> 
         ModelTuningStartRequest(candidate_count=3)
     with pytest.raises(ValidationError):
         ModelTuningStartRequest(candidate_count=61)
-    with pytest.raises(ValidationError):
-        ModelTuningStartRequest(method="champion_probability", candidate_count=8, probability={"startup_trials": 8})
+    legacy_floor = ModelTuningStartRequest(method="champion_probability", candidate_count=8, probability={"startup_trials": 8})
+    assert legacy_floor.probability.startup_trials == 8
     with pytest.raises(ValidationError):
         ModelTuningStartRequest(method="latin_hypercube", source_tuning_run_id="lhs-1")
     with pytest.raises(ValidationError):
@@ -79,6 +84,32 @@ def test_tuning_request_bounds_candidate_count_and_prior_campaign_contract() -> 
 
 
 
+
+
+def test_automatic_latin_hypercube_to_caro_request_contract() -> None:
+    pipeline = ModelTuningStartRequest(
+        method="latin_hypercube_then_caro",
+        candidate_count=20,
+        caro_candidate_count=24,
+    )
+    assert pipeline.method == "latin_hypercube_then_caro"
+    assert pipeline.candidate_count == 20
+    assert pipeline.caro_candidate_count == 24
+    with pytest.raises(ValidationError):
+        ModelTuningStartRequest(method="latin_hypercube_then_caro", source_tuning_run_id="lhs-1")
+    with pytest.raises(ValidationError):
+        ModelTuningStartRequest(method="latin_hypercube", caro_candidate_count=12)
+
+
+def test_tuning_catalog_declares_unified_caro_and_keeps_static_lhs_for_diagnostics() -> None:
+    catalog = tuning_catalog()
+    assert [item["id"] for item in catalog["methods"]] == ["champion_probability", "latin_hypercube"]
+    unified = catalog["methods"][0]
+    assert "no fixed Hypercube" in unified["description"]
+    assert catalog["unified_caro"] is True
+    assert catalog["dynamic_exploration"] is True
+    assert catalog["legacy_pipeline_supported"] is True
+    assert catalog["automatic_lhs_to_caro_handoff"] is False
 
 def test_completed_latin_hypercube_source_imports_all_21_observations_and_anchor() -> None:
     candidates = generate_latin_hypercube_candidates(BASE_LIGHTGBM, candidate_count=20, seed=42)
@@ -166,8 +197,10 @@ def test_tuning_catalog_declares_integrated_worker_prior_reuse_and_reproducibili
     assert catalog["reproducibility_guard"] == "frozen_execution_snapshot_and_market_data_signature"
     assert catalog["probability"]["probability_model"] == PROBABILITY_MODEL
     assert catalog["recommended_method"] == "champion_probability"
-    assert catalog["probability"]["default_startup_trials"] == 6
-    assert catalog["probability"]["search_policy"] == "small_lhs_warmup_then_sequential_adaptive_trust_region"
+    assert catalog["probability"]["default_minimum_exploration_trials"] == 10
+    assert catalog["probability"]["search_policy"] == "dynamic_space_filling_plus_sequential_adaptive_trust_region"
+    assert catalog["probability"]["space_filling_sampler"] == "latin_hypercube_maximin"
+    assert catalog["probability"]["global_exploration_never_zero"] is True
     assert len(catalog["search_space"]) == 8
 
 
@@ -297,7 +330,7 @@ def test_tuning_routes_and_integrated_execution_contract() -> None:
     jobs_router = (SRC / "api" / "routers" / "jobs.py").read_text(encoding="utf-8")
     strategy_lab = (SRC / "services" / "strategy_lab.py").read_text(encoding="utf-8")
 
-    assert "application.include_router(model_tuning.router, dependencies=admin_required)" in main
+    assert "application.include_router(model_tuning.router, dependencies=research_access)" in main
     assert '@router.get("/sources")' in router
     assert "threading.Thread(target=run_model_tuning" in service
     assert '"execution_mode": "integrated_api_worker"' in service
@@ -319,11 +352,11 @@ def test_frontend_uses_candidate_directly_without_clone_or_prior_campaign_contro
     assert "source_tuning_run_id" not in panel
     assert "anchor_candidate_id" not in panel
     assert "Clone the protected Strategy before starting model tuning." not in panel
-    assert "Automatic baseline" in panel
+    assert "Certified Candidate baseline" in panel
     assert "No clone, baseline selection or prior tuning campaign is required." in panel
     assert "Advanced CARO settings" in panel
     assert "useState(PROBABILITY_METHOD)" in panel
-    assert "Start Adaptive CARO" in panel
+    assert "Start Unified CARO" in panel
     assert "catalog.search_space.map" in panel
     assert "/admin/model-tuning/workers" not in panel
     for protected_key in (
@@ -356,6 +389,13 @@ def test_tuning_target_prefers_active_candidate_and_allows_promoted_candidate_lo
     assert source == "candidate"
     assert _tuning_target_allows_locked_strategy({"status": "promoted_candidate", "locked": True}) is True
     assert _tuning_target_allows_locked_strategy({"status": "winner", "locked": True}) is False
+
+
+def test_caro_baseline_remains_pinned_to_active_candidate_certified_backtest() -> None:
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    assert '("candidate", control.get("candidate_strategy_id"))' in service
+    assert 'preferred_job_id = str(strategy.get("candidate_backtest_id") or strategy.get("last_backtest_id") or "")' in service
+    assert 'query["id"] = preferred_job_id' in service
 
 
 def test_tuning_adoption_always_preserves_source_by_creating_working_strategy() -> None:
@@ -524,7 +564,7 @@ def test_v206_model_tuning_stop_cancels_active_candidate_and_front_is_explicit()
     assert '"cancel_requested": True' in jobs
     assert '"status": "cancelled"' in jobs
     assert "Start Latin Hypercube" in panel
-    assert "Start Adaptive CARO" in panel
+    assert "Start Unified CARO" in panel
     assert "Stopping…" in panel
     assert "The active tuning candidate is being cancelled" in panel
     assert "Active candidates will finish safely" not in panel
@@ -765,11 +805,13 @@ def test_tuning_completed_candidate_can_be_used_without_research_gates() -> None
     assert '"adoption_requires_final_backtest": False' in service
 
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
-    assert "Use in Backtest" in panel
+    assert "Promote to Backtest" in panel
+    assert "ModelTuningHistory" not in panel
+    assert "/admin/model-tuning/history?limit=100" not in panel
     assert "const [reason, setReason]" not in panel
     assert "metrics.eligible &&" not in panel
     assert "candidate.champion_gate_passed === true" not in panel
-    assert "Champion Gate and fold eligibility are informational" in panel
+    assert "Champion Gate and fold eligibility are informational" not in panel
 
 
 def test_adopted_strategy_description_uses_tuning_metrics_without_user_text() -> None:
@@ -816,3 +858,535 @@ def test_use_in_backtest_always_creates_a_new_strategy_catalog_entry() -> None:
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
     assert "selected as BACKTEST" in panel
     assert "becomes the active CANDIDATE automatically" in panel
+
+
+def test_model_tuning_history_returns_previous_campaigns_with_best_candidate_and_promotions() -> None:
+    from copy import deepcopy
+    from market_cycle_trader_api.infrastructure.persistence.mongo_repository import MODEL_TUNING_RUNS_COLLECTION
+
+    class Cursor:
+        def __init__(self, rows):
+            self.rows = list(rows)
+        def sort(self, key, direction):
+            reverse = int(direction) < 0
+            self.rows.sort(key=lambda row: row.get(key) or "", reverse=reverse)
+            return self
+        def limit(self, count):
+            self.rows = self.rows[:count]
+            return self
+        def __iter__(self):
+            return iter(deepcopy(self.rows))
+
+    class Collection:
+        def __init__(self, rows):
+            self.rows = rows
+        def find(self, query, *args, **kwargs):
+            assert query == {}
+            return Cursor(self.rows)
+
+    rows = [
+        {
+            "id": "run-old",
+            "status": "completed",
+            "method": "latin_hypercube",
+            "strategy_profile_name": "Older Strategy",
+            "created_at": "2026-08-12T10:00:00Z",
+            "completed_candidates": 2,
+            "total_candidates": 2,
+            "best_candidate_id": 1,
+            "candidates": [
+                {"candidate_id": 0, "status": "completed", "rank": 2, "metrics": {"ending_capital": 200_000.0}},
+                {"candidate_id": 1, "status": "completed", "rank": 1, "metrics": {"ending_capital": 250_000.0}},
+            ],
+        },
+        {
+            "id": "run-new",
+            "status": "completed",
+            "method": "champion_probability",
+            "strategy_profile_name": "New Strategy",
+            "created_at": "2026-08-13T10:00:00Z",
+            "completed_candidates": 3,
+            "total_candidates": 3,
+            "best_candidate_id": 2,
+            "adopted_candidate_id": 2,
+            "adopted_strategy_id": "strategy-backtest-2",
+            "adoption_history": [
+                {"candidate_id": 2, "strategy_id": "strategy-backtest-2", "at": "2026-08-13T11:00:00Z"}
+            ],
+            "candidates": [
+                {"candidate_id": 1, "status": "completed", "rank": 2, "metrics": {"ending_capital": 700_000.0}},
+                {"candidate_id": 2, "status": "completed", "rank": 1, "metrics": {"ending_capital": 1_100_000.0, "sharpe": 1.96}},
+            ],
+        },
+    ]
+    db = {MODEL_TUNING_RUNS_COLLECTION: Collection(rows)}
+
+    history = list_model_tuning_history(db, limit=50)
+    assert [item["id"] for item in history] == ["run-new", "run-old"]
+    assert history[0]["best_candidate"]["candidate_id"] == 2
+    assert history[0]["best_candidate"]["metrics"]["ending_capital"] == 1_100_000.0
+    assert history[0]["adopted_strategy_id"] == "strategy-backtest-2"
+    assert len(history[0]["adoption_history"]) == 1
+
+
+def test_model_tuning_history_route_is_declared_before_dynamic_run_route() -> None:
+    router = (SRC / "api" / "routers" / "model_tuning.py").read_text(encoding="utf-8")
+    history_index = router.index('@router.get("/history")')
+    dynamic_index = router.index('@router.get("/{run_id}")')
+    assert history_index < dynamic_index
+    assert "list_model_tuning_history" in router
+
+
+def test_historical_tuning_candidate_can_restore_frozen_strategy_after_source_revision_changed(monkeypatch) -> None:
+    import json
+    from copy import deepcopy
+    from market_cycle_trader_api.infrastructure.persistence.mongo_repository import MODEL_TUNING_RUNS_COLLECTION
+    from market_cycle_trader_api.services import model_tuning as tuning_service
+
+    winner_path = SRC / "parameterizations" / "winner-v1.13.2.json"
+    frozen_request = json.loads(winner_path.read_text(encoding="utf-8"))
+    document = {
+        "id": "historical-run-1",
+        "method": "champion_probability",
+        "strategy_profile_id": "source-strategy",
+        "strategy_profile_name": "Frozen Source",
+        "strategy_profile_revision": 4,
+        "execution_request_snapshot": frozen_request,
+        "market_data_cutoff_date": "2026-08-11",
+        "candidates": [{
+            "candidate_id": 18,
+            "status": "completed",
+            "settings": deepcopy(BASE_LIGHTGBM),
+            "metrics": {"ending_capital": 1_109_354.0, "sharpe": 1.966, "maximum_drawdown": -0.3145, "worst_fold_return": 0.9806},
+        }],
+    }
+
+    class Collection:
+        def __init__(self, row):
+            self.row = row
+            self.updates = []
+        def find_one(self, query, *args, **kwargs):
+            return deepcopy(self.row) if query.get("id") == self.row["id"] else None
+        def update_one(self, query, update, *args, **kwargs):
+            self.updates.append((deepcopy(query), deepcopy(update)))
+
+    collection = Collection(document)
+    db = {MODEL_TUNING_RUNS_COLLECTION: collection}
+    restored = {}
+
+    def fake_get_strategy(_db, strategy_id):
+        if strategy_id == "source-strategy":
+            return {"id": "source-strategy", "name": "Current Changed Source", "revision": 99, "status": "candidate"}
+        return {"id": strategy_id, "name": "Derived", "revision": 4, "status": "backtest"}
+
+    def fake_create_strategy(_db, **kwargs):
+        assert kwargs["clone_from_strategy_id"] == "source-strategy"
+        return {"id": "derived-strategy", "name": kwargs["name"], "revision": 1, "status": "draft"}
+
+    def fake_update_strategy(_db, strategy_id, *, configuration, expected_revision, **kwargs):
+        assert strategy_id == "derived-strategy"
+        assert expected_revision == 1
+        restored["configuration"] = configuration
+        return {"id": strategy_id, "name": kwargs["name"], "revision": 2, "status": "draft"}
+
+    def fake_update_strategy_model(_db, strategy_id, **kwargs):
+        assert strategy_id == "derived-strategy"
+        assert kwargs["expected_strategy_revision"] == 2
+        assert kwargs["values"] == BASE_LIGHTGBM
+        return {"id": strategy_id, "name": "Derived", "revision": 3, "status": "draft"}
+
+    def fake_prepare(_db, strategy_id, **kwargs):
+        assert kwargs["tuning_run_id"] == "historical-run-1"
+        assert kwargs["tuning_candidate_id"] == 18
+        return {"id": strategy_id, "name": "Derived", "revision": 4, "status": "backtest"}
+
+    monkeypatch.setattr(tuning_service, "get_strategy", fake_get_strategy)
+    monkeypatch.setattr(tuning_service, "create_strategy", fake_create_strategy)
+    monkeypatch.setattr(tuning_service, "update_strategy", fake_update_strategy)
+    monkeypatch.setattr(tuning_service, "update_strategy_model", fake_update_strategy_model)
+    monkeypatch.setattr(tuning_service, "prepare_strategy_for_backtest_candidate", fake_prepare)
+    monkeypatch.setattr(tuning_service, "get_strategy_control", lambda _db: {"revision": 7})
+    monkeypatch.setattr(tuning_service, "select_research_strategy", lambda *args, **kwargs: None)
+
+    result = tuning_service.adopt_model_tuning_candidate(
+        db,
+        "historical-run-1",
+        18,
+        reason=None,
+        actor_email="admin@example.com",
+    )
+
+    assert restored["configuration"].assets == frozen_request["assets"]
+    assert result["strategy"]["id"] == "derived-strategy"
+    assert result["ready_for_backtest"] is True
+    assert result["auto_candidate_after_backtest"] is True
+    assert collection.updates
+    pushed = collection.updates[-1][1]["$push"]["adoption_history"]
+    assert pushed["candidate_id"] == 18
+    assert pushed["strategy_id"] == "derived-strategy"
+
+
+def test_absolute_utility_gate_jointly_tunes_model_and_cash_gate_with_valid_lhs() -> None:
+    strategy = {
+        "configuration": {
+            "strategy_mode": "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
+            "opportunity_utility_entry_threshold": 0.28,
+            "opportunity_utility_exit_threshold": 0.27,
+        }
+    }
+    model_snapshot = {
+        "family": "lightgbm_utility",
+        "settings_snapshot": {"lightgbm": BASE_LIGHTGBM},
+    }
+    plan = _tuning_plan(strategy, model_snapshot)
+    assert plan["scope"] == "joint_model_absolute_utility_cash_gate"
+    names = [item["name"] for item in plan["search_space"]]
+    assert names[:8] == [
+        "n_estimators", "learning_rate", "max_depth", "num_leaves",
+        "min_child_samples", "colsample_bytree", "reg_alpha", "reg_lambda",
+    ]
+    assert names[-2:] == [
+        "opportunity_utility_entry_threshold",
+        "opportunity_utility_exit_threshold",
+    ]
+    assert plan["tuned_model_parameters"] == names[:8]
+    assert plan["tuned_strategy_parameters"] == names[-2:]
+    assert plan["base_model_values"] == BASE_LIGHTGBM
+    assert plan["base_values"]["opportunity_utility_entry_threshold"] == 0.28
+    assert plan["base_values"]["opportunity_utility_exit_threshold"] == 0.27
+
+    candidates = generate_latin_hypercube_candidates(
+        plan["base_values"],
+        candidate_count=12,
+        seed=42,
+        search_space=plan["search_space"],
+    )
+    assert len(candidates) == 13
+    assert candidates[0]["settings"]["n_estimators"] == BASE_LIGHTGBM["n_estimators"]
+    assert candidates[0]["settings"]["opportunity_utility_entry_threshold"] == 0.28
+    assert candidates[0]["settings"]["opportunity_utility_exit_threshold"] == 0.27
+    assert len({item["settings_hash"] for item in candidates}) == 13
+    for candidate in candidates:
+        values = candidate["settings"]
+        assert 220 <= values["n_estimators"] <= 380
+        assert 0.020 <= values["learning_rate"] <= 0.050
+        assert 2 <= values["max_depth"] <= 4
+        assert 4 <= values["num_leaves"] <= min(12, 2 ** values["max_depth"])
+        assert 15 <= values["min_child_samples"] <= 30
+        assert 0.75 <= values["colsample_bytree"] <= 0.95
+        assert 0.0 <= values["reg_alpha"] <= 0.50
+        assert 1.0 <= values["reg_lambda"] <= 4.0
+        assert 0.22 <= values["opportunity_utility_entry_threshold"] <= 0.38
+        assert 0.20 <= values["opportunity_utility_exit_threshold"] <= 0.36
+        assert values["opportunity_utility_exit_threshold"] <= values["opportunity_utility_entry_threshold"]
+        for frozen in (
+            "min_child_weight", "subsample", "subsample_freq", "max_bin",
+            "n_jobs", "repetitions", "seed_step", "random_state",
+        ):
+            assert values[frozen] == BASE_LIGHTGBM[frozen]
+
+
+
+def _completed_candidate(candidate: dict, *, capital: float = 300_000.0, score: float = 1.0) -> dict:
+    row = dict(candidate)
+    row["status"] = "completed"
+    row["metrics"] = {
+        "ending_capital": capital,
+        "sharpe": 1.6,
+        "maximum_drawdown": -0.35,
+        "worst_fold_return": 0.20,
+        "risk_adjusted_compound_score": score,
+    }
+    return row
+
+
+def test_unified_caro_starts_with_internal_space_filling_then_switches_to_probability() -> None:
+    catalog = tuning_catalog()
+    control = generate_latin_hypercube_candidates(BASE_LIGHTGBM, candidate_count=1, seed=42)[0]
+    document = {
+        "seed": 42,
+        "candidate_count": 20,
+        "total_candidates": 21,
+        "search_space": catalog["search_space"],
+        "base_tuning_values": BASE_LIGHTGBM,
+        "base_model_values": BASE_LIGHTGBM,
+        "prior_observations": [],
+        "candidates": [_completed_candidate(control)],
+        "probability_anchor": {"settings": BASE_LIGHTGBM, "metrics": _completed_candidate(control)["metrics"]},
+        "baseline_execution": {"metrics": _completed_candidate(control)["metrics"]},
+        "probability_state": initial_probability_state(),
+        "probability_config": {
+            "minimum_exploration_trials": 5,
+            "initial_exploration_fraction": 0.45,
+            "minimum_exploration_fraction": 0.20,
+            "stagnation_recovery_trials": 4,
+            "candidate_pool_size": 512,
+            "exploration_weight": 0.15,
+        },
+    }
+    for index in range(5):
+        policy = unified_caro_next_mode(document)
+        assert policy["mode"] == "space_filling"
+        candidate = propose_unified_space_filling_candidate(document)
+        assert candidate["kind"] == "unified_exploration"
+        assert candidate["proposal"]["proposal_mode"] == "space_filling"
+        candidate = _completed_candidate(candidate, capital=301_000.0 + index, score=1.01 + index / 100)
+        evolution = evolve_probability_search(document, candidate, candidate["metrics"], {"passed": False})
+        document["probability_state"] = evolution["state"]
+        document["candidates"].append(candidate)
+
+    policy = unified_caro_next_mode(document)
+    assert policy["mode"] == "adaptive_probability"
+    adaptive = propose_champion_probability_candidate(document)
+    assert adaptive["kind"] == "champion_probability"
+    assert adaptive["proposal"]["proposal_mode"] == "adaptive_probability"
+
+
+def test_unified_caro_reopens_space_filling_after_adaptive_stagnation() -> None:
+    catalog = tuning_catalog()
+    initial = generate_latin_hypercube_candidates(BASE_LIGHTGBM, candidate_count=5, seed=19)
+    candidates = [_completed_candidate(initial[0])]
+    for item in initial[1:]:
+        row = _completed_candidate(item)
+        row["kind"] = "unified_exploration"
+        candidates.append(row)
+    document = {
+        "seed": 42,
+        "candidate_count": 20,
+        "total_candidates": 21,
+        "search_space": catalog["search_space"],
+        "base_tuning_values": BASE_LIGHTGBM,
+        "base_model_values": BASE_LIGHTGBM,
+        "prior_observations": [],
+        "candidates": candidates,
+        "probability_anchor": {"settings": BASE_LIGHTGBM, "metrics": candidates[0]["metrics"]},
+        "baseline_execution": {"metrics": candidates[0]["metrics"]},
+        "probability_state": {
+            **initial_probability_state(),
+            "exploration_trials_completed": 5,
+            "adaptive_trials_completed": 4,
+            "no_improvement_streak": 4,
+            "last_proposal_mode": "adaptive_probability",
+        },
+        "probability_config": {
+            "minimum_exploration_trials": 5,
+            "initial_exploration_fraction": 0.45,
+            "minimum_exploration_fraction": 0.20,
+            "stagnation_recovery_trials": 4,
+        },
+    }
+    policy = unified_caro_next_mode(document)
+    assert policy["mode"] == "space_filling"
+    assert policy["reason"] == "stagnation_recovery"
+
+
+def test_absolute_utility_catalog_declares_joint_10d_caro_and_larger_warmup(monkeypatch) -> None:
+    plan = _tuning_plan(
+        {"configuration": {
+            "strategy_mode": "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
+            "opportunity_utility_entry_threshold": 0.28,
+            "opportunity_utility_exit_threshold": 0.27,
+        }},
+        {"family": "lightgbm_utility", "settings_snapshot": {"lightgbm": BASE_LIGHTGBM}},
+    )
+    monkeypatch.setattr(
+        "market_cycle_trader_api.services.model_tuning._current_tuning_plan",
+        lambda _db: plan,
+    )
+    catalog = tuning_catalog(object())
+    assert catalog["baseline_policy"] == "active_candidate_certified_backtest"
+    assert catalog["joint_optimization"] is True
+    assert len(catalog["search_space"]) == 10
+    assert len(catalog["tuned_model_parameters"]) == 8
+    assert len(catalog["tuned_strategy_parameters"]) == 2
+    assert catalog["probability"]["default_minimum_exploration_trials"] == 12
+
+
+def test_probability_candidate_supports_joint_model_and_strategy_scope() -> None:
+    plan = _tuning_plan(
+        {"configuration": {
+            "strategy_mode": "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
+            "opportunity_utility_entry_threshold": 0.28,
+            "opportunity_utility_exit_threshold": 0.27,
+        }},
+        {"family": "lightgbm_utility", "settings_snapshot": {"lightgbm": BASE_LIGHTGBM}},
+    )
+    search_space = plan["search_space"]
+    initial = generate_latin_hypercube_candidates(
+        plan["base_values"],
+        candidate_count=7,
+        seed=9,
+        search_space=search_space,
+    )
+    observations = []
+    for index, candidate in enumerate(initial):
+        row = dict(candidate)
+        row["status"] = "completed"
+        row["metrics"] = {
+            "ending_capital": 1_000_000.0 + index * 10_000.0,
+            "sharpe": 1.8 + index * 0.01,
+            "maximum_drawdown": -0.35 + index * 0.002,
+            "worst_fold_return": 0.20 + index * 0.01,
+            "risk_adjusted_compound_score": 1.0 + index * 0.01,
+        }
+        observations.append(row)
+    anchor = observations[-1]
+    document = {
+        "seed": 42,
+        "search_space": search_space,
+        "base_tuning_values": plan["base_values"],
+        "prior_observations": observations,
+        "candidates": [],
+        "probability_anchor": {"candidate_id": anchor["candidate_id"], "settings": anchor["settings"], "metrics": anchor["metrics"]},
+        "probability_config": {
+            "min_capital_improvement": 0.0,
+            "sharpe_tolerance": 0.1,
+            "drawdown_tolerance": 0.05,
+            "min_worst_fold_return": 0.0,
+            "candidate_pool_size": 256,
+            "exploration_weight": 0.15,
+        },
+    }
+    proposed = propose_champion_probability_candidate(document)
+    values = proposed["settings"]
+    assert 220 <= values["n_estimators"] <= 380
+    assert 0.020 <= values["learning_rate"] <= 0.050
+    assert values["opportunity_utility_exit_threshold"] <= values["opportunity_utility_entry_threshold"]
+    assert set(proposed["proposal"]["promising_region"]) == {item["name"] for item in search_space}
+
+
+def test_unified_ranking_keeps_control_above_non_beating_economically_weaker_candidate() -> None:
+    control = {
+        "candidate_id": 0, "is_control": True, "status": "completed", "champion_gate_passed": None,
+        "metrics": {
+            "eligible": True, "ending_capital": 1_142_410.0, "sharpe": 2.015,
+            "maximum_drawdown": -0.3145, "worst_fold_return": 0.749,
+            "risk_adjusted_compound_score": -1.368,
+        },
+    }
+    weaker = {
+        "candidate_id": 15, "is_control": False, "status": "completed", "champion_gate_passed": False,
+        "metrics": {
+            "eligible": True, "ending_capital": 218_426.0, "sharpe": 1.571,
+            "maximum_drawdown": -0.5654, "worst_fold_return": 0.427,
+            "risk_adjusted_compound_score": -0.4747,
+        },
+    }
+    ranked = _rank_candidates([weaker, control])
+    by_id = {item["candidate_id"]: item for item in ranked}
+    assert by_id[0]["rank"] == 1
+    assert by_id[15]["rank"] == 2
+
+
+def test_joint_lhs_samples_cash_gate_directly_inside_valid_domain_without_diagonal_pileup() -> None:
+    plan = _tuning_plan(
+        {"configuration": {
+            "strategy_mode": "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
+            "opportunity_utility_entry_threshold": 0.28,
+            "opportunity_utility_exit_threshold": 0.27,
+        }},
+        {"family": "lightgbm_utility", "settings_snapshot": {"lightgbm": BASE_LIGHTGBM}},
+    )
+    candidates = generate_latin_hypercube_candidates(
+        plan["base_values"], candidate_count=80, seed=42, search_space=plan["search_space"],
+    )
+    sampled = [item["settings"] for item in candidates if not item["is_control"]]
+    assert all(row["opportunity_utility_exit_threshold"] <= row["opportunity_utility_entry_threshold"] for row in sampled)
+    assert sum(
+        row["opportunity_utility_exit_threshold"] == row["opportunity_utility_entry_threshold"]
+        for row in sampled
+    ) == 0
+
+
+def test_unified_default_10d_readiness_requires_twelve_space_filling_observations() -> None:
+    plan = _tuning_plan(
+        {"configuration": {
+            "strategy_mode": "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
+            "opportunity_utility_entry_threshold": 0.28,
+            "opportunity_utility_exit_threshold": 0.27,
+        }},
+        {"family": "lightgbm_utility", "settings_snapshot": {"lightgbm": BASE_LIGHTGBM}},
+    )
+    initial = generate_latin_hypercube_candidates(plan["base_values"], candidate_count=11, seed=7, search_space=plan["search_space"])
+    candidates = [_completed_candidate(initial[0])]
+    for item in initial[1:]:
+        row = _completed_candidate(item)
+        row["kind"] = "unified_exploration"
+        candidates.append(row)
+    document = {
+        "seed": 42, "candidate_count": 20, "total_candidates": 21,
+        "search_space": plan["search_space"], "base_tuning_values": plan["base_values"],
+        "prior_observations": [], "candidates": candidates,
+        "probability_state": initial_probability_state(),
+        "probability_config": {
+            "initial_exploration_fraction": 0.45, "minimum_exploration_fraction": 0.20,
+            "stagnation_recovery_trials": 4,
+        },
+    }
+    policy = unified_caro_next_mode(document)
+    assert policy["minimum_exploration_trials"] == 12
+    assert policy["mode"] == "space_filling"
+    assert policy["surrogate_readiness"]["observation_count"] == 11
+
+
+def test_stagnation_recovery_resets_streak_and_enforces_adaptive_cooldown() -> None:
+    document = {
+        "probability_state": {
+            **initial_probability_state(),
+            "no_improvement_streak": 4,
+            "last_proposal_mode": "adaptive_probability",
+        },
+        "probability_config": {"stagnation_recovery_trials": 4},
+    }
+    recovery = {
+        "candidate_id": 99, "kind": "unified_exploration",
+        "proposal": {"selection_reason": "stagnation_recovery"},
+    }
+    evolution = evolve_probability_search(document, recovery, {}, {"passed": False})
+    state = evolution["state"]
+    assert state["no_improvement_streak"] == 0
+    assert state["recovery_cooldown_remaining"] == 2
+    assert state["stagnation_recoveries"] == 1
+
+
+def test_control_champion_gate_is_rendered_as_control() -> None:
+    panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
+    assert "candidate.is_control\n                ? tr('Control')" in panel
+    assert "candidate.is_control ? 'Baseline'" not in panel
+    assert "Control stays fixed as the first reference card" not in panel
+
+
+def test_tuning_control_reuses_certified_candidate_backtest_without_rerun(monkeypatch) -> None:
+    from market_cycle_trader_api.services import model_tuning as tuning_service
+
+    monkeypatch.setattr(tuning_service, "_candidate_equity_preview", lambda _db, job_id: [{"job": job_id}])
+    baseline = {
+        "job_id": "certified-job-7",
+        "started_at": "2026-08-14T10:00:00Z",
+        "finished_at": "2026-08-14T11:00:00Z",
+        "strategy_configuration_hash": "cfg-7",
+        "metrics": {
+            "eligible": True,
+            "ending_capital": 1_142_410.36,
+            "sharpe": 2.0149,
+            "maximum_drawdown": -0.3145,
+            "worst_fold_return": 0.749,
+        },
+    }
+    control = tuning_service._reused_baseline_control_candidate(
+        object(), baseline=baseline, settings=BASE_LIGHTGBM,
+    )
+
+    assert control["candidate_id"] == 0
+    assert control["is_control"] is True
+    assert control["status"] == "completed"
+    assert control["baseline_reused"] is True
+    assert control["job_id"] == "certified-job-7"
+    assert control["source_job_id"] == "certified-job-7"
+    assert control["metrics"]["ending_capital"] == 1_142_410.36
+    assert control["equity_preview"] == [{"job": "certified-job-7"}]
+
+    service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    assert '"control_execution_mode": "reuse_certified_candidate_backtest"' in service
+    assert 'initial_completed_candidates = sum(1 for item in candidates if item.get("status") == "completed")' in service
+    assert 'expected_signature=expected or None' in service

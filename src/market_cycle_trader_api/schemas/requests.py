@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .model_research import ResearchModelFamily
 
-StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION"]
+StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPPORTUNITY_CASH_GATE", "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"]
 Timeframe = Literal["1Day"]
 MarketDataProvider = Literal["alpaca"]
 AlpacaHistoricalFeed = Literal["sip", "iex"]
@@ -111,13 +111,20 @@ class BacktestRequest(BaseModel):
     rotation_switch_margin: float = Field(ge=0, le=0.50)
     rotation_switch_margin_candidates: list[float]
 
+    opportunity_utility_entry_threshold: float = Field(
+        default=0.28, ge=-10, le=10, title="Absolute utility entry threshold"
+    )
+    opportunity_utility_exit_threshold: float = Field(
+        default=0.27, ge=-10, le=10, title="Absolute utility exit threshold"
+    )
+
     allocation_lookback_days: int = Field(default=126, ge=40, le=1_000)
-    allocation_max_asset_weight: float = Field(default=0.35, gt=0, le=1)
+    allocation_max_asset_weight: float = Field(default=1.0, gt=0, le=1)
     allocation_cvar_confidence: float = Field(default=0.95, ge=0.80, lt=1)
     allocation_cvar_penalty: float = Field(default=1.0, ge=0, le=100)
     allocation_turnover_penalty: float = Field(default=0.0025, ge=0, le=10)
-    allocation_minimum_utility: float = Field(default=0.0, ge=-10, le=10)
-    allocation_signal_scale: float = Field(default=1.0, gt=0, le=100)
+    allocation_minimum_utility: float = Field(default=0.0, ge=-10, le=10, title="Minimum relative signal")
+    allocation_signal_scale: float = Field(default=1.0, gt=0, le=100, title="Scale-free allocation reward scale")
     rotation_xgb_n_estimators: int = Field(ge=10, le=100_000)
     rotation_xgb_learning_rate: float = Field(gt=0, le=1)
     rotation_xgb_max_depth: int = Field(ge=1, le=20)
@@ -237,6 +244,11 @@ class BacktestRequest(BaseModel):
             raise ValueError("rotation_horizon_days must be included in rotation_target_horizons.")
         if self.rotation_purge_days < max(self.rotation_target_horizons):
             raise ValueError("Swing rotation purge must be at least the maximum target horizon.")
+        if self.opportunity_utility_exit_threshold > self.opportunity_utility_entry_threshold:
+            raise ValueError(
+                "Absolute Utility Cash Gate requires opportunity_utility_exit_threshold <= "
+                "opportunity_utility_entry_threshold."
+            )
         return self
 
 

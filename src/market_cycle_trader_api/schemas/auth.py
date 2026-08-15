@@ -43,3 +43,4 @@ class SessionResponse(BaseModel):
     idle_expires_at: datetime | None = None
     display_name: str | None = None
     email: str | None = None
+    capabilities: dict[str, bool] = Field(default_factory=dict)

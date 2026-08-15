@@ -11,6 +11,7 @@ from fastapi import HTTPException, Request, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from market_cycle_trader_api.auth.config import AuthSettings as Settings, get_auth_settings as get_settings
+from market_cycle_trader_api.auth.capabilities import capabilities_for_role
 
 SESSION_COOKIE_NAME = "market_cycle_trader_session"
 
@@ -25,13 +26,16 @@ class SessionIdentity:
     display_name: str | None = None
     email: str | None = None
 
+    def has_capability(self, name: str) -> bool:
+        return bool(capabilities_for_role(self.role).get(name))
+
     @property
     def is_admin(self) -> bool:
-        return self.role == "admin"
+        return self.has_capability("admin.manage")
 
     @property
     def can_view_portfolio(self) -> bool:
-        return self.role in {"admin", "trader"}
+        return self.has_capability("portfolio.view")
 
 
 class SessionManager:
@@ -176,21 +180,28 @@ def require_trader_session(request: Request) -> SessionIdentity:
 
 def require_trader_access(request: Request) -> SessionIdentity:
     identity = require_trader_session(request)
-    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and not identity.is_admin:
+    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and not identity.has_capability("research.manage"):
         raise HTTPException(status_code=403, detail="Administrator access required for this operation.")
+    return identity
+
+
+def require_backtest_access(request: Request) -> SessionIdentity:
+    identity = require_trader_session(request)
+    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and not identity.has_capability("backtest.start"):
+        raise HTTPException(status_code=403, detail="Trader or administrator access required for this operation.")
     return identity
 
 
 def require_portfolio_session(request: Request) -> SessionIdentity:
     identity = require_trader_session(request)
-    if not identity.can_view_portfolio:
+    if not identity.has_capability("portfolio.view"):
         raise HTTPException(status_code=403, detail="Trader or administrator access required.")
     return identity
 
 
 def require_admin_session(request: Request) -> SessionIdentity:
     identity = require_trader_session(request)
-    if not identity.is_admin:
+    if not identity.has_capability("admin.manage"):
         raise HTTPException(status_code=403, detail="Administrator access required.")
     return identity
 

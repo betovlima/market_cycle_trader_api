@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from market_cycle_trader_api.auth.access_service import get_access_service
+from market_cycle_trader_api.auth.capabilities import capabilities_for_role
 from market_cycle_trader_api.auth.security import (
     SESSION_COOKIE_NAME,
     get_session_manager,
@@ -32,6 +33,7 @@ def _session_response(identity, idle_expires_at=None) -> SessionResponse:
         idle_expires_at=idle_expires_at,
         display_name=identity.display_name,
         email=identity.email,
+        capabilities=capabilities_for_role(identity.role),
     )
 
 

@@ -53,7 +53,11 @@ def _operational_document(document: dict[str, Any]) -> dict[str, Any]:
 
 def _configuration_hash(configuration: dict[str, Any]) -> str:
     canonical = dict(configuration)
-    if str(canonical.get("strategy_mode") or "") != "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION":
+    mode = str(canonical.get("strategy_mode") or "")
+    if mode != "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE":
+        canonical.pop("opportunity_utility_entry_threshold", None)
+        canonical.pop("opportunity_utility_exit_threshold", None)
+    if mode not in {"COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"}:
         for field in (
             "allocation_lookback_days",
             "allocation_max_asset_weight",

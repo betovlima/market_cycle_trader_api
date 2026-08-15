@@ -35,7 +35,7 @@ from .api.routers import (
 )
 from .core.config import API_VERSION, cors_origins
 from .auth.config import get_auth_settings
-from .auth.security import require_admin_session, require_portfolio_session, require_trader_session
+from .auth.security import require_admin_session, require_backtest_access, require_portfolio_session, require_trader_access, require_trader_session
 from .auth.access_service import get_access_service
 from .core.runtime import MONGO_STATUS, close_mongo, database, initialize_mongo
 from .services.paper_market_scheduler import (
@@ -89,12 +89,14 @@ def create_app() -> FastAPI:
     application.include_router(auth.router)
     application.include_router(access_admin.router)
     viewer_required = [Depends(require_trader_session)]
+    backtest_access = [Depends(require_backtest_access)]
     admin_required = [Depends(require_admin_session)]
+    research_access = [Depends(require_trader_access)]
     portfolio_required = [Depends(require_portfolio_session)]
     application.include_router(dashboard.router, dependencies=viewer_required)
-    application.include_router(jobs.router, dependencies=viewer_required)
-    application.include_router(model_research.router, dependencies=admin_required)
-    application.include_router(model_tuning.router, dependencies=admin_required)
+    application.include_router(jobs.router, dependencies=backtest_access)
+    application.include_router(model_research.router, dependencies=research_access)
+    application.include_router(model_tuning.router, dependencies=research_access)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)
     application.include_router(paper_market.router, dependencies=admin_required)
@@ -103,7 +105,7 @@ def create_app() -> FastAPI:
     application.include_router(admin_trader.router, dependencies=admin_required)
     application.include_router(parameter_bootstrap.router, dependencies=admin_required)
     application.include_router(strategy_configuration.router, dependencies=admin_required)
-    application.include_router(strategy_lab.router, dependencies=admin_required)
+    application.include_router(strategy_lab.router, dependencies=research_access)
     application.include_router(asset_discovery.router, dependencies=admin_required)
     application.include_router(system_settings.router, dependencies=admin_required)
     application.include_router(admin_setup.router, dependencies=admin_required)

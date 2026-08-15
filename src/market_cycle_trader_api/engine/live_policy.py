@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .capital_rotation import ROTATION_FEATURES, _risk_off_enabled
-from .selective_opportunity import SelectiveOpportunityGate, evaluate_opportunity, selective_opportunity_enabled
+from .selective_opportunity import SelectiveOpportunityGate, evaluate_opportunity, opportunity_cash_gate_enabled, selective_opportunity_enabled
 
 
 def live_model_utilities(
@@ -51,6 +51,7 @@ def build_live_rotation_policy(
 
     risk_off = _risk_off_enabled(config)
     selective = selective_opportunity_enabled(config)
+    opportunity_cash_gate = opportunity_cash_gate_enabled(config)
     if risk_off and cash_edge_models is None:
         raise ValueError("Explicit risk-off mode requires live cash-edge models.")
     if selective and opportunity_gate is None:
@@ -68,6 +69,7 @@ def build_live_rotation_policy(
                 frames,
                 symbols,
                 timestamp,
+                current_position=current_position if opportunity_cash_gate else None,
             )
             if opportunity is None or not bool(opportunity.accepted):
                 return (0, 0.0)

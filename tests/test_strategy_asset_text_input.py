@@ -78,3 +78,26 @@ def test_legacy_strategy_update_with_assets_array_remains_supported() -> None:
     built = request.build_configuration()
 
     assert built.assets == configuration["assets"]
+
+
+def test_strategy_update_allows_omitted_change_reason() -> None:
+    request = StrategyUpdateRequest(
+        expected_revision=1,
+        configuration=_configuration(),
+        name="Optional audit note strategy",
+        description="",
+    )
+
+    assert request.note is None
+
+
+def test_strategy_update_normalizes_blank_change_reason_to_none() -> None:
+    request = StrategyUpdateRequest(
+        expected_revision=1,
+        configuration=_configuration(),
+        name="Blank audit note strategy",
+        description="",
+        note="   ",
+    )
+
+    assert request.note is None

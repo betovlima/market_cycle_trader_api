@@ -1,5 +1,6 @@
 from __future__ import annotations
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass
 import math
 import subprocess
@@ -13,20 +14,43 @@ from .rotation_diagnostics import enrich_trade_diagnostics
 from .optimized_allocation import (
     OPTIMIZED_ALLOCATION_MODE,
     AllocationDecision,
+    ExpectedReturnCalibrator,
+    fit_expected_return_calibrator,
     optimize_allocation,
-    optimized_allocation_enabled,
+)
+from .concentrated_allocation import (
+    CONCENTRATED_ALLOCATION_MODE,
+    concentrated_allocation_enabled,
+    optimize_concentrated_allocation,
+    portfolio_allocation_enabled,
+)
+from .compound_risk_overlay import (
+    COMPOUND_RISK_OVERLAY_MODE,
+    allocation_execution_enabled,
+    compound_risk_overlay_enabled,
+    optimize_compound_risk_overlay,
+)
+from .absolute_utility_cash_gate import (
+    ABSOLUTE_UTILITY_CASH_GATE_MODE,
+    absolute_utility_cash_gate_enabled,
+    evaluate_absolute_utility_cash_gate,
 )
 from .selective_opportunity import (
+    OPPORTUNITY_CASH_GATE_MODE,
     SELECTIVE_ROTATION_MODE,
+    AdaptiveOpportunityCashGate,
     SelectiveOpportunityGate,
+    build_base_policy_opportunity_samples,
     evaluate_opportunity,
+    fit_adaptive_opportunity_cash_gate,
     fit_selective_opportunity_gate,
+    opportunity_cash_gate_enabled,
     selective_opportunity_enabled,
 )
 
 LEGACY_ROTATION_MODE = 'COMPOUND_ROTATION_SWING_XGBOOST'
 RISK_OFF_ROTATION_MODE = 'COMPOUND_ROTATION_SWING_RISK_OFF'
-SUPPORTED_ROTATION_MODES = frozenset({LEGACY_ROTATION_MODE, RISK_OFF_ROTATION_MODE, SELECTIVE_ROTATION_MODE, OPTIMIZED_ALLOCATION_MODE})
+SUPPORTED_ROTATION_MODES = frozenset({LEGACY_ROTATION_MODE, RISK_OFF_ROTATION_MODE, SELECTIVE_ROTATION_MODE, OPPORTUNITY_CASH_GATE_MODE, ABSOLUTE_UTILITY_CASH_GATE_MODE, OPTIMIZED_ALLOCATION_MODE, CONCENTRATED_ALLOCATION_MODE, COMPOUND_RISK_OVERLAY_MODE})
 
 def _risk_off_enabled(config: Any) -> bool:
     return str(getattr(config, 'strategy_mode', LEGACY_ROTATION_MODE)) == RISK_OFF_ROTATION_MODE
@@ -377,6 +401,34 @@ def _training_transition_log_return(frames: dict[str, pd.DataFrame], symbols: li
             gross *= close_next / open_next
     return float(np.log(max(gross, 1e-12)))
 
+def _cash_gate_action_log_return(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    date_now: pd.Timestamp,
+    date_next: pd.Timestamp,
+    from_position: int,
+    to_position: int,
+    config: Any,
+) -> float:
+    """Return controlled by the close(t) MARKET-vs-CASH decision.
+
+    The decision executes at the next open, so v2 deliberately labels only the
+    next session's open-to-close risky exposure plus switch costs. Overnight
+    movement from close(t) to open(t+1) is already unavoidable at decision time
+    and must not teach the gate to predict something it cannot control.
+    """
+    if int(to_position) <= 0:
+        return float("nan")
+    symbol = symbols[int(to_position) - 1]
+    open_next = float(frames[symbol].loc[date_next, 'open'])
+    close_next = float(frames[symbol].loc[date_next, 'close'])
+    if not (np.isfinite(open_next) and open_next > 0 and np.isfinite(close_next) and close_next > 0):
+        return float("nan")
+    gross = close_next / open_next
+    gross *= max(1e-08, 1.0 - _proportional_switch_cost(config, int(from_position), int(to_position)))
+    return float(np.log(max(gross, 1e-12)))
+
+
 def _risk_adjusted_reward(log_return: float, wealth_before: float, peak_before: float, config: Any) -> tuple[float, float, float]:
     wealth_after = wealth_before * math.exp(log_return)
     peak_after = max(peak_before, wealth_after)
@@ -557,7 +609,9 @@ def _xgb_policy(
     switch_margin: float,
     *,
     cash_edge_models: dict[str, Any] | None = None,
-    opportunity_gate: SelectiveOpportunityGate | None = None,
+    opportunity_gate: SelectiveOpportunityGate | AdaptiveOpportunityCashGate | None = None,
+    expected_return_calibrator: ExpectedReturnCalibrator | None = None,
+    cash_gate_base_state: dict[str, Any] | None = None,
     decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     fold_id: int | None = None,
     calibrated_switch_margin: float | None = None,
@@ -573,10 +627,37 @@ def _xgb_policy(
 
     risk_off = _risk_off_enabled(config)
     selective = selective_opportunity_enabled(config)
+    opportunity_cash_gate = opportunity_cash_gate_enabled(config)
+    absolute_utility_cash_gate = absolute_utility_cash_gate_enabled(config)
+    cash_gate_mode = bool(opportunity_cash_gate or absolute_utility_cash_gate)
     if risk_off and cash_edge_models is None:
         raise ValueError('Explicit risk-off mode requires cash-edge models.')
     if selective and opportunity_gate is None:
-        raise ValueError('Selective Opportunity mode requires a calibrated opportunity gate.')
+        raise ValueError('Selective Opportunity / Opportunity Cash Gate requires a calibrated opportunity gate.')
+
+    cash_gate_base_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
+    cash_gate_base_policy: Callable[[pd.Timestamp, int, int], tuple[int, float]] | None = None
+    cash_gate_state = (
+        cash_gate_base_state
+        if cash_gate_base_state is not None
+        else {"position": 0, "holding_days": 0, "pending_sample": None}
+    )
+    if cash_gate_mode:
+        if hasattr(config, 'model_copy'):
+            base_config = config.model_copy(update={'strategy_mode': LEGACY_ROTATION_MODE})
+        else:
+            base_config = copy(config)
+            setattr(base_config, 'strategy_mode', LEGACY_ROTATION_MODE)
+        cash_gate_base_policy = _xgb_policy(
+            models,
+            frames,
+            symbols,
+            base_config,
+            switch_margin,
+            decision_diagnostics=cash_gate_base_diagnostics,
+            fold_id=fold_id,
+            calibrated_switch_margin=calibrated_switch_margin,
+        )
 
     def position_asset(position: int) -> str:
         return 'CASH' if position <= 0 else symbols[position - 1]
@@ -585,6 +666,28 @@ def _xgb_policy(
         return float(value) if np.isfinite(value) else None
 
     def policy(timestamp: pd.Timestamp, current_position: int, holding_days: int) -> tuple[int, float]:
+        if opportunity_cash_gate and isinstance(opportunity_gate, AdaptiveOpportunityCashGate):
+            pending = cash_gate_state.get("pending_sample")
+            if pending is not None and pd.Timestamp(timestamp) > pd.Timestamp(pending["timestamp"]):
+                realized = _cash_gate_action_log_return(
+                    frames,
+                    symbols,
+                    pd.Timestamp(pending["timestamp"]),
+                    pd.Timestamp(timestamp),
+                    int(pending["from_position"]),
+                    int(pending["to_position"]),
+                    config,
+                )
+                if np.isfinite(realized):
+                    opportunity_gate.record_matured_sample({
+                        "timestamp": pd.Timestamp(pending["timestamp"]),
+                        **dict(pending["features"]),
+                        "realized_net_log_return": float(realized),
+                        "label": int(realized > 0.0),
+                    })
+                cash_gate_state["pending_sample"] = None
+                opportunity_gate.refresh_if_needed()
+
         utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
         if not np.isfinite(utilities[1:]).any():
             return (0, 0.0)
@@ -594,14 +697,84 @@ def _xgb_policy(
             if risk_off
             else utilities.copy()
         )
+        cash_gate_base_target_position: int | None = None
+        cash_gate_base_target_score: float | None = None
+        cash_gate_base_reason: str | None = None
+        cash_gate_base_position_before: int | None = None
+        cash_gate_base_holding_before: int | None = None
+
+        # Opportunity Cash Gate v2 keeps an independent B0 state.  Going to
+        # CASH must never reset the counterfactual strategy that we are trying
+        # to protect and selectively override.
+        if cash_gate_mode and cash_gate_base_policy is not None:
+            cash_gate_base_position_before = int(cash_gate_state.get("position", 0))
+            cash_gate_base_holding_before = int(cash_gate_state.get("holding_days", 0))
+            base_target, base_score = cash_gate_base_policy(
+                timestamp,
+                cash_gate_base_position_before,
+                cash_gate_base_holding_before,
+            )
+            cash_gate_base_target_position = int(base_target)
+            cash_gate_base_target_score = float(base_score)
+            cash_gate_base_reason = (
+                cash_gate_base_diagnostics.get(pd.Timestamp(timestamp), {}).get('decision_reason')
+            )
+            if cash_gate_base_target_position == cash_gate_base_position_before:
+                cash_gate_state["holding_days"] = (
+                    cash_gate_base_holding_before + 1
+                    if cash_gate_base_target_position > 0
+                    else 0
+                )
+            else:
+                cash_gate_state["position"] = int(cash_gate_base_target_position)
+                cash_gate_state["holding_days"] = 1 if cash_gate_base_target_position > 0 else 0
+
         opportunity = (
-            evaluate_opportunity(opportunity_gate, utilities, frames, symbols, timestamp)
+            evaluate_opportunity(
+                opportunity_gate,
+                utilities,
+                frames,
+                symbols,
+                timestamp,
+                current_position=current_position if opportunity_cash_gate else None,
+            )
             if selective and opportunity_gate is not None
             else None
         )
         opportunity_probability = float(opportunity.probability) if opportunity is not None else None
         opportunity_confidence = float(opportunity.confidence) if opportunity is not None else None
-        opportunity_accepted = bool(opportunity.accepted) if opportunity is not None else None
+        opportunity_accepted = bool(opportunity.accepted) if opportunity is not None else (False if opportunity_cash_gate else None)
+        opportunity_active_threshold = (
+            float(opportunity_gate.active_threshold(current_position if opportunity_cash_gate else None))
+            if selective and opportunity_gate is not None
+            else None
+        )
+        opportunity_threshold_basis = (
+            str(opportunity_gate.threshold_basis)
+            if selective and opportunity_gate is not None
+            else None
+        )
+        opportunity_decision_value = (
+            float(opportunity_gate.decision_value(opportunity_probability, opportunity_confidence))
+            if opportunity_gate is not None
+            and opportunity_probability is not None
+            and opportunity_confidence is not None
+            else None
+        )
+        if (
+            opportunity_cash_gate
+            and isinstance(opportunity_gate, AdaptiveOpportunityCashGate)
+            and opportunity is not None
+            and cash_gate_base_target_position is not None
+            and cash_gate_base_target_position > 0
+        ):
+            cash_gate_state["pending_sample"] = {
+                "timestamp": pd.Timestamp(timestamp),
+                "features": dict(opportunity.features),
+                "from_position": int(cash_gate_base_position_before or 0),
+                "to_position": int(cash_gate_base_target_position),
+            }
+
         ranked_positions = sorted(
             (
                 position
@@ -696,6 +869,21 @@ def _xgb_policy(
             else None
         )
 
+        absolute_utility_evaluation = (
+            evaluate_absolute_utility_cash_gate(
+                config,
+                best_score=float(best_asset_score),
+                current_position=current_position,
+            )
+            if absolute_utility_cash_gate and best_asset_score is not None
+            else None
+        )
+        absolute_utility_accepted = (
+            bool(absolute_utility_evaluation.accepted)
+            if absolute_utility_evaluation is not None
+            else None
+        )
+
         def finish(
             target_position: int,
             final_score: float,
@@ -714,14 +902,57 @@ def _xgb_policy(
                     else 0.0
                 )
                 diagnostic = {
-                    'decision_diagnostics_schema_version': 5 if selective else (3 if risk_off else 2),
+                    'decision_diagnostics_schema_version': 8 if absolute_utility_cash_gate else (7 if opportunity_cash_gate else (5 if selective else (3 if risk_off else 2))),
                     'decision_fold_id': fold_id,
                     'strategy_risk_off_enabled': bool(risk_off),
                     'strategy_selective_opportunity_enabled': bool(selective),
+                    'strategy_opportunity_cash_gate_enabled': bool(opportunity_cash_gate),
+                    'strategy_absolute_utility_cash_gate_enabled': bool(absolute_utility_cash_gate),
+                    'absolute_utility_best_score': (float(absolute_utility_evaluation.best_score) if absolute_utility_evaluation is not None else None),
+                    'absolute_utility_entry_threshold': (float(config.opportunity_utility_entry_threshold) if absolute_utility_cash_gate else None),
+                    'absolute_utility_exit_threshold': (float(config.opportunity_utility_exit_threshold) if absolute_utility_cash_gate else None),
+                    'absolute_utility_active_threshold': (float(absolute_utility_evaluation.active_threshold) if absolute_utility_evaluation is not None else None),
+                    'absolute_utility_accepted': absolute_utility_accepted,
+                    'absolute_utility_hysteresis_market_hold': (bool(absolute_utility_evaluation.hysteresis_market_hold) if absolute_utility_evaluation is not None else False),
+                    'absolute_utility_hysteresis_cash_block': (bool(absolute_utility_evaluation.hysteresis_cash_block) if absolute_utility_evaluation is not None else False),
                     'opportunity_probability': opportunity_probability,
                     'opportunity_confidence': opportunity_confidence,
-                    'opportunity_threshold': float(opportunity_gate.threshold) if selective and opportunity_gate is not None else None,
+                    'opportunity_threshold': opportunity_active_threshold,
+                    'opportunity_entry_threshold': (float(opportunity_gate.entry_threshold) if opportunity_gate is not None and opportunity_gate.entry_threshold is not None else None),
+                    'opportunity_exit_threshold': (float(opportunity_gate.exit_threshold) if opportunity_gate is not None and opportunity_gate.exit_threshold is not None else None),
+                    'opportunity_active_threshold': opportunity_active_threshold,
+                    'opportunity_threshold_basis': opportunity_threshold_basis,
+                    'opportunity_target_basis': (str(opportunity_gate.target_basis) if opportunity_gate is not None and hasattr(opportunity_gate, 'target_basis') else None),
+                    'opportunity_target_horizon_sessions': (int(opportunity_gate.target_horizon_sessions) if opportunity_gate is not None and getattr(opportunity_gate, 'target_horizon_sessions', None) is not None else None),
+                    'opportunity_adaptive_refresh_count': (int(opportunity_gate.refresh_count) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else 0),
+                    'opportunity_regularized_to_base_policy': (bool(opportunity_gate.regularized_to_base_policy) if opportunity_gate is not None and hasattr(opportunity_gate, 'regularized_to_base_policy') else False),
+                    'opportunity_validation_alpha': (float(opportunity_gate.threshold_validation_alpha) if opportunity_gate is not None and getattr(opportunity_gate, 'threshold_validation_alpha', None) is not None else None),
+                    'opportunity_validation_exposure_ratio': (float(opportunity_gate.threshold_validation_exposure_ratio) if opportunity_gate is not None and getattr(opportunity_gate, 'threshold_validation_exposure_ratio', None) is not None else None),
+                    'opportunity_decision_value': opportunity_decision_value,
                     'opportunity_accepted': opportunity_accepted,
+                    'opportunity_hysteresis_market_hold': bool(
+                        opportunity_cash_gate
+                        and current_position > 0
+                        and opportunity_decision_value is not None
+                        and opportunity_gate is not None
+                        and opportunity_gate.entry_threshold is not None
+                        and opportunity_gate.exit_threshold is not None
+                        and float(opportunity_gate.exit_threshold) <= float(opportunity_decision_value) < float(opportunity_gate.entry_threshold)
+                    ),
+                    'opportunity_hysteresis_cash_block': bool(
+                        opportunity_cash_gate
+                        and current_position == 0
+                        and opportunity_decision_value is not None
+                        and opportunity_gate is not None
+                        and opportunity_gate.entry_threshold is not None
+                        and opportunity_gate.exit_threshold is not None
+                        and float(opportunity_gate.exit_threshold) <= float(opportunity_decision_value) < float(opportunity_gate.entry_threshold)
+                    ),
+                    'cash_gate_base_position_before': cash_gate_base_position_before,
+                    'cash_gate_base_holding_days_before': cash_gate_base_holding_before,
+                    'cash_gate_base_action_asset': (position_asset(cash_gate_base_target_position) if cash_gate_base_target_position is not None else None),
+                    'cash_gate_base_action_score': finite(cash_gate_base_target_score) if cash_gate_base_target_score is not None else None,
+                    'cash_gate_base_decision_reason': cash_gate_base_reason,
                     'current_asset': position_asset(current_position),
                     'current_score': finite(current_value),
                     'current_cash_edge': finite(current_cash_edge),
@@ -794,6 +1025,38 @@ def _xgb_policy(
                     diagnostic[f'top_{rank + 1}_cash_edge'] = finite(edge) if edge is not None else None
                 decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
             return (target_position, final_score)
+
+        if absolute_utility_cash_gate:
+            if absolute_utility_accepted is False:
+                return finish(
+                    0,
+                    0.0,
+                    'ABSOLUTE_UTILITY_CASH_GATE_REJECT',
+                    cash_threshold_guard=True,
+                )
+            if cash_gate_base_target_position is None or cash_gate_base_target_score is None:
+                raise ValueError('Absolute Utility Cash Gate could not resolve the protected base-policy action.')
+            return finish(
+                cash_gate_base_target_position,
+                cash_gate_base_target_score,
+                cash_gate_base_reason or 'ABSOLUTE_UTILITY_CASH_GATE_BASE_POLICY',
+            )
+
+        if opportunity_cash_gate:
+            if opportunity_accepted is False:
+                return finish(
+                    0,
+                    0.0,
+                    'OPPORTUNITY_CASH_GATE_REJECT',
+                    cash_threshold_guard=True,
+                )
+            if cash_gate_base_target_position is None or cash_gate_base_target_score is None:
+                raise ValueError('Opportunity Cash Gate could not resolve the protected base-policy action.')
+            return finish(
+                cash_gate_base_target_position,
+                cash_gate_base_target_score,
+                cash_gate_base_reason or 'OPPORTUNITY_CASH_GATE_BASE_POLICY',
+            )
 
         if selective and opportunity_accepted is False:
             return finish(
@@ -1070,24 +1333,29 @@ def _optimized_policy(
     config: Any,
     *,
     opportunity_gate: SelectiveOpportunityGate | None = None,
+    expected_return_calibrator: ExpectedReturnCalibrator | None = None,
     decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     fold_id: int | None = None,
 ) -> Callable[[pd.Timestamp, dict[str, float]], AllocationDecision]:
-    if not optimized_allocation_enabled(config):
-        raise ValueError("Optimized allocation policy requires COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION.")
+    if not portfolio_allocation_enabled(config):
+        raise ValueError("Portfolio allocation policy requires an allocation Strategy mode.")
     if opportunity_gate is None:
         raise ValueError("Optimized allocation requires a calibrated Selective Opportunity gate.")
+    if expected_return_calibrator is None:
+        raise ValueError("Optimized allocation requires an out-of-sample cross-sectional relative-alpha calibrator.")
 
     def policy(timestamp: pd.Timestamp, current_weights: dict[str, float]) -> AllocationDecision:
         utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
         opportunity = evaluate_opportunity(opportunity_gate, utilities, frames, symbols, timestamp)
-        decision = optimize_allocation(
+        allocator = optimize_concentrated_allocation if concentrated_allocation_enabled(config) else optimize_allocation
+        decision = allocator(
             utilities,
             frames,
             symbols,
             timestamp,
             current_weights,
             config,
+            expected_return_calibrator=expected_return_calibrator,
             opportunity=opportunity,
             opportunity_threshold=float(opportunity_gate.threshold),
         )
@@ -1101,11 +1369,12 @@ def _optimized_policy(
             top = finite_scores[:3]
             target_weights = {symbol: float(decision.weights.get(symbol, 0.0)) for symbol in symbols}
             diagnostic = {
-                "decision_diagnostics_schema_version": 6,
+                "decision_diagnostics_schema_version": 10 if concentrated_allocation_enabled(config) else 9,
                 "decision_fold_id": fold_id,
                 "strategy_risk_off_enabled": False,
                 "strategy_selective_opportunity_enabled": True,
                 "strategy_optimized_allocation_enabled": True,
+                "strategy_concentrated_allocation_enabled": bool(concentrated_allocation_enabled(config)),
                 "opportunity_probability": decision.opportunity_probability,
                 "opportunity_confidence": decision.opportunity_confidence,
                 "opportunity_threshold": decision.opportunity_threshold,
@@ -1113,12 +1382,33 @@ def _optimized_policy(
                 "allocation_weights": target_weights,
                 "allocation_cash_weight": float(decision.cash_weight),
                 "allocation_expected_utility": float(decision.expected_utility),
+                "allocation_expected_relative_alpha": float(decision.expected_relative_alpha),
+                "allocation_confidence_adjusted_relative_alpha": float(decision.confidence_adjusted_relative_alpha),
+                "allocation_reward": float(decision.allocation_reward),
+                "allocation_confidence_adjusted_reward": float(decision.confidence_adjusted_allocation_reward),
+                "allocation_normalized_cvar": decision.normalized_cvar,
+                "allocation_risk_reference": decision.risk_reference,
+                "allocation_expected_net_return": float(decision.expected_net_return),
+                "allocation_confidence_adjusted_expected_return": float(decision.confidence_adjusted_expected_return),
+                "allocation_relative_alpha_calibration_method": str(expected_return_calibrator.method),
+                "allocation_relative_alpha_calibration_rows": int(expected_return_calibrator.sample_count),
+                "allocation_expected_return_calibration_method": str(expected_return_calibrator.method),
+                "allocation_expected_return_calibration_rows": int(expected_return_calibrator.sample_count),
                 "allocation_estimated_cvar": decision.estimated_cvar,
                 "allocation_turnover": float(decision.turnover),
                 "allocation_objective_value": decision.objective_value,
                 "allocation_eligible_assets": list(decision.eligible_assets),
                 "allocation_eligible_asset_count": int(len(decision.eligible_assets)),
                 "allocation_optimizer_status": str(decision.optimizer_status),
+                "allocation_primary_asset": top[0][0] if len(top) > 0 else None,
+                "allocation_primary_weight": float(decision.weights.get(top[0][0], 0.0)) if len(top) > 0 else 0.0,
+                "allocation_risky_weight": float(sum(decision.weights.values())),
+                "allocation_secondary_weight": float(max(0.0, sum(decision.weights.values()) - (float(decision.weights.get(top[0][0], 0.0)) if len(top) > 0 else 0.0))),
+                "allocation_primary_share_of_risk": (
+                    float(decision.weights.get(top[0][0], 0.0)) / float(sum(decision.weights.values()))
+                    if len(top) > 0 and float(sum(decision.weights.values())) > 1e-12
+                    else 0.0
+                ),
                 "top_1_asset": top[0][0] if len(top) > 0 else None,
                 "top_1_score": top[0][1] if len(top) > 0 else None,
                 "top_2_asset": top[1][0] if len(top) > 1 else None,
@@ -1126,6 +1416,88 @@ def _optimized_policy(
                 "top_3_asset": top[2][0] if len(top) > 2 else None,
                 "top_3_score": top[2][1] if len(top) > 2 else None,
             }
+            decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
+        return decision
+
+    return policy
+
+
+def _compound_risk_overlay_policy(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    switch_margin: float,
+    *,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+    fold_id: int | None = None,
+    calibrated_switch_margin: float | None = None,
+    state: dict[str, int] | None = None,
+) -> Callable[[pd.Timestamp, dict[str, float]], AllocationDecision]:
+    base_policy = _xgb_policy(
+        models,
+        frames,
+        symbols,
+        config,
+        switch_margin,
+        decision_diagnostics=decision_diagnostics,
+        fold_id=fold_id,
+        calibrated_switch_margin=calibrated_switch_margin,
+    )
+    shared_state = state if state is not None else {"position": 0, "holding_days": 0}
+
+    def policy(timestamp: pd.Timestamp, current_weights: dict[str, float]) -> AllocationDecision:
+        position_before = int(shared_state.get("position", 0))
+        holding_before = int(shared_state.get("holding_days", 0))
+        target_position, target_score = base_policy(timestamp, position_before, holding_before)
+        if target_position == position_before:
+            shared_state["holding_days"] = holding_before + 1 if target_position > 0 else 0
+        else:
+            shared_state["position"] = int(target_position)
+            shared_state["holding_days"] = 1 if target_position > 0 else 0
+        decision = optimize_compound_risk_overlay(
+            target_position,
+            target_score,
+            frames,
+            symbols,
+            timestamp,
+            current_weights,
+            config,
+        )
+        if decision_diagnostics is not None:
+            diagnostic = dict(decision_diagnostics.get(pd.Timestamp(timestamp), {}))
+            primary_asset = symbols[target_position - 1] if target_position > 0 else "CASH"
+            primary_weight = float(decision.weights.get(primary_asset, 0.0)) if target_position > 0 else 0.0
+            risky_weight = float(sum(decision.weights.values()))
+            diagnostic.update({
+                "decision_diagnostics_schema_version": 11,
+                "strategy_compound_risk_overlay_enabled": True,
+                "strategy_optimized_allocation_enabled": False,
+                "strategy_concentrated_allocation_enabled": False,
+                "risk_overlay_base_position_before": position_before,
+                "risk_overlay_base_holding_days_before": holding_before,
+                "risk_overlay_base_target_position": int(target_position),
+                "risk_overlay_base_target_asset": primary_asset,
+                "risk_overlay_base_target_score": float(target_score) if np.isfinite(target_score) else None,
+                "risk_overlay_target_weight": primary_weight,
+                "risk_overlay_cash_weight": float(decision.cash_weight),
+                "risk_overlay_current_cvar": (float(decision.normalized_cvar) * float(decision.risk_reference) if decision.normalized_cvar is not None and decision.risk_reference is not None else decision.estimated_cvar),
+                "risk_overlay_reference_cvar": decision.risk_reference,
+                "risk_overlay_normalized_cvar": decision.normalized_cvar,
+                "risk_overlay_risky_turnover": float(decision.turnover),
+                "risk_overlay_optimizer_status": decision.optimizer_status,
+                "risk_overlay_technical_fallback": bool(str(decision.optimizer_status).startswith("technical_fallback_base_policy:")),
+                "allocation_primary_weight": primary_weight,
+                "allocation_risky_weight": risky_weight,
+                "allocation_secondary_weight": 0.0,
+                "allocation_primary_share_of_risk": 1.0 if risky_weight > 1e-12 else 0.0,
+                "allocation_cash_weight": float(decision.cash_weight),
+                "allocation_normalized_cvar": decision.normalized_cvar,
+                "allocation_risk_reference": decision.risk_reference,
+                "allocation_target_turnover": float(decision.turnover),
+                "allocation_optimizer_status": decision.optimizer_status,
+                "allocation_eligible_asset_count": int(len(decision.eligible_assets)),
+            })
             decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
         return decision
 
@@ -1262,7 +1634,7 @@ def _simulate_optimized_allocation(
                 "decision_timestamp": decision_date,
                 "action": "SELL",
                 "asset": symbol,
-                "reason": "OPTIMIZED_REBALANCE",
+                "reason": "RISK_OVERLAY_REBALANCE" if compound_risk_overlay_enabled(config) else "OPTIMIZED_REBALANCE",
                 "execution_price": execution_price,
                 "quantity": sell_qty,
                 "gross_trade_value": gross,
@@ -1290,26 +1662,23 @@ def _simulate_optimized_allocation(
             if spendable <= 0:
                 break
             raw_open = open_prices[symbol]
-            execution_price = float(slippage(raw_open, "BUY", config))
             gross_budget = min(desired_gross, spendable)
-            buy_qty = gross_budget / max(execution_price, 1e-12)
-            if bool(config.whole_shares):
-                buy_qty = float(math.floor(buy_qty + 1e-12))
+            buy_qty, execution_price, fees = _execute_buy(
+                gross_budget,
+                raw_open,
+                config,
+                fee_calculator,
+                slippage,
+            )
             if buy_qty <= 0:
                 continue
-            fees = fee_calculator("BUY", buy_qty, execution_price, config)
             gross = buy_qty * execution_price
             total_cost = gross + float(fees["total_fee"])
-            if total_cost > spendable + 1e-9:
-                affordable = spendable / max(execution_price * (1.0 + float(config.commission_rate)), 1e-12)
-                buy_qty = float(math.floor(affordable)) if bool(config.whole_shares) else float(affordable)
-                if buy_qty <= 0:
-                    continue
-                fees = fee_calculator("BUY", buy_qty, execution_price, config)
-                gross = buy_qty * execution_price
-                total_cost = gross + float(fees["total_fee"])
-            if total_cost > cash + 1e-7:
-                continue
+            if total_cost > spendable + 1e-7 or total_cost > cash + 1e-7:
+                raise RuntimeError(
+                    f"Fee-aware allocation BUY sizing exceeded available cash at {execution_date}: "
+                    f"required={total_cost:.10f}, spendable={spendable:.10f}, cash={cash:.10f}."
+                )
             cash -= total_cost
             shares[symbol] += buy_qty
             total_fees += float(fees["total_fee"])
@@ -1322,7 +1691,7 @@ def _simulate_optimized_allocation(
                 "decision_timestamp": decision_date,
                 "action": "BUY",
                 "asset": symbol,
-                "reason": "OPTIMIZED_REBALANCE",
+                "reason": "RISK_OVERLAY_REBALANCE" if compound_risk_overlay_enabled(config) else "OPTIMIZED_REBALANCE",
                 "execution_price": execution_price,
                 "quantity": buy_qty,
                 "gross_trade_value": gross,
@@ -1351,13 +1720,21 @@ def _simulate_optimized_allocation(
             "strategy_equity": float(equity_close),
             "buy_hold_equity": float(benchmark.loc[execution_date]),
             "trade_action": "+".join(sorted(set(day_actions))) if day_actions else None,
-            "trade_reason": "OPTIMIZED_REBALANCE" if day_actions else "OPTIMIZED_HOLD",
+            "trade_reason": ("RISK_OVERLAY_REBALANCE" if day_actions else "RISK_OVERLAY_HOLD") if compound_risk_overlay_enabled(config) else ("OPTIMIZED_REBALANCE" if day_actions else "OPTIMIZED_HOLD"),
             "walk_forward_fold": fold_id,
             "portfolio_weights": {symbol: float(actual_weights.get(symbol, 0.0)) for symbol in symbols},
             "cash_weight": float(actual_weights.get("CASH", 0.0)),
             "market_exposure_weight": risky_weight,
             "assets_held": int(len(held_assets)),
             "allocation_expected_utility": float(allocation.expected_utility),
+            "allocation_expected_relative_alpha": float(allocation.expected_relative_alpha),
+            "allocation_confidence_adjusted_relative_alpha": float(allocation.confidence_adjusted_relative_alpha),
+            "allocation_reward": float(allocation.allocation_reward),
+            "allocation_confidence_adjusted_reward": float(allocation.confidence_adjusted_allocation_reward),
+            "allocation_normalized_cvar": allocation.normalized_cvar,
+            "allocation_risk_reference": allocation.risk_reference,
+            "allocation_expected_net_return": float(allocation.expected_net_return),
+            "allocation_confidence_adjusted_expected_return": float(allocation.confidence_adjusted_expected_return),
             "allocation_estimated_cvar": allocation.estimated_cvar,
             "allocation_target_turnover": float(allocation.turnover),
             "allocation_objective_value": allocation.objective_value,
@@ -1431,7 +1808,9 @@ def _simulate_optimized_allocation(
 
     metrics = {
         "portfolio_rotation": True,
-        "optimized_allocation_enabled": True,
+        "optimized_allocation_enabled": bool(portfolio_allocation_enabled(config)),
+        "concentrated_allocation_enabled": bool(concentrated_allocation_enabled(config)),
+        "compound_risk_overlay_enabled": bool(compound_risk_overlay_enabled(config)),
         "strategy_mode": config.strategy_mode,
         "strategy_label": model_label,
         "symbol": "PORTFOLIO",
@@ -1458,6 +1837,15 @@ def _simulate_optimized_allocation(
         "average_assets_held": float(predictions["assets_held"].astype(float).mean()),
         "maximum_assets_held": int(predictions["assets_held"].max()),
         "allocation_rebalances": int(rebalance_count),
+        "risk_overlay_decisions": int(len(predictions)) if compound_risk_overlay_enabled(config) else 0,
+        "risk_overlay_full_exposure_decisions": int((predictions.get("risk_overlay_target_weight", pd.Series(dtype=float)).astype(float) >= 0.999).sum()) if compound_risk_overlay_enabled(config) and "risk_overlay_target_weight" in predictions else 0,
+        "risk_overlay_reduced_exposure_decisions": int(((predictions.get("risk_overlay_target_weight", pd.Series(dtype=float)).astype(float) > 0.001) & (predictions.get("risk_overlay_target_weight", pd.Series(dtype=float)).astype(float) < 0.999)).sum()) if compound_risk_overlay_enabled(config) and "risk_overlay_target_weight" in predictions else 0,
+        "risk_overlay_base_cash_decisions": int((predictions.get("risk_overlay_base_target_asset", pd.Series(dtype=object)) == "CASH").sum()) if compound_risk_overlay_enabled(config) and "risk_overlay_base_target_asset" in predictions else 0,
+        "risk_overlay_technical_fallbacks": int(predictions.get("risk_overlay_technical_fallback", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if compound_risk_overlay_enabled(config) and "risk_overlay_technical_fallback" in predictions else 0,
+        "risk_overlay_average_normalized_cvar": float(predictions["risk_overlay_normalized_cvar"].dropna().astype(float).mean()) if compound_risk_overlay_enabled(config) and "risk_overlay_normalized_cvar" in predictions and predictions["risk_overlay_normalized_cvar"].notna().any() else None,
+        "average_primary_weight": float(predictions["allocation_primary_weight"].astype(float).mean()) if "allocation_primary_weight" in predictions else None,
+        "average_primary_share_of_risk": float(predictions["allocation_primary_share_of_risk"].astype(float).mean()) if "allocation_primary_share_of_risk" in predictions else None,
+        "average_secondary_weight": float(predictions["allocation_secondary_weight"].astype(float).mean()) if "allocation_secondary_weight" in predictions else None,
         "allocation_lookback_days": int(config.allocation_lookback_days),
         "allocation_max_asset_weight": float(config.allocation_max_asset_weight),
         "allocation_cvar_confidence": float(config.allocation_cvar_confidence),
@@ -1465,7 +1853,7 @@ def _simulate_optimized_allocation(
         "allocation_turnover_penalty": float(config.allocation_turnover_penalty),
         "allocation_minimum_utility": float(config.allocation_minimum_utility),
         "allocation_signal_scale": float(config.allocation_signal_scale),
-        "selective_opportunity_enabled": True,
+        "selective_opportunity_enabled": bool(selective_opportunity_enabled(config)),
         "opportunity_gate_decisions": int(len(opportunity_rows)),
         "opportunity_gate_accepted": opportunity_accepted,
         "opportunity_gate_rejected": opportunity_rejected,
@@ -1489,12 +1877,34 @@ def _simulate_optimized_allocation(
         "decision_horizon_label": f"{int(config.rotation_horizon_days)} trading sessions",
         "benchmark_name": "Equal-weight buy-and-hold across continuously available assets",
     }
+    allocation_title = "CONCENTRATED OPTIMAL CAPITAL ALLOCATION" if concentrated_allocation_enabled(config) else "OPTIMIZED ALLOCATION"
+    allocation_description = (
+        "Top-1/CASH capital allocation with conditional Top-2/Top-3 diversification"
+        if concentrated_allocation_enabled(config)
+        else "long-only multi-asset portfolio plus CASH"
+    )
+    method_details = (
+        [
+            "- Ranking Utility selects the primary Top-1 asset; the current compounded capital is never split by default.",
+            "- The optimizer decides risky exposure versus CASH using Opportunity Confidence and normalized CVaR.",
+            "- Top-2/Top-3 may receive capital only when their Utility is close to Top-1 on the robust cross-sectional scale; each secondary weight is constrained relative to the Top-1 weight.",
+            "- Top-1 may receive up to the configured maximum asset weight, including 100% when the risk/reward solution justifies it.",
+            "- Calibrated relative alpha remains diagnostic and does not gate or size positions.",
+        ]
+        if concentrated_allocation_enabled(config)
+        else [
+            "- Ranking Utility supplies the cross-sectional opportunity signal.",
+            "- Ranking Utility is normalized cross-sectionally and calibrated out-of-sample into expected relative alpha versus the same-date universe median.",
+            "- Opportunity Confidence scales the scale-free allocation reward; a rejected opportunity is evidence, not a hard all-CASH command.",
+            "- A linear-programmed convex CVaR risk penalty allocates capital across eligible assets and CASH.",
+        ]
+    )
     summary = "\n".join([
-        "COMPOUND CAPITAL ROTATION — OPTIMIZED ALLOCATION",
+        f"COMPOUND CAPITAL ROTATION — {allocation_title}",
         "",
         f"Model: {model_label}",
         f"Assets: {', '.join(symbols)}",
-        "Allocation: long-only multi-asset portfolio plus CASH",
+        f"Allocation: {allocation_description}",
         f"Maximum weight per asset: {float(config.allocation_max_asset_weight):.2%}",
         f"CVaR confidence: {float(config.allocation_cvar_confidence):.2%}",
         f"CVaR penalty: {float(config.allocation_cvar_penalty):.4f}",
@@ -1515,10 +1925,9 @@ def _simulate_optimized_allocation(
         f"Transaction fees: ${total_fees:,.2f}",
         "",
         "METHOD",
-        (method_line or "- Ranking Utility supplies the cross-sectional opportunity signal."),
-        "- Selective Opportunity can abstain completely when the top opportunity is not accepted.",
-        "- A linear CVaR optimizer allocates capital across eligible assets and CASH.",
-        "- Historical risk scenarios contain only returns observed through the current decision close.",
+        *([method_line] if method_line else []),
+        *method_details,
+        "- Historical CVaR scenarios use the same weighted target horizons and only prices observed through the current decision close.",
         "- Turnover and estimated transaction costs penalize unnecessary movement of capital.",
         "- Position changes execute at the next daily open.",
     ])
@@ -1559,6 +1968,50 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
         target_position, score = policy(decision_date, position, holding_days)
         decision_diag = dict((policy_decision_diagnostics or {}).get(pd.Timestamp(decision_date), {}))
         decision_diag.update(market_regime_by_date.get(pd.Timestamp(decision_date), {}))
+
+        cash_gate_base_asset = str(decision_diag.get('cash_gate_base_action_asset') or 'CASH')
+        cash_gate_rejected = bool(
+            (
+                decision_diag.get('strategy_opportunity_cash_gate_enabled')
+                and decision_diag.get('opportunity_accepted') is False
+            )
+            or (
+                decision_diag.get('strategy_absolute_utility_cash_gate_enabled')
+                and decision_diag.get('absolute_utility_accepted') is False
+            )
+        )
+        cash_gate_changed_base_action = bool(
+            cash_gate_rejected
+            and cash_gate_base_asset != 'CASH'
+            and target_position == 0
+        )
+        cash_gate_counterfactual_return = None
+        if cash_gate_changed_base_action and cash_gate_base_asset in frames:
+            counterfactual_row = frames[cash_gate_base_asset].loc[execution_date]
+            counterfactual_open = float(counterfactual_row.get('open', float('nan')))
+            counterfactual_close = float(counterfactual_row.get('close', float('nan')))
+            if (
+                np.isfinite(counterfactual_open)
+                and counterfactual_open > 0
+                and np.isfinite(counterfactual_close)
+                and counterfactual_close > 0
+            ):
+                cash_gate_counterfactual_return = float(counterfactual_close / counterfactual_open - 1.0)
+        decision_diag.update({
+            'cash_gate_changed_base_action': cash_gate_changed_base_action,
+            'cash_gate_counterfactual_asset': cash_gate_base_asset if cash_gate_changed_base_action else None,
+            'cash_gate_counterfactual_open_to_close_return': cash_gate_counterfactual_return,
+            'cash_gate_avoided_loss_return': (
+                float(-cash_gate_counterfactual_return)
+                if cash_gate_counterfactual_return is not None and cash_gate_counterfactual_return < 0.0
+                else 0.0 if cash_gate_changed_base_action else None
+            ),
+            'cash_gate_missed_gain_return': (
+                float(cash_gate_counterfactual_return)
+                if cash_gate_counterfactual_return is not None and cash_gate_counterfactual_return > 0.0
+                else 0.0 if cash_gate_changed_base_action else None
+            ),
+        })
 
         if position > 0 and np.isfinite(entry_price) and entry_price > 0:
             current_symbol = symbols[position - 1]
@@ -1646,15 +2099,45 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
             old_symbol = symbols[position - 1] if position > 0 else None
             new_symbol = symbols[target_position - 1] if target_position > 0 else None
             is_rotation = previous_position > 0 and target_position > 0
-            rotation_id = f'{pd.Timestamp(execution_date).isoformat()}::{old_symbol}->{new_symbol}' if is_rotation else None
+            from_asset = old_symbol or 'CASH'
+            to_asset = new_symbol or 'CASH'
+            rotation_id = f'{pd.Timestamp(execution_date).isoformat()}::{from_asset}->{to_asset}'
             decision_trade_fields = {
                 'decision_timestamp': pd.Timestamp(decision_date),
                 'rotation_id': rotation_id,
-                'rotation_from_asset': old_symbol if is_rotation else None,
-                'rotation_to_asset': new_symbol if is_rotation else None,
+                'rotation_from_asset': from_asset,
+                'rotation_to_asset': to_asset,
             }
             for diagnostic_key in (
                 'decision_diagnostics_schema_version',
+                'strategy_opportunity_cash_gate_enabled',
+                'strategy_absolute_utility_cash_gate_enabled',
+                'absolute_utility_best_score',
+                'absolute_utility_entry_threshold',
+                'absolute_utility_exit_threshold',
+                'absolute_utility_active_threshold',
+                'absolute_utility_accepted',
+                'absolute_utility_hysteresis_market_hold',
+                'absolute_utility_hysteresis_cash_block',
+                'opportunity_probability',
+                'opportunity_confidence',
+                'opportunity_threshold',
+                'opportunity_entry_threshold',
+                'opportunity_exit_threshold',
+                'opportunity_active_threshold',
+                'opportunity_threshold_basis',
+                'opportunity_decision_value',
+                'opportunity_accepted',
+                'opportunity_hysteresis_market_hold',
+                'opportunity_hysteresis_cash_block',
+                'cash_gate_base_action_asset',
+                'cash_gate_base_action_score',
+                'cash_gate_base_decision_reason',
+                'cash_gate_changed_base_action',
+                'cash_gate_counterfactual_asset',
+                'cash_gate_counterfactual_open_to_close_return',
+                'cash_gate_avoided_loss_return',
+                'cash_gate_missed_gain_return',
                 'current_asset',
                 'current_score',
                 'holding_days_at_decision',
@@ -1823,6 +2306,62 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     opportunity_rows = [row for row in prediction_rows if row.get('opportunity_probability') is not None]
     opportunity_accepted = int(sum(row.get('opportunity_accepted') is True for row in opportunity_rows))
     opportunity_rejected = int(sum(row.get('opportunity_accepted') is False for row in opportunity_rows))
+    cash_gate_rows = [row for row in prediction_rows if row.get('cash_gate_changed_base_action') is True]
+    opportunity_entry_thresholds = [
+        float(row['opportunity_entry_threshold'])
+        for row in prediction_rows
+        if row.get('opportunity_entry_threshold') is not None
+        and np.isfinite(float(row['opportunity_entry_threshold']))
+    ]
+    opportunity_exit_thresholds = [
+        float(row['opportunity_exit_threshold'])
+        for row in prediction_rows
+        if row.get('opportunity_exit_threshold') is not None
+        and np.isfinite(float(row['opportunity_exit_threshold']))
+    ]
+    opportunity_refreshes_by_fold: dict[int, int] = {}
+    for row in opportunity_rows:
+        fold_key = int(row.get('decision_fold_id') or row.get('walk_forward_fold') or 0)
+        refresh_count = int(row.get('opportunity_adaptive_refresh_count') or 0)
+        opportunity_refreshes_by_fold[fold_key] = max(
+            refresh_count,
+            opportunity_refreshes_by_fold.get(fold_key, 0),
+        )
+    opportunity_adaptive_refreshes = int(sum(opportunity_refreshes_by_fold.values()))
+    opportunity_regularized_sessions = int(sum(
+        row.get('opportunity_regularized_to_base_policy') is True
+        for row in opportunity_rows
+    ))
+    opportunity_target_horizons = [
+        int(row['opportunity_target_horizon_sessions'])
+        for row in opportunity_rows
+        if row.get('opportunity_target_horizon_sessions') is not None
+    ]
+    cash_gate_counterfactual_returns = [
+        float(row['cash_gate_counterfactual_open_to_close_return'])
+        for row in cash_gate_rows
+        if row.get('cash_gate_counterfactual_open_to_close_return') is not None
+        and np.isfinite(float(row['cash_gate_counterfactual_open_to_close_return']))
+    ]
+    cash_gate_avoided_loss_sum = float(sum(max(0.0, -value) for value in cash_gate_counterfactual_returns))
+    cash_gate_missed_gain_sum = float(sum(max(0.0, value) for value in cash_gate_counterfactual_returns))
+    cash_gate_entries = int(sum(
+        row.get('previous_asset') == 'CASH' and row.get('selected_asset') != 'CASH'
+        and (row.get('strategy_opportunity_cash_gate_enabled') is True or row.get('strategy_absolute_utility_cash_gate_enabled') is True)
+        for row in prediction_rows
+    ))
+    cash_gate_exits = int(sum(
+        row.get('previous_asset') != 'CASH' and row.get('selected_asset') == 'CASH'
+        and (row.get('strategy_opportunity_cash_gate_enabled') is True or row.get('strategy_absolute_utility_cash_gate_enabled') is True)
+        and row.get('decision_reason') in {'OPPORTUNITY_CASH_GATE_REJECT', 'ABSOLUTE_UTILITY_CASH_GATE_REJECT'}
+        for row in prediction_rows
+    ))
+    absolute_utility_rows = [
+        row for row in prediction_rows
+        if row.get('absolute_utility_best_score') is not None
+    ]
+    absolute_utility_accepted_count = int(sum(row.get('absolute_utility_accepted') is True for row in absolute_utility_rows))
+    absolute_utility_rejected_count = int(sum(row.get('absolute_utility_accepted') is False for row in absolute_utility_rows))
     completed_sells = trades.loc[trades['action'].isin(['SELL', 'FINAL_SELL'])] if not trades.empty else pd.DataFrame()
     avg_holding = float(pd.to_numeric(completed_sells['holding_bars']).mean()) if not completed_sells.empty else float('nan')
     days = max(1, (pd.Timestamp(execution_dates[-1]) - pd.Timestamp(execution_dates[0])).days)
@@ -1836,7 +2375,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     candidate_assets = [symbol for symbol in getattr(config, 'research_candidate_assets', []) if symbol in symbols and symbol not in reference_set]
     if not getattr(config, 'research_candidate_assets', None):
         candidate_assets = [symbol for symbol in symbols if symbol not in reference_set]
-    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
+    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_cash_gate_enabled': bool(opportunity_cash_gate_enabled(config)), 'absolute_utility_cash_gate_enabled': bool(absolute_utility_cash_gate_enabled(config)), 'absolute_utility_entry_threshold': (float(config.opportunity_utility_entry_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_exit_threshold': (float(config.opportunity_utility_exit_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_gate_decisions': int(len(absolute_utility_rows)), 'absolute_utility_gate_accepted': absolute_utility_accepted_count, 'absolute_utility_gate_rejected': absolute_utility_rejected_count, 'absolute_utility_gate_acceptance_rate': (float(absolute_utility_accepted_count / len(absolute_utility_rows)) if absolute_utility_rows else None), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'opportunity_entry_threshold_mean': float(np.mean(opportunity_entry_thresholds)) if opportunity_entry_thresholds else None, 'opportunity_exit_threshold_mean': float(np.mean(opportunity_exit_thresholds)) if opportunity_exit_thresholds else None, 'opportunity_gate_adaptive_refreshes': opportunity_adaptive_refreshes, 'opportunity_gate_regularized_sessions': opportunity_regularized_sessions, 'opportunity_target_horizon_sessions': int(round(float(np.mean(opportunity_target_horizons)))) if opportunity_target_horizons else None, 'cash_gate_changed_base_action_sessions': int(len(cash_gate_rows)), 'cash_gate_entries': cash_gate_entries, 'cash_gate_exits': cash_gate_exits, 'cash_gate_counterfactual_negative_sessions': int(sum(value < 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_counterfactual_positive_sessions': int(sum(value > 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_avoided_loss_return_sum': cash_gate_avoided_loss_sum, 'cash_gate_missed_gain_return_sum': cash_gate_missed_gain_sum, 'cash_gate_net_avoided_return_sum': float(cash_gate_avoided_loss_sum - cash_gate_missed_gain_sum), 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
     summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
@@ -2068,6 +2607,9 @@ def _run_xgboost_rotation_models(
         seed = int(config.random_state) + repetition * seed_step
         rep_config = config.model_copy(update={'random_state': seed})
         policies: dict[int, Callable] = {}
+        risk_overlay_state = {"position": 0, "holding_days": 0}
+        cash_gate_base_state: dict[str, Any] = {"position": 0, "holding_days": 0, "pending_sample": None}
+        cash_gate_oos_history: list[dict[str, Any]] = []
         decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
         fallback_reasons: list[str] = []
@@ -2174,7 +2716,9 @@ def _run_xgboost_rotation_models(
                 if fallback_reason:
                     fallback_reasons.append(fallback_reason)
             opportunity_gate = None
-            if selective_opportunity_enabled(rep_config):
+            expected_return_calibrator = None
+            label_horizon = max(int(item) for item in rep_config.rotation_target_horizons)
+            if selective_opportunity_enabled(rep_config) and not opportunity_cash_gate_enabled(rep_config):
                 opportunity_gate = fit_selective_opportunity_gate(
                     calibration_models,
                     frames,
@@ -2182,7 +2726,17 @@ def _run_xgboost_rotation_models(
                     calibration_dates,
                     lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
                     random_state=int(rep_config.random_state),
-                    label_horizon=max(int(item) for item in rep_config.rotation_target_horizons),
+                    label_horizon=label_horizon,
+                    hysteresis=False,
+                )
+            if portfolio_allocation_enabled(rep_config):
+                expected_return_calibrator = fit_expected_return_calibrator(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    label_horizon=label_horizon,
                 )
 
             report(
@@ -2275,13 +2829,57 @@ def _run_xgboost_rotation_models(
                 float(rep_config.rotation_switch_margin),
                 float(best_candidate),
             )
-            if optimized_allocation_enabled(rep_config):
+            if opportunity_cash_gate_enabled(rep_config):
+                if hasattr(rep_config, 'model_copy'):
+                    gate_base_config = rep_config.model_copy(update={'strategy_mode': LEGACY_ROTATION_MODE})
+                else:
+                    gate_base_config = copy(rep_config)
+                    setattr(gate_base_config, 'strategy_mode', LEGACY_ROTATION_MODE)
+                calibration_base_policy = _xgb_policy(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    gate_base_config,
+                    effective_margin,
+                    calibrated_switch_margin=float(best_candidate),
+                )
+                initial_gate_samples = build_base_policy_opportunity_samples(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    calibration_base_policy,
+                    lambda now, nxt, from_pos, to_pos: _cash_gate_action_log_return(
+                        frames, symbols, now, nxt, from_pos, to_pos, rep_config
+                    ),
+                )
+                opportunity_gate = fit_adaptive_opportunity_cash_gate(
+                    initial_gate_samples,
+                    random_state=int(rep_config.random_state),
+                    shared_history=cash_gate_oos_history,
+                    fold_id=fold_id,
+                )
+            if compound_risk_overlay_enabled(rep_config):
+                policies[fold_id] = _compound_risk_overlay_policy(
+                    final_models,
+                    frames,
+                    symbols,
+                    rep_config,
+                    effective_margin,
+                    decision_diagnostics=decision_diagnostics,
+                    fold_id=fold_id,
+                    calibrated_switch_margin=float(best_candidate),
+                    state=risk_overlay_state,
+                )
+            elif portfolio_allocation_enabled(rep_config):
                 policies[fold_id] = _optimized_policy(
                     final_models,
                     frames,
                     symbols,
                     rep_config,
                     opportunity_gate=opportunity_gate,
+                    expected_return_calibrator=expected_return_calibrator,
                     decision_diagnostics=decision_diagnostics,
                     fold_id=fold_id,
                 )
@@ -2294,6 +2892,7 @@ def _run_xgboost_rotation_models(
                     effective_margin,
                     cash_edge_models=final_cash_edge_models,
                     opportunity_gate=opportunity_gate,
+                    cash_gate_base_state=cash_gate_base_state if (opportunity_cash_gate_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)) else None,
                     decision_diagnostics=decision_diagnostics,
                     fold_id=fold_id,
                     calibrated_switch_margin=float(best_candidate),
@@ -2307,12 +2906,34 @@ def _run_xgboost_rotation_models(
             if opportunity_gate is not None:
                 margin_detail.update({
                     'opportunity_threshold': float(opportunity_gate.threshold),
+                    'opportunity_entry_threshold': (float(opportunity_gate.entry_threshold) if opportunity_gate.entry_threshold is not None else None),
+                    'opportunity_exit_threshold': (float(opportunity_gate.exit_threshold) if opportunity_gate.exit_threshold is not None else None),
                     'opportunity_training_rows': int(opportunity_gate.training_rows),
                     'opportunity_positive_rate': float(opportunity_gate.positive_rate),
                     'opportunity_threshold_validation_rows': int(opportunity_gate.threshold_validation_rows),
                     'opportunity_threshold_validation_score': float(opportunity_gate.threshold_validation_score),
                     'opportunity_threshold_validation_accepted': int(opportunity_gate.threshold_validation_accepted),
+                    'opportunity_threshold_validation_transitions': int(opportunity_gate.threshold_validation_transitions),
                     'opportunity_calibration_method': str(opportunity_gate.calibration_method),
+                    'opportunity_threshold_basis': str(opportunity_gate.threshold_basis),
+                    'opportunity_target_basis': str(getattr(opportunity_gate, 'target_basis', 'weighted_forward_net_log_return')),
+                    'opportunity_target_horizon_sessions': getattr(opportunity_gate, 'target_horizon_sessions', None),
+                    'opportunity_regularized_to_base_policy': bool(getattr(opportunity_gate, 'regularized_to_base_policy', False)),
+                    'opportunity_threshold_validation_alpha': getattr(opportunity_gate, 'threshold_validation_alpha', None),
+                    'opportunity_threshold_validation_exposure_ratio': getattr(opportunity_gate, 'threshold_validation_exposure_ratio', None),
+                    'opportunity_refresh_interval_sessions': (int(opportunity_gate.refresh_interval) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else None),
+                    'opportunity_rolling_sample_window': (int(opportunity_gate.rolling_window) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else None),
+                })
+            if expected_return_calibrator is not None:
+                margin_detail.update({
+                    'allocation_relative_alpha_calibration_method': str(expected_return_calibrator.method),
+                    'allocation_relative_alpha_calibration_rows': int(expected_return_calibrator.sample_count),
+                    'allocation_relative_alpha_mean': float(expected_return_calibrator.realized_alpha_mean),
+                    'allocation_relative_alpha_std': float(expected_return_calibrator.realized_alpha_std),
+                    'allocation_expected_return_calibration_method': str(expected_return_calibrator.method),
+                    'allocation_expected_return_calibration_rows': int(expected_return_calibrator.sample_count),
+                    'allocation_expected_return_mean': float(expected_return_calibrator.realized_return_mean),
+                    'allocation_expected_return_std': float(expected_return_calibrator.realized_return_std),
                 })
             margin_details.append(margin_detail)
             report(
@@ -2355,7 +2976,7 @@ def _run_xgboost_rotation_models(
             f'event=simulation_start run={run_index}/{repetitions} '
             f'decision_sessions={max(0, len(all_decision_dates) - 1)}'
         )
-        if optimized_allocation_enabled(rep_config):
+        if allocation_execution_enabled(rep_config):
             scheduled = _scheduled_allocation_policy(policies, decision_to_fold)
             result = _simulate_optimized_allocation(
                 'xgboost_utility',
@@ -2431,7 +3052,16 @@ def _run_xgboost_rotation_models(
             'deterministic_execution': bool(rep_config.deterministic_execution),
             'numeric_thread_limit': int(rep_config.numeric_thread_limit),
             'xgb_n_jobs': int(rep_config.xgb_n_jobs),
-            'decision_diagnostics_schema_version': 6 if optimized_allocation_enabled(rep_config) else (5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2)),
+            'decision_diagnostics_schema_version': (
+                11 if compound_risk_overlay_enabled(rep_config)
+                else 10 if concentrated_allocation_enabled(rep_config)
+                else 9 if portfolio_allocation_enabled(rep_config)
+                else 8 if absolute_utility_cash_gate_enabled(rep_config)
+                else 7 if opportunity_cash_gate_enabled(rep_config)
+                else 5 if selective_opportunity_enabled(rep_config)
+                else 3 if _risk_off_enabled(rep_config)
+                else 2
+            ),
             'position_risk_diagnostics_schema_version': 1,
             'market_regime_diagnostics_schema_version': 1,
             'decision_diagnostics_rows': int(len(decision_diagnostics)),

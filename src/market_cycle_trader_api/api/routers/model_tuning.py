@@ -18,6 +18,7 @@ from ...services.model_tuning import (
     get_model_tuning_campaign_log,
     get_model_tuning_run,
     list_model_tuning_baselines,
+    list_model_tuning_history,
     list_model_tuning_sources,
     request_model_tuning_stop,
     start_model_tuning,
@@ -37,7 +38,7 @@ def _translate_error(exc: Exception) -> HTTPException:
 
 @router.get("/catalog")
 def get_tuning_catalog() -> dict[str, Any]:
-    return tuning_catalog()
+    return tuning_catalog(database())
 
 
 
@@ -55,6 +56,15 @@ def get_tuning_baselines(limit: int = 20) -> dict[str, Any]:
         raise _translate_error(exc) from exc
 
 
+
+
+@router.get("/history")
+def get_tuning_history(limit: int = 100) -> dict[str, Any]:
+    try:
+        items = list_model_tuning_history(database(), limit=limit)
+        return {"items": items, "count": len(items)}
+    except (ModelTuningConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
 
 
 @router.get("/sources")
@@ -76,6 +86,7 @@ def create_tuning(
             database(),
             method=payload.method,
             candidate_count=payload.candidate_count,
+            caro_candidate_count=payload.caro_candidate_count,
             seed=payload.seed,
             baseline_job_id=payload.baseline_job_id,
             source_tuning_run_id=payload.source_tuning_run_id,
@@ -129,7 +140,10 @@ def stop_tuning(run_id: str) -> dict[str, Any]:
 
 
 @router.get("/{run_id}/export.zip")
-def export_tuning(run_id: str) -> Response:
+def export_tuning(
+    run_id: str,
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> Response:
     try:
         content = build_model_tuning_export(database(), run_id)
     except ModelTuningNotFound as exc:

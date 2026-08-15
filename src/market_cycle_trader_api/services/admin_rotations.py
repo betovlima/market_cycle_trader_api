@@ -115,6 +115,9 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
             "job_id": job_id,
             "summary": {
                 "total_rotations": 0,
+                "asset_to_asset_rotations": 0,
+                "market_to_cash_moves": 0,
+                "cash_to_market_moves": 0,
                 "profitable_rotations": 0,
                 "losing_rotations": 0,
                 "flat_rotations": 0,
@@ -145,6 +148,7 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
                 "sequence": 1,
                 "action": 1,
                 "asset": 1,
+                "reason": 1,
                 "rotation_id": 1,
                 "rotation_from_asset": 1,
                 "rotation_to_asset": 1,
@@ -177,6 +181,28 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in trade_rows:
         rotation_id = str(row.get("rotation_id") or "").strip()
+        if not rotation_id:
+            # Backward-compatible reconstruction for historical jobs created
+            # before CASH transitions received an explicit rotation_id.
+            action = str(row.get("action") or "").upper()
+            timestamp = _as_utc(row.get("timestamp"))
+            asset = str(row.get("asset") or "").strip()
+            if timestamp is not None and asset and action == "SELL":
+                rotation_id = f"{timestamp.isoformat()}::{asset}->CASH"
+                row = {
+                    **row,
+                    "rotation_id": rotation_id,
+                    "rotation_from_asset": asset,
+                    "rotation_to_asset": "CASH",
+                }
+            elif timestamp is not None and asset and action == "BUY":
+                rotation_id = f"{timestamp.isoformat()}::CASH->{asset}"
+                row = {
+                    **row,
+                    "rotation_id": rotation_id,
+                    "rotation_from_asset": "CASH",
+                    "rotation_to_asset": asset,
+                }
         if rotation_id:
             grouped.setdefault(rotation_id, []).append(row)
 
@@ -186,6 +212,19 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
         if (item := _rotation_row(rows)) is not None
     ]
     rotations.sort(key=lambda item: str(item.get("executed_at") or ""))
+
+    asset_to_asset_rotations = sum(
+        item.get("from_asset") != "CASH" and item.get("to_asset") != "CASH"
+        for item in rotations
+    )
+    market_to_cash_moves = sum(
+        item.get("from_asset") != "CASH" and item.get("to_asset") == "CASH"
+        for item in rotations
+    )
+    cash_to_market_moves = sum(
+        item.get("from_asset") == "CASH" and item.get("to_asset") != "CASH"
+        for item in rotations
+    )
 
     realized = [
         value
@@ -232,6 +271,9 @@ def admin_job_rotations(db: Any, job_id: str) -> dict[str, Any]:
         "job_id": job_id,
         "summary": {
             "total_rotations": len(rotations),
+            "asset_to_asset_rotations": int(asset_to_asset_rotations),
+            "market_to_cash_moves": int(market_to_cash_moves),
+            "cash_to_market_moves": int(cash_to_market_moves),
             "profitable_rotations": sum(value > 0 for value in realized),
             "losing_rotations": sum(value < 0 for value in realized),
             "flat_rotations": sum(value == 0 for value in realized),

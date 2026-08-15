@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+
+import pytest
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ from market_cycle_trader_api.services.strategy_configuration import (
 )
 from market_cycle_trader_api.services.strategy_lab import (
     create_strategy,
+    delete_strategy,
     ensure_strategy_catalog,
     get_research_reference_context,
     get_research_strategy_context,
@@ -33,6 +36,7 @@ from market_cycle_trader_api.services.strategy_lab import (
     select_research_strategy,
     update_strategy,
     update_strategy_model,
+    StrategyLabConflict,
 )
 
 
@@ -1373,3 +1377,144 @@ def test_failed_backtest_keeps_tuning_strategy_in_backtest_status() -> None:
     assert stored["status"] == "backtest"
     assert stored["last_backtest_status"] == "failed"
     assert stored["auto_candidate_after_backtest"] is True
+
+
+def test_delete_historical_promoted_strategy_clears_non_protected_control_roles() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    created = create_strategy(
+        db,
+        name="Disposable promoted history",
+        description="Historical strategy that is no longer protected.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    strategy_id = created["id"]
+    profile = db[STRATEGY_PROFILES_COLLECTION].documents[strategy_id]
+    profile.update(
+        {
+            "status": "promoted_candidate",
+            "locked": True,
+            "last_promoted_winner_strategy_id": "historical-winner",
+        }
+    )
+    control = db[STRATEGY_CONTROL_COLLECTION].documents["default"]
+    control.update(
+        {
+            "research_strategy_id": strategy_id,
+            "research_reference_strategy_id": strategy_id,
+            "research_reference_configuration_hash": profile["configuration_hash"],
+            "research_reference_assets": list(profile["configuration"]["assets"]),
+            "promoted_candidate_strategy_id": strategy_id,
+        }
+    )
+
+    result = delete_strategy(
+        db,
+        strategy_id,
+        note="Delete historical promoted strategy.",
+        actor_email="admin@example.com",
+    )
+
+    assert result["status"] == "deleted"
+    assert set(result["cleared_control_roles"]) == {
+        "backtest_selection",
+        "research_reference",
+        "promoted_candidate",
+    }
+    assert db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id}) is None
+    updated_control = db[STRATEGY_CONTROL_COLLECTION].documents["default"]
+    assert updated_control["research_strategy_id"] == "winner-v1-13-2"
+    assert updated_control["research_reference_strategy_id"] == "winner-v1-13-2"
+    assert updated_control["promoted_candidate_strategy_id"] is None
+    catalog = list_strategies(db)
+    assert catalog["control"]["research_strategy_id"] == "winner-v1-13-2"
+    assert catalog["control"]["research_reference_strategy_id"] == "winner-v1-13-2"
+    assert catalog["control"]["promoted_candidate_strategy_id"] is None
+
+
+def test_delete_former_winner_is_allowed_even_when_locked() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    created = create_strategy(
+        db,
+        name="Former winner history",
+        description="Disposable historical winner.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    strategy_id = created["id"]
+    db[STRATEGY_PROFILES_COLLECTION].documents[strategy_id].update(
+        {"status": "former_winner", "locked": True, "winner_sequence": 1}
+    )
+
+    result = delete_strategy(
+        db,
+        strategy_id,
+        note="Remove former winner history.",
+        actor_email="admin@example.com",
+    )
+
+    assert result["status"] == "deleted"
+    assert db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id}) is None
+
+
+def test_delete_current_winner_and_current_candidate_remains_blocked() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+
+    with pytest.raises(StrategyLabConflict, match="current Trader winner"):
+        delete_strategy(
+            db,
+            "winner-v1-13-2",
+            note="Should not delete current winner.",
+            actor_email="admin@example.com",
+        )
+
+    created = create_strategy(
+        db,
+        name="Active candidate",
+        description="Current candidate must remain protected.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    strategy_id = created["id"]
+    db[STRATEGY_PROFILES_COLLECTION].documents[strategy_id].update(
+        {"status": "candidate", "locked": False}
+    )
+    db[STRATEGY_CONTROL_COLLECTION].documents["default"]["candidate_strategy_id"] = strategy_id
+
+    with pytest.raises(StrategyLabConflict, match="current Candidate"):
+        delete_strategy(
+            db,
+            strategy_id,
+            note="Should not delete current candidate.",
+            actor_email="admin@example.com",
+        )
+
+
+def test_delete_strategy_used_by_active_backtest_keeps_runtime_safety() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    created = create_strategy(
+        db,
+        name="Running backtest strategy",
+        description="Runtime safety test.",
+        clone_from_strategy_id="winner-v1-13-2",
+        actor_email="admin@example.com",
+    )
+    strategy_id = created["id"]
+    db[JOBS_COLLECTION].documents["job-running"] = {
+        "_id": "job-running",
+        "id": "job-running",
+        "status": "running",
+        "strategy_profile_id": strategy_id,
+    }
+
+    with pytest.raises(StrategyLabConflict, match="job-running"):
+        delete_strategy(
+            db,
+            strategy_id,
+            note="Wait for runtime safety.",
+            actor_email="admin@example.com",
+        )

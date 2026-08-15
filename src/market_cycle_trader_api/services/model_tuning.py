@@ -38,7 +38,11 @@ from .model_tuning_probability import (
     evolve_probability_search,
     initial_probability_state,
     propose_champion_probability_candidate,
+    propose_unified_space_filling_candidate,
+    unified_caro_next_mode,
 )
+from .model_tuning_space import normalize_tuning_values as _normalize_tuning_values, settings_from_unit_point
+from .model_tuning_ranking import candidate_economic_sort_key
 from .model_tuning_market_snapshot import (
     TuningMarketSnapshotMismatch,
     freeze_tuning_market_snapshot,
@@ -46,6 +50,7 @@ from .model_tuning_market_snapshot import (
     require_tuning_market_snapshot,
 )
 from .serialization import downsample_documents, iso_value
+from ..schemas.requests import BacktestRequest
 from .strategy_lab import (
     create_strategy,
     get_strategy,
@@ -53,13 +58,17 @@ from .strategy_lab import (
     get_strategy_model_snapshot,
     prepare_strategy_for_backtest_candidate,
     select_research_strategy,
+    update_strategy,
     update_strategy_model,
+    _configuration_hash as _strategy_configuration_hash,
 )
 
 TUNING_METHOD = "latin_hypercube"
 PROBABILITY_METHOD = "champion_probability"
+PIPELINE_METHOD = "latin_hypercube_then_caro"
+_ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 5
+TUNING_SCHEMA_VERSION = 11
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
@@ -76,6 +85,19 @@ _SEARCH_SPACE: tuple[dict[str, Any], ...] = (
     {"name": "reg_lambda", "type": "number", "min": 1.0, "max": 4.0, "precision": 6},
 )
 _TUNED_NAMES = tuple(item["name"] for item in _SEARCH_SPACE)
+MODEL_PARAMETER_TUNING_SCOPE = "model_parameters"
+LEGACY_ABSOLUTE_UTILITY_TUNING_SCOPE = "absolute_utility_cash_gate"
+ABSOLUTE_UTILITY_TUNING_SCOPE = "joint_model_absolute_utility_cash_gate"
+ABSOLUTE_UTILITY_STRATEGY_MODE = "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE"
+_ABSOLUTE_UTILITY_STRATEGY_PARAMETER_NAMES = (
+    "opportunity_utility_entry_threshold",
+    "opportunity_utility_exit_threshold",
+)
+_ABSOLUTE_UTILITY_SEARCH_SPACE: tuple[dict[str, Any], ...] = (
+    *_SEARCH_SPACE,
+    {"name": "opportunity_utility_entry_threshold", "type": "number", "min": 0.22, "max": 0.38, "precision": 6},
+    {"name": "opportunity_utility_exit_threshold", "type": "number", "min": 0.20, "max": 0.36, "precision": 6},
+)
 _ACTIVE_STATUSES = ("queued", "running", "stop_requested")
 _TUNING_LOG_MAX_EVENTS = 250
 _TUNING_CANDIDATE_LOG_MAX_LINES = 400
@@ -319,50 +341,133 @@ def get_model_tuning_candidate_log(db: Any, run_id: str, candidate_id: int) -> d
     return payload
 
 
-def tuning_catalog() -> dict[str, Any]:
+def _tuning_plan(strategy: dict[str, Any], model_snapshot: dict[str, Any]) -> dict[str, Any]:
+    configuration = strategy.get("configuration") if isinstance(strategy.get("configuration"), dict) else {}
+    mode = str(configuration.get("strategy_mode") or "")
+    frozen_model_values = model_values_from_snapshot(model_snapshot)
+    if mode == ABSOLUTE_UTILITY_STRATEGY_MODE:
+        search_space = [dict(item) for item in _ABSOLUTE_UTILITY_SEARCH_SPACE]
+        base_values = deepcopy(frozen_model_values)
+        base_values.update({
+            "opportunity_utility_entry_threshold": float(configuration.get("opportunity_utility_entry_threshold", 0.28)),
+            "opportunity_utility_exit_threshold": float(configuration.get("opportunity_utility_exit_threshold", 0.27)),
+        })
+        return {
+            "scope": ABSOLUTE_UTILITY_TUNING_SCOPE,
+            "scope_label": "Joint LightGBM + Absolute Utility Cash Gate",
+            "description": "Jointly tune the LightGBM ranking hyperparameters and MARKET/CASH hysteresis thresholds from the active Candidate Backtest, under one frozen validation and market-data protocol.",
+            "search_space": search_space,
+            "tuned_parameters": [item["name"] for item in search_space],
+            "tuned_model_parameters": list(_TUNED_NAMES),
+            "tuned_strategy_parameters": list(_ABSOLUTE_UTILITY_STRATEGY_PARAMETER_NAMES),
+            "base_values": _normalize_tuning_values(base_values, search_space),
+            "base_model_values": frozen_model_values,
+            "frozen_model_values": frozen_model_values,
+            "fixed_model_values": {
+                name: value for name, value in frozen_model_values.items() if name not in _TUNED_NAMES
+            },
+            "strategy_mode": mode,
+        }
+    search_space = [dict(item) for item in _SEARCH_SPACE]
+    return {
+        "scope": MODEL_PARAMETER_TUNING_SCOPE,
+        "scope_label": "LightGBM model parameters",
+        "description": "Tune the saved LightGBM model hyperparameters under the frozen Strategy and market-data protocol.",
+        "search_space": search_space,
+        "tuned_parameters": [item["name"] for item in search_space],
+        "tuned_model_parameters": [item["name"] for item in search_space],
+        "tuned_strategy_parameters": [],
+        "base_values": frozen_model_values,
+        "base_model_values": frozen_model_values,
+        "frozen_model_values": frozen_model_values,
+        "fixed_model_values": {
+            name: value for name, value in frozen_model_values.items() if name not in _TUNED_NAMES
+        },
+        "strategy_mode": mode,
+    }
+
+
+def _current_tuning_plan(db: Any | None) -> dict[str, Any] | None:
+    if db is None:
+        return None
+    try:
+        strategy, model_snapshot, _ = _tuning_target_strategy(db)
+        return _tuning_plan(strategy, model_snapshot)
+    except Exception:
+        return None
+
+
+def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
+    plan = _current_tuning_plan(db)
+    search_space = list((plan or {}).get("search_space") or [dict(item) for item in _SEARCH_SPACE])
+    scope = str((plan or {}).get("scope") or MODEL_PARAMETER_TUNING_SCOPE)
+    scope_label = str((plan or {}).get("scope_label") or "LightGBM model parameters")
+    scope_description = str((plan or {}).get("description") or "Tune the saved LightGBM model hyperparameters under the frozen Strategy and market-data protocol.")
+    default_startup_trials = max(4, min(24, len(search_space) + 2))
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
         "method": PROBABILITY_METHOD,
         "methods": [
             {
-                "id": TUNING_METHOD,
-                "label": "Latin Hypercube — exploration only",
-                "description": "Static space-filling design for diagnostics and sensitivity analysis. It does not learn from previous candidate results.",
+                "id": PROBABILITY_METHOD,
+                "label": "Unified Adaptive CARO — recommended",
+                "description": "One sequential research engine that automatically alternates Latin-Hypercube space filling, global exploration and Champion-focused probabilistic refinement. There is no fixed Hypercube → CARO boundary.",
             },
             {
-                "id": PROBABILITY_METHOD,
-                "label": "Adaptive CARO — recommended",
-                "description": "Fresh Control + small Latin Hypercube warm-up + sequential Champion-anchored probabilistic optimization. Every adaptive candidate is proposed only after learning from all completed observations.",
+                "id": TUNING_METHOD,
+                "label": "Latin Hypercube — diagnostics only",
+                "description": "Static space-filling design retained for sensitivity analysis and diagnostics. It does not learn from candidate outcomes and is not required before Unified CARO.",
             },
         ],
         "recommended_method": PROBABILITY_METHOD,
         "model_family": TUNING_MODEL_FAMILY,
         "model_label": "LightGBM Utility",
+        "tuning_scope": scope,
+        "tuning_scope_label": scope_label,
+        "tuning_scope_description": scope_description,
+        "baseline_policy": "active_candidate_certified_backtest",
+        "joint_optimization": scope == ABSOLUTE_UTILITY_TUNING_SCOPE,
         "default_candidate_count": DEFAULT_CANDIDATE_COUNT,
         "candidate_count_min": 4,
         "candidate_count_max": 60,
         "default_seed": DEFAULT_SEED,
         "control_candidate_included": True,
-        "control_execution_mode": "fresh_rerun",
+        "control_execution_mode": "reuse_certified_candidate_backtest",
         "baseline_execution_required": True,
         "campaign_export_available": True,
         "validation": "chronological_walk_forward",
-        "selection_metric": "risk_adjusted_compound_score",
+        "selection_metric": "champion_gate_then_realized_economic_quality",
+        "legacy_compound_score_role": "diagnostic_tiebreaker",
         "eligibility_gate": "all_walk_forward_folds_positive",
-        "search_space": [dict(item) for item in _SEARCH_SPACE],
+        "search_space": search_space,
+        "tuned_parameters": list((plan or {}).get("tuned_parameters") or [item["name"] for item in search_space]),
+        "tuned_model_parameters": list((plan or {}).get("tuned_model_parameters") or [item["name"] for item in search_space]),
+        "tuned_strategy_parameters": list((plan or {}).get("tuned_strategy_parameters") or []),
         "raw_artifacts": "summary_only",
         "adoption_requires_final_backtest": False,
         "dedicated_worker": False,
         "execution_mode": "integrated_api_worker",
         "market_data_access": "database_only",
         "prior_campaign_reuse": True,
+        "automatic_compatible_prior_observation_reuse": True,
+        "automatic_lhs_to_caro_handoff": False,
+        "unified_caro": True,
+        "dynamic_exploration": True,
+        "legacy_pipeline_supported": True,
         "reproducibility_guard": "frozen_execution_snapshot_and_market_data_signature",
         "restart_recovery": "invalidate_unfinished_campaign_after_restart",
         "probability": {
-            "label": "Adaptive CARO",
+            "label": "Unified Adaptive CARO",
             "probability_model": PROBABILITY_MODEL,
-            "default_startup_trials": 6,
-            "search_policy": "small_lhs_warmup_then_sequential_adaptive_trust_region",
+            "default_minimum_exploration_trials": default_startup_trials,
+            "default_startup_trials": default_startup_trials,
+            "search_policy": "dynamic_space_filling_plus_sequential_adaptive_trust_region",
+            "exploration_strategy": "automatic",
+            "space_filling_sampler": "latin_hypercube_maximin",
+            "global_exploration_never_zero": True,
+            "default_initial_exploration_fraction": 0.45,
+            "default_minimum_exploration_fraction": 0.20,
+            "default_stagnation_recovery_trials": 4,
             "champion_policy": "promote_only_after_observed_champion_gate_pass",
             "default_min_capital_improvement": 0.03,
             "default_sharpe_tolerance": 0.05,
@@ -380,51 +485,38 @@ def _settings_hash(values: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _sample_value(spec: dict[str, Any], unit_value: float) -> Any:
-    low = float(spec["min"])
-    high = float(spec["max"])
-    value = low + float(unit_value) * (high - low)
-    if spec["type"] == "integer":
-        return int(round(value))
-    return round(value, int(spec.get("precision") or 8))
-
-
 def generate_latin_hypercube_candidates(
     base_values: dict[str, Any],
     *,
     candidate_count: int = DEFAULT_CANDIDATE_COUNT,
     seed: int = DEFAULT_SEED,
+    search_space: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> list[dict[str, Any]]:
-    
     if candidate_count < 1:
         raise ValueError("candidate_count must be positive.")
     if not base_values:
-        raise ValueError("A LightGBM Strategy model snapshot is required.")
-
+        raise ValueError("A tuning baseline parameter snapshot is required.")
+    active_space = [dict(item) for item in (search_space or _SEARCH_SPACE)]
+    if not active_space:
+        raise ValueError("A non-empty tuning search space is required.")
+    control_values = _normalize_tuning_values(base_values, active_space)
     candidates: list[dict[str, Any]] = [
         {
             "candidate_id": 0,
             "kind": "control",
             "is_control": True,
-            "settings": deepcopy(base_values),
-            "settings_hash": _settings_hash(base_values),
+            "settings": deepcopy(control_values),
+            "settings_hash": _settings_hash(control_values),
             "status": "pending",
         }
     ]
     seen = {candidates[0]["settings_hash"]}
+
     def add_points(points: Any) -> None:
         for point in points:
             if len(candidates) >= candidate_count + 1:
                 return
-            values = deepcopy(base_values)
-            for spec, unit_value in zip(_SEARCH_SPACE, point, strict=True):
-                values[spec["name"]] = _sample_value(spec, float(unit_value))
-
-            depth = int(values["max_depth"])
-            if depth > 0:
-                values["num_leaves"] = min(int(values["num_leaves"]), 2 ** depth)
-            values["num_leaves"] = max(2, int(values["num_leaves"]))
-
+            values = settings_from_unit_point(control_values, active_space, point)
             fingerprint = _settings_hash(values)
             if fingerprint in seen:
                 continue
@@ -440,18 +532,12 @@ def generate_latin_hypercube_candidates(
                 }
             )
 
-    
-    
-    add_points(qmc.LatinHypercube(d=len(_SEARCH_SPACE), seed=seed).random(n=candidate_count))
-
-    
-    
-    
+    add_points(qmc.LatinHypercube(d=len(active_space), seed=seed).random(n=candidate_count))
     attempt = 1
-    while len(candidates) < candidate_count + 1 and attempt <= 8:
+    while len(candidates) < candidate_count + 1 and attempt <= 12:
         missing = candidate_count + 1 - len(candidates)
-        auxiliary = qmc.LatinHypercube(d=len(_SEARCH_SPACE), seed=seed + attempt)
-        add_points(auxiliary.random(n=max(4, missing)))
+        auxiliary = qmc.LatinHypercube(d=len(active_space), seed=seed + attempt)
+        add_points(auxiliary.random(n=max(8, missing * 2)))
         attempt += 1
 
     if len(candidates) != candidate_count + 1:
@@ -500,6 +586,22 @@ def _metric_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "turnover_ratio": float(metrics.get("turnover_ratio") or 0.0),
         "capital_rotations": int(metrics.get("capital_rotations") or 0),
         "average_holding_days": float(metrics.get("average_holding_days") or 0.0),
+        "market_exposure": float(metrics.get("market_exposure") or 0.0),
+        "cash_days": int(metrics.get("cash_days") or 0),
+        "absolute_utility_entry_threshold": (
+            float(metrics.get("absolute_utility_entry_threshold"))
+            if metrics.get("absolute_utility_entry_threshold") is not None else None
+        ),
+        "absolute_utility_exit_threshold": (
+            float(metrics.get("absolute_utility_exit_threshold"))
+            if metrics.get("absolute_utility_exit_threshold") is not None else None
+        ),
+        "absolute_utility_gate_acceptance_rate": (
+            float(metrics.get("absolute_utility_gate_acceptance_rate"))
+            if metrics.get("absolute_utility_gate_acceptance_rate") is not None else None
+        ),
+        "cash_gate_changed_base_action_sessions": int(metrics.get("cash_gate_changed_base_action_sessions") or 0),
+        "cash_gate_net_avoided_return_sum": float(metrics.get("cash_gate_net_avoided_return_sum") or 0.0),
         "benchmark_ending_capital": float(metrics.get("buy_hold_ending_capital") or 0.0),
         "market_data_signature_sha256": metrics.get("market_data_signature_sha256"),
         "market_data_last_timestamp": market_data_last_timestamp,
@@ -587,12 +689,14 @@ def _rank_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         and isinstance(item.get("metrics"), dict)
         and bool(item["metrics"].get("eligible"))
     ]
+    # Very old campaign documents may predate the explicit `eligible` metric but
+    # already contain a persisted rank. Preserve that legacy ranking instead of
+    # erasing it when there is not enough information to recompute scientifically.
+    if not eligible and any(item.get("rank") is not None for item in result):
+        return result
+    champion_aware = any(item.get("champion_gate_passed") is not None for item in eligible)
     eligible.sort(
-        key=lambda item: (
-            float(item["metrics"].get("risk_adjusted_compound_score") or -math.inf),
-            float(item["metrics"].get("ending_capital") or -math.inf),
-            float(item["metrics"].get("sharpe") or -math.inf),
-        ),
+        key=lambda item: candidate_economic_sort_key(item, champion_aware=champion_aware),
         reverse=True,
     )
     rank_by_id = {int(item["candidate_id"]): index + 1 for index, item in enumerate(eligible)}
@@ -716,6 +820,44 @@ def _baseline_by_job_id(db: Any, job_id: str) -> dict[str, Any]:
             "The selected baseline Backtest is not compatible with the current Strategy and saved LightGBM model snapshot."
         )
     return baseline
+
+
+def _reused_baseline_control_candidate(
+    db: Any,
+    *,
+    baseline: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Materialize candidate #0 from the already-certified Candidate Backtest.
+
+    Control is a reference observation, not a new experiment. Reusing the exact
+    certified Backtest saves one complete execution while preserving the frozen
+    Strategy/model/market-data validation context used by every challenger.
+    """
+    job_id = str(baseline.get("job_id") or "").strip()
+    metrics = deepcopy(baseline.get("metrics") or {})
+    if not job_id or not metrics:
+        raise ModelTuningConflict("The certified Candidate Backtest cannot be reused as tuning Control.")
+    return {
+        "candidate_id": 0,
+        "kind": "control",
+        "is_control": True,
+        "settings": deepcopy(settings),
+        "settings_hash": _settings_hash(settings),
+        "status": "completed",
+        "rank": None,
+        "metrics": metrics,
+        "equity_preview": _candidate_equity_preview(db, job_id),
+        "job_id": job_id,
+        "source_job_id": job_id,
+        "baseline_reused": True,
+        "champion_gate_passed": None,
+        "champion_gate": None,
+        "strategy_configuration_hash": baseline.get("strategy_configuration_hash"),
+        "started_at": baseline.get("started_at"),
+        "finished_at": baseline.get("finished_at"),
+        "raw_results_retained": True,
+    }
 
 
 
@@ -865,7 +1007,14 @@ def _is_pristine_completed_latin_campaign(document: dict[str, Any]) -> bool:
 
 
 def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
-    
+    try:
+        current_strategy, current_model_snapshot, _ = _tuning_target_strategy(db)
+        current_plan = _tuning_plan(current_strategy, current_model_snapshot)
+    except Exception:
+        current_plan = None
+    expected_scope = str((current_plan or {}).get("scope") or MODEL_PARAMETER_TUNING_SCOPE)
+    expected_space = list((current_plan or {}).get("search_space") or [dict(item) for item in _SEARCH_SPACE])
+
     documents = list(
         db[MODEL_TUNING_RUNS_COLLECTION]
         .find(
@@ -891,6 +1040,8 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
                 "market_data_cutoff_date": 1,
                 "model_family": 1,
                 "model_label": 1,
+                "tuning_scope": 1,
+                "tuning_scope_label": 1,
             },
         )
         .sort("finished_at", -1)
@@ -906,7 +1057,10 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
             and isinstance(item.get("settings"), dict)
             and isinstance(item.get("metrics"), dict)
         ]
-        if len(observations) < 4 or list(document.get("search_space") or []) != [dict(item) for item in _SEARCH_SPACE]:
+        document_scope = str(document.get("tuning_scope") or MODEL_PARAMETER_TUNING_SCOPE)
+        if document_scope != expected_scope:
+            continue
+        if len(observations) < 4 or list(document.get("search_space") or []) != expected_space:
             continue
         best_id = document.get("best_candidate_id")
         best = next(
@@ -932,6 +1086,8 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
         result.append(
             bson_value({
                 "run_id": document.get("id"),
+                "tuning_scope": document_scope,
+                "tuning_scope_label": document.get("tuning_scope_label"),
                 "finished_at": document.get("finished_at"),
                 "seed": document.get("seed"),
                 "strategy_profile_id": document.get("strategy_profile_id"),
@@ -968,7 +1124,13 @@ def list_model_tuning_sources(db: Any, *, limit: int = 20) -> list[dict[str, Any
     return result
 
 
-def _source_campaign(db: Any, run_id: str) -> dict[str, Any]:
+def _source_campaign(
+    db: Any,
+    run_id: str,
+    *,
+    expected_scope: str,
+    expected_search_space: list[dict[str, Any]],
+) -> dict[str, Any]:
     document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": str(run_id)})
     if document is None:
         raise ModelTuningNotFound("Source tuning campaign not found.")
@@ -977,8 +1139,11 @@ def _source_campaign(db: Any, run_id: str) -> dict[str, Any]:
             "CARO can import observations only from a fully completed Latin Hypercube campaign "
             "with zero failed or cancelled candidates."
         )
-    if list(document.get("search_space") or []) != [dict(item) for item in _SEARCH_SPACE]:
-        raise ModelTuningConflict("The source tuning campaign uses a different LightGBM search space.")
+    source_scope = str(document.get("tuning_scope") or MODEL_PARAMETER_TUNING_SCOPE)
+    if source_scope != str(expected_scope):
+        raise ModelTuningConflict("The source tuning campaign targets a different parameter scope.")
+    if list(document.get("search_space") or []) != list(expected_search_space):
+        raise ModelTuningConflict("The source tuning campaign uses a different parameter search space.")
     return document
 
 
@@ -1003,6 +1168,93 @@ def _source_observations(document: dict[str, Any]) -> list[dict[str, Any]]:
     return observations
 
 
+def _automatic_compatible_prior_observations(
+    db: Any,
+    *,
+    strategy: dict[str, Any],
+    tuning_scope: str,
+    strategy_mode: str | None,
+    search_space: list[dict[str, Any]],
+    execution_context: dict[str, Any],
+    base_values: dict[str, Any],
+    limit: int = 160,
+) -> list[dict[str, Any]]:
+    """Reuse only scientifically identical historical tuning observations.
+
+    This automatic path is deliberately stricter than the manual source-campaign
+    workflow: same Strategy id/configuration, tuning scope/search space, frozen
+    execution context and market-data signature. It can therefore reuse a prior
+    Unified CARO/LHS campaign without silently mixing different research surfaces.
+    """
+    strategy_id = str(strategy.get("id") or "")
+    configuration_hash = str(strategy.get("configuration_hash") or "")
+    context_hash = str(execution_context.get("context_hash") or "")
+    market_signature = str(execution_context.get("market_data_signature_sha256") or "").strip().lower()
+    if not strategy_id or not configuration_hash or not context_hash or not market_signature:
+        return []
+
+    projection = {
+        "_id": 0, "id": 1, "status": 1, "method": 1, "tuning_scope": 1,
+        "strategy_mode": 1, "strategy_profile_id": 1, "strategy_configuration_hash": 1,
+        "execution_context_hash": 1, "expected_market_data_signature_sha256": 1,
+        "search_space": 1, "candidates": 1, "finished_at": 1,
+    }
+    cursor = (
+        db[MODEL_TUNING_RUNS_COLLECTION]
+        .find(
+            {
+                "status": "completed",
+                "strategy_profile_id": strategy_id,
+                "strategy_configuration_hash": configuration_hash,
+                "tuning_scope": str(tuning_scope),
+                "strategy_mode": str(strategy_mode or ""),
+                "execution_context_hash": context_hash,
+            },
+            projection,
+        )
+        .sort("finished_at", -1)
+        .limit(20)
+    )
+
+    seen = {_settings_hash(_normalize_tuning_values(base_values, search_space))}
+    imported: list[dict[str, Any]] = []
+    for campaign in cursor:
+        campaign_signature = str(campaign.get("expected_market_data_signature_sha256") or "").strip().lower()
+        if campaign_signature != market_signature:
+            continue
+        if list(campaign.get("search_space") or []) != list(search_space):
+            continue
+        campaign_id = str(campaign.get("id") or "")
+        for item in campaign.get("candidates") or []:
+            if len(imported) >= max(0, int(limit)):
+                break
+            if bool(item.get("is_control")) or item.get("status") != "completed":
+                continue
+            if not isinstance(item.get("settings"), dict) or not isinstance(item.get("metrics"), dict):
+                continue
+            fingerprint = str(item.get("settings_hash") or "") or _settings_hash(dict(item["settings"]))
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            imported.append({
+                "candidate_id": -len(imported) - 1,
+                "source_candidate_id": int(item.get("candidate_id") or 0),
+                "source_tuning_run_id": campaign_id,
+                "source": "automatic_compatible_prior_campaign",
+                "kind": str(item.get("kind") or "historical_observation"),
+                "is_control": False,
+                "settings": deepcopy(item.get("settings") or {}),
+                "settings_hash": fingerprint,
+                "status": "completed",
+                "metrics": deepcopy(item.get("metrics") or {}),
+                "champion_gate_passed": item.get("champion_gate_passed"),
+                "champion_gate": deepcopy(item.get("champion_gate") or None),
+            })
+        if len(imported) >= max(0, int(limit)):
+            break
+    return imported
+
+
 def _source_anchor(document: dict[str, Any], anchor_candidate_id: int | None) -> dict[str, Any]:
     candidate_id = int(anchor_candidate_id) if anchor_candidate_id is not None else int(document.get("best_candidate_id") or -1)
     candidate = next(
@@ -1020,12 +1272,13 @@ def _candidate_export_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     tuned_parameters = list(document.get("tuned_parameters") or _TUNED_NAMES)
     all_setting_names = list(tuned_parameters)
-    for candidate in document.get("candidates") or []:
+    ranked_candidates = _rank_candidates(list(document.get("candidates") or []))
+    for candidate in ranked_candidates:
         settings = candidate.get("settings") if isinstance(candidate.get("settings"), dict) else {}
         for name in settings:
             if name not in all_setting_names:
                 all_setting_names.append(name)
-    for candidate in document.get("candidates") or []:
+    for candidate in ranked_candidates:
         settings = candidate.get("settings") if isinstance(candidate.get("settings"), dict) else {}
         metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
         row: dict[str, Any] = {
@@ -1038,6 +1291,7 @@ def _candidate_export_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
             "champion_gate_passed": candidate.get("champion_gate_passed"),
             "champion_gate": deepcopy(candidate.get("champion_gate") or None),
             "settings_hash": candidate.get("settings_hash"),
+            "strategy_configuration_hash": candidate.get("strategy_configuration_hash"),
             "job_id": candidate.get("job_id"),
             "worker_id": candidate.get("worker_id"),
             "worker_cpu_count": candidate.get("worker_cpu_count"),
@@ -1056,6 +1310,13 @@ def _candidate_export_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
             "turnover_ratio": metrics.get("turnover_ratio"),
             "capital_rotations": metrics.get("capital_rotations"),
             "average_holding_days": metrics.get("average_holding_days"),
+            "market_exposure": metrics.get("market_exposure"),
+            "cash_days": metrics.get("cash_days"),
+            "absolute_utility_entry_threshold": metrics.get("absolute_utility_entry_threshold"),
+            "absolute_utility_exit_threshold": metrics.get("absolute_utility_exit_threshold"),
+            "absolute_utility_gate_acceptance_rate": metrics.get("absolute_utility_gate_acceptance_rate"),
+            "cash_gate_changed_base_action_sessions": metrics.get("cash_gate_changed_base_action_sessions"),
+            "cash_gate_net_avoided_return_sum": metrics.get("cash_gate_net_avoided_return_sum"),
             "benchmark_ending_capital": metrics.get("benchmark_ending_capital"),
             "worst_fold_return": metrics.get("worst_fold_return"),
             "error": candidate.get("error"),
@@ -1110,18 +1371,27 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
     if document is None:
         raise ModelTuningNotFound("Model tuning run not found.")
 
-    candidate_rows = _candidate_export_rows(document)
+    ranked_candidate_docs = _rank_candidates(list(document.get("candidates") or []))
+    export_document = deepcopy(document)
+    export_document["candidates"] = ranked_candidate_docs
+    candidate_rows = _candidate_export_rows(export_document)
     prior_rows = _candidate_export_rows({
         "tuned_parameters": document.get("tuned_parameters") or list(_TUNED_NAMES),
         "candidates": document.get("prior_observations") or [],
     })
     ranked = [item for item in candidate_rows if item.get("rank") is not None]
     ranked.sort(key=lambda item: int(item["rank"]))
+    best_row = ranked[0] if ranked else None
+    best_exploratory_row = next((item for item in ranked if not bool(item.get("is_control"))), None)
+    best_champion_row = next((item for item in ranked if item.get("champion_gate_passed") is True), None)
     baseline = deepcopy(document.get("baseline_execution") or {})
     summary_row = {
         "run_id": document.get("id"),
         "status": document.get("status"),
         "method": document.get("method"),
+        "tuning_scope": document.get("tuning_scope"),
+        "tuning_scope_label": document.get("tuning_scope_label"),
+        "strategy_mode": document.get("strategy_mode"),
         "execution_mode": document.get("execution_mode"),
         "generated_candidates": document.get("generated_candidates"),
         "model_family": document.get("model_family"),
@@ -1143,9 +1413,9 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
         "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
         "market_data_snapshot_id": document.get("market_data_snapshot_id"),
         "control_candidate_id": document.get("control_candidate_id"),
-        "best_candidate_id": document.get("best_candidate_id"),
-        "best_exploratory_candidate_id": document.get("best_exploratory_candidate_id"),
-        "best_champion_beating_candidate_id": document.get("best_champion_beating_candidate_id"),
+        "best_candidate_id": best_row.get("candidate_id") if best_row else None,
+        "best_exploratory_candidate_id": best_exploratory_row.get("candidate_id") if best_exploratory_row else None,
+        "best_champion_beating_candidate_id": best_champion_row.get("candidate_id") if best_champion_row else None,
         "best_ending_capital": ranked[0].get("ending_capital") if ranked else None,
         "best_sharpe": ranked[0].get("sharpe") if ranked else None,
         "best_maximum_drawdown": ranked[0].get("maximum_drawdown") if ranked else None,
@@ -1160,11 +1430,15 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
             "status": document.get("status"),
             "phase": document.get("phase"),
             "method": document.get("method"),
+            "tuning_scope": document.get("tuning_scope"),
+            "tuning_scope_label": document.get("tuning_scope_label"),
+            "tuning_scope_description": document.get("tuning_scope_description"),
+            "strategy_mode": document.get("strategy_mode"),
             "execution_mode": document.get("execution_mode"),
             "generated_candidates": document.get("generated_candidates"),
             "probability_config": deepcopy(document.get("probability_config") or {}),
             "validation": "chronological_walk_forward",
-            "selection_metric": "risk_adjusted_compound_score",
+            "selection_metric": "champion_gate_then_realized_economic_quality",
             "eligibility_gate": "all_walk_forward_folds_positive",
             "model_family": document.get("model_family"),
             "model_label": document.get("model_label"),
@@ -1175,10 +1449,16 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
             "seed": document.get("seed"),
             "search_space": deepcopy(document.get("search_space") or []),
             "tuned_parameters": deepcopy(document.get("tuned_parameters") or []),
+            "tuned_model_parameters": deepcopy(document.get("tuned_model_parameters") or []),
+            "tuned_strategy_parameters": deepcopy(document.get("tuned_strategy_parameters") or []),
+            "base_tuning_values": deepcopy(document.get("base_tuning_values") or {}),
+            "frozen_model_values": deepcopy(document.get("frozen_model_values") or {}),
+            "fixed_model_values": deepcopy(document.get("fixed_model_values") or {}),
             "strategy_profile_id": document.get("strategy_profile_id"),
             "strategy_profile_name": document.get("strategy_profile_name"),
             "strategy_profile_revision": document.get("strategy_profile_revision"),
             "strategy_configuration_hash": document.get("strategy_configuration_hash"),
+            "strategy_configuration_snapshot": deepcopy(document.get("strategy_configuration_snapshot") or {}),
             "base_model_settings_hash": document.get("base_model_settings_hash"),
             "base_model_settings_revision": document.get("base_model_settings_revision"),
             "baseline_execution": baseline,
@@ -1196,14 +1476,14 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
             "market_data_cutoff_date": document.get("market_data_cutoff_date"),
             "adoption_context_compatible": document.get("adoption_context_compatible"),
             "control_candidate_id": document.get("control_candidate_id"),
-            "best_candidate_id": document.get("best_candidate_id"),
-            "best_exploratory_candidate_id": document.get("best_exploratory_candidate_id"),
-            "best_champion_beating_candidate_id": document.get("best_champion_beating_candidate_id"),
+            "best_candidate_id": best_row.get("candidate_id") if best_row else None,
+            "best_exploratory_candidate_id": best_exploratory_row.get("candidate_id") if best_exploratory_row else None,
+            "best_champion_beating_candidate_id": best_champion_row.get("candidate_id") if best_champion_row else None,
             "adopted_candidate_id": document.get("adopted_candidate_id"),
             "created_at": document.get("created_at"),
             "started_at": document.get("started_at"),
             "finished_at": document.get("finished_at"),
-            "candidates": deepcopy(document.get("candidates") or []),
+            "candidates": deepcopy(ranked_candidate_docs),
         }
     )
 
@@ -1217,11 +1497,99 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
     return archive_buffer.getvalue()
 
 
+def _history_candidate(document: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = _rank_candidates(list(document.get("candidates") or []))
+    ranked = [item for item in candidates if item.get("rank") is not None]
+    if not ranked:
+        return None
+    return min(ranked, key=lambda item: int(item.get("rank") or 10**9))
+
+
+def _public_tuning_history_item(document: dict[str, Any]) -> dict[str, Any]:
+    reranked = _rank_candidates(list(document.get("candidates") or []))
+    best = _history_candidate({**document, "candidates": reranked})
+    best_public = _public_candidate(best) if best is not None else None
+    ranked = sorted((item for item in reranked if item.get("rank") is not None), key=lambda item: int(item["rank"]))
+    best_champion = next((item for item in ranked if item.get("champion_gate_passed") is True), None)
+    return bson_value({
+        "id": document.get("id"),
+        "status": str(document.get("status") or "unknown"),
+        "phase": str(document.get("phase") or "unknown"),
+        "method": str(document.get("method") or TUNING_METHOD),
+        "tuning_scope": str(document.get("tuning_scope") or MODEL_PARAMETER_TUNING_SCOPE),
+        "tuning_scope_label": str(document.get("tuning_scope_label") or "LightGBM model parameters"),
+        "model_family": str(document.get("model_family") or TUNING_MODEL_FAMILY),
+        "model_label": str(document.get("model_label") or "LightGBM Utility"),
+        "strategy_profile_id": document.get("strategy_profile_id"),
+        "strategy_profile_name": document.get("strategy_profile_name"),
+        "strategy_profile_revision": int(document.get("strategy_profile_revision") or 0),
+        "strategy_profile_status": document.get("strategy_profile_status"),
+        "created_at": document.get("created_at"),
+        "started_at": document.get("started_at"),
+        "finished_at": document.get("finished_at"),
+        "market_data_cutoff_date": document.get("market_data_cutoff_date"),
+        "candidate_count": int(document.get("candidate_count") or 0),
+        "total_candidates": int(document.get("total_candidates") or len(document.get("candidates") or [])),
+        "completed_candidates": int(document.get("completed_candidates") or 0),
+        "failed_candidates": int(document.get("failed_candidates") or 0),
+        "cancelled_candidates": int(document.get("cancelled_candidates") or 0),
+        "best_candidate_id": int(best["candidate_id"]) if best is not None else None,
+        "best_champion_beating_candidate_id": int(best_champion["candidate_id"]) if best_champion is not None else None,
+        "best_candidate": best_public,
+        "adopted_candidate_id": document.get("adopted_candidate_id"),
+        "adopted_strategy_id": document.get("adopted_strategy_id"),
+        "adoption_history": deepcopy(document.get("adoption_history") or []),
+    })
+
+
+def list_model_tuning_history(db: Any, *, limit: int = 100) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(100, int(limit)))
+    projection = {
+        "_id": 0,
+        "id": 1,
+        "status": 1,
+        "phase": 1,
+        "method": 1,
+        "tuning_scope": 1,
+        "tuning_scope_label": 1,
+        "model_family": 1,
+        "model_label": 1,
+        "strategy_profile_id": 1,
+        "strategy_profile_name": 1,
+        "strategy_profile_revision": 1,
+        "strategy_profile_status": 1,
+        "created_at": 1,
+        "started_at": 1,
+        "finished_at": 1,
+        "market_data_cutoff_date": 1,
+        "candidate_count": 1,
+        "total_candidates": 1,
+        "completed_candidates": 1,
+        "failed_candidates": 1,
+        "cancelled_candidates": 1,
+        "best_candidate_id": 1,
+        "best_champion_beating_candidate_id": 1,
+        "adopted_candidate_id": 1,
+        "adopted_strategy_id": 1,
+        "adoption_history": 1,
+        "candidates.candidate_id": 1,
+        "candidates.status": 1,
+        "candidates.rank": 1,
+        "candidates.kind": 1,
+        "candidates.is_control": 1,
+        "candidates.metrics": 1,
+        "candidates.champion_gate_passed": 1,
+    }
+    cursor = db[MODEL_TUNING_RUNS_COLLECTION].find({}, projection).sort("created_at", -1).limit(safe_limit)
+    return [_public_tuning_history_item(document) for document in cursor]
+
+
 def start_model_tuning(
     db: Any,
     *,
     method: str = TUNING_METHOD,
     candidate_count: int = DEFAULT_CANDIDATE_COUNT,
+    caro_candidate_count: int | None = None,
     seed: int = DEFAULT_SEED,
     baseline_job_id: str | None = None,
     source_tuning_run_id: str | None = None,
@@ -1230,7 +1598,7 @@ def start_model_tuning(
     actor_email: str | None = None,
 ) -> dict[str, Any]:
     normalized_method = str(method or TUNING_METHOD).strip().lower()
-    if normalized_method not in {TUNING_METHOD, PROBABILITY_METHOD}:
+    if normalized_method not in {TUNING_METHOD, PROBABILITY_METHOD, PIPELINE_METHOD}:
         raise ModelTuningConflict("Unsupported model tuning method.")
 
     active_tuning = db[MODEL_TUNING_RUNS_COLLECTION].find_one(
@@ -1254,6 +1622,19 @@ def start_model_tuning(
     if bool(strategy.get("locked")) and not _tuning_target_allows_locked_strategy(strategy):
         raise ModelTuningConflict("The current protected Strategy is not a Candidate tuning target.")
 
+    tuning_plan = _tuning_plan(strategy, model_snapshot)
+    tuning_scope = str(tuning_plan["scope"])
+    tuning_scope_label = str(tuning_plan["scope_label"])
+    tuning_scope_description = str(tuning_plan["description"])
+    search_space = [dict(item) for item in tuning_plan["search_space"]]
+    tuned_parameters = list(tuning_plan["tuned_parameters"])
+    tuned_model_parameters = list(tuning_plan.get("tuned_model_parameters") or [])
+    tuned_strategy_parameters = list(tuning_plan.get("tuned_strategy_parameters") or [])
+    base_tuning_values = deepcopy(tuning_plan["base_values"])
+    base_model_values = deepcopy(tuning_plan.get("base_model_values") or model_values_from_snapshot(model_snapshot))
+    frozen_model_values = deepcopy(tuning_plan["frozen_model_values"])
+    fixed_model_values = deepcopy(tuning_plan.get("fixed_model_values") or {})
+
     probability = dict(probability_config or {})
     prior_observations: list[dict[str, Any]] = []
     probability_anchor: dict[str, Any] | None = None
@@ -1266,7 +1647,12 @@ def start_model_tuning(
     market_data_signature_source = "frozen_campaign_snapshot"
 
     if normalized_method == PROBABILITY_METHOD and source_tuning_run_id:
-        source = _source_campaign(db, source_tuning_run_id)
+        source = _source_campaign(
+            db,
+            source_tuning_run_id,
+            expected_scope=tuning_scope,
+            expected_search_space=search_space,
+        )
         prior_observations = _source_observations(source)
         anchor = _source_anchor(source, anchor_candidate_id)
         source_run_id = str(source.get("id") or source_tuning_run_id)
@@ -1281,6 +1667,10 @@ def start_model_tuning(
         market_data_snapshot_id = str(execution_context.get("market_data_snapshot_id") or "").strip().lower() or None
         market_data_signature_source = "source_campaign_snapshot" if market_data_snapshot_id else "source_campaign_legacy_signature"
         base_values = deepcopy(anchor.get("settings") or {})
+        if tuning_scope == ABSOLUTE_UTILITY_TUNING_SCOPE:
+            source_base_model = deepcopy(source.get("base_model_values") or base_model_values)
+            base_model_values = source_base_model
+            frozen_model_values = deepcopy(source.get("frozen_model_values") or source_base_model)
         adoption_context_compatible = False
         if str(strategy.get("id") or "") == str(source.get("strategy_profile_id") or ""):
             current_baselines = list_model_tuning_baselines(db, limit=10)
@@ -1309,8 +1699,13 @@ def start_model_tuning(
             "min_worst_fold_return": float(probability.get("min_worst_fold_return", 0.0)),
             "candidate_pool_size": int(probability.get("candidate_pool_size", 2048)),
             "exploration_weight": float(probability.get("exploration_weight", 0.15)),
+            "initial_exploration_fraction": float(probability.get("initial_exploration_fraction", 0.45)),
+            "minimum_exploration_fraction": float(probability.get("minimum_exploration_fraction", 0.20)),
+            "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 4)),
+            "space_filling_pool_size": int(probability.get("space_filling_pool_size", 1024)),
             "probability_model": PROBABILITY_MODEL,
-            "source_mode": "prior_campaign",
+            "source_mode": "prior_campaign_unified",
+            "search_policy": "dynamic_space_filling_plus_sequential_adaptive_trust_region",
         }
     else:
         if source_tuning_run_id:
@@ -1323,26 +1718,75 @@ def start_model_tuning(
         baseline = _baseline_by_job_id(db, baseline_job_id) if baseline_job_id else baselines[0]
         reference_job_id = str(baseline.get("job_id") or "")
         execution_context = _frozen_execution_context_from_job(db, reference_job_id)
-        base_values = model_values_from_snapshot(model_snapshot)
+        expected_market_data_signature = str(execution_context.get("market_data_signature_sha256") or "").strip().lower() or None
+        market_data_signature_source = "certified_baseline_backtest"
+        base_values = deepcopy(base_tuning_values)
 
         if normalized_method == PROBABILITY_METHOD:
-            startup_trials = max(4, int(probability.get("startup_trials") or 6))
-            if startup_trials >= int(candidate_count):
-                raise ModelTuningConflict("Probabilistic startup trials must be smaller than the total candidate count.")
-            candidates = generate_latin_hypercube_candidates(base_values, candidate_count=startup_trials, seed=seed)
-            for candidate in candidates:
-                if not candidate.get("is_control"):
-                    candidate["kind"] = "probability_startup"
+            default_minimum_exploration = max(4, min(24, len(search_space) + 2))
+            legacy_startup = probability.get("startup_trials")
+            minimum_exploration = max(
+                4,
+                int(probability.get("minimum_exploration_trials") or legacy_startup or default_minimum_exploration),
+            )
+            minimum_exploration = min(minimum_exploration, max(4, int(candidate_count)))
+            control_values = _normalize_tuning_values(base_values, search_space)
+            candidates = [_reused_baseline_control_candidate(
+                db, baseline=baseline, settings=control_values,
+            )]
             total_candidates = int(candidate_count) + 1
             probability_anchor = {
                 "source": "baseline_backtest",
                 "job_id": reference_job_id,
-                "settings_hash": str(baseline.get("model_settings_hash") or ""),
+                "settings_hash": _settings_hash(base_values),
+                "settings": deepcopy(base_values),
+                "metrics": deepcopy(baseline.get("metrics") or {}),
+            }
+            prior_observations = _automatic_compatible_prior_observations(
+                db,
+                strategy=strategy,
+                tuning_scope=tuning_scope,
+                strategy_mode=tuning_plan.get("strategy_mode"),
+                search_space=search_space,
+                execution_context=execution_context,
+                base_values=base_values,
+            )
+            probability = {
+                "startup_trials": minimum_exploration,
+                "minimum_exploration_trials": minimum_exploration,
+                "imported_observation_count": len(prior_observations),
+                "min_capital_improvement": float(probability.get("min_capital_improvement", 0.03)),
+                "sharpe_tolerance": float(probability.get("sharpe_tolerance", 0.05)),
+                "drawdown_tolerance": float(probability.get("drawdown_tolerance", 0.03)),
+                "min_worst_fold_return": float(probability.get("min_worst_fold_return", 0.0)),
+                "candidate_pool_size": int(probability.get("candidate_pool_size", 2048)),
+                "exploration_weight": float(probability.get("exploration_weight", 0.15)),
+                "initial_exploration_fraction": float(probability.get("initial_exploration_fraction", 0.45)),
+                "minimum_exploration_fraction": float(probability.get("minimum_exploration_fraction", 0.20)),
+                "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 4)),
+                "space_filling_pool_size": int(probability.get("space_filling_pool_size", 1024)),
+                "probability_model": PROBABILITY_MODEL,
+                "source_mode": ("standalone_unified_with_compatible_history" if prior_observations else "standalone_unified"),
+                "search_policy": "dynamic_space_filling_plus_sequential_adaptive_trust_region",
+            }
+        elif normalized_method == PIPELINE_METHOD:
+            adaptive_trials = max(1, int(caro_candidate_count or DEFAULT_CANDIDATE_COUNT))
+            candidates = generate_latin_hypercube_candidates(base_values, candidate_count=candidate_count, seed=seed, search_space=search_space)
+            candidates[0] = _reused_baseline_control_candidate(
+                db, baseline=baseline, settings=deepcopy(candidates[0]["settings"]),
+            )
+            total_candidates = len(candidates) + adaptive_trials
+            probability_anchor = {
+                "source": "baseline_backtest",
+                "job_id": reference_job_id,
+                "settings_hash": _settings_hash(base_values),
                 "settings": deepcopy(base_values),
                 "metrics": deepcopy(baseline.get("metrics") or {}),
             }
             probability = {
-                "startup_trials": startup_trials,
+                "startup_trials": int(candidate_count),
+                "full_lhs_candidate_count": int(candidate_count),
+                "adaptive_trials": adaptive_trials,
                 "imported_observation_count": 0,
                 "min_capital_improvement": float(probability.get("min_capital_improvement", 0.03)),
                 "sharpe_tolerance": float(probability.get("sharpe_tolerance", 0.05)),
@@ -1351,13 +1795,17 @@ def start_model_tuning(
                 "candidate_pool_size": int(probability.get("candidate_pool_size", 2048)),
                 "exploration_weight": float(probability.get("exploration_weight", 0.15)),
                 "probability_model": PROBABILITY_MODEL,
-                "source_mode": "standalone",
+                "source_mode": "full_lhs_then_caro",
             }
         else:
-            candidates = generate_latin_hypercube_candidates(base_values, candidate_count=candidate_count, seed=seed)
+            candidates = generate_latin_hypercube_candidates(base_values, candidate_count=candidate_count, seed=seed, search_space=search_space)
+            candidates[0] = _reused_baseline_control_candidate(
+                db, baseline=baseline, settings=deepcopy(candidates[0]["settings"]),
+            )
             total_candidates = int(candidate_count) + 1
             probability = {}
 
+    initial_completed_candidates = sum(1 for item in candidates if item.get("status") == "completed")
     now = utc_now()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-tune-" + uuid.uuid4().hex[:8]
     document = {
@@ -1369,28 +1817,41 @@ def start_model_tuning(
         "method": normalized_method,
         "model_family": TUNING_MODEL_FAMILY,
         "model_label": "LightGBM Utility",
+        "tuning_scope": tuning_scope,
+        "tuning_scope_label": tuning_scope_label,
+        "tuning_scope_description": tuning_scope_description,
+        "strategy_mode": tuning_plan.get("strategy_mode"),
         "candidate_count": int(candidate_count),
+        "caro_candidate_count": (int(caro_candidate_count or DEFAULT_CANDIDATE_COUNT) if normalized_method == PIPELINE_METHOD else None),
+        "pipeline_mode": ("full_lhs_then_caro" if normalized_method == PIPELINE_METHOD else None),
+        "pipeline_handoff_completed": False,
         "total_candidates": int(total_candidates),
         "generated_candidates": len(candidates),
-        "completed_candidates": 0,
+        "completed_candidates": int(initial_completed_candidates),
         "failed_candidates": 0,
         "cancelled_candidates": 0,
         "seed": int(seed),
-        "search_space": [dict(item) for item in _SEARCH_SPACE],
-        "tuned_parameters": list(_TUNED_NAMES),
+        "search_space": search_space,
+        "tuned_parameters": tuned_parameters,
+        "tuned_model_parameters": tuned_model_parameters,
+        "tuned_strategy_parameters": tuned_strategy_parameters,
         "strategy_profile_id": strategy["id"],
         "strategy_profile_name": strategy["name"],
         "strategy_profile_revision": int(strategy["revision"]),
         "strategy_profile_status": str(strategy.get("status") or "draft"),
         "tuning_target_source": tuning_target_source,
         "strategy_configuration_hash": strategy.get("configuration_hash"),
+        "strategy_configuration_snapshot": bson_value(deepcopy(strategy.get("configuration") or {})),
         "base_model_settings_hash": model_snapshot.get("settings_hash"),
         "base_model_settings_revision": int(model_snapshot.get("settings_revision") or 0),
-        "base_model_values": bson_value(base_values),
+        "base_model_values": bson_value(base_model_values),
+        "base_tuning_values": bson_value(base_values),
+        "frozen_model_values": bson_value(frozen_model_values),
+        "fixed_model_values": bson_value(fixed_model_values),
         "baseline_execution": bson_value(baseline),
         "probability_config": bson_value(probability),
         "probability_anchor": bson_value(probability_anchor) if probability_anchor else None,
-        "probability_state": bson_value(initial_probability_state()) if normalized_method == PROBABILITY_METHOD else None,
+        "probability_state": bson_value(initial_probability_state(prior_observations)) if normalized_method in _ADAPTIVE_METHODS else None,
         "probability_champion_history": [],
         "source_tuning_run_id": source_run_id,
         "source_strategy_profile_id": source_strategy_profile_id,
@@ -1424,12 +1885,24 @@ def start_model_tuning(
                 "level": "info",
                 "stage": "created",
                 "message": _sanitize_tuning_log_line(
-                    f"Campaign created. method={normalized_method}; total_candidates={int(total_candidates)}; "
+                    f"Campaign created. method={normalized_method}; scope={tuning_scope}; total_candidates={int(total_candidates)}; "
                     f"imported_observations={len(prior_observations)}; source_campaign={source_run_id or 'none'}."
                 ),
                 "candidate_id": None,
                 "job_id": None,
-            }
+            },
+            *([
+                {
+                    "at": now,
+                    "level": "info",
+                    "stage": "control_reused",
+                    "message": _sanitize_tuning_log_line(
+                        f"Control #0 reused certified Candidate Backtest {reference_job_id}; no duplicate Control Backtest was executed."
+                    ),
+                    "candidate_id": 0,
+                    "job_id": reference_job_id,
+                }
+            ] if any(item.get("is_control") and item.get("baseline_reused") for item in candidates) else []),
         ]),
         "candidates": bson_value(candidates),
     }
@@ -1458,7 +1931,7 @@ def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[
             snapshot = freeze_tuning_market_snapshot(
                 db,
                 deepcopy(document.get("execution_request_snapshot") or {}),
-                expected_signature=expected if document.get("source_tuning_run_id") else None,
+                expected_signature=expected or None,
             )
         except TuningMarketSnapshotMismatch:
             raise
@@ -1505,9 +1978,10 @@ def run_model_tuning(run_id: str) -> None:
         document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
         if document is None:
             return
+        initial_phase = "latin_hypercube_exploration" if str(document.get("method") or "") == PIPELINE_METHOD else "running"
         db[MODEL_TUNING_RUNS_COLLECTION].update_one(
             {"id": run_id},
-            {"$set": {"status": "running", "phase": "running", "started_at": utc_now(), "updated_at": utc_now()}},
+            {"$set": {"status": "running", "phase": initial_phase, "started_at": utc_now(), "updated_at": utc_now()}},
         )
         _append_campaign_event(db, run_id, message="Integrated tuning worker started.", stage="running")
         document = _ensure_campaign_market_snapshot(db, document)
@@ -1524,14 +1998,64 @@ def run_model_tuning(run_id: str) -> None:
 
             candidates = list(document.get("candidates") or [])
             pending = next((item for item in candidates if item.get("status") == "pending"), None)
-            if pending is None and str(document.get("method") or "") == PROBABILITY_METHOD and len(candidates) < int(document.get("total_candidates") or 0):
-                candidate = propose_champion_probability_candidate(document)
+            method = str(document.get("method") or "")
+            if pending is None and method in _ADAPTIVE_METHODS and len(candidates) < int(document.get("total_candidates") or 0):
+                if method == PIPELINE_METHOD and not bool(document.get("pipeline_handoff_completed")):
+                    failed_count = int(document.get("failed_candidates") or 0)
+                    cancelled_count = int(document.get("cancelled_candidates") or 0)
+                    expected_lhs = int((document.get("probability_config") or {}).get("full_lhs_candidate_count") or document.get("candidate_count") or 0) + 1
+                    completed_count = int(document.get("completed_candidates") or 0)
+                    if failed_count or cancelled_count or completed_count < expected_lhs:
+                        message = (
+                            "Automatic Latin Hypercube → CARO handoff requires a complete exploration phase: "
+                            f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={expected_lhs}."
+                        )
+                        db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                            {"id": run_id},
+                            {"$set": {"status": "failed", "phase": "pipeline_handoff_failed", "failure_type": "IncompleteExplorationPhase", "failure_message": message, "finished_at": utc_now(), "updated_at": utc_now()}},
+                        )
+                        _append_campaign_event(db, run_id, message=message, stage="pipeline_handoff_failed")
+                        return
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {"pipeline_handoff_completed": True, "phase": "probabilistic_refinement", "updated_at": utc_now()}},
+                    )
+                    document["pipeline_handoff_completed"] = True
+                    _append_campaign_event(
+                        db, run_id,
+                        message=f"Full Latin Hypercube exploration completed with {completed_count} observations. Adaptive CARO started automatically using the same frozen baseline and market-data snapshot.",
+                        stage="pipeline_handoff",
+                    )
+                if method == PROBABILITY_METHOD:
+                    policy = unified_caro_next_mode(document)
+                    if str(policy.get("mode")) == "space_filling":
+                        candidate = propose_unified_space_filling_candidate(document)
+                        next_phase = "adaptive_exploration"
+                        message = (
+                            f"Unified CARO proposed space-filling candidate #{int(candidate.get('candidate_id') or 0)} "
+                            f"({policy.get('reason')}; exploration={int(policy.get('exploration_observations') or 0)}, "
+                            f"adaptive={int(policy.get('adaptive_observations') or 0)})."
+                        )
+                    else:
+                        candidate = propose_champion_probability_candidate(document)
+                        next_phase = "probabilistic_refinement"
+                        message = (
+                            f"Unified CARO proposed adaptive candidate #{int(candidate.get('candidate_id') or 0)} "
+                            f"using {int((candidate.get('proposal') or {}).get('observation_count') or 0)} observations."
+                        )
+                else:
+                    candidate = propose_champion_probability_candidate(document)
+                    next_phase = "probabilistic_refinement"
+                    message = (
+                        f"CARO proposed candidate #{int(candidate.get('candidate_id') or 0)} "
+                        f"using {int((candidate.get('proposal') or {}).get('observation_count') or 0)} observations."
+                    )
                 db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                     {"id": run_id},
                     {
                         "$push": {"candidates": bson_value(candidate)},
                         "$set": {
-                            "phase": "probabilistic_refinement",
+                            "phase": next_phase,
                             "generated_candidates": len(candidates) + 1,
                             "updated_at": utc_now(),
                         },
@@ -1539,8 +2063,8 @@ def run_model_tuning(run_id: str) -> None:
                 )
                 _append_campaign_event(
                     db, run_id,
-                    message=f"CARO proposed candidate #{int(candidate.get('candidate_id') or 0)} using {int((candidate.get('proposal') or {}).get('observation_count') or 0)} observations.",
-                    stage="probabilistic_refinement",
+                    message=message,
+                    stage=next_phase,
                     candidate_id=int(candidate.get("candidate_id") or 0),
                 )
                 continue
@@ -1576,8 +2100,8 @@ def run_model_tuning(run_id: str) -> None:
                     "$set": {
                         "current_candidate_id": candidate_id,
                         "phase": (
-                            "startup_exploration"
-                            if str(pending.get("kind") or "") == "probability_startup"
+                            "adaptive_exploration"
+                            if str(pending.get("kind") or "") in {"probability_startup", "unified_exploration"}
                             else "adaptive_refinement"
                             if str(pending.get("kind") or "") == "champion_probability"
                             else "running_candidate"
@@ -1629,8 +2153,41 @@ def run_model_tuning(run_id: str) -> None:
                 snapshot_id = str(document.get("market_data_snapshot_id") or "").strip().lower()
                 candidate_request["expected_market_data_signature_sha256"] = expected_signature or None
                 candidate_request["research_market_data_snapshot_id"] = snapshot_id or None
+                tuning_scope = str(document.get("tuning_scope") or MODEL_PARAMETER_TUNING_SCOPE)
+                if tuning_scope in {ABSOLUTE_UTILITY_TUNING_SCOPE, LEGACY_ABSOLUTE_UTILITY_TUNING_SCOPE}:
+                    candidate_settings = dict(pending["settings"])
+                    strategy_overrides = {
+                        name: candidate_settings[name]
+                        for name in _ABSOLUTE_UTILITY_STRATEGY_PARAMETER_NAMES
+                        if name in candidate_settings
+                    }
+                    candidate_request.update(strategy_overrides)
+                    frozen_strategy_configuration = deepcopy(
+                        document.get("strategy_configuration_snapshot") or {}
+                    )
+                    if frozen_strategy_configuration:
+                        frozen_strategy_configuration.update(strategy_overrides)
+                        validated_candidate_configuration = BacktestRequest.model_validate(
+                            frozen_strategy_configuration
+                        )
+                        execution_metadata["strategy_configuration_hash"] = _strategy_configuration_hash(
+                            validated_candidate_configuration.model_dump(mode="json")
+                        )
+                    if tuning_scope == ABSOLUTE_UTILITY_TUNING_SCOPE:
+                        model_values_override = deepcopy(document.get("base_model_values") or {})
+                        for name in _TUNED_NAMES:
+                            if name in candidate_settings:
+                                model_values_override[name] = candidate_settings[name]
+                    else:
+                        model_values_override = dict(
+                            document.get("base_model_values")
+                            or document.get("frozen_model_values")
+                            or {}
+                        )
+                else:
+                    model_values_override = dict(pending["settings"])
                 queued = queue_backtest_job(
-                    model_values_override=dict(pending["settings"]),
+                    model_values_override=model_values_override,
                     start_thread=False,
                     certify_strategy=False,
                     tuning_run_id=run_id,
@@ -1699,7 +2256,7 @@ def run_model_tuning(run_id: str) -> None:
                 if not expected_signature:
                     if not is_control:
                         raise RuntimeError(
-                            "MarketDataSignatureMissing: only the fresh Control candidate may establish a campaign signature."
+                            "MarketDataSignatureMissing: a legacy Control rerun is the only candidate allowed to establish a missing campaign signature."
                         )
                     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                         {"id": run_id},
@@ -1726,8 +2283,8 @@ def run_model_tuning(run_id: str) -> None:
                 
                 if (
                     is_control
-                    and str(document.get("method") or "") == PROBABILITY_METHOD
-                    and str((document.get("probability_config") or {}).get("source_mode") or "") == "standalone"
+                    and str(document.get("method") or "") in _ADAPTIVE_METHODS
+                    and str((document.get("probability_config") or {}).get("source_mode") or "") in {"standalone", "standalone_unified", "standalone_unified_with_compatible_history", "full_lhs_then_caro"}
                 ):
                     fresh_anchor = {
                         "source": "fresh_control",
@@ -1745,11 +2302,11 @@ def run_model_tuning(run_id: str) -> None:
 
                 champion_gate = (
                     champion_gate_evaluation(document, summary)
-                    if str(document.get("method") or "") == PROBABILITY_METHOD and not is_control
+                    if str(document.get("method") or "") in _ADAPTIVE_METHODS and not is_control
                     else None
                 )
                 probability_evolution = None
-                if str(document.get("method") or "") == PROBABILITY_METHOD and not is_control:
+                if str(document.get("method") or "") in _ADAPTIVE_METHODS and not is_control:
                     probability_evolution = evolve_probability_search(document, {**pending, "job_id": job_id}, summary, champion_gate)
 
                 db[MODEL_TUNING_RUNS_COLLECTION].update_one(
@@ -1759,6 +2316,7 @@ def run_model_tuning(run_id: str) -> None:
                             "candidates.$.status": "completed",
                             "candidates.$.metrics": bson_value(summary),
                             "candidates.$.equity_preview": bson_value(equity_preview),
+                            "candidates.$.strategy_configuration_hash": job.get("strategy_configuration_hash"),
                             "candidates.$.champion_gate_passed": (bool(champion_gate.get("passed")) if champion_gate else None),
                             "candidates.$.champion_gate": bson_value(champion_gate) if champion_gate else None,
                             "candidates.$.finished_at": utc_now(),
@@ -2026,7 +2584,7 @@ def _format_adopted_strategy_description(
     source_strategy: dict[str, Any],
 ) -> str:
     metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
-    method_label = "Adaptive CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "Latin Hypercube"
+    method_label = ("Latin Hypercube → Adaptive CARO (legacy)" if str(document.get("method") or "") == PIPELINE_METHOD else ("Unified Adaptive CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "Latin Hypercube"))
     parts = [
         f"{method_label} campaign {document.get('id')} candidate #{int(candidate.get('candidate_id') or 0)}.",
         f"Source: {source_strategy.get('name') or 'Strategy'} rev {int(source_strategy.get('revision') or 1)}.",
@@ -2078,15 +2636,37 @@ def adopt_model_tuning_candidate(
     if candidate is None or candidate.get("status") != "completed":
         raise ModelTuningConflict("Only a completed tuning candidate can be adopted.")
     source_strategy = get_strategy(db, str(document["strategy_profile_id"]))
-    if int(source_strategy.get("revision") or 0) != int(document.get("strategy_profile_revision") or -1):
-        raise ModelTuningConflict("The tuning source Strategy revision changed after this campaign started.")
+    frozen_request = document.get("execution_request_snapshot") if isinstance(document.get("execution_request_snapshot"), dict) else {}
+    frozen_configuration = None
+    if frozen_request:
+        configuration_payload = {
+            name: deepcopy(frozen_request[name])
+            for name in BacktestRequest.model_fields
+            if name in frozen_request
+        }
+        try:
+            frozen_configuration = BacktestRequest.model_validate(configuration_payload)
+        except Exception as exc:
+            if int(source_strategy.get("revision") or 0) != int(document.get("strategy_profile_revision") or -1):
+                raise ModelTuningConflict(
+                    "The historical tuning source changed and its frozen Strategy configuration cannot be reconstructed safely."
+                ) from exc
+    elif int(source_strategy.get("revision") or 0) != int(document.get("strategy_profile_revision") or -1):
+        raise ModelTuningConflict(
+            "The historical tuning source changed and this legacy campaign has no frozen Strategy configuration snapshot."
+        )
 
     adoption_note = (reason or f"Use tuning candidate #{int(candidate_id)} from {run_id} in Backtest.").strip()
-    method_tag = "CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "LHS"
+    method_tag = ("LHS-CARO" if str(document.get("method") or "") == PIPELINE_METHOD else ("CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "LHS"))
     suffix = f" {method_tag} C{int(candidate_id)} {str(run_id)[-8:]}"
     source_name = str(source_strategy.get("name") or "Strategy")
     derived_name = f"{source_name[:max(3, 120 - len(suffix))]}{suffix}"
-    description = _format_adopted_strategy_description(document, candidate, source_strategy)
+    description_source = {
+        **source_strategy,
+        "name": document.get("strategy_profile_name") or source_strategy.get("name"),
+        "revision": int(document.get("strategy_profile_revision") or source_strategy.get("revision") or 1),
+    }
+    description = _format_adopted_strategy_description(document, candidate, description_source)
     created = create_strategy(
         db,
         name=derived_name,
@@ -2094,15 +2674,65 @@ def adopt_model_tuning_candidate(
         clone_from_strategy_id=str(source_strategy["id"]),
         actor_email=actor_email,
     )
-    updated_strategy = update_strategy_model(
-        db,
-        str(created["id"]),
-        model_family=TUNING_MODEL_FAMILY,
-        values=dict(candidate["settings"]),
-        note=adoption_note,
-        expected_strategy_revision=int(created["revision"]),
-        actor_email=actor_email,
-    )
+    working_strategy = created
+    if frozen_configuration is not None:
+        working_strategy = update_strategy(
+            db,
+            str(created["id"]),
+            configuration=frozen_configuration,
+            name=derived_name,
+            description=description,
+            note=f"Restore frozen Strategy configuration from tuning campaign {run_id}.",
+            expected_revision=int(created["revision"]),
+            actor_email=actor_email,
+        )
+    tuning_scope = str(document.get("tuning_scope") or MODEL_PARAMETER_TUNING_SCOPE)
+    if tuning_scope in {ABSOLUTE_UTILITY_TUNING_SCOPE, LEGACY_ABSOLUTE_UTILITY_TUNING_SCOPE}:
+        candidate_settings = dict(candidate["settings"])
+        strategy_overrides = {
+            name: candidate_settings[name]
+            for name in _ABSOLUTE_UTILITY_STRATEGY_PARAMETER_NAMES
+            if name in candidate_settings
+        }
+        base_configuration = frozen_configuration
+        if base_configuration is None:
+            raw_configuration = working_strategy.get("configuration") if isinstance(working_strategy.get("configuration"), dict) else {}
+            base_configuration = BacktestRequest.model_validate(raw_configuration)
+        candidate_configuration = base_configuration.model_copy(update=strategy_overrides)
+        updated_strategy = update_strategy(
+            db,
+            str(working_strategy["id"]),
+            configuration=candidate_configuration,
+            name=derived_name,
+            description=description,
+            note=adoption_note,
+            expected_revision=int(working_strategy["revision"]),
+            actor_email=actor_email,
+        )
+        if tuning_scope == ABSOLUTE_UTILITY_TUNING_SCOPE:
+            model_values = deepcopy(document.get("base_model_values") or {})
+            for name in _TUNED_NAMES:
+                if name in candidate_settings:
+                    model_values[name] = candidate_settings[name]
+            updated_strategy = update_strategy_model(
+                db,
+                str(updated_strategy["id"]),
+                model_family=TUNING_MODEL_FAMILY,
+                values=model_values,
+                note=adoption_note,
+                expected_strategy_revision=int(updated_strategy["revision"]),
+                actor_email=actor_email,
+            )
+    else:
+        updated_strategy = update_strategy_model(
+            db,
+            str(working_strategy["id"]),
+            model_family=TUNING_MODEL_FAMILY,
+            values=dict(candidate["settings"]),
+            note=adoption_note,
+            expected_strategy_revision=int(working_strategy["revision"]),
+            actor_email=actor_email,
+        )
     updated_strategy = prepare_strategy_for_backtest_candidate(
         db,
         str(updated_strategy["id"]),
@@ -2122,16 +2752,27 @@ def adopt_model_tuning_candidate(
     )
     updated_strategy = get_strategy(db, str(updated_strategy["id"]))
 
+    adopted_at = utc_now()
+    adoption_entry = {
+        "candidate_id": int(candidate_id),
+        "strategy_id": str(updated_strategy.get("id") or ""),
+        "strategy_name": str(updated_strategy.get("name") or derived_name),
+        "at": adopted_at,
+        "by": (actor_email or "").strip().lower() or None,
+    }
     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
         {"id": run_id},
-        {"$set": {
-            "adopted_candidate_id": int(candidate_id),
-            "adopted_strategy_id": str(updated_strategy.get("id") or ""),
-            "derived_strategy_created": True,
-            "adopted_at": utc_now(),
-            "adopted_by": (actor_email or "").strip().lower() or None,
-            "updated_at": utc_now(),
-        }},
+        {
+            "$set": {
+                "adopted_candidate_id": int(candidate_id),
+                "adopted_strategy_id": str(updated_strategy.get("id") or ""),
+                "derived_strategy_created": True,
+                "adopted_at": adopted_at,
+                "adopted_by": (actor_email or "").strip().lower() or None,
+                "updated_at": adopted_at,
+            },
+            "$push": {"adoption_history": bson_value(adoption_entry)},
+        },
     )
     return {
         "strategy": updated_strategy,
@@ -2156,6 +2797,8 @@ def _public_candidate(candidate: dict[str, Any], current_jobs: dict[str, dict[st
         "champion_gate": deepcopy(candidate.get("champion_gate") or None),
         "proposal": deepcopy(candidate.get("proposal") or None),
         "job_id": candidate.get("job_id"),
+        "source_job_id": candidate.get("source_job_id"),
+        "baseline_reused": bool(candidate.get("baseline_reused")),
         "worker_id": candidate.get("worker_id"),
         "worker_cpu_count": candidate.get("worker_cpu_count"),
         "worker_concurrency": candidate.get("worker_concurrency"),
@@ -2179,7 +2822,11 @@ def _public_candidate(candidate: dict[str, Any], current_jobs: dict[str, dict[st
 def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[str, Any] | None:
     if document is None:
         return None
-    raw_candidates = list(document.get("candidates") or [])
+    raw_candidates = _rank_candidates(list(document.get("candidates") or []))
+    ranked_public_candidates = sorted((item for item in raw_candidates if item.get("rank") is not None), key=lambda item: int(item["rank"]))
+    public_best = ranked_public_candidates[0] if ranked_public_candidates else None
+    public_best_exploratory = next((item for item in ranked_public_candidates if not bool(item.get("is_control"))), None)
+    public_best_champion = next((item for item in ranked_public_candidates if item.get("champion_gate_passed") is True), None)
     active_job_ids = [str(item.get("job_id") or "") for item in raw_candidates if item.get("status") == "running" and item.get("job_id")]
     current_jobs: dict[str, dict[str, Any]] = {}
     if active_job_ids:
@@ -2190,13 +2837,20 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
             current_jobs[str(job.get("id") or "")] = job
     candidates = [_public_candidate(item, current_jobs) for item in raw_candidates]
     total = max(1, int(document.get("total_candidates") or len(candidates) or 1))
+    reused_control_count = sum(
+        1 for item in raw_candidates if bool(item.get("is_control")) and bool(item.get("baseline_reused"))
+    )
+    research_total = max(1, total - reused_control_count)
+    research_completed = max(
+        0, int(document.get("completed_candidates") or 0) - reused_control_count,
+    )
     completed = (
-        int(document.get("completed_candidates") or 0)
+        research_completed
         + int(document.get("failed_candidates") or 0)
         + int(document.get("cancelled_candidates") or 0)
     )
     fractional_active = sum(float(job.get("progress") or 0.0) / 100.0 for job in current_jobs.values())
-    progress = min(100.0, 100.0 * (completed + fractional_active) / total)
+    progress = min(100.0, 100.0 * (completed + fractional_active) / research_total)
     if current_jobs and str(document.get("status") or "") in _ACTIVE_STATUSES:
         progress = min(99.9, progress)
     active_candidate_ids = [int(item.get("candidate_id") or 0) for item in raw_candidates if item.get("status") == "running"]
@@ -2206,11 +2860,19 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "status": str(document.get("status") or "queued"),
         "phase": str(document.get("phase") or "queued"),
         "method": str(document.get("method") or TUNING_METHOD),
+        "tuning_scope": str(document.get("tuning_scope") or MODEL_PARAMETER_TUNING_SCOPE),
+        "tuning_scope_label": str(document.get("tuning_scope_label") or "LightGBM model parameters"),
+        "tuning_scope_description": str(document.get("tuning_scope_description") or ""),
         "execution_mode": str(document.get("execution_mode") or "integrated_api_worker"),
         "model_family": str(document.get("model_family") or TUNING_MODEL_FAMILY),
         "model_label": str(document.get("model_label") or "LightGBM Utility"),
         "candidate_count": int(document.get("candidate_count") or 0),
+        "caro_candidate_count": (int(document.get("caro_candidate_count")) if document.get("caro_candidate_count") is not None else None),
+        "pipeline_mode": document.get("pipeline_mode"),
+        "pipeline_handoff_completed": bool(document.get("pipeline_handoff_completed")),
         "total_candidates": total,
+        "research_total_candidates": research_total,
+        "research_completed_candidates": research_completed,
         "generated_candidates": int(document.get("generated_candidates") or len(candidates)),
         "completed_candidates": int(document.get("completed_candidates") or 0),
         "failed_candidates": int(document.get("failed_candidates") or 0),
@@ -2218,6 +2880,9 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "progress": progress,
         "seed": int(document.get("seed") or DEFAULT_SEED),
         "search_space": deepcopy(document.get("search_space") or []),
+        "tuned_parameters": deepcopy(document.get("tuned_parameters") or []),
+        "tuned_model_parameters": deepcopy(document.get("tuned_model_parameters") or []),
+        "tuned_strategy_parameters": deepcopy(document.get("tuned_strategy_parameters") or []),
         "probability_config": deepcopy(document.get("probability_config") or {}),
         "probability_anchor": deepcopy(document.get("probability_anchor") or None),
         "probability_state": deepcopy(document.get("probability_state") or None),
@@ -2245,11 +2910,13 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "active_job_ids": active_job_ids,
         "current_candidate_id": active_candidate_ids[0] if active_candidate_ids else None,
         "current_job_id": active_job_ids[0] if active_job_ids else None,
-        "best_candidate_id": document.get("best_candidate_id"),
-        "best_exploratory_candidate_id": document.get("best_exploratory_candidate_id"),
-        "best_champion_beating_candidate_id": document.get("best_champion_beating_candidate_id"),
+        "best_candidate_id": int(public_best["candidate_id"]) if public_best is not None else None,
+        "best_exploratory_candidate_id": int(public_best_exploratory["candidate_id"]) if public_best_exploratory is not None else None,
+        "best_champion_beating_candidate_id": int(public_best_champion["candidate_id"]) if public_best_champion is not None else None,
         "control_candidate_id": int(document["control_candidate_id"]) if document.get("control_candidate_id") is not None else None,
         "adopted_candidate_id": document.get("adopted_candidate_id"),
+        "adopted_strategy_id": document.get("adopted_strategy_id"),
+        "adoption_history": deepcopy(document.get("adoption_history") or []),
         "baseline_execution": deepcopy(document.get("baseline_execution") or None),
         "candidates": candidates,
     })

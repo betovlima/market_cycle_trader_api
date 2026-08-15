@@ -29,12 +29,18 @@ class StrategyUpdateRequest(BaseModel):
     assets_input: str | None = Field(default=None, min_length=1, max_length=20_000)
     name: str = Field(min_length=3, max_length=120)
     description: str = Field(default="", max_length=500)
-    note: str = Field(min_length=3, max_length=500)
+    note: str | None = Field(default=None, max_length=500)
 
-    @field_validator("name", "description", "note")
+    @field_validator("name", "description")
     @classmethod
     def normalize_text(cls, value: str) -> str:
         return " ".join(str(value).split())
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str | None) -> str | None:
+        normalized = " ".join(str(value or "").split())
+        return normalized or None
 
     def build_configuration(self) -> BacktestRequest:
         payload = dict(self.configuration)

@@ -29,13 +29,13 @@ def test_model_research_request_accepts_all_supported_models() -> None:
 def test_persisted_strategy_contract_keeps_xgboost_model_marker_and_adds_risk_off_mode() -> None:
     source = (SRC / "schemas" / "requests.py").read_text(encoding="utf-8")
     assert 'RotationModel = Literal["xgboost_utility"]' in source
-    assert 'StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION"]' in source
+    assert 'StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPPORTUNITY_CASH_GATE", "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"]' in source
 
 
 def test_model_jobs_are_admin_only_and_only_live_capable_models_certify_strategy() -> None:
     main = (SRC / "main.py").read_text(encoding="utf-8")
     jobs = (SRC / "services" / "jobs.py").read_text(encoding="utf-8")
-    assert "application.include_router(model_research.router, dependencies=admin_required)" in main
+    assert "application.include_router(model_research.router, dependencies=research_access)" in main
     router = (SRC / "api" / "routers" / "model_research.py").read_text(encoding="utf-8")
     assert '@router.get("/executions")' in router
     assert 'certifies_strategy = research_model_family in {"xgboost_utility", "lightgbm_utility"}' in jobs
@@ -256,7 +256,7 @@ def test_model_parameter_selector_is_embedded_in_selected_strategy_box() -> None
     assert "ModelResearchSettingsPanel" not in system_source
     assert "MODEL PARAMETERS" in panel_source
     assert "Model saved with this Strategy" in panel_source
-    assert "Backtest uses this saved model automatically and cannot override it." in panel_source
+    assert "Backtest uses this saved model automatically and cannot override it." not in panel_source
 
 
 def test_same_named_parameters_are_independent_per_model_profile() -> None:

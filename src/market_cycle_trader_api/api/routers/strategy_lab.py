@@ -5,7 +5,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import ValidationError
 
-from ...auth.security import SessionIdentity, require_admin_session
+from ...auth.security import SessionIdentity, require_admin_session, require_trader_session
 from ...core.runtime import database, refresh_locked_configuration_status
 from ...schemas.strategy_lab import (
     StrategyCandidateRequest,
@@ -34,6 +34,7 @@ from ...services.strategy_lab import (
 
 router = APIRouter(prefix="/api/admin/strategies", tags=["admin-strategies"])
 AdminIdentity = Annotated[SessionIdentity, Depends(require_admin_session)]
+ViewerIdentity = Annotated[SessionIdentity, Depends(require_trader_session)]
 
 
 def _translate_error(exc: Exception) -> HTTPException:
@@ -54,7 +55,7 @@ def _translate_error(exc: Exception) -> HTTPException:
 
 
 @router.get("")
-def read_strategies(_: AdminIdentity) -> dict[str, Any]:
+def read_strategies(_: ViewerIdentity) -> dict[str, Any]:
     try:
         return list_strategies(database())
     except (StrategyLabError, ValidationError) as exc:
@@ -62,7 +63,7 @@ def read_strategies(_: AdminIdentity) -> dict[str, Any]:
 
 
 @router.get("/control")
-def read_strategy_control(_: AdminIdentity) -> dict[str, Any]:
+def read_strategy_control(_: ViewerIdentity) -> dict[str, Any]:
     try:
         return get_strategy_control(database())
     except (StrategyLabError, ValidationError) as exc:
@@ -87,7 +88,7 @@ def create_strategy_profile(
 
 
 @router.get("/{strategy_id}")
-def read_strategy(strategy_id: str, _: AdminIdentity) -> dict[str, Any]:
+def read_strategy(strategy_id: str, _: ViewerIdentity) -> dict[str, Any]:
     try:
         return get_strategy(database(), strategy_id)
     except (StrategyLabError, ValidationError) as exc:

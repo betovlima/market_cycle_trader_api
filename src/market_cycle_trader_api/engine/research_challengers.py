@@ -15,9 +15,11 @@ from .capital_rotation import (
     RotationRunResult,
     _analysis_decision_dates,
     _optimized_policy,
+    _compound_risk_overlay_policy,
     _scheduled_allocation_policy,
     _simulate_optimized_allocation,
     _build_walk_forward_folds,
+    _cash_gate_action_log_return,
     _fold_performance,
     _risk_adjusted_reward,
     _risk_off_enabled,
@@ -29,8 +31,18 @@ from .capital_rotation import (
     _xgb_utilities,
     prepare_rotation_panel,
 )
-from .optimized_allocation import optimized_allocation_enabled
-from .selective_opportunity import fit_selective_opportunity_gate, selective_opportunity_enabled
+from .optimized_allocation import fit_expected_return_calibrator
+from .absolute_utility_cash_gate import absolute_utility_cash_gate_enabled
+from .concentrated_allocation import concentrated_allocation_enabled, portfolio_allocation_enabled
+from .compound_risk_overlay import allocation_execution_enabled, compound_risk_overlay_enabled
+from .selective_opportunity import (
+    AdaptiveOpportunityCashGate,
+    build_base_policy_opportunity_samples,
+    fit_adaptive_opportunity_cash_gate,
+    fit_selective_opportunity_gate,
+    opportunity_cash_gate_enabled,
+    selective_opportunity_enabled,
+)
 
 
 def _effective_n_jobs(configured: int) -> int:
@@ -232,6 +244,9 @@ def _run_lightgbm(
         seed = int(config.random_state) + repetition * seed_step
         rep_config = config.model_copy(update={"random_state": seed})
         policies: dict[int, Callable] = {}
+        risk_overlay_state = {"position": 0, "holding_days": 0}
+        cash_gate_base_state: dict[str, Any] = {"position": 0, "holding_days": 0, "pending_sample": None}
+        cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
         run_base = repetition / repetitions
@@ -298,7 +313,9 @@ def _run_lightgbm(
                     target_column="forward_cash_edge",
                 )
             opportunity_gate = None
-            if selective_opportunity_enabled(rep_config):
+            expected_return_calibrator = None
+            label_horizon = max(int(item) for item in rep_config.rotation_target_horizons)
+            if selective_opportunity_enabled(rep_config) and not opportunity_cash_gate_enabled(rep_config):
                 opportunity_gate = fit_selective_opportunity_gate(
                     calibration_models,
                     frames,
@@ -306,14 +323,24 @@ def _run_lightgbm(
                     calibration_dates,
                     lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
                     random_state=int(rep_config.random_state),
-                    label_horizon=max(int(item) for item in rep_config.rotation_target_horizons),
+                    label_horizon=label_horizon,
+                    hysteresis=False,
+                )
+            if portfolio_allocation_enabled(rep_config):
+                expected_return_calibrator = fit_expected_return_calibrator(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    label_horizon=label_horizon,
                 )
             candidate_margins = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
             best_candidate = candidate_margins[0]
             best_score = float("-inf")
             margin_config = (
                 rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
-                if selective_opportunity_enabled(rep_config)
+                if selective_opportunity_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)
                 else rep_config
             )
             for candidate in candidate_margins:
@@ -367,13 +394,53 @@ def _run_lightgbm(
                     target_column="forward_cash_edge",
                 )
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
-            if optimized_allocation_enabled(rep_config):
+            if opportunity_cash_gate_enabled(rep_config):
+                gate_base_config = rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
+                calibration_base_policy = _xgb_policy(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    gate_base_config,
+                    effective_margin,
+                    calibrated_switch_margin=float(best_candidate),
+                )
+                initial_gate_samples = build_base_policy_opportunity_samples(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    calibration_base_policy,
+                    lambda now, nxt, from_pos, to_pos: _cash_gate_action_log_return(
+                        frames, symbols, now, nxt, from_pos, to_pos, rep_config
+                    ),
+                )
+                opportunity_gate = fit_adaptive_opportunity_cash_gate(
+                    initial_gate_samples,
+                    random_state=int(rep_config.random_state),
+                    shared_history=cash_gate_oos_history,
+                    fold_id=fold_id,
+                )
+            if compound_risk_overlay_enabled(rep_config):
+                policies[fold_id] = _compound_risk_overlay_policy(
+                    final_models,
+                    frames,
+                    symbols,
+                    rep_config,
+                    effective_margin,
+                    decision_diagnostics=diagnostics,
+                    fold_id=fold_id,
+                    calibrated_switch_margin=float(best_candidate),
+                    state=risk_overlay_state,
+                )
+            elif portfolio_allocation_enabled(rep_config):
                 policies[fold_id] = _optimized_policy(
                     final_models,
                     frames,
                     symbols,
                     rep_config,
                     opportunity_gate=opportunity_gate,
+                    expected_return_calibrator=expected_return_calibrator,
                     decision_diagnostics=diagnostics,
                     fold_id=fold_id,
                 )
@@ -386,6 +453,7 @@ def _run_lightgbm(
                     effective_margin,
                     cash_edge_models=final_cash_edge_models,
                     opportunity_gate=opportunity_gate,
+                    cash_gate_base_state=cash_gate_base_state if (opportunity_cash_gate_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)) else None,
                     decision_diagnostics=diagnostics,
                     fold_id=fold_id,
                     calibrated_switch_margin=float(best_candidate),
@@ -396,16 +464,46 @@ def _run_lightgbm(
                 "effective_switch_margin": float(effective_margin),
                 "calibration_risk_adjusted_score": float(best_score),
             }
+            if absolute_utility_cash_gate_enabled(rep_config):
+                margin_detail.update({
+                    "absolute_utility_entry_threshold": float(rep_config.opportunity_utility_entry_threshold),
+                    "absolute_utility_exit_threshold": float(rep_config.opportunity_utility_exit_threshold),
+                    "absolute_utility_threshold_basis": "champion_top1_absolute_utility",
+                })
             if opportunity_gate is not None:
                 margin_detail.update(
                     {
                         "opportunity_threshold": float(opportunity_gate.threshold),
+                        "opportunity_entry_threshold": (float(opportunity_gate.entry_threshold) if opportunity_gate.entry_threshold is not None else None),
+                        "opportunity_exit_threshold": (float(opportunity_gate.exit_threshold) if opportunity_gate.exit_threshold is not None else None),
                         "opportunity_training_rows": int(opportunity_gate.training_rows),
                         "opportunity_positive_rate": float(opportunity_gate.positive_rate),
                         "opportunity_threshold_validation_rows": int(opportunity_gate.threshold_validation_rows),
                         "opportunity_threshold_validation_score": float(opportunity_gate.threshold_validation_score),
                         "opportunity_threshold_validation_accepted": int(opportunity_gate.threshold_validation_accepted),
+                        "opportunity_threshold_validation_transitions": int(opportunity_gate.threshold_validation_transitions),
                         "opportunity_calibration_method": str(opportunity_gate.calibration_method),
+                        "opportunity_threshold_basis": str(opportunity_gate.threshold_basis),
+                        "opportunity_target_basis": str(getattr(opportunity_gate, "target_basis", "weighted_forward_net_log_return")),
+                        "opportunity_target_horizon_sessions": getattr(opportunity_gate, "target_horizon_sessions", None),
+                        "opportunity_regularized_to_base_policy": bool(getattr(opportunity_gate, "regularized_to_base_policy", False)),
+                        "opportunity_threshold_validation_alpha": getattr(opportunity_gate, "threshold_validation_alpha", None),
+                        "opportunity_threshold_validation_exposure_ratio": getattr(opportunity_gate, "threshold_validation_exposure_ratio", None),
+                        "opportunity_refresh_interval_sessions": (int(opportunity_gate.refresh_interval) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else None),
+                        "opportunity_rolling_sample_window": (int(opportunity_gate.rolling_window) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else None),
+                    }
+                )
+            if expected_return_calibrator is not None:
+                margin_detail.update(
+                    {
+                        "allocation_relative_alpha_calibration_method": str(expected_return_calibrator.method),
+                        "allocation_relative_alpha_calibration_rows": int(expected_return_calibrator.sample_count),
+                        "allocation_relative_alpha_mean": float(expected_return_calibrator.realized_alpha_mean),
+                        "allocation_relative_alpha_std": float(expected_return_calibrator.realized_alpha_std),
+                        "allocation_expected_return_calibration_method": str(expected_return_calibrator.method),
+                        "allocation_expected_return_calibration_rows": int(expected_return_calibrator.sample_count),
+                        "allocation_expected_return_mean": float(expected_return_calibrator.realized_return_mean),
+                        "allocation_expected_return_std": float(expected_return_calibrator.realized_return_std),
                     }
                 )
             margin_details.append(margin_detail)
@@ -422,7 +520,7 @@ def _run_lightgbm(
         )
         scheduled = (
             _scheduled_allocation_policy(policies, decision_to_fold)
-            if optimized_allocation_enabled(rep_config)
+            if allocation_execution_enabled(rep_config)
             else _scheduled_policy(policies, decision_to_fold)
         )
 
@@ -440,7 +538,7 @@ def _run_lightgbm(
                 )
                 trade_callback(payload)
 
-        simulator = _simulate_optimized_allocation if optimized_allocation_enabled(rep_config) else _simulate_exact
+        simulator = _simulate_optimized_allocation if allocation_execution_enabled(rep_config) else _simulate_exact
         result = simulator(
             "lightgbm_utility",
             scheduled,
@@ -477,7 +575,16 @@ def _run_lightgbm(
                 "effective_compute_device": "cpu",
                 "deterministic_execution": bool(rep_config.deterministic_execution),
                 "numeric_thread_limit": int(rep_config.numeric_thread_limit),
-                "decision_diagnostics_schema_version": 6 if optimized_allocation_enabled(rep_config) else (5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2)),
+                "decision_diagnostics_schema_version": (
+                    11 if compound_risk_overlay_enabled(rep_config)
+                    else 10 if concentrated_allocation_enabled(rep_config)
+                    else 9 if portfolio_allocation_enabled(rep_config)
+                    else 8 if absolute_utility_cash_gate_enabled(rep_config)
+                    else 7 if opportunity_cash_gate_enabled(rep_config)
+                    else 5 if selective_opportunity_enabled(rep_config)
+                    else 3 if _risk_off_enabled(rep_config)
+                    else 2
+                ),
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
@@ -1274,7 +1381,7 @@ def _run_iqn(
                 "iqn_training_details": training_details,
                 "iqn_settings_revision": _research_settings(config).get("settings_revision"),
                 "iqn_profile_id": _research_settings(config).get("profile_id"),
-                "decision_diagnostics_schema_version": 5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2),
+                "decision_diagnostics_schema_version": 8 if absolute_utility_cash_gate_enabled(rep_config) else (7 if opportunity_cash_gate_enabled(rep_config) else (5 if selective_opportunity_enabled(rep_config) else (3 if _risk_off_enabled(rep_config) else 2))),
                 "decision_diagnostics_rows": len(diagnostics),
             }
         )
@@ -1313,8 +1420,8 @@ def run_research_challenger(
             technical_log_callback=technical_log_callback,
         )
     if model_family == "iqn":
-        if optimized_allocation_enabled(config):
-            raise ValueError("Optimized Allocation v3.0.0 supports Ranking Utility models (XGBoost/LightGBM); IQN allocation is not enabled in this release.")
+        if allocation_execution_enabled(config):
+            raise ValueError("Portfolio Allocation / Compound Risk Overlay v3.12.0 supports Ranking Utility models (XGBoost/LightGBM); IQN allocation is not enabled in this release.")
         return _run_iqn(
             bars_by_symbol,
             config,

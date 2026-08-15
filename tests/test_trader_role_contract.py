@@ -94,3 +94,22 @@ def test_google_administrator_session_gets_full_scope() -> None:
     assert identity.is_admin is True
     assert identity.can_view_portfolio is True
     assert "admin:manage" in identity.scope.split()
+
+
+def test_backtest_access_blocks_viewer_mutations_but_keeps_read_access(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from market_cycle_trader_api.auth import security
+
+    viewer = security.SessionIdentity(
+        subject='google:viewer', role='viewer', scope='trader:read', expires_at=__import__('datetime').datetime.now(__import__('datetime').UTC)
+    )
+    monkeypatch.setattr(security, 'require_trader_session', lambda request: viewer)
+
+    assert security.require_backtest_access(SimpleNamespace(method='GET')) is viewer
+    try:
+        security.require_backtest_access(SimpleNamespace(method='POST'))
+    except HTTPException as exc:
+        assert exc.status_code == 403
+    else:
+        raise AssertionError('Viewer POST must be rejected')
