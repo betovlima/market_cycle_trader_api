@@ -293,13 +293,13 @@ def test_candidate_loader_keeps_visible_steam_at_compact_scale() -> None:
     assert '--color-5: color-mix(in srgb, var(--candidate-accent) 88%, transparent);' in styles
     assert 'animation: animloader 1s ease-in-out infinite;' in styles
 
-def test_caro_candidate_title_uses_ripple_while_running_and_green_dot_when_completed() -> None:
+def test_candidate_execution_title_uses_ripple_while_running_and_green_dot_when_completed() -> None:
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
     styles = (FRONT / "src" / "styles.css").read_text(encoding="utf-8")
 
-    assert "const isCaroCandidate = !candidate.is_control && candidate.kind === 'champion_probability'" in panel
-    assert "isCaroCandidate && status === 'running' ? <span className=\"model-tuning-caro-status-loader\"" in panel
-    assert "isCaroCandidate && status === 'completed' ? <span className=\"model-tuning-caro-status-complete\"" in panel
+    assert "const hasExecutionStatusIndicator = !candidate.is_control && ['probability_startup', 'unified_exploration', 'champion_probability'].includes(candidate.kind)" in panel
+    assert "hasExecutionStatusIndicator && status === 'running' ? <span className=\"model-tuning-caro-status-loader\"" in panel
+    assert "hasExecutionStatusIndicator && status === 'completed' ? <span className=\"model-tuning-caro-status-complete\"" in panel
     assert '.model-tuning-caro-status-loader {' in styles
     assert 'animation: modelTuningCaroStatusColor 2.4s ease-in-out infinite;' in styles
     assert 'animation: modelTuningCaroRipple 1.4s ease-out infinite;' in styles
