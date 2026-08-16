@@ -50,13 +50,24 @@ from .model_tuning_market_snapshot import (
     require_tuning_market_snapshot,
 )
 from .serialization import downsample_documents, iso_value
+from .temporal_policy_tuning import (
+    TEMPORAL_POLICY_MODEL_FAMILY,
+    TEMPORAL_POLICY_TUNING_SCOPE,
+    derived_temporal_policy_snapshot,
+    evaluate_temporal_policy_candidate,
+    is_temporal_policy_strategy,
+    temporal_policy_baseline,
+    temporal_policy_plan,
+)
 from ..schemas.requests import BacktestRequest
 from .strategy_lab import (
     create_strategy,
+    create_tuned_temporal_strategy,
     get_strategy,
     get_strategy_control,
     get_strategy_model_snapshot,
     prepare_strategy_for_backtest_candidate,
+    select_model_tuning_strategy,
     select_research_strategy,
     update_strategy,
     update_strategy_model,
@@ -68,7 +79,7 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 11
+TUNING_SCHEMA_VERSION = 12
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
@@ -116,6 +127,12 @@ class ModelTuningNotFound(RuntimeError):
 
 def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
     control = get_strategy_control(db)
+    temporal_strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()
+    if temporal_strategy_id:
+        strategy = get_strategy(db, temporal_strategy_id)
+        if is_temporal_policy_strategy(strategy):
+            model_snapshot = get_strategy_model_snapshot(db, temporal_strategy_id)
+            return strategy, model_snapshot, "temporal_policy_selection"
     candidates = (
         ("candidate", control.get("candidate_strategy_id")),
         ("promoted_candidate", control.get("promoted_candidate_strategy_id")),
@@ -342,6 +359,8 @@ def get_model_tuning_candidate_log(db: Any, run_id: str, candidate_id: int) -> d
 
 
 def _tuning_plan(strategy: dict[str, Any], model_snapshot: dict[str, Any]) -> dict[str, Any]:
+    if is_temporal_policy_strategy(strategy):
+        return temporal_policy_plan(strategy)
     configuration = strategy.get("configuration") if isinstance(strategy.get("configuration"), dict) else {}
     mode = str(configuration.get("strategy_mode") or "")
     frozen_model_values = model_values_from_snapshot(model_snapshot)
@@ -403,6 +422,7 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     scope = str((plan or {}).get("scope") or MODEL_PARAMETER_TUNING_SCOPE)
     scope_label = str((plan or {}).get("scope_label") or "LightGBM model parameters")
     scope_description = str((plan or {}).get("description") or "Tune the saved LightGBM model hyperparameters under the frozen Strategy and market-data protocol.")
+    temporal_scope = scope == TEMPORAL_POLICY_TUNING_SCOPE
     default_startup_trials = max(4, min(24, len(search_space) + 2))
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
@@ -420,19 +440,19 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
             },
         ],
         "recommended_method": PROBABILITY_METHOD,
-        "model_family": TUNING_MODEL_FAMILY,
-        "model_label": "LightGBM Utility",
+        "model_family": TEMPORAL_POLICY_MODEL_FAMILY if temporal_scope else TUNING_MODEL_FAMILY,
+        "model_label": "Temporal Policy" if temporal_scope else "LightGBM Utility",
         "tuning_scope": scope,
         "tuning_scope_label": scope_label,
         "tuning_scope_description": scope_description,
-        "baseline_policy": "active_candidate_certified_backtest",
+        "baseline_policy": "materialized_temporal_run" if temporal_scope else "active_candidate_certified_backtest",
         "joint_optimization": scope == ABSOLUTE_UTILITY_TUNING_SCOPE,
         "default_candidate_count": DEFAULT_CANDIDATE_COUNT,
         "candidate_count_min": 4,
         "candidate_count_max": 60,
         "default_seed": DEFAULT_SEED,
         "control_candidate_included": True,
-        "control_execution_mode": "reuse_certified_candidate_backtest",
+        "control_execution_mode": "reuse_materialized_temporal_result" if temporal_scope else "reuse_certified_candidate_backtest",
         "baseline_execution_required": True,
         "campaign_export_available": True,
         "validation": "chronological_walk_forward",
@@ -446,15 +466,15 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
         "raw_artifacts": "summary_only",
         "adoption_requires_final_backtest": False,
         "dedicated_worker": False,
-        "execution_mode": "integrated_api_worker",
-        "market_data_access": "database_only",
-        "prior_campaign_reuse": True,
-        "automatic_compatible_prior_observation_reuse": True,
+        "execution_mode": "frozen_temporal_replay" if temporal_scope else "integrated_api_worker",
+        "market_data_access": "frozen_temporal_replay_only" if temporal_scope else "database_only",
+        "prior_campaign_reuse": not temporal_scope,
+        "automatic_compatible_prior_observation_reuse": not temporal_scope,
         "automatic_lhs_to_caro_handoff": False,
         "unified_caro": True,
         "dynamic_exploration": True,
         "legacy_pipeline_supported": True,
-        "reproducibility_guard": "frozen_execution_snapshot_and_market_data_signature",
+        "reproducibility_guard": "materialized_temporal_strategy_and_frozen_replay" if temporal_scope else "frozen_execution_snapshot_and_market_data_signature",
         "restart_recovery": "invalidate_unfinished_campaign_after_restart",
         "probability": {
             "label": "Unified Adaptive CARO",
@@ -733,6 +753,8 @@ def _refresh_campaign_ranking(db: Any, run_id: str) -> None:
 
 def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     strategy, model_snapshot, target_source = _tuning_target_strategy(db)
+    if is_temporal_policy_strategy(strategy):
+        return [temporal_policy_baseline(strategy)]
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
         return []
 
@@ -1584,6 +1606,231 @@ def list_model_tuning_history(db: Any, *, limit: int = 100) -> list[dict[str, An
     return [_public_tuning_history_item(document) for document in cursor]
 
 
+
+def _temporal_control_candidate(strategy: dict[str, Any], baseline: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    metrics = deepcopy(baseline.get("metrics") or {})
+    source_run_id = str(baseline.get("source_temporal_run_id") or baseline.get("job_id") or "")
+    if not source_run_id or not metrics:
+        raise ModelTuningConflict("The materialized TEMPORAL Strategy does not contain a reusable validation baseline.")
+    return {
+        "candidate_id": 0,
+        "kind": "control",
+        "is_control": True,
+        "settings": deepcopy(settings),
+        "settings_hash": _settings_hash(settings),
+        "status": "completed",
+        "rank": None,
+        "metrics": metrics,
+        "equity_preview": [],
+        "job_id": None,
+        "source_job_id": None,
+        "source_temporal_run_id": source_run_id,
+        "baseline_reused": True,
+        "champion_gate_passed": None,
+        "champion_gate": None,
+        "raw_results_retained": False,
+    }
+
+
+def _start_temporal_policy_tuning(
+    db: Any,
+    *,
+    strategy: dict[str, Any],
+    method: str,
+    candidate_count: int,
+    caro_candidate_count: int | None,
+    seed: int,
+    baseline_job_id: str | None,
+    source_tuning_run_id: str | None,
+    probability_config: dict[str, Any] | None,
+    actor_email: str | None,
+    tuning_target_source: str,
+) -> dict[str, Any]:
+    if source_tuning_run_id:
+        raise ModelTuningConflict("TEMPORAL Policy tuning starts from the selected materialized TEMPORAL Strategy. Prior-campaign seeding is not used for this frozen replay workflow.")
+    plan = temporal_policy_plan(strategy)
+    search_space = [dict(item) for item in plan["search_space"]]
+    base_values = deepcopy(plan["base_values"])
+    baseline = temporal_policy_baseline(strategy)
+    source_run_id = str(baseline.get("source_temporal_run_id") or "")
+    if baseline_job_id and str(baseline_job_id) != source_run_id:
+        raise ModelTuningConflict("The selected TEMPORAL baseline does not match the Strategy source Temporal run.")
+    control = _temporal_control_candidate(strategy, baseline, base_values)
+    probability_input = dict(probability_config or {})
+    probability: dict[str, Any]
+    probability_anchor: dict[str, Any] | None = None
+    prior_observations: list[dict[str, Any]] = []
+
+    if method == PROBABILITY_METHOD:
+        candidates = [control]
+        total_candidates = int(candidate_count) + 1
+        minimum_exploration = min(max(4, min(24, len(search_space) + 2)), max(4, int(candidate_count)))
+        probability_anchor = {
+            "source": "materialized_temporal_run",
+            "source_temporal_run_id": source_run_id,
+            "candidate_id": 0,
+            "settings_hash": control["settings_hash"],
+            "settings": deepcopy(base_values),
+            "metrics": deepcopy(baseline.get("metrics") or {}),
+        }
+        probability = {
+            "startup_trials": minimum_exploration,
+            "minimum_exploration_trials": minimum_exploration,
+            "imported_observation_count": 0,
+            "min_capital_improvement": float(probability_input.get("min_capital_improvement", 0.03)),
+            "sharpe_tolerance": float(probability_input.get("sharpe_tolerance", 0.05)),
+            "drawdown_tolerance": float(probability_input.get("drawdown_tolerance", 0.03)),
+            "min_worst_fold_return": float(probability_input.get("min_worst_fold_return", 0.0)),
+            "candidate_pool_size": int(probability_input.get("candidate_pool_size", 2048)),
+            "exploration_weight": float(probability_input.get("exploration_weight", 0.15)),
+            "initial_exploration_fraction": float(probability_input.get("initial_exploration_fraction", 0.45)),
+            "minimum_exploration_fraction": float(probability_input.get("minimum_exploration_fraction", 0.20)),
+            "stagnation_recovery_trials": int(probability_input.get("stagnation_recovery_trials", 4)),
+            "space_filling_pool_size": int(probability_input.get("space_filling_pool_size", 1024)),
+            "probability_model": PROBABILITY_MODEL,
+            "source_mode": "temporal_frozen_replay_unified",
+            "search_policy": "dynamic_space_filling_plus_sequential_adaptive_trust_region",
+        }
+    elif method == PIPELINE_METHOD:
+        adaptive_trials = max(1, int(caro_candidate_count or DEFAULT_CANDIDATE_COUNT))
+        candidates = generate_latin_hypercube_candidates(base_values, candidate_count=candidate_count, seed=seed, search_space=search_space)
+        candidates[0] = control
+        total_candidates = len(candidates) + adaptive_trials
+        probability_anchor = {
+            "source": "materialized_temporal_run",
+            "source_temporal_run_id": source_run_id,
+            "candidate_id": 0,
+            "settings_hash": control["settings_hash"],
+            "settings": deepcopy(base_values),
+            "metrics": deepcopy(baseline.get("metrics") or {}),
+        }
+        probability = {
+            "startup_trials": int(candidate_count),
+            "full_lhs_candidate_count": int(candidate_count),
+            "adaptive_trials": adaptive_trials,
+            "imported_observation_count": 0,
+            "min_capital_improvement": float(probability_input.get("min_capital_improvement", 0.03)),
+            "sharpe_tolerance": float(probability_input.get("sharpe_tolerance", 0.05)),
+            "drawdown_tolerance": float(probability_input.get("drawdown_tolerance", 0.03)),
+            "min_worst_fold_return": float(probability_input.get("min_worst_fold_return", 0.0)),
+            "candidate_pool_size": int(probability_input.get("candidate_pool_size", 2048)),
+            "exploration_weight": float(probability_input.get("exploration_weight", 0.15)),
+            "probability_model": PROBABILITY_MODEL,
+            "source_mode": "temporal_frozen_replay_lhs_then_caro",
+        }
+    else:
+        candidates = generate_latin_hypercube_candidates(base_values, candidate_count=candidate_count, seed=seed, search_space=search_space)
+        candidates[0] = control
+        total_candidates = len(candidates)
+        probability = {}
+
+    policy = strategy.get("temporal_policy") if isinstance(strategy.get("temporal_policy"), dict) else {}
+    snapshot_id = str(policy.get("market_data_snapshot_id") or "").strip().lower() or None
+    analysis_end = str(policy.get("analysis_end_date") or "").strip() or None
+    now = utc_now()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-tune-" + uuid.uuid4().hex[:8]
+    initial_completed = sum(1 for item in candidates if item.get("status") == "completed")
+    document = {
+        "_id": run_id,
+        "id": run_id,
+        "schema_version": TUNING_SCHEMA_VERSION,
+        "status": "queued",
+        "phase": "queued",
+        "method": method,
+        "model_family": TEMPORAL_POLICY_MODEL_FAMILY,
+        "model_label": "Temporal Policy",
+        "tuning_scope": TEMPORAL_POLICY_TUNING_SCOPE,
+        "tuning_scope_label": plan["scope_label"],
+        "tuning_scope_description": plan["description"],
+        "strategy_mode": plan.get("strategy_mode"),
+        "candidate_count": int(candidate_count),
+        "caro_candidate_count": (int(caro_candidate_count or DEFAULT_CANDIDATE_COUNT) if method == PIPELINE_METHOD else None),
+        "pipeline_mode": ("full_lhs_then_caro" if method == PIPELINE_METHOD else None),
+        "pipeline_handoff_completed": False,
+        "total_candidates": int(total_candidates),
+        "generated_candidates": len(candidates),
+        "completed_candidates": int(initial_completed),
+        "failed_candidates": 0,
+        "cancelled_candidates": 0,
+        "seed": int(seed),
+        "search_space": search_space,
+        "tuned_parameters": list(plan["tuned_parameters"]),
+        "tuned_model_parameters": [],
+        "tuned_strategy_parameters": list(plan["tuned_strategy_parameters"]),
+        "strategy_profile_id": strategy["id"],
+        "strategy_profile_name": strategy["name"],
+        "strategy_profile_revision": int(strategy["revision"]),
+        "strategy_profile_status": str(strategy.get("status") or "draft"),
+        "tuning_target_source": tuning_target_source,
+        "strategy_configuration_hash": strategy.get("configuration_hash"),
+        "strategy_configuration_snapshot": bson_value(deepcopy(strategy.get("configuration") or {})),
+        "base_model_settings_hash": None,
+        "base_model_settings_revision": 0,
+        "base_model_values": {},
+        "base_tuning_values": bson_value(base_values),
+        "frozen_model_values": {},
+        "fixed_model_values": {},
+        "baseline_execution": bson_value(baseline),
+        "probability_config": bson_value(probability),
+        "probability_anchor": bson_value(probability_anchor) if probability_anchor else None,
+        "probability_state": bson_value(initial_probability_state(prior_observations)) if method in _ADAPTIVE_METHODS else None,
+        "probability_champion_history": [],
+        "source_tuning_run_id": None,
+        "source_strategy_profile_id": strategy["id"],
+        "source_strategy_profile_revision": int(strategy["revision"]),
+        "source_temporal_run_id": source_run_id,
+        "prior_observations": [],
+        "imported_observation_count": 0,
+        "execution_mode": "frozen_temporal_replay",
+        "execution_request_snapshot": None,
+        "execution_context_hash": None,
+        "expected_market_data_signature_sha256": snapshot_id,
+        "market_data_snapshot_id": snapshot_id,
+        "market_data_signature_source": "materialized_temporal_run",
+        "market_data_signature_established_by_candidate_id": None,
+        "market_data_cutoff_date": analysis_end,
+        "adoption_context_compatible": True,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "created_by": (actor_email or "").strip().lower() or None,
+        "stop_requested": False,
+        "current_candidate_id": None,
+        "current_job_id": None,
+        "best_candidate_id": None,
+        "best_exploratory_candidate_id": None,
+        "best_champion_beating_candidate_id": None,
+        "control_candidate_id": 0,
+        "event_log": bson_value([
+            {
+                "at": now,
+                "level": "info",
+                "stage": "created",
+                "message": _sanitize_tuning_log_line(
+                    f"TEMPORAL Policy campaign created. method={method}; source_temporal_run={source_run_id}; total_candidates={int(total_candidates)}."
+                ),
+                "candidate_id": None,
+                "job_id": None,
+            },
+            {
+                "at": now,
+                "level": "info",
+                "stage": "control_reused",
+                "message": _sanitize_tuning_log_line(
+                    f"Control #0 reused materialized Temporal Intelligence run {source_run_id}; no model retraining or market-data download was executed."
+                ),
+                "candidate_id": 0,
+                "job_id": None,
+            },
+        ]),
+        "candidates": bson_value(candidates),
+    }
+    db[MODEL_TUNING_RUNS_COLLECTION].insert_one(document)
+    threading.Thread(target=run_model_tuning, args=(run_id,), daemon=True).start()
+    return public_model_tuning_run(db, document)
+
+
 def start_model_tuning(
     db: Any,
     *,
@@ -1617,6 +1864,20 @@ def start_model_tuning(
         )
 
     strategy, model_snapshot, tuning_target_source = _tuning_target_strategy(db)
+    if is_temporal_policy_strategy(strategy):
+        return _start_temporal_policy_tuning(
+            db,
+            strategy=strategy,
+            method=normalized_method,
+            candidate_count=candidate_count,
+            caro_candidate_count=caro_candidate_count,
+            seed=seed,
+            baseline_job_id=baseline_job_id,
+            source_tuning_run_id=source_tuning_run_id,
+            probability_config=probability_config,
+            actor_email=actor_email,
+            tuning_target_source=tuning_target_source,
+        )
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
         raise ModelTuningConflict("The current tuning target must use LightGBM before model tuning can start.")
     if bool(strategy.get("locked")) and not _tuning_target_allows_locked_strategy(strategy):
@@ -1970,8 +2231,209 @@ def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[
     return document
 
 
+
+def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
+    document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
+    if document is None:
+        return
+    initial_phase = "latin_hypercube_exploration" if str(document.get("method") or "") == PIPELINE_METHOD else "running"
+    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+        {"id": run_id},
+        {"$set": {"status": "running", "phase": initial_phase, "started_at": utc_now(), "updated_at": utc_now()}},
+    )
+    _append_campaign_event(db, run_id, message="Frozen Temporal Policy tuning worker started.", stage="running")
+
+    while True:
+        document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or {}
+        if bool(document.get("stop_requested")):
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id},
+                {"$set": {"status": "stopped", "phase": "stopped", "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
+            )
+            _append_campaign_event(db, run_id, message="Stop request honored after the current frozen replay unit.", stage="stopped")
+            return
+
+        candidates = list(document.get("candidates") or [])
+        pending = next((item for item in candidates if item.get("status") == "pending"), None)
+        method = str(document.get("method") or "")
+        if pending is None and method in _ADAPTIVE_METHODS and len(candidates) < int(document.get("total_candidates") or 0):
+            if method == PIPELINE_METHOD and not bool(document.get("pipeline_handoff_completed")):
+                failed_count = int(document.get("failed_candidates") or 0)
+                cancelled_count = int(document.get("cancelled_candidates") or 0)
+                expected_lhs = int((document.get("probability_config") or {}).get("full_lhs_candidate_count") or document.get("candidate_count") or 0) + 1
+                completed_count = int(document.get("completed_candidates") or 0)
+                if failed_count or cancelled_count or completed_count < expected_lhs:
+                    message = (
+                        "Automatic Latin Hypercube → CARO handoff requires a complete Temporal replay exploration phase: "
+                        f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={expected_lhs}."
+                    )
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {"status": "failed", "phase": "pipeline_handoff_failed", "failure_type": "IncompleteExplorationPhase", "failure_message": message, "finished_at": utc_now(), "updated_at": utc_now()}},
+                    )
+                    _append_campaign_event(db, run_id, message=message, level="error", stage="pipeline_handoff_failed")
+                    return
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                    {"id": run_id},
+                    {"$set": {"pipeline_handoff_completed": True, "phase": "probabilistic_refinement", "updated_at": utc_now()}},
+                )
+                document["pipeline_handoff_completed"] = True
+                _append_campaign_event(
+                    db, run_id,
+                    message=f"Temporal Latin Hypercube exploration completed with {completed_count} observations. Adaptive CARO started on the same frozen replay.",
+                    stage="pipeline_handoff",
+                )
+            if method == PROBABILITY_METHOD:
+                policy = unified_caro_next_mode(document)
+                if str(policy.get("mode")) == "space_filling":
+                    candidate = propose_unified_space_filling_candidate(document)
+                    next_phase = "adaptive_exploration"
+                    message = f"Unified CARO proposed Temporal space-filling candidate #{int(candidate.get('candidate_id') or 0)}."
+                else:
+                    candidate = propose_champion_probability_candidate(document)
+                    next_phase = "probabilistic_refinement"
+                    message = f"Unified CARO proposed Temporal adaptive candidate #{int(candidate.get('candidate_id') or 0)}."
+            else:
+                candidate = propose_champion_probability_candidate(document)
+                next_phase = "probabilistic_refinement"
+                message = f"CARO proposed Temporal candidate #{int(candidate.get('candidate_id') or 0)}."
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id},
+                {"$push": {"candidates": bson_value(candidate)}, "$set": {"phase": next_phase, "generated_candidates": len(candidates) + 1, "updated_at": utc_now()}},
+            )
+            _append_campaign_event(db, run_id, message=message, stage=next_phase, candidate_id=int(candidate.get("candidate_id") or 0))
+            continue
+
+        if pending is None:
+            failed_count = int(document.get("failed_candidates") or 0)
+            cancelled_count = int(document.get("cancelled_candidates") or 0)
+            completed_count = int(document.get("completed_candidates") or 0)
+            total_count = int(document.get("total_candidates") or len(candidates))
+            if failed_count or cancelled_count or completed_count != total_count:
+                message = (
+                    "Temporal Policy campaign is incomplete and cannot be certified: "
+                    f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={total_count}."
+                )
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                    {"id": run_id},
+                    {"$set": {"status": "failed", "phase": "incomplete_campaign", "failure_type": "IncompleteTuningCampaign", "failure_message": message, "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
+                )
+                _append_campaign_event(db, run_id, message=message, level="error", stage="incomplete_campaign")
+                return
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id},
+                {"$set": {"status": "completed", "phase": "completed", "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
+            )
+            _refresh_campaign_ranking(db, run_id)
+            _append_campaign_event(db, run_id, message="Temporal Policy campaign completed with every candidate successful.", stage="completed")
+            return
+
+        candidate_id = int(pending["candidate_id"])
+        db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+            {"id": run_id, "candidates.candidate_id": candidate_id},
+            {"$set": {
+                "current_candidate_id": candidate_id,
+                "phase": (
+                    "adaptive_exploration" if str(pending.get("kind") or "") in {"probability_startup", "unified_exploration"}
+                    else "adaptive_refinement" if str(pending.get("kind") or "") == "champion_probability"
+                    else "running_candidate"
+                ),
+                "updated_at": utc_now(),
+                "candidates.$.status": "running",
+                "candidates.$.started_at": utc_now(),
+            }},
+        )
+        _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} started frozen replay.", stage="running_candidate", candidate_id=candidate_id)
+        try:
+            strategy = get_strategy(db, str(document.get("strategy_profile_id") or ""))
+            evaluation = evaluate_temporal_policy_candidate(db, strategy, dict(pending.get("settings") or {}))
+            summary = dict(evaluation.get("metrics") or {})
+            equity_preview = list(evaluation.get("equity_preview") or [])
+            is_control = bool(pending.get("is_control"))
+            champion_gate = (
+                champion_gate_evaluation(document, summary)
+                if method in _ADAPTIVE_METHODS and not is_control
+                else None
+            )
+            probability_evolution = None
+            if method in _ADAPTIVE_METHODS and not is_control:
+                probability_evolution = evolve_probability_search(document, dict(pending), summary, champion_gate)
+            now = utc_now()
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id, "candidates.candidate_id": candidate_id},
+                {"$set": {
+                    "candidates.$.status": "completed",
+                    "candidates.$.metrics": bson_value(summary),
+                    "candidates.$.equity_preview": bson_value(equity_preview),
+                    "candidates.$.champion_gate_passed": (bool(champion_gate.get("passed")) if champion_gate else None),
+                    "candidates.$.champion_gate": bson_value(champion_gate) if champion_gate else None,
+                    "candidates.$.finished_at": now,
+                    "candidates.$.raw_results_retained": False,
+                    "updated_at": now,
+                    "current_candidate_id": None,
+                    "current_job_id": None,
+                }, "$inc": {"completed_candidates": 1}},
+            )
+            if probability_evolution is not None:
+                probability_update: dict[str, Any] = {
+                    "probability_state": bson_value(probability_evolution["state"]),
+                    "updated_at": utc_now(),
+                }
+                next_anchor = probability_evolution.get("probability_anchor")
+                if next_anchor is not None:
+                    probability_update["probability_anchor"] = bson_value(next_anchor)
+                update_document: dict[str, Any] = {"$set": probability_update}
+                if next_anchor is not None:
+                    update_document["$push"] = {"probability_champion_history": bson_value({
+                        "at": utc_now(),
+                        "candidate_id": candidate_id,
+                        "settings_hash": pending.get("settings_hash"),
+                        "metrics": summary,
+                    })}
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one({"id": run_id}, update_document)
+                if next_anchor is not None:
+                    _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} became the new research Champion.", stage="champion_promoted", candidate_id=candidate_id)
+            _refresh_campaign_ranking(db, run_id)
+            _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} completed successfully.", stage="candidate_completed", candidate_id=candidate_id)
+        except Exception as exc:
+            now = utc_now()
+            failure_message = _sanitize_tuning_log_line(str(exc))[:500]
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id, "candidates.candidate_id": candidate_id},
+                {"$set": {
+                    "candidates.$.status": "failed",
+                    "candidates.$.finished_at": now,
+                    "candidates.$.error": failure_message,
+                    "candidates.$.failure_type": type(exc).__name__,
+                    "candidates.$.failure_message": failure_message,
+                    "candidates.$.diagnostic_log": bson_value(_diagnostic_traceback_lines()),
+                    "updated_at": now,
+                    "current_candidate_id": None,
+                    "current_job_id": None,
+                }, "$inc": {"failed_candidates": 1}},
+            )
+            _refresh_campaign_ranking(db, run_id)
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id},
+                {"$set": {
+                    "status": "failed",
+                    "phase": "candidate_failed",
+                    "failure_type": type(exc).__name__,
+                    "failure_message": failure_message,
+                    "finished_at": now,
+                    "updated_at": now,
+                }},
+            )
+            _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} failed: {failure_message}", level="error", stage="candidate_failed", candidate_id=candidate_id)
+            return
+
+
 def run_model_tuning(run_id: str) -> None:
     db = database()
+    document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
+    if document is not None and str(document.get("tuning_scope") or "") == TEMPORAL_POLICY_TUNING_SCOPE:
+        _run_temporal_policy_tuning(db, run_id)
+        return
     from ..api.routers.jobs import queue_backtest_job  
 
     try:
@@ -2448,6 +2910,7 @@ def recover_integrated_model_tuning_runs(db: Any) -> int:
                 "status": {"$in": list(_ACTIVE_STATUSES)},
                 "$or": [
                     {"execution_mode": "integrated_api_worker"},
+                    {"execution_mode": "frozen_temporal_replay"},
                     {"execution_mode": {"$exists": False}},
                 ],
             }
@@ -2636,6 +3099,75 @@ def adopt_model_tuning_candidate(
     if candidate is None or candidate.get("status") != "completed":
         raise ModelTuningConflict("Only a completed tuning candidate can be adopted.")
     source_strategy = get_strategy(db, str(document["strategy_profile_id"]))
+    if str(document.get("tuning_scope") or "") == TEMPORAL_POLICY_TUNING_SCOPE:
+        adoption_note = (reason or f"Use Temporal Policy tuning candidate #{int(candidate_id)} from {run_id}.").strip()
+        method_tag = ("LHS-CARO" if str(document.get("method") or "") == PIPELINE_METHOD else ("CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "LHS"))
+        suffix = f" Temporal {method_tag} C{int(candidate_id)} {str(run_id)[-8:]}"
+        source_name = str(source_strategy.get("name") or "TEMPORAL Strategy")
+        derived_name = f"{source_name[:max(3, 120 - len(suffix))]}{suffix}"
+        metrics = dict(candidate.get("metrics") or {})
+        policy_snapshot = derived_temporal_policy_snapshot(
+            source_strategy,
+            tuning_run_id=run_id,
+            candidate_id=int(candidate_id),
+            settings=dict(candidate.get("settings") or {}),
+            metrics=metrics,
+        )
+        description = (
+            f"Derived from TEMPORAL Strategy {source_strategy.get('id')} by Model Tuning {run_id}, "
+            f"candidate #{int(candidate_id)}. {adoption_note}"
+        )
+        updated_strategy = create_tuned_temporal_strategy(
+            db,
+            str(source_strategy["id"]),
+            name=derived_name,
+            description=description,
+            policy_snapshot=policy_snapshot,
+            tuning_run_id=run_id,
+            tuning_candidate_id=int(candidate_id),
+            tuning_metrics=metrics,
+            actor_email=actor_email,
+        )
+        control = get_strategy_control(db)
+        select_model_tuning_strategy(
+            db,
+            str(updated_strategy["id"]),
+            expected_control_revision=int(control["revision"]),
+            note=adoption_note,
+            actor_email=actor_email,
+        )
+        updated_strategy = get_strategy(db, str(updated_strategy["id"]))
+        adopted_at = utc_now()
+        adoption_entry = {
+            "candidate_id": int(candidate_id),
+            "strategy_id": str(updated_strategy.get("id") or ""),
+            "strategy_name": str(updated_strategy.get("name") or derived_name),
+            "at": adopted_at,
+            "by": (actor_email or "").strip().lower() or None,
+        }
+        db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+            {"id": run_id},
+            {
+                "$set": {
+                    "adopted_candidate_id": int(candidate_id),
+                    "adopted_strategy_id": str(updated_strategy.get("id") or ""),
+                    "derived_strategy_created": True,
+                    "adopted_at": adopted_at,
+                    "adopted_by": (actor_email or "").strip().lower() or None,
+                    "updated_at": adopted_at,
+                },
+                "$push": {"adoption_history": bson_value(adoption_entry)},
+            },
+        )
+        return {
+            "strategy": updated_strategy,
+            "candidate_id": int(candidate_id),
+            "derived_strategy_created": True,
+            "source_strategy_preserved": True,
+            "ready_for_backtest": False,
+            "ready_for_model_tuning": True,
+            "auto_candidate_after_backtest": False,
+        }
     frozen_request = document.get("execution_request_snapshot") if isinstance(document.get("execution_request_snapshot"), dict) else {}
     frozen_configuration = None
     if frozen_request:
@@ -2798,6 +3330,7 @@ def _public_candidate(candidate: dict[str, Any], current_jobs: dict[str, dict[st
         "proposal": deepcopy(candidate.get("proposal") or None),
         "job_id": candidate.get("job_id"),
         "source_job_id": candidate.get("source_job_id"),
+        "source_temporal_run_id": candidate.get("source_temporal_run_id"),
         "baseline_reused": bool(candidate.get("baseline_reused")),
         "worker_id": candidate.get("worker_id"),
         "worker_cpu_count": candidate.get("worker_cpu_count"),
@@ -2888,6 +3421,7 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "probability_state": deepcopy(document.get("probability_state") or None),
         "probability_champion_history": deepcopy(document.get("probability_champion_history") or []),
         "source_tuning_run_id": document.get("source_tuning_run_id"),
+        "source_temporal_run_id": document.get("source_temporal_run_id"),
         "imported_observation_count": int(document.get("imported_observation_count") or 0),
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),
         "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),

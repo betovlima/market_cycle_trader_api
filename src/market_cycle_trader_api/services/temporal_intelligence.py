@@ -162,6 +162,7 @@ def _build_execution_request(db: Any) -> tuple[BacktestExecutionRequest, dict[st
         "research_model_settings": model_settings,
         "research_market_data_mode": "database_only",
         "deterministic_execution": True,
+        "xgb_n_jobs": 1,
         "numeric_thread_limit": 1,
     })
     return request, winner_strategy, model_snapshot
@@ -234,6 +235,7 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
             "research_market_data_snapshot_id": snapshot_id,
             "expected_market_data_signature_sha256": snapshot_id,
             "deterministic_execution": True,
+            "xgb_n_jobs": 1,
             "numeric_thread_limit": 1,
         })
     except TemporalIntelligenceConflict:
