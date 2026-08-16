@@ -25,6 +25,7 @@ def test_viewer_capabilities_are_read_only_for_backtest_and_tuning() -> None:
     assert capabilities["temporal_intelligence.start"] is False
     assert capabilities["temporal_intelligence.stop"] is False
     assert capabilities["temporal_intelligence.export"] is False
+    assert capabilities["temporal_intelligence.materialize_strategy"] is False
     assert capabilities["portfolio.view"] is False
     assert capabilities["administration.view"] is False
     assert capabilities["settings.view"] is False

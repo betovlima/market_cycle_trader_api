@@ -77,16 +77,24 @@ def test_temporal_intelligence_is_shadow_only_and_capability_driven() -> None:
     assert '"affects_paper_trading": False' in engine
     assert 'get_trader_winner_context(db)' in service
     assert 'get_trader_winner_model_snapshot(db)' in service
-    assert '"experiment": "temporal_decision_intelligence_v8_winner_anchored_timing"' in service
+    assert '"deterministic_execution": True' in service
+    assert '"numeric_thread_limit": 1' in service
+    assert '_stable_temporal_market_snapshot' in service
+    assert 'market_snapshot_exists(db, snapshot_id)' in service
+    assert 'temporal_baseline_reuse' in service
+    assert 'TEMPORAL_EXPERIMENT = "temporal_decision_intelligence_v8_winner_anchored_timing"' in service
     assert 'temporal_intelligence_decision_diagnostics.csv' in service
     assert 'temporal_intelligence_multi_horizon_daily_assets.csv' in service
     assert 'require_capability("temporal_intelligence.view")' in router
     assert 'require_capability("temporal_intelligence.start")' in router
     assert 'require_capability("temporal_intelligence.stop")' in router
     assert 'require_capability("temporal_intelligence.export")' in router
+    assert 'require_capability("temporal_intelligence.materialize_strategy")' in router
     assert 'build_temporal_intelligence_export' in router
     assert '/export.zip' in router
     assert 'downloadFile' in panel
+    assert "temporal_intelligence.materialize_strategy" in panel
+    assert "/strategy`" in panel
     assert "require_admin_session" not in router
     assert "TemporalIntelligencePanel" in backtest
     assert "temporal_intelligence.view" in backtest
@@ -101,9 +109,12 @@ def test_temporal_intelligence_is_shadow_only_and_capability_driven() -> None:
     assert trader["temporal_intelligence.start"] is False
     assert admin["temporal_intelligence.start"] is True
     assert admin["temporal_intelligence.stop"] is True
+    assert admin["temporal_intelligence.materialize_strategy"] is True
     assert viewer["temporal_intelligence.export"] is False
     assert trader["temporal_intelligence.export"] is False
     assert admin["temporal_intelligence.export"] is True
+    assert viewer["temporal_intelligence.materialize_strategy"] is False
+    assert trader["temporal_intelligence.materialize_strategy"] is False
 
 
 class _TemporalCollection:
@@ -1043,7 +1054,7 @@ def test_temporal_v8_export_schema_is_v11() -> None:
     content = build_temporal_intelligence_export(_TemporalDb(document), "temporal-v8-test")
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         manifest = json.loads(archive.read("temporal_intelligence_manifest.json").decode("utf-8"))
-        assert manifest["schema_version"] == "temporal_intelligence_export_v11"
+        assert manifest["schema_version"] == "temporal_intelligence_export_v12"
         names = set(archive.namelist())
         assert "temporal_intelligence_cost_stress.csv" in names
         assert "temporal_intelligence_timing_override_attribution.csv" in names

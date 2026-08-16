@@ -13,6 +13,7 @@ from ...services.temporal_intelligence import (
     get_latest_temporal_intelligence_run,
     get_temporal_intelligence_run,
     list_temporal_intelligence_history,
+    materialize_temporal_intelligence_strategy,
     start_temporal_intelligence,
     stop_temporal_intelligence,
 )
@@ -22,6 +23,7 @@ require_temporal_view = require_capability("temporal_intelligence.view")
 require_temporal_start = require_capability("temporal_intelligence.start")
 require_temporal_stop = require_capability("temporal_intelligence.stop")
 require_temporal_export = require_capability("temporal_intelligence.export")
+require_temporal_materialize_strategy = require_capability("temporal_intelligence.materialize_strategy")
 
 
 def _translate_error(exc: Exception) -> HTTPException:
@@ -73,6 +75,17 @@ def export_temporal_intelligence(
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="temporal_intelligence_{run_id}.zip"'},
     )
+
+
+@router.post("/{run_id}/strategy", status_code=201)
+def create_strategy_from_temporal_intelligence(
+    run_id: str,
+    identity: Annotated[SessionIdentity, Depends(require_temporal_materialize_strategy)],
+) -> dict[str, Any]:
+    try:
+        return materialize_temporal_intelligence_strategy(database(), run_id, actor_email=identity.email)
+    except (TemporalIntelligenceNotFound, TemporalIntelligenceConflict) as exc:
+        raise _translate_error(exc) from exc
 
 
 @router.post("", status_code=202)

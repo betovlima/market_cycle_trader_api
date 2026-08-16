@@ -18,6 +18,7 @@ CAPABILITY_NAMES = (
     "temporal_intelligence.start",
     "temporal_intelligence.stop",
     "temporal_intelligence.export",
+    "temporal_intelligence.materialize_strategy",
     "analytics.view",
     "portfolio.view",
     "asset_discovery.view",
