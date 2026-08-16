@@ -41,6 +41,7 @@ class ModelTuningStartRequest(BaseModel):
     baseline_job_id: str | None = Field(default=None, min_length=1, max_length=128)
     source_tuning_run_id: str | None = Field(default=None, min_length=1, max_length=128)
     anchor_candidate_id: int | None = Field(default=None, ge=0)
+    tuning_target: Literal["temporal_model", "temporal_policy"] | None = None
     probability: ChampionProbabilityConfig | None = None
 
     @model_validator(mode="after")

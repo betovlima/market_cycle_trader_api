@@ -91,6 +91,7 @@ def create_tuning(
             baseline_job_id=payload.baseline_job_id,
             source_tuning_run_id=payload.source_tuning_run_id,
             anchor_candidate_id=payload.anchor_candidate_id,
+            tuning_target=payload.tuning_target,
             probability_config=payload.probability.model_dump(mode="python") if payload.probability is not None else None,
             actor_email=identity.email,
         )

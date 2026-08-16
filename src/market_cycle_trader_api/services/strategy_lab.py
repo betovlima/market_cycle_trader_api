@@ -1146,6 +1146,7 @@ def materialize_temporal_strategy(
     experiment: str,
     policy_snapshot: dict[str, Any],
     actor_email: str | None,
+    research_model_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_strategy_catalog(db)
     existing = db[STRATEGY_PROFILES_COLLECTION].find_one({"source_temporal_run_id": str(run_id)})
@@ -1180,6 +1181,7 @@ def materialize_temporal_strategy(
                 "source_temporal_experiment": str(experiment),
                 "temporal_policy_revision": 1,
                 "temporal_policy_snapshot": bson_value(policy_snapshot),
+                **({"research_model_snapshot": bson_value(research_model_snapshot)} if isinstance(research_model_snapshot, dict) else {}),
                 "updated_at": now,
                 "updated_by": (actor_email or "").strip().lower() or None,
             }
@@ -1697,8 +1699,8 @@ def select_model_tuning_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    if str(profile.get("strategy_kind") or "standard") != "temporal_intelligence" or str(profile.get("tuning_target") or "") != "temporal_policy":
-        raise StrategyLabConflict("Only a TEMPORAL Strategy with tuning_target=temporal_policy can use the dedicated Temporal Policy Model Tuning workflow.")
+    if str(profile.get("strategy_kind") or "standard") != "temporal_intelligence":
+        raise StrategyLabConflict("Only a materialized TEMPORAL Strategy can use the dedicated Temporal Model/Policy Tuning workflow.")
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},

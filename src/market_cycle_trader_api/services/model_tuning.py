@@ -59,6 +59,14 @@ from .temporal_policy_tuning import (
     temporal_policy_baseline,
     temporal_policy_plan,
 )
+from .temporal_model_tuning import (
+    TEMPORAL_MODEL_FAMILY,
+    TEMPORAL_MODEL_TUNING_SCOPE,
+    evaluate_temporal_model_candidate,
+    persist_temporal_model_champion_cache,
+    temporal_model_baseline,
+    temporal_model_plan,
+)
 from ..schemas.requests import BacktestRequest
 from .strategy_lab import (
     create_strategy,
@@ -79,7 +87,7 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 12
+TUNING_SCHEMA_VERSION = 13
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 
@@ -130,9 +138,9 @@ def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], st
     temporal_strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()
     if temporal_strategy_id:
         strategy = get_strategy(db, temporal_strategy_id)
-        if is_temporal_policy_strategy(strategy):
+        if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
             model_snapshot = get_strategy_model_snapshot(db, temporal_strategy_id)
-            return strategy, model_snapshot, "temporal_policy_selection"
+            return strategy, model_snapshot, "temporal_tuning_selection"
     candidates = (
         ("candidate", control.get("candidate_strategy_id")),
         ("promoted_candidate", control.get("promoted_candidate_strategy_id")),
@@ -358,8 +366,14 @@ def get_model_tuning_candidate_log(db: Any, run_id: str, candidate_id: int) -> d
     return payload
 
 
-def _tuning_plan(strategy: dict[str, Any], model_snapshot: dict[str, Any]) -> dict[str, Any]:
-    if is_temporal_policy_strategy(strategy):
+def _tuning_plan(
+    strategy: dict[str, Any],
+    model_snapshot: dict[str, Any],
+    requested_target: str | None = None,
+) -> dict[str, Any]:
+    if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
+        if str(requested_target or "") == TEMPORAL_MODEL_TUNING_SCOPE:
+            return temporal_model_plan(strategy, model_snapshot)
         return temporal_policy_plan(strategy)
     configuration = strategy.get("configuration") if isinstance(strategy.get("configuration"), dict) else {}
     mode = str(configuration.get("strategy_mode") or "")
@@ -422,7 +436,26 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     scope = str((plan or {}).get("scope") or MODEL_PARAMETER_TUNING_SCOPE)
     scope_label = str((plan or {}).get("scope_label") or "LightGBM model parameters")
     scope_description = str((plan or {}).get("description") or "Tune the saved LightGBM model hyperparameters under the frozen Strategy and market-data protocol.")
-    temporal_scope = scope == TEMPORAL_POLICY_TUNING_SCOPE
+    temporal_scope = scope in {TEMPORAL_POLICY_TUNING_SCOPE, TEMPORAL_MODEL_TUNING_SCOPE}
+    temporal_modes: list[dict[str, Any]] = []
+    if db is not None:
+        try:
+            temporal_strategy, temporal_model_snapshot, _ = _tuning_target_strategy(db)
+            if str(temporal_strategy.get("strategy_kind") or "") == "temporal_intelligence":
+                for target in (TEMPORAL_MODEL_TUNING_SCOPE, TEMPORAL_POLICY_TUNING_SCOPE):
+                    target_plan = _tuning_plan(temporal_strategy, temporal_model_snapshot, target)
+                    temporal_modes.append({
+                        "id": target,
+                        "label": target_plan["scope_label"],
+                        "description": target_plan["description"],
+                        "search_space": deepcopy(target_plan["search_space"]),
+                        "tuned_parameters": list(target_plan["tuned_parameters"]),
+                        "tuned_model_parameters": list(target_plan.get("tuned_model_parameters") or []),
+                        "tuned_strategy_parameters": list(target_plan.get("tuned_strategy_parameters") or []),
+                        "execution_mode": "full_temporal_lightgbm_retrain" if target == TEMPORAL_MODEL_TUNING_SCOPE else "frozen_temporal_replay",
+                    })
+        except Exception:
+            temporal_modes = []
     default_startup_trials = max(4, min(24, len(search_space) + 2))
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
@@ -440,8 +473,10 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
             },
         ],
         "recommended_method": PROBABILITY_METHOD,
-        "model_family": TEMPORAL_POLICY_MODEL_FAMILY if temporal_scope else TUNING_MODEL_FAMILY,
-        "model_label": "Temporal Policy" if temporal_scope else "LightGBM Utility",
+        "model_family": (TEMPORAL_MODEL_FAMILY if scope == TEMPORAL_MODEL_TUNING_SCOPE else TEMPORAL_POLICY_MODEL_FAMILY) if temporal_scope else TUNING_MODEL_FAMILY,
+        "model_label": ("LightGBM Temporal Intelligence" if scope == TEMPORAL_MODEL_TUNING_SCOPE else "Temporal Policy") if temporal_scope else "LightGBM Utility",
+        "temporal_tuning_modes": temporal_modes,
+        "default_temporal_tuning_target": TEMPORAL_MODEL_TUNING_SCOPE if temporal_modes else None,
         "tuning_scope": scope,
         "tuning_scope_label": scope_label,
         "tuning_scope_description": scope_description,
@@ -466,8 +501,8 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
         "raw_artifacts": "summary_only",
         "adoption_requires_final_backtest": False,
         "dedicated_worker": False,
-        "execution_mode": "frozen_temporal_replay" if temporal_scope else "integrated_api_worker",
-        "market_data_access": "frozen_temporal_replay_only" if temporal_scope else "database_only",
+        "execution_mode": ("full_temporal_lightgbm_retrain" if scope == TEMPORAL_MODEL_TUNING_SCOPE else "frozen_temporal_replay") if temporal_scope else "integrated_api_worker",
+        "market_data_access": "frozen_temporal_snapshot_only" if temporal_scope else "database_only",
         "prior_campaign_reuse": not temporal_scope,
         "automatic_compatible_prior_observation_reuse": not temporal_scope,
         "automatic_lhs_to_caro_handoff": False,
@@ -753,7 +788,7 @@ def _refresh_campaign_ranking(db: Any, run_id: str) -> None:
 
 def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     strategy, model_snapshot, target_source = _tuning_target_strategy(db)
-    if is_temporal_policy_strategy(strategy):
+    if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
         return [temporal_policy_baseline(strategy)]
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
         return []
@@ -1632,10 +1667,12 @@ def _temporal_control_candidate(strategy: dict[str, Any], baseline: dict[str, An
     }
 
 
-def _start_temporal_policy_tuning(
+def _start_temporal_tuning(
     db: Any,
     *,
     strategy: dict[str, Any],
+    model_snapshot: dict[str, Any],
+    tuning_scope: str,
     method: str,
     candidate_count: int,
     caro_candidate_count: int | None,
@@ -1647,11 +1684,12 @@ def _start_temporal_policy_tuning(
     tuning_target_source: str,
 ) -> dict[str, Any]:
     if source_tuning_run_id:
-        raise ModelTuningConflict("TEMPORAL Policy tuning starts from the selected materialized TEMPORAL Strategy. Prior-campaign seeding is not used for this frozen replay workflow.")
-    plan = temporal_policy_plan(strategy)
+        raise ModelTuningConflict("TEMPORAL tuning starts from the selected materialized TEMPORAL Strategy. Prior-campaign seeding is not used for this workflow.")
+    temporal_model_scope = str(tuning_scope) == TEMPORAL_MODEL_TUNING_SCOPE
+    plan = temporal_model_plan(strategy, model_snapshot) if temporal_model_scope else temporal_policy_plan(strategy)
     search_space = [dict(item) for item in plan["search_space"]]
     base_values = deepcopy(plan["base_values"])
-    baseline = temporal_policy_baseline(strategy)
+    baseline = temporal_model_baseline(strategy, model_snapshot) if temporal_model_scope else temporal_policy_baseline(strategy)
     source_run_id = str(baseline.get("source_temporal_run_id") or "")
     if baseline_job_id and str(baseline_job_id) != source_run_id:
         raise ModelTuningConflict("The selected TEMPORAL baseline does not match the Strategy source Temporal run.")
@@ -1688,7 +1726,7 @@ def _start_temporal_policy_tuning(
             "stagnation_recovery_trials": int(probability_input.get("stagnation_recovery_trials", 4)),
             "space_filling_pool_size": int(probability_input.get("space_filling_pool_size", 1024)),
             "probability_model": PROBABILITY_MODEL,
-            "source_mode": "temporal_frozen_replay_unified",
+            "source_mode": "temporal_lightgbm_retrain_unified" if temporal_model_scope else "temporal_frozen_replay_unified",
             "search_policy": "dynamic_space_filling_plus_sequential_adaptive_trust_region",
         }
     elif method == PIPELINE_METHOD:
@@ -1716,7 +1754,7 @@ def _start_temporal_policy_tuning(
             "candidate_pool_size": int(probability_input.get("candidate_pool_size", 2048)),
             "exploration_weight": float(probability_input.get("exploration_weight", 0.15)),
             "probability_model": PROBABILITY_MODEL,
-            "source_mode": "temporal_frozen_replay_lhs_then_caro",
+            "source_mode": "temporal_lightgbm_retrain_lhs_then_caro" if temporal_model_scope else "temporal_frozen_replay_lhs_then_caro",
         }
     else:
         candidates = generate_latin_hypercube_candidates(base_values, candidate_count=candidate_count, seed=seed, search_space=search_space)
@@ -1737,9 +1775,9 @@ def _start_temporal_policy_tuning(
         "status": "queued",
         "phase": "queued",
         "method": method,
-        "model_family": TEMPORAL_POLICY_MODEL_FAMILY,
-        "model_label": "Temporal Policy",
-        "tuning_scope": TEMPORAL_POLICY_TUNING_SCOPE,
+        "model_family": TEMPORAL_MODEL_FAMILY if temporal_model_scope else TEMPORAL_POLICY_MODEL_FAMILY,
+        "model_label": "LightGBM Temporal Intelligence" if temporal_model_scope else "Temporal Policy",
+        "tuning_scope": TEMPORAL_MODEL_TUNING_SCOPE if temporal_model_scope else TEMPORAL_POLICY_TUNING_SCOPE,
         "tuning_scope_label": plan["scope_label"],
         "tuning_scope_description": plan["description"],
         "strategy_mode": plan.get("strategy_mode"),
@@ -1755,8 +1793,8 @@ def _start_temporal_policy_tuning(
         "seed": int(seed),
         "search_space": search_space,
         "tuned_parameters": list(plan["tuned_parameters"]),
-        "tuned_model_parameters": [],
-        "tuned_strategy_parameters": list(plan["tuned_strategy_parameters"]),
+        "tuned_model_parameters": list(plan.get("tuned_model_parameters") or []),
+        "tuned_strategy_parameters": list(plan.get("tuned_strategy_parameters") or []),
         "strategy_profile_id": strategy["id"],
         "strategy_profile_name": strategy["name"],
         "strategy_profile_revision": int(strategy["revision"]),
@@ -1764,12 +1802,12 @@ def _start_temporal_policy_tuning(
         "tuning_target_source": tuning_target_source,
         "strategy_configuration_hash": strategy.get("configuration_hash"),
         "strategy_configuration_snapshot": bson_value(deepcopy(strategy.get("configuration") or {})),
-        "base_model_settings_hash": None,
-        "base_model_settings_revision": 0,
-        "base_model_values": {},
+        "base_model_settings_hash": model_snapshot.get("settings_hash") if temporal_model_scope else None,
+        "base_model_settings_revision": int(model_snapshot.get("settings_revision") or 0) if temporal_model_scope else 0,
+        "base_model_values": bson_value(plan.get("base_model_values") or {}) if temporal_model_scope else {},
         "base_tuning_values": bson_value(base_values),
-        "frozen_model_values": {},
-        "fixed_model_values": {},
+        "frozen_model_values": bson_value(plan.get("frozen_model_values") or {}) if temporal_model_scope else {},
+        "fixed_model_values": bson_value(plan.get("fixed_model_values") or {}) if temporal_model_scope else {},
         "baseline_execution": bson_value(baseline),
         "probability_config": bson_value(probability),
         "probability_anchor": bson_value(probability_anchor) if probability_anchor else None,
@@ -1781,7 +1819,7 @@ def _start_temporal_policy_tuning(
         "source_temporal_run_id": source_run_id,
         "prior_observations": [],
         "imported_observation_count": 0,
-        "execution_mode": "frozen_temporal_replay",
+        "execution_mode": "full_temporal_lightgbm_retrain" if temporal_model_scope else "frozen_temporal_replay",
         "execution_request_snapshot": None,
         "execution_context_hash": None,
         "expected_market_data_signature_sha256": snapshot_id,
@@ -1808,7 +1846,7 @@ def _start_temporal_policy_tuning(
                 "level": "info",
                 "stage": "created",
                 "message": _sanitize_tuning_log_line(
-                    f"TEMPORAL Policy campaign created. method={method}; source_temporal_run={source_run_id}; total_candidates={int(total_candidates)}."
+                    f"TEMPORAL {'Model' if temporal_model_scope else 'Policy'} campaign created. method={method}; source_temporal_run={source_run_id}; total_candidates={int(total_candidates)}."
                 ),
                 "candidate_id": None,
                 "job_id": None,
@@ -1818,7 +1856,7 @@ def _start_temporal_policy_tuning(
                 "level": "info",
                 "stage": "control_reused",
                 "message": _sanitize_tuning_log_line(
-                    f"Control #0 reused materialized Temporal Intelligence run {source_run_id}; no model retraining or market-data download was executed."
+                    (f"Control #0 reused materialized Temporal Intelligence run {source_run_id}; challenger candidates retrain Temporal LightGBM on the same frozen market snapshot." if temporal_model_scope else f"Control #0 reused materialized Temporal Intelligence run {source_run_id}; no model retraining or market-data download was executed.")
                 ),
                 "candidate_id": 0,
                 "job_id": None,
@@ -1841,6 +1879,7 @@ def start_model_tuning(
     baseline_job_id: str | None = None,
     source_tuning_run_id: str | None = None,
     anchor_candidate_id: int | None = None,
+    tuning_target: str | None = None,
     probability_config: dict[str, Any] | None = None,
     actor_email: str | None = None,
 ) -> dict[str, Any]:
@@ -1864,10 +1903,15 @@ def start_model_tuning(
         )
 
     strategy, model_snapshot, tuning_target_source = _tuning_target_strategy(db)
-    if is_temporal_policy_strategy(strategy):
-        return _start_temporal_policy_tuning(
+    if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
+        requested_temporal_target = str(tuning_target or TEMPORAL_MODEL_TUNING_SCOPE).strip().lower()
+        if requested_temporal_target not in {TEMPORAL_MODEL_TUNING_SCOPE, TEMPORAL_POLICY_TUNING_SCOPE}:
+            raise ModelTuningConflict("TEMPORAL Strategies support only Temporal Model Tuning or Temporal Policy Tuning.")
+        return _start_temporal_tuning(
             db,
             strategy=strategy,
+            model_snapshot=model_snapshot,
+            tuning_scope=requested_temporal_target,
             method=normalized_method,
             candidate_count=candidate_count,
             caro_candidate_count=caro_candidate_count,
@@ -2232,7 +2276,7 @@ def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[
 
 
 
-def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
+def _run_temporal_tuning(db: Any, run_id: str) -> None:
     document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
     if document is None:
         return
@@ -2241,7 +2285,13 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
         {"id": run_id},
         {"$set": {"status": "running", "phase": initial_phase, "started_at": utc_now(), "updated_at": utc_now()}},
     )
-    _append_campaign_event(db, run_id, message="Frozen Temporal Policy tuning worker started.", stage="running")
+    tuning_scope = str(document.get("tuning_scope") or TEMPORAL_POLICY_TUNING_SCOPE)
+    temporal_model_scope = tuning_scope == TEMPORAL_MODEL_TUNING_SCOPE
+    _append_campaign_event(
+        db, run_id,
+        message="Temporal LightGBM model tuning worker started." if temporal_model_scope else "Frozen Temporal Policy tuning worker started.",
+        stage="running",
+    )
 
     while True:
         document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or {}
@@ -2250,7 +2300,7 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
                 {"id": run_id},
                 {"$set": {"status": "stopped", "phase": "stopped", "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
             )
-            _append_campaign_event(db, run_id, message="Stop request honored after the current frozen replay unit.", stage="stopped")
+            _append_campaign_event(db, run_id, message=("Stop request honored after the current Temporal LightGBM candidate." if temporal_model_scope else "Stop request honored after the current frozen replay unit."), stage="stopped")
             return
 
         candidates = list(document.get("candidates") or [])
@@ -2264,8 +2314,8 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
                 completed_count = int(document.get("completed_candidates") or 0)
                 if failed_count or cancelled_count or completed_count < expected_lhs:
                     message = (
-                        "Automatic Latin Hypercube → CARO handoff requires a complete Temporal replay exploration phase: "
-                        f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={expected_lhs}."
+                        ("Automatic Latin Hypercube → CARO handoff requires a complete Temporal model exploration phase: " if temporal_model_scope else "Automatic Latin Hypercube → CARO handoff requires a complete Temporal replay exploration phase: ")
+                        + f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={expected_lhs}."
                     )
                     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                         {"id": run_id},
@@ -2280,7 +2330,7 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
                 document["pipeline_handoff_completed"] = True
                 _append_campaign_event(
                     db, run_id,
-                    message=f"Temporal Latin Hypercube exploration completed with {completed_count} observations. Adaptive CARO started on the same frozen replay.",
+                    message=(f"Temporal LightGBM Latin Hypercube exploration completed with {completed_count} observations. Adaptive CARO started on the same frozen market snapshot." if temporal_model_scope else f"Temporal Latin Hypercube exploration completed with {completed_count} observations. Adaptive CARO started on the same frozen replay."),
                     stage="pipeline_handoff",
                 )
             if method == PROBABILITY_METHOD:
@@ -2311,8 +2361,8 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
             total_count = int(document.get("total_candidates") or len(candidates))
             if failed_count or cancelled_count or completed_count != total_count:
                 message = (
-                    "Temporal Policy campaign is incomplete and cannot be certified: "
-                    f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={total_count}."
+                    ("Temporal Model campaign is incomplete and cannot be certified: " if temporal_model_scope else "Temporal Policy campaign is incomplete and cannot be certified: ")
+                    + f"completed={completed_count}, failed={failed_count}, cancelled={cancelled_count}, expected={total_count}."
                 )
                 db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                     {"id": run_id},
@@ -2325,7 +2375,7 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
                 {"$set": {"status": "completed", "phase": "completed", "finished_at": utc_now(), "updated_at": utc_now(), "current_candidate_id": None, "current_job_id": None}},
             )
             _refresh_campaign_ranking(db, run_id)
-            _append_campaign_event(db, run_id, message="Temporal Policy campaign completed with every candidate successful.", stage="completed")
+            _append_campaign_event(db, run_id, message=("Temporal Model campaign completed with every candidate successful." if temporal_model_scope else "Temporal Policy campaign completed with every candidate successful."), stage="completed")
             return
 
         candidate_id = int(pending["candidate_id"])
@@ -2339,14 +2389,27 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
                     else "running_candidate"
                 ),
                 "updated_at": utc_now(),
+                "current_candidate_progress": 0.0 if temporal_model_scope else None,
+                "current_candidate_stage": "Preparing Temporal LightGBM candidate" if temporal_model_scope else None,
                 "candidates.$.status": "running",
                 "candidates.$.started_at": utc_now(),
             }},
         )
-        _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} started frozen replay.", stage="running_candidate", candidate_id=candidate_id)
+        _append_campaign_event(db, run_id, message=(f"Temporal candidate #{candidate_id} started full LightGBM retraining." if temporal_model_scope else f"Temporal candidate #{candidate_id} started frozen replay."), stage="running_candidate", candidate_id=candidate_id)
         try:
             strategy = get_strategy(db, str(document.get("strategy_profile_id") or ""))
-            evaluation = evaluate_temporal_policy_candidate(db, strategy, dict(pending.get("settings") or {}))
+            if temporal_model_scope:
+                model_snapshot = get_strategy_model_snapshot(db, str(strategy.get("id") or ""))
+                def temporal_progress(percent: float, stage: str) -> None:
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {"current_candidate_progress": max(0.0, min(100.0, float(percent))), "current_candidate_stage": str(stage), "updated_at": utc_now()}},
+                    )
+                evaluation = evaluate_temporal_model_candidate(
+                    db, strategy, model_snapshot, dict(pending.get("settings") or {}), progress_callback=temporal_progress
+                )
+            else:
+                evaluation = evaluate_temporal_policy_candidate(db, strategy, dict(pending.get("settings") or {}))
             summary = dict(evaluation.get("metrics") or {})
             equity_preview = list(evaluation.get("equity_preview") or [])
             is_control = bool(pending.get("is_control"))
@@ -2394,6 +2457,41 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
                 if next_anchor is not None:
                     _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} became the new research Champion.", stage="champion_promoted", candidate_id=candidate_id)
             _refresh_campaign_ranking(db, run_id)
+            if temporal_model_scope:
+                refreshed = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or {}
+                if int(refreshed.get("best_candidate_id") if refreshed.get("best_candidate_id") is not None else -1) == candidate_id:
+                    try:
+                        cache_run_id = persist_temporal_model_champion_cache(
+                            db, tuning_run_id=run_id, candidate_id=candidate_id, strategy=strategy, evaluation=evaluation
+                        )
+                    except Exception as cache_exc:
+                        failure_message = _sanitize_tuning_log_line(str(cache_exc))[:500]
+                        db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                            {"id": run_id},
+                            {"$set": {
+                                "status": "failed",
+                                "phase": "temporal_model_champion_cache_failed",
+                                "failure_type": type(cache_exc).__name__,
+                                "failure_message": failure_message,
+                                "finished_at": utc_now(),
+                                "updated_at": utc_now(),
+                                "current_candidate_id": None,
+                                "current_job_id": None,
+                            }},
+                        )
+                        _append_campaign_event(db, run_id, message=f"Temporal model Champion cache failed after candidate #{candidate_id}: {failure_message}", level="error", stage="temporal_model_champion_cache_failed", candidate_id=candidate_id)
+                        return
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {
+                            "temporal_model_champion_cache_run_id": cache_run_id,
+                            "temporal_model_champion_candidate_id": candidate_id,
+                            "current_candidate_progress": 100.0,
+                            "current_candidate_stage": "Completed",
+                            "updated_at": utc_now(),
+                        }},
+                    )
+                    _append_campaign_event(db, run_id, message=f"Temporal model candidate #{candidate_id} became the cached model Champion.", stage="temporal_model_champion_cached", candidate_id=candidate_id)
             _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} completed successfully.", stage="candidate_completed", candidate_id=candidate_id)
         except Exception as exc:
             now = utc_now()
@@ -2431,8 +2529,8 @@ def _run_temporal_policy_tuning(db: Any, run_id: str) -> None:
 def run_model_tuning(run_id: str) -> None:
     db = database()
     document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id})
-    if document is not None and str(document.get("tuning_scope") or "") == TEMPORAL_POLICY_TUNING_SCOPE:
-        _run_temporal_policy_tuning(db, run_id)
+    if document is not None and str(document.get("tuning_scope") or "") in {TEMPORAL_POLICY_TUNING_SCOPE, TEMPORAL_MODEL_TUNING_SCOPE}:
+        _run_temporal_tuning(db, run_id)
         return
     from ..api.routers.jobs import queue_backtest_job  
 
@@ -3099,6 +3197,77 @@ def adopt_model_tuning_candidate(
     if candidate is None or candidate.get("status") != "completed":
         raise ModelTuningConflict("Only a completed tuning candidate can be adopted.")
     source_strategy = get_strategy(db, str(document["strategy_profile_id"]))
+    if str(document.get("tuning_scope") or "") == TEMPORAL_MODEL_TUNING_SCOPE:
+        best_candidate_id = int(document.get("best_candidate_id") if document.get("best_candidate_id") is not None else -1)
+        if int(candidate_id) != best_candidate_id:
+            raise ModelTuningConflict("Temporal Model Tuning can materialize only the final ranked model Champion so its frozen prediction cache remains exact.")
+        if bool(candidate.get("is_control")):
+            control = get_strategy_control(db)
+            select_model_tuning_strategy(
+                db,
+                str(source_strategy["id"]),
+                expected_control_revision=int(control["revision"]),
+                note=(reason or f"Keep TEMPORAL model Control from {run_id}.").strip(),
+                actor_email=actor_email,
+            )
+            return {
+                "strategy": get_strategy(db, str(source_strategy["id"])),
+                "candidate_id": int(candidate_id),
+                "derived_strategy_created": False,
+                "source_strategy_preserved": True,
+                "ready_for_backtest": False,
+                "ready_for_model_tuning": True,
+                "recommended_tuning_target": TEMPORAL_POLICY_TUNING_SCOPE,
+                "auto_candidate_after_backtest": False,
+            }
+        cache_run_id = str(document.get("temporal_model_champion_cache_run_id") or "").strip()
+        cache_candidate_id = int(document.get("temporal_model_champion_candidate_id") if document.get("temporal_model_champion_candidate_id") is not None else -1)
+        if not cache_run_id or cache_candidate_id != int(candidate_id):
+            raise ModelTuningConflict("The final Temporal model Champion prediction cache is unavailable. Re-run the Temporal Model Tuning campaign before materialization.")
+        from .temporal_intelligence import materialize_temporal_intelligence_strategy
+        materialized = materialize_temporal_intelligence_strategy(db, cache_run_id, actor_email=actor_email)
+        updated_strategy = materialized["strategy"]
+        control = get_strategy_control(db)
+        select_model_tuning_strategy(
+            db,
+            str(updated_strategy["id"]),
+            expected_control_revision=int(control["revision"]),
+            note=(reason or f"Use Temporal Model tuning Champion #{int(candidate_id)} from {run_id} for Policy Tuning.").strip(),
+            actor_email=actor_email,
+        )
+        updated_strategy = get_strategy(db, str(updated_strategy["id"]))
+        adopted_at = utc_now()
+        adoption_entry = {
+            "candidate_id": int(candidate_id),
+            "strategy_id": str(updated_strategy.get("id") or ""),
+            "strategy_name": str(updated_strategy.get("name") or "TEMPORAL Strategy"),
+            "at": adopted_at,
+            "by": (actor_email or "").strip().lower() or None,
+        }
+        db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+            {"id": run_id},
+            {
+                "$set": {
+                    "adopted_candidate_id": int(candidate_id),
+                    "adopted_strategy_id": str(updated_strategy.get("id") or ""),
+                    "derived_strategy_created": bool(materialized.get("created")),
+                    "adopted_at": adopted_at,
+                    "adopted_by": (actor_email or "").strip().lower() or None,
+                    "updated_at": adopted_at,
+                },
+                "$push": {"adoption_history": bson_value(adoption_entry)},
+            },
+        )
+        return {
+            "strategy": updated_strategy,
+            "candidate_id": int(candidate_id),
+            "derived_strategy_created": bool(materialized.get("created")),
+            "source_strategy_preserved": True,
+            "ready_for_backtest": False,
+            "ready_for_model_tuning": True,
+            "recommended_tuning_target": TEMPORAL_POLICY_TUNING_SCOPE,
+            "auto_candidate_after_backtest": False,
+        }
     if str(document.get("tuning_scope") or "") == TEMPORAL_POLICY_TUNING_SCOPE:
         adoption_note = (reason or f"Use Temporal Policy tuning candidate #{int(candidate_id)} from {run_id}.").strip()
         method_tag = ("LHS-CARO" if str(document.get("method") or "") == PIPELINE_METHOD else ("CARO" if str(document.get("method") or "") == PROBABILITY_METHOD else "LHS"))
@@ -3383,6 +3552,8 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         + int(document.get("cancelled_candidates") or 0)
     )
     fractional_active = sum(float(job.get("progress") or 0.0) / 100.0 for job in current_jobs.values())
+    if not current_jobs and str(document.get("tuning_scope") or "") == TEMPORAL_MODEL_TUNING_SCOPE and document.get("current_candidate_id") is not None:
+        fractional_active = max(fractional_active, max(0.0, min(1.0, float(document.get("current_candidate_progress") or 0.0) / 100.0)))
     progress = min(100.0, 100.0 * (completed + fractional_active) / research_total)
     if current_jobs and str(document.get("status") or "") in _ACTIVE_STATUSES:
         progress = min(99.9, progress)
@@ -3442,8 +3613,12 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "stop_requested": bool(document.get("stop_requested")),
         "active_candidate_ids": active_candidate_ids,
         "active_job_ids": active_job_ids,
-        "current_candidate_id": active_candidate_ids[0] if active_candidate_ids else None,
-        "current_job_id": active_job_ids[0] if active_job_ids else None,
+        "current_candidate_id": (active_candidate_ids[0] if active_candidate_ids else document.get("current_candidate_id")),
+        "current_job_id": (active_job_ids[0] if active_job_ids else document.get("current_job_id")),
+        "current_candidate_progress": document.get("current_candidate_progress"),
+        "current_candidate_stage": document.get("current_candidate_stage"),
+        "temporal_model_champion_cache_run_id": document.get("temporal_model_champion_cache_run_id"),
+        "temporal_model_champion_candidate_id": document.get("temporal_model_champion_candidate_id"),
         "best_candidate_id": int(public_best["candidate_id"]) if public_best is not None else None,
         "best_exploratory_candidate_id": int(public_best_exploratory["candidate_id"]) if public_best_exploratory is not None else None,
         "best_champion_beating_candidate_id": int(public_best_champion["candidate_id"]) if public_best_champion is not None else None,

@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import zlib
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -109,6 +110,9 @@ def _effective_n_jobs(configured: int) -> int:
 
 def _model_kwargs(config: Any) -> dict[str, Any]:
     settings = _lightgbm_settings(config)
+    n_jobs = _effective_n_jobs(int(settings["n_jobs"]))
+    if bool(config.deterministic_execution):
+        n_jobs = max(1, int(config.numeric_thread_limit))
     return {
         "boosting_type": "gbdt",
         "n_estimators": int(settings["n_estimators"]),
@@ -124,7 +128,7 @@ def _model_kwargs(config: Any) -> dict[str, Any]:
         "reg_lambda": float(settings["reg_lambda"]),
         "max_bin": int(settings["max_bin"]),
         "random_state": int(config.random_state),
-        "n_jobs": _effective_n_jobs(int(settings["n_jobs"])),
+        "n_jobs": n_jobs,
         "deterministic": bool(config.deterministic_execution),
         "force_col_wise": bool(config.deterministic_execution),
         "verbosity": -1,
@@ -2771,6 +2775,8 @@ def run_temporal_intelligence(
     config: BacktestExecutionRequest,
     *,
     progress_callback: Callable[[float, str], None] | None = None,
+    winner_reference_override: dict[str, Any] | None = None,
+    candidate_evaluation_only: bool = False,
 ) -> dict[str, Any]:
     if str(config.research_model_family) != "lightgbm_utility":
         raise ValueError("Temporal Decision Intelligence is restricted to a LightGBM Strategy snapshot.")
@@ -2895,25 +2901,26 @@ def run_temporal_intelligence(
             "shadow_capital": _shadow_capital_study(combined, open_prices, common_dates, config, include_diagnostics=True),
         })
         horizon_summaries.append(summary)
-        if progress_callback:
-            progress_callback(
-                78.0 + 14.0 * (horizons.index(horizon) / max(1, len(horizons))),
-                f"Training latest {horizon}-session relative decision forecast",
+        if not candidate_evaluation_only:
+            if progress_callback:
+                progress_callback(
+                    78.0 + 14.0 * (horizons.index(horizon) / max(1, len(horizons))),
+                    f"Training latest {horizon}-session relative decision forecast",
+                )
+            latest_quality, latest_quality_samples = _latest_online_quality(combined)
+            latest_forecasts.extend(
+                _latest_decision_forecasts(
+                    frames,
+                    common_dates,
+                    symbols,
+                    horizon,
+                    targets_by_horizon[horizon],
+                    config,
+                    quality_overrides=latest_quality,
+                    quality_history_samples=latest_quality_samples,
+                    quality_source="online_matured_oos",
+                )
             )
-        latest_quality, latest_quality_samples = _latest_online_quality(combined)
-        latest_forecasts.extend(
-            _latest_decision_forecasts(
-                frames,
-                common_dates,
-                symbols,
-                horizon,
-                targets_by_horizon[horizon],
-                config,
-                quality_overrides=latest_quality,
-                quality_history_samples=latest_quality_samples,
-                quality_source="online_matured_oos",
-            )
-        )
 
     latest_forecasts.sort(
         key=lambda row: (int(row["horizon"]), -(row.get("asset_rank_score") or -1e9), row["symbol"])
@@ -2939,9 +2946,14 @@ def run_temporal_intelligence(
 
     if progress_callback:
         progress_callback(95.0, "Replaying immutable Winner and applying Temporal timing overlay")
-    winner_reference = _winner_reference_replay(bars_by_symbol, config, progress_callback=progress_callback)
-    winner_reference_daily_rows = winner_reference.pop("_daily_rows", [])
-    winner_reference_trade_rows = winner_reference.pop("_trade_rows", [])
+    if winner_reference_override:
+        winner_reference = deepcopy(winner_reference_override.get("summary") or {})
+        winner_reference_daily_rows = deepcopy(winner_reference_override.get("daily_rows") or [])
+        winner_reference_trade_rows = deepcopy(winner_reference_override.get("trade_rows") or [])
+    else:
+        winner_reference = _winner_reference_replay(bars_by_symbol, config, progress_callback=progress_callback)
+        winner_reference_daily_rows = winner_reference.pop("_daily_rows", [])
+        winner_reference_trade_rows = winner_reference.pop("_trade_rows", [])
     _attach_winner_reference(horizon_summaries, fold_summaries, winner_reference)
 
     winner_anchor_replay = _winner_anchored_temporal_study(
