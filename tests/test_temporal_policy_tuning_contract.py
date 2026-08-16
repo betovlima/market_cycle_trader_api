@@ -65,3 +65,39 @@ def test_temporal_policy_replay_changes_only_top1_top2_timing() -> None:
     assert metrics["ending_capital"] == pytest.approx(112.2)
     assert metrics["capital_rotations"] == 2
     assert metrics["eligible"] is True
+
+
+def test_temporal_tuning_exposes_model_and_policy_modes_in_one_workflow() -> None:
+    root = Path(__file__).resolve().parents[1]
+    api = root / "src" / "market_cycle_trader_api"
+    front = root.parent / "market_cycle_trader" / "src"
+    tuning_service = (api / "services" / "model_tuning.py").read_text(encoding="utf-8")
+    model_service = (api / "services" / "temporal_model_tuning.py").read_text(encoding="utf-8")
+    schema = (api / "schemas" / "model_tuning.py").read_text(encoding="utf-8")
+    panel = (front / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
+    backtest = (front / "features" / "backtest" / "components" / "BacktestPage.jsx").read_text(encoding="utf-8")
+
+    assert 'TEMPORAL_MODEL_TUNING_SCOPE = "temporal_model"' in model_service
+    assert "evaluate_temporal_model_candidate" in tuning_service
+    assert "persist_temporal_model_champion_cache" in tuning_service
+    assert 'Literal["temporal_model", "temporal_policy"]' in schema
+    assert "body.tuning_target = temporalTuningTarget" in panel
+    assert "Model Tuning · LightGBM" in panel
+    assert "Policy Tuning · Replay" in panel
+    assert "Research Lab" in backtest
+    assert "backtest-research-lab-stack" in backtest
+
+
+def test_temporal_model_tuning_retrains_lightgbm_without_replaying_winner_or_downloading_market_data() -> None:
+    root = Path(__file__).resolve().parents[1] / "src" / "market_cycle_trader_api"
+    model_service = (root / "services" / "temporal_model_tuning.py").read_text(encoding="utf-8")
+    temporal_engine = (root / "engine" / "temporal_intelligence.py").read_text(encoding="utf-8")
+
+    assert "run_temporal_intelligence(" in model_service
+    assert "winner_reference_override=winner_override" in model_service
+    assert "candidate_evaluation_only=True" in model_service
+    assert '"research_market_data_snapshot_id": snapshot_id' in model_service
+    assert '"research_market_data_mode": "database_only"' in model_service
+    assert "winner_reference_override" in temporal_engine
+    assert "candidate_evaluation_only" in temporal_engine
+    assert 'n_jobs = max(1, int(config.numeric_thread_limit))' in temporal_engine

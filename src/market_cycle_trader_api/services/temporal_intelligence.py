@@ -30,7 +30,7 @@ from ..infrastructure.persistence.mongo_repository import (
     utc_now,
 )
 from ..schemas.requests import BacktestExecutionRequest
-from .model_research import apply_execution_profile
+from .model_research import apply_execution_profile, model_execution_snapshot
 from .model_tuning_market_snapshot import freeze_tuning_market_snapshot, market_snapshot_exists
 from .strategy_lab import (
     StrategyLabConflict,
@@ -523,6 +523,13 @@ def materialize_temporal_intelligence_strategy(db: Any, run_id: str, *, actor_em
     name = f"{label} — {name_suffix}"
     description = f"Generated from Temporal Intelligence run {run_id}."
 
+    request_payload = document.get("request") if isinstance(document.get("request"), dict) else {}
+    research_model_snapshot = None
+    research_settings = request_payload.get("research_model_settings") if isinstance(request_payload.get("research_model_settings"), dict) else {}
+    model_family = str(document.get("model_family") or request_payload.get("research_model_family") or "")
+    if model_family and research_settings:
+        research_model_snapshot = model_execution_snapshot(model_family, research_settings)
+
     try:
         materialized = materialize_temporal_strategy(
             db,
@@ -535,6 +542,7 @@ def materialize_temporal_intelligence_strategy(db: Any, run_id: str, *, actor_em
             experiment=experiment,
             policy_snapshot=snapshot,
             actor_email=actor_email,
+            research_model_snapshot=research_model_snapshot,
         )
     except (StrategyLabConflict, StrategyLabNotFound, StrategyLabError, ValueError) as exc:
         raise TemporalIntelligenceConflict(str(exc)) from exc

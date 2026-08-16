@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "3.24.2"' in config
+    assert 'API_VERSION = "3.25.0"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -168,18 +168,18 @@ def test_save_test_strategy_change_reason_is_optional() -> None:
     assert "Saving an editable draft revision does not require a note" in config
 
 
-def test_dashboard_strategy_intelligence_charts_use_explicit_dimensions_and_numeric_series() -> None:
+def test_dashboard_is_the_single_frontend_home_for_the_retained_backtest_charts() -> None:
     front = ROOT.parent / "market_cycle_trader" / "src"
-    section = (front / "features" / "dashboard" / "components" / "StrategyIntelligenceSection.jsx").read_text(encoding="utf-8")
-    story = (front / "features" / "dashboard" / "components" / "TradeStorySection.jsx").read_text(encoding="utf-8")
-    page = (front / "features" / "dashboard" / "DashboardPage.jsx").read_text(encoding="utf-8")
-    measured = (front / "shared" / "components" / "MeasuredChartContainer.jsx").read_text(encoding="utf-8")
+    dashboard = (front / "features" / "dashboard" / "DashboardPage.jsx").read_text(encoding="utf-8")
+    analytics_hub = (front / "features" / "dashboard" / "components" / "DashboardBacktestAnalyticsSection.jsx").read_text(encoding="utf-8")
+    backtest = (front / "features" / "backtest" / "components" / "BacktestPage.jsx").read_text(encoding="utf-8")
+    portfolio = (front / "features" / "paperPortfolio" / "PaperPortfolioDashboard.jsx").read_text(encoding="utf-8")
+    header = (front / "features" / "backtest" / "components" / "AppHeader.jsx").read_text(encoding="utf-8")
 
-    assert "ResponsiveContainer" not in section
-    assert "ResponsiveContainer" not in story
-    assert "ResizeObserver" in measured
-    assert "getBoundingClientRect" in measured
-    assert 'dataKey="best_utility"' in section
-    assert "absolute_utility_best_score ?? row.best_score" in page
-    assert "decisionHasCashEdge" in section
-    assert "decisionUsesAbsoluteUtility" in section
+    assert "DashboardBacktestAnalyticsSection" in dashboard
+    assert "MonthlyCapitalMovementHeatmap" in analytics_hub
+    assert "BacktestPerformanceExplorer" in analytics_hub
+    assert "Latest completed processing is selected by default." in analytics_hub
+    assert '<ComposedChart' not in backtest
+    assert '<ComposedChart' not in portfolio
+    assert "id: 'analytics'" not in header
