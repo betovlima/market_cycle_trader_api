@@ -31,6 +31,7 @@ from market_cycle_trader_api.services.strategy_lab import (
     get_trader_winner_context,
     mark_strategy_as_candidate,
     mark_strategy_backtest,
+    materialize_temporal_strategy,
     prepare_strategy_for_backtest_candidate,
     promote_strategy_to_trader,
     select_research_strategy,
@@ -1516,5 +1517,88 @@ def test_delete_strategy_used_by_active_backtest_keeps_runtime_safety() -> None:
             db,
             strategy_id,
             note="Wait for runtime safety.",
+            actor_email="admin@example.com",
+        )
+
+
+
+def test_temporal_run_materializes_first_class_strategy_snapshot() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": "winner-v1-13-2"})
+    assert source is not None
+
+    result = materialize_temporal_strategy(
+        db,
+        run_id="20260816T170000-temporal-abcd1234",
+        source_strategy_id="winner-v1-13-2",
+        source_strategy_revision=int(source["revision"]),
+        source_configuration_hash=str(source["configuration_hash"]),
+        name="Temporal Intelligence v8 — Winner-Anchored Timing — 2026-08-16",
+        description="Generated from Temporal Intelligence run.",
+        experiment="temporal_decision_intelligence_v8_winner_anchored_timing",
+        policy_snapshot={
+            "schema_version": 1,
+            "family": "winner_anchored_temporal_timing",
+            "parameters": {
+                "timing_base_weak_threshold": 0.50,
+                "timing_challenger_minimum": 0.60,
+                "timing_minimum_advantage": 0.25,
+            },
+            "validation": {"ending_capital": 1_318_356.29, "capital_vs_winner": 0.1884},
+        },
+        actor_email="admin@example.com",
+    )
+
+    assert result["created"] is True
+    strategy = result["strategy"]
+    assert strategy["strategy_kind"] == "temporal_intelligence"
+    assert strategy["tuning_target"] == "temporal_policy"
+    assert strategy["source_temporal_run_id"] == "20260816T170000-temporal-abcd1234"
+    assert strategy["source_temporal_experiment"] == "temporal_decision_intelligence_v8_winner_anchored_timing"
+    assert strategy["temporal_policy"]["parameters"]["timing_minimum_advantage"] == pytest.approx(0.25)
+    assert strategy["temporal_policy"]["validation"]["ending_capital"] == pytest.approx(1_318_356.29)
+    assert strategy["configuration_hash"] == source["configuration_hash"]
+    assert strategy["research_model"]["settings_hash"] == source["research_model_snapshot"]["settings_hash"]
+
+    duplicate = materialize_temporal_strategy(
+        db,
+        run_id="20260816T170000-temporal-abcd1234",
+        source_strategy_id="winner-v1-13-2",
+        source_strategy_revision=int(source["revision"]),
+        source_configuration_hash=str(source["configuration_hash"]),
+        name="Ignored duplicate name",
+        description="Ignored duplicate description.",
+        experiment="temporal_decision_intelligence_v8_winner_anchored_timing",
+        policy_snapshot={"schema_version": 1},
+        actor_email="admin@example.com",
+    )
+    assert duplicate["created"] is False
+    assert duplicate["strategy"]["id"] == strategy["id"]
+
+
+def test_temporal_strategy_cannot_use_standard_strategy_mutation_workflow() -> None:
+    db = _Database()
+    install_winner_strategy_configuration(db, note="Install winner.", source="test")
+    source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": "winner-v1-13-2"})
+    created = materialize_temporal_strategy(
+        db,
+        run_id="temporal-locked-policy",
+        source_strategy_id="winner-v1-13-2",
+        source_strategy_revision=int(source["revision"]),
+        source_configuration_hash=str(source["configuration_hash"]),
+        name="Temporal Strategy",
+        description="Temporal policy snapshot.",
+        experiment="temporal_decision_intelligence_v8_winner_anchored_timing",
+        policy_snapshot={"schema_version": 1},
+        actor_email="admin@example.com",
+    )["strategy"]
+
+    with pytest.raises(StrategyLabConflict, match="dedicated Temporal Policy workflow"):
+        select_research_strategy(
+            db,
+            created["id"],
+            expected_control_revision=db[STRATEGY_CONTROL_COLLECTION].documents["default"]["revision"],
+            note="Do not use a temporal snapshot as a standard backtest strategy.",
             actor_email="admin@example.com",
         )

@@ -429,6 +429,16 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "configuration_hash": str(document.get("configuration_hash") or ""),
         "source_strategy_id": document.get("source_strategy_id"),
         "source_strategy_revision": document.get("source_strategy_revision"),
+        "strategy_kind": str(document.get("strategy_kind") or "standard"),
+        "tuning_target": str(document.get("tuning_target") or "model_strategy"),
+        "source_temporal_run_id": document.get("source_temporal_run_id"),
+        "source_temporal_experiment": document.get("source_temporal_experiment"),
+        "temporal_policy_revision": document.get("temporal_policy_revision"),
+        "temporal_policy": (
+            bson_value(document.get("temporal_policy_snapshot"))
+            if isinstance(document.get("temporal_policy_snapshot"), dict)
+            else None
+        ),
         "research_model": (
             public_model_snapshot(document.get("research_model_snapshot"))
             if isinstance(document.get("research_model_snapshot"), dict)
@@ -1110,6 +1120,70 @@ def create_strategy(
     return _public_profile(profile)
 
 
+def materialize_temporal_strategy(
+    db: Any,
+    *,
+    run_id: str,
+    source_strategy_id: str,
+    source_strategy_revision: int | None,
+    source_configuration_hash: str | None,
+    name: str,
+    description: str,
+    experiment: str,
+    policy_snapshot: dict[str, Any],
+    actor_email: str | None,
+) -> dict[str, Any]:
+    ensure_strategy_catalog(db)
+    existing = db[STRATEGY_PROFILES_COLLECTION].find_one({"source_temporal_run_id": str(run_id)})
+    if existing is not None:
+        return {"created": False, "strategy": _public_profile(existing)}
+
+    source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": str(source_strategy_id)})
+    if source is None:
+        raise StrategyLabNotFound("The Strategy used by this Temporal Intelligence run is no longer available in the catalog.")
+    expected_revision = int(source_strategy_revision or 0)
+    if expected_revision and int(source.get("revision") or 1) != expected_revision:
+        raise StrategyLabConflict("The source Strategy revision no longer matches the completed Temporal Intelligence run.")
+    expected_hash = str(source_configuration_hash or "").strip()
+    if expected_hash and str(source.get("configuration_hash") or "") != expected_hash:
+        raise StrategyLabConflict("The source Strategy configuration no longer matches the completed Temporal Intelligence run.")
+
+    created = create_strategy(
+        db,
+        name=name,
+        description=description,
+        clone_from_strategy_id=str(source_strategy_id),
+        actor_email=actor_email,
+    )
+    now = utc_now()
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {"_id": created["id"], "revision": int(created["revision"])},
+        {
+            "$set": {
+                "strategy_kind": "temporal_intelligence",
+                "tuning_target": "temporal_policy",
+                "source_temporal_run_id": str(run_id),
+                "source_temporal_experiment": str(experiment),
+                "temporal_policy_revision": 1,
+                "temporal_policy_snapshot": bson_value(policy_snapshot),
+                "updated_at": now,
+                "updated_by": (actor_email or "").strip().lower() or None,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise StrategyLabConflict("Unable to materialize the Temporal Intelligence Strategy.")
+    return {"created": True, "strategy": _public_profile(updated)}
+
+
+def _assert_standard_strategy_action(profile: dict[str, Any], action: str) -> None:
+    if str(profile.get("strategy_kind") or "standard") == "temporal_intelligence":
+        raise StrategyLabConflict(
+            f"Temporal Intelligence Strategies are immutable policy snapshots for research. {action} must use the dedicated Temporal Policy workflow."
+        )
+
+
 def _assert_strategy_not_under_model_tuning(db: Any, strategy_id: str) -> None:
     active = db[MODEL_TUNING_RUNS_COLLECTION].find_one(
         {
@@ -1140,6 +1214,7 @@ def update_strategy(
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    _assert_standard_strategy_action(current, "Editing")
     if bool(current.get("locked")):
         raise StrategyLabConflict(
             "Protected winner snapshots cannot be edited. Clone the strategy to create a test version."
@@ -1281,6 +1356,7 @@ def update_strategy_model(
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    _assert_standard_strategy_action(current, "Editing")
     if bool(current.get("locked")):
         raise StrategyLabConflict(
             "Protected lifecycle snapshots cannot change model configuration. Clone the strategy first."
@@ -1567,6 +1643,7 @@ def select_research_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    _assert_standard_strategy_action(profile, "Backtest selection")
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},
@@ -1600,6 +1677,7 @@ def mark_strategy_as_candidate(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    _assert_standard_strategy_action(profile, "Candidate promotion")
     if bool(profile.get("locked")):
         raise StrategyLabConflict(
             "Protected lifecycle snapshots cannot be marked as candidates. Clone the strategy first."

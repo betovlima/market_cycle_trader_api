@@ -31,14 +31,19 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from ..schemas.requests import BacktestExecutionRequest
 from .model_research import apply_execution_profile
-from .model_tuning_market_snapshot import freeze_tuning_market_snapshot
+from .model_tuning_market_snapshot import freeze_tuning_market_snapshot, market_snapshot_exists
 from .strategy_lab import (
+    StrategyLabConflict,
+    StrategyLabError,
+    StrategyLabNotFound,
     get_trader_winner_context,
     get_trader_winner_model_snapshot,
+    materialize_temporal_strategy,
 )
 from .system_settings import apply_training_runtime_settings, get_system_settings
 
 TEMPORAL_ENGINE_MODULE = "market_cycle_trader_api.engine.temporal_intelligence"
+TEMPORAL_EXPERIMENT = "temporal_decision_intelligence_v8_winner_anchored_timing"
 _NUMERIC_THREAD_ENVIRONMENT_KEYS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -114,10 +119,16 @@ def public_temporal_run(document: dict[str, Any] | None, *, include_result: bool
         "model_label": document.get("model_label"),
         "model_settings_hash": document.get("model_settings_hash"),
         "market_data_snapshot_id": document.get("market_data_snapshot_id"),
+        "market_data_snapshot_source": document.get("market_data_snapshot_source"),
+        "market_data_snapshot_source_run_id": document.get("market_data_snapshot_source_run_id"),
+        "deterministic_execution": bool((document.get("request") or {}).get("deterministic_execution")),
         "analysis_end_date": document.get("analysis_end_date"),
         "horizons": list(document.get("horizons") or []),
         "failure_message": document.get("failure_message"),
         "experiment": document.get("experiment") or (result.get("experiment") if isinstance(result, dict) else None),
+        "materialized_strategy_id": document.get("materialized_strategy_id"),
+        "materialized_strategy_name": document.get("materialized_strategy_name"),
+        "materialized_strategy_at": bson_value(document.get("materialized_strategy_at")),
         "shadow_only": True,
         **({"result": bson_value(_public_temporal_result(result)) if result is not None else None} if include_result else {}),
     }
@@ -150,8 +161,35 @@ def _build_execution_request(db: Any) -> tuple[BacktestExecutionRequest, dict[st
         "research_model_family": model_family,
         "research_model_settings": model_settings,
         "research_market_data_mode": "database_only",
+        "deterministic_execution": True,
+        "numeric_thread_limit": 1,
     })
     return request, winner_strategy, model_snapshot
+
+
+def _stable_temporal_market_snapshot(
+    db: Any,
+    *,
+    strategy_configuration_hash: str,
+    model_settings_hash: str,
+    analysis_end_date: str | None,
+) -> tuple[str | None, str | None]:
+    cursor = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find(
+        {
+            "status": "completed",
+            "experiment": TEMPORAL_EXPERIMENT,
+            "strategy_configuration_hash": str(strategy_configuration_hash or ""),
+            "model_settings_hash": str(model_settings_hash or ""),
+            "analysis_end_date": analysis_end_date,
+            "market_data_snapshot_id": {"$type": "string"},
+        },
+        {"_id": 0, "id": 1, "market_data_snapshot_id": 1, "created_at": 1},
+    ).sort("created_at", 1)
+    for item in cursor:
+        snapshot_id = str(item.get("market_data_snapshot_id") or "").strip().lower()
+        if snapshot_id and market_snapshot_exists(db, snapshot_id):
+            return snapshot_id, str(item.get("id") or "").strip() or None
+    return None, None
 
 
 def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_thread: bool = True) -> dict[str, Any]:
@@ -179,14 +217,24 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
 
     try:
         request, strategy, model_snapshot = _build_execution_request(db)
-        frozen = freeze_tuning_market_snapshot(db, request.model_dump(mode="python"))
-        snapshot_id = str(frozen.get("snapshot_id") or frozen.get("signature") or "").strip().lower()
+        snapshot_id, source_run_id = _stable_temporal_market_snapshot(
+            db,
+            strategy_configuration_hash=str(strategy.get("configuration_hash") or ""),
+            model_settings_hash=str(model_snapshot.get("settings_hash") or ""),
+            analysis_end_date=request.analysis_end_date,
+        )
+        snapshot_source = "temporal_baseline_reuse" if snapshot_id else "new_frozen_snapshot"
+        if not snapshot_id:
+            frozen = freeze_tuning_market_snapshot(db, request.model_dump(mode="python"))
+            snapshot_id = str(frozen.get("snapshot_id") or frozen.get("signature") or "").strip().lower()
         if not snapshot_id:
             raise RuntimeError("Unable to freeze the Temporal Intelligence market-data snapshot.")
         request = request.model_copy(update={
             "research_market_data_mode": "database_only",
             "research_market_data_snapshot_id": snapshot_id,
             "expected_market_data_signature_sha256": snapshot_id,
+            "deterministic_execution": True,
+            "numeric_thread_limit": 1,
         })
     except TemporalIntelligenceConflict:
         raise
@@ -214,10 +262,12 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         "model_settings_hash": model_snapshot.get("settings_hash"),
         "model_settings_revision": model_snapshot.get("settings_revision"),
         "market_data_snapshot_id": snapshot_id,
+        "market_data_snapshot_source": snapshot_source,
+        "market_data_snapshot_source_run_id": source_run_id,
         "analysis_end_date": request.analysis_end_date,
         "horizons": list(request.rotation_target_horizons),
         "request": bson_value(request.model_dump(mode="python")),
-        "experiment": "temporal_decision_intelligence_v8_winner_anchored_timing",
+        "experiment": TEMPORAL_EXPERIMENT,
         "result": None,
         "failure_message": None,
         "technical_error": None,
@@ -379,6 +429,126 @@ def _load_temporal_artifact_rows(db: Any, run_id: str, kind: str) -> list[dict[s
             if isinstance(row, dict):
                 rows.append(bson_value(dict(row)))
     return rows
+
+
+def _temporal_strategy_label(experiment: str) -> str:
+    labels = {
+        "temporal_decision_intelligence_v8_winner_anchored_timing": "Temporal Intelligence v8 — Winner-Anchored Timing",
+        "temporal_decision_intelligence_v7_rotation_before_cash": "Temporal Intelligence v7 — Rotation Before CASH",
+        "temporal_decision_intelligence_v6_adaptive_trend_capture": "Temporal Intelligence v6 — Adaptive Trend Capture",
+        "temporal_decision_intelligence_v5_trend_capture_hysteresis": "Temporal Intelligence v5 — Trend Capture + Hysteresis",
+        "temporal_decision_intelligence_v4_multi_horizon": "Temporal Intelligence v4 — Multi-Horizon",
+    }
+    return labels.get(str(experiment), "Temporal Intelligence Strategy")
+
+
+def _temporal_policy_strategy_snapshot(document: dict[str, Any]) -> dict[str, Any]:
+    result = document.get("result") if isinstance(document.get("result"), dict) else {}
+    experiment = str(document.get("experiment") or result.get("experiment") or "")
+    multi = result.get("multi_horizon_metrics") if isinstance(result.get("multi_horizon_metrics"), dict) else {}
+    capital = multi.get("shadow_capital") if isinstance(multi.get("shadow_capital"), dict) else {}
+    winner = result.get("winner_reference") if isinstance(result.get("winner_reference"), dict) else {}
+    parameters = {
+        "decision_policy": capital.get("decision_policy") or (result.get("decision_policy") or {}).get("policy"),
+        "timing_base_weak_threshold": capital.get("timing_base_weak_threshold"),
+        "timing_challenger_minimum": capital.get("timing_challenger_minimum"),
+        "timing_minimum_advantage": capital.get("timing_minimum_advantage"),
+        "entry_horizons": list(multi.get("entry_horizons") or []),
+        "hold_horizons": list(multi.get("hold_horizons") or []),
+        "risk_horizons": list(multi.get("risk_horizons") or []),
+        "horizons": list(result.get("horizons") or document.get("horizons") or []),
+    }
+    validation = {
+        "initial_capital": capital.get("initial_capital"),
+        "ending_capital": capital.get("ending_capital"),
+        "total_return": capital.get("total_return"),
+        "cagr": capital.get("cagr"),
+        "sharpe": capital.get("sharpe"),
+        "max_drawdown": capital.get("max_drawdown"),
+        "exposure": capital.get("exposure"),
+        "switch_count": capital.get("switch_count"),
+        "timing_override_count": capital.get("timing_override_count"),
+        "capital_vs_winner": multi.get("capital_vs_winner"),
+        "capital_vs_benchmark": multi.get("capital_vs_benchmark"),
+        "winner_ending_capital": winner.get("ending_capital"),
+        "winner_cagr": winner.get("cagr"),
+        "winner_sharpe": winner.get("sharpe"),
+        "winner_max_drawdown": winner.get("max_drawdown"),
+        "folds": bson_value(result.get("multi_horizon_fold_metrics") or []),
+        "cost_stress": bson_value(capital.get("cost_stress") or []),
+    }
+    return {
+        "schema_version": 1,
+        "family": "winner_anchored_temporal_timing" if experiment == "temporal_decision_intelligence_v8_winner_anchored_timing" else "temporal_decision_policy",
+        "label": _temporal_strategy_label(experiment),
+        "experiment": experiment,
+        "source_run_id": str(document.get("id") or ""),
+        "source_strategy_id": document.get("strategy_profile_id"),
+        "source_strategy_revision": document.get("strategy_profile_revision"),
+        "source_strategy_configuration_hash": document.get("strategy_configuration_hash"),
+        "market_data_snapshot_id": document.get("market_data_snapshot_id"),
+        "market_data_snapshot_source": document.get("market_data_snapshot_source"),
+        "market_data_snapshot_source_run_id": document.get("market_data_snapshot_source_run_id"),
+        "analysis_end_date": document.get("analysis_end_date"),
+        "model_family": document.get("model_family"),
+        "model_settings_hash": document.get("model_settings_hash"),
+        "parameters": bson_value(parameters),
+        "validation": bson_value(validation),
+    }
+
+
+def materialize_temporal_intelligence_strategy(db: Any, run_id: str, *, actor_email: str | None) -> dict[str, Any]:
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)})
+    if document is None:
+        raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
+    if str(document.get("status") or "") != "completed" or not isinstance(document.get("result"), dict):
+        raise TemporalIntelligenceConflict("Only a successfully completed Temporal Intelligence run can create a Strategy.")
+
+    existing_strategy_id = str(document.get("materialized_strategy_id") or "").strip()
+    if existing_strategy_id:
+        try:
+            from .strategy_lab import get_strategy
+            return {"created": False, "strategy": get_strategy(db, existing_strategy_id)}
+        except StrategyLabNotFound:
+            pass
+
+    snapshot = _temporal_policy_strategy_snapshot(document)
+    experiment = str(snapshot.get("experiment") or "")
+    label = str(snapshot.get("label") or "Temporal Intelligence Strategy")
+    analysis_end = str(document.get("analysis_end_date") or "").strip()
+    run_suffix = str(run_id).split("-")[-1][:8]
+    name_suffix = analysis_end[:10] if analysis_end else run_suffix
+    name = f"{label} — {name_suffix}"
+    description = f"Generated from Temporal Intelligence run {run_id}."
+
+    try:
+        materialized = materialize_temporal_strategy(
+            db,
+            run_id=str(run_id),
+            source_strategy_id=str(document.get("strategy_profile_id") or ""),
+            source_strategy_revision=int(document.get("strategy_profile_revision") or 0) or None,
+            source_configuration_hash=str(document.get("strategy_configuration_hash") or "") or None,
+            name=name,
+            description=description,
+            experiment=experiment,
+            policy_snapshot=snapshot,
+            actor_email=actor_email,
+        )
+    except (StrategyLabConflict, StrategyLabNotFound, StrategyLabError, ValueError) as exc:
+        raise TemporalIntelligenceConflict(str(exc)) from exc
+
+    strategy = materialized["strategy"]
+    now = utc_now()
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
+        {"id": str(run_id)},
+        {"$set": {
+            "materialized_strategy_id": strategy.get("id"),
+            "materialized_strategy_name": strategy.get("name"),
+            "materialized_strategy_at": now,
+            "updated_at": now,
+        }},
+    )
+    return materialized
 
 
 def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
@@ -576,6 +746,9 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
         "model_settings_hash": document.get("model_settings_hash"),
         "model_settings_revision": document.get("model_settings_revision"),
         "market_data_snapshot_id": document.get("market_data_snapshot_id"),
+        "market_data_snapshot_source": document.get("market_data_snapshot_source"),
+        "market_data_snapshot_source_run_id": document.get("market_data_snapshot_source_run_id"),
+        "deterministic_execution": bool((document.get("request") or {}).get("deterministic_execution")),
         "analysis_end_date": document.get("analysis_end_date"),
         "horizons": json.dumps(result.get("horizons") or document.get("horizons") or []),
         "asset_count": result.get("asset_count"),
@@ -603,8 +776,8 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
         manifest_multi_horizon["shadow_capital"].pop("economic_curve", None)
     manifest = bson_value({
         "schema_version": (
-            "temporal_intelligence_export_v11"
-            if result.get("experiment") == "temporal_decision_intelligence_v8_winner_anchored_timing"
+            "temporal_intelligence_export_v12"
+            if result.get("experiment") == TEMPORAL_EXPERIMENT
             else "temporal_intelligence_export_v9"
             if result.get("experiment") == "temporal_decision_intelligence_v7_rotation_before_cash"
             else "temporal_intelligence_export_v7"
@@ -627,7 +800,8 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
                 "id", "status", "stage", "progress", "created_at", "updated_at", "started_at", "finished_at",
                 "experiment", "strategy_profile_id", "strategy_profile_name", "strategy_profile_revision", "strategy_configuration_hash",
                 "model_family", "model_label", "model_settings_hash", "model_settings_revision",
-                "market_data_snapshot_id", "analysis_end_date", "horizons", "system_settings_revision", "shadow_only",
+                "market_data_snapshot_id", "market_data_snapshot_source", "market_data_snapshot_source_run_id",
+                "analysis_end_date", "horizons", "system_settings_revision", "shadow_only",
             )
         },
         "request": deepcopy(document.get("request") or {}),
