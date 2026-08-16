@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ...auth.security import SessionIdentity, require_portfolio_session, require_trader_session
 from ...core.runtime import database
-from ...services.analytics import backtest_analytics, completed_backtests, portfolio_analytics
+from ...services.analytics import asset_strategy_comparison, backtest_analytics, completed_backtests, portfolio_analytics
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 AuthenticatedSession = Annotated[SessionIdentity, Depends(require_trader_session)]
@@ -24,6 +24,15 @@ def list_completed_backtests(
 @router.get("/backtests/{job_id}")
 def get_backtest_analytics(job_id: str, _: AuthenticatedSession) -> dict[str, Any]:
     return backtest_analytics(database(), job_id)
+
+
+@router.get("/backtests/{job_id}/assets/{asset}")
+def get_backtest_asset_comparison(
+    job_id: str,
+    asset: str,
+    _: AuthenticatedSession,
+) -> dict[str, Any]:
+    return asset_strategy_comparison(database(), job_id, asset)
 
 
 @router.get("/portfolio")

@@ -178,6 +178,20 @@ def require_trader_session(request: Request) -> SessionIdentity:
     return get_session_manager().require_session(request)
 
 
+def require_capability(capability: str):
+    name = str(capability).strip()
+    if not name:
+        raise ValueError("Capability name is required.")
+
+    def dependency(request: Request) -> SessionIdentity:
+        identity = require_trader_session(request)
+        if not identity.has_capability(name):
+            raise HTTPException(status_code=403, detail="Required capability is not available for this session.")
+        return identity
+
+    return dependency
+
+
 def require_trader_access(request: Request) -> SessionIdentity:
     identity = require_trader_session(request)
     if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and not identity.has_capability("research.manage"):

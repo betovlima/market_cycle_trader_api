@@ -311,3 +311,18 @@ def test_candidate_execution_title_uses_ripple_while_running_and_green_dot_when_
     assert '.model-tuning-caro-status-complete {' in styles
     assert 'background: #58e6a8;' in styles
 
+
+
+def test_mobile_layout_keeps_tuning_content_and_charts_inside_viewport() -> None:
+    styles = (FRONT / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "@media (max-width: 680px)" in styles
+    assert ".workspace-main {\n    width: calc(100% - 12px);" in styles
+    assert ".model-tuning-baseline-head {\n    display: grid;" in styles
+    assert ".model-tuning-context-grid > .model-tuning-context-card > strong," in styles
+    assert "overflow-wrap: anywhere;" in styles
+    assert ".recharts-responsive-container," in styles
+    assert ".recharts-default-legend {" in styles
+    assert ".recharts-tooltip-wrapper { max-width: calc(100vw - 20px); }" in styles
+    assert ".portfolio-chart-events," in styles
+    assert ".rotation-inspector-chart {" in styles
