@@ -27,6 +27,7 @@ from ...services.strategy_lab import (
     list_strategies,
     mark_strategy_as_candidate,
     promote_strategy_to_trader,
+    select_model_tuning_strategy,
     select_research_strategy,
     update_strategy,
     update_strategy_model,
@@ -137,6 +138,24 @@ def replace_strategy_model(
         refresh_locked_configuration_status()
         return result
     except (StrategyLabError, ValidationError, ValueError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{strategy_id}/select-for-model-tuning")
+def select_strategy_for_model_tuning(
+    strategy_id: str,
+    payload: StrategySelectRequest,
+    identity: AdminIdentity,
+) -> dict[str, Any]:
+    try:
+        return select_model_tuning_strategy(
+            database(),
+            strategy_id,
+            expected_control_revision=payload.expected_control_revision,
+            note=payload.note,
+            actor_email=identity.email,
+        )
+    except (StrategyLabError, ValidationError) as exc:
         raise _translate_error(exc) from exc
 
 

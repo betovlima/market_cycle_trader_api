@@ -517,6 +517,7 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     reference_id = str(control.get("research_reference_strategy_id") or research_id)
     candidate_id = str(control.get("candidate_strategy_id") or "")
     promoted_candidate_id = str(control.get("promoted_candidate_strategy_id") or "")
+    model_tuning_id = str(control.get("model_tuning_strategy_id") or "")
     research = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": research_id})
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id})
     reference = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": reference_id})
@@ -530,6 +531,11 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         if promoted_candidate_id
         else None
     )
+    model_tuning = (
+        db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": model_tuning_id})
+        if model_tuning_id
+        else None
+    )
     if research is None or winner is None:
         raise StrategyLabError("Strategy selection references a missing strategy profile.")
     return {
@@ -538,6 +544,7 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "research_reference_strategy_id": reference_id,
         "candidate_strategy_id": candidate_id or None,
         "promoted_candidate_strategy_id": promoted_candidate_id or None,
+        "model_tuning_strategy_id": model_tuning_id or None,
         "trader_winner_strategy_id": winner_id,
         "winner_sequence": int(control.get("winner_sequence") or 0),
         "research_strategy": _public_profile(research, include_configuration=False),
@@ -556,6 +563,11 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "promoted_candidate_strategy": (
             _public_profile(promoted_candidate, include_configuration=False)
             if promoted_candidate is not None
+            else None
+        ),
+        "model_tuning_strategy": (
+            _public_profile(model_tuning, include_configuration=False)
+            if model_tuning is not None
             else None
         ),
         "trader_winner": _public_profile(winner, include_configuration=False),
@@ -868,6 +880,7 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
         "research_reference_assets": list(configuration.assets),
         "candidate_strategy_id": None,
         "promoted_candidate_strategy_id": None,
+        "model_tuning_strategy_id": None,
         "trader_winner_strategy_id": strategy_id,
         "winner_sequence": 1,
         "created_at": now,
@@ -935,6 +948,7 @@ def synchronize_bundled_winner_installation(
         "research_reference_assets": list(configuration.assets),
         "candidate_strategy_id": None,
         "promoted_candidate_strategy_id": None,
+        "model_tuning_strategy_id": None,
         "trader_winner_strategy_id": BUNDLED_WINNER_ID,
         "winner_sequence": 1,
         "created_at": now,
@@ -1650,6 +1664,7 @@ def select_research_strategy(
         {
             "$set": {
                 "research_strategy_id": strategy_id,
+                "model_tuning_strategy_id": None,
                 "updated_at": now,
                 "updated_by": (actor_email or "").strip().lower() or None,
                 "last_selection_note": note,
@@ -1661,6 +1676,96 @@ def select_research_strategy(
     if updated_control is None:
         raise StrategyLabConflict("Strategy selection changed before this update was applied.")
     return _control_response(db, updated_control)
+
+
+
+def select_model_tuning_strategy(
+    db: Any,
+    strategy_id: str,
+    *,
+    expected_control_revision: int,
+    note: str,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    _assert_no_active_backtest(db)
+    control = ensure_strategy_catalog(db)
+    current_revision = int(control.get("revision") or 1)
+    if current_revision != expected_control_revision:
+        raise StrategyLabConflict(
+            f"Expected selection revision {expected_control_revision}, current revision {current_revision}."
+        )
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
+    if profile is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
+    if str(profile.get("strategy_kind") or "standard") != "temporal_intelligence" or str(profile.get("tuning_target") or "") != "temporal_policy":
+        raise StrategyLabConflict("Only a TEMPORAL Strategy with tuning_target=temporal_policy can use the dedicated Temporal Policy Model Tuning workflow.")
+    now = utc_now()
+    updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {"_id": CONTROL_ID, "revision": current_revision},
+        {
+            "$set": {
+                "model_tuning_strategy_id": strategy_id,
+                "updated_at": now,
+                "updated_by": (actor_email or "").strip().lower() or None,
+                "last_model_tuning_selection_note": note,
+            },
+            "$inc": {"revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated_control is None:
+        raise StrategyLabConflict("Model Tuning strategy selection changed before this update was applied.")
+    return _control_response(db, updated_control)
+
+
+def create_tuned_temporal_strategy(
+    db: Any,
+    source_strategy_id: str,
+    *,
+    name: str,
+    description: str,
+    policy_snapshot: dict[str, Any],
+    tuning_run_id: str,
+    tuning_candidate_id: int,
+    tuning_metrics: dict[str, Any],
+    actor_email: str | None,
+) -> dict[str, Any]:
+    source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": source_strategy_id})
+    if source is None:
+        raise StrategyLabNotFound("Source TEMPORAL Strategy not found.")
+    if str(source.get("strategy_kind") or "") != "temporal_intelligence":
+        raise StrategyLabConflict("Temporal Policy tuning can derive only from a TEMPORAL Strategy.")
+    created = create_strategy(
+        db,
+        name=name,
+        description=description,
+        clone_from_strategy_id=source_strategy_id,
+        actor_email=actor_email,
+    )
+    now = utc_now()
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {"_id": created["id"], "revision": int(created["revision"])},
+        {
+            "$set": {
+                "strategy_kind": "temporal_intelligence",
+                "tuning_target": "temporal_policy",
+                "source_temporal_run_id": source.get("source_temporal_run_id"),
+                "source_temporal_experiment": source.get("source_temporal_experiment"),
+                "temporal_policy_revision": int(source.get("temporal_policy_revision") or 1) + 1,
+                "temporal_policy_snapshot": bson_value(policy_snapshot),
+                "temporal_policy_parent_strategy_id": source_strategy_id,
+                "tuning_source_run_id": str(tuning_run_id),
+                "tuning_source_candidate_id": int(tuning_candidate_id),
+                "tuning_result_metrics": bson_value(tuning_metrics),
+                "updated_at": now,
+                "updated_by": (actor_email or "").strip().lower() or None,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise StrategyLabConflict("Unable to create the tuned TEMPORAL Strategy.")
+    return _public_profile(updated)
 
 
 def mark_strategy_as_candidate(
@@ -2344,6 +2449,7 @@ def _strategy_delete_control_updates(
     research_id = str(control.get("research_strategy_id") or "")
     reference_id = str(control.get("research_reference_strategy_id") or research_id)
     promoted_candidate_id = str(control.get("promoted_candidate_strategy_id") or "")
+    model_tuning_id = str(control.get("model_tuning_strategy_id") or "")
 
     updates: dict[str, Any] = {}
     cleared_roles: list[str] = []
@@ -2388,6 +2494,10 @@ def _strategy_delete_control_updates(
         updates["promoted_candidate_strategy_id"] = None
         cleared_roles.append("promoted_candidate")
 
+    if model_tuning_id == strategy_id:
+        updates["model_tuning_strategy_id"] = None
+        cleared_roles.append("model_tuning_selection")
+
     return updates, cleared_roles
 
 
@@ -2414,6 +2524,7 @@ def delete_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    _assert_strategy_not_under_model_tuning(db, strategy_id)
 
     # Runtime safety is independent from lifecycle retention: historical/draft
     # strategies are deletable, but the exact strategy of an in-flight backtest
