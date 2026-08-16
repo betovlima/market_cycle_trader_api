@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "3.12.6"' in config
+    assert 'API_VERSION = "3.23.1"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -22,6 +22,7 @@ def test_admin_strategy_routes_are_composed() -> None:
     assert "dashboard" in main
     assert "admin_rotations" in main
     assert "analytics" in main
+    assert "temporal_intelligence" in main
 
 
 def test_legacy_public_mutation_routers_are_not_packaged() -> None:
@@ -165,3 +166,20 @@ def test_save_test_strategy_change_reason_is_optional() -> None:
     assert "maxLength={500} placeholder={tr('Optional audit note')}" in panel
     assert "maxLength={500} required" not in panel
     assert "Saving an editable draft revision does not require a note" in config
+
+
+def test_dashboard_strategy_intelligence_charts_use_explicit_dimensions_and_numeric_series() -> None:
+    front = ROOT.parent / "market_cycle_trader" / "src"
+    section = (front / "features" / "dashboard" / "components" / "StrategyIntelligenceSection.jsx").read_text(encoding="utf-8")
+    story = (front / "features" / "dashboard" / "components" / "TradeStorySection.jsx").read_text(encoding="utf-8")
+    page = (front / "features" / "dashboard" / "DashboardPage.jsx").read_text(encoding="utf-8")
+    measured = (front / "shared" / "components" / "MeasuredChartContainer.jsx").read_text(encoding="utf-8")
+
+    assert "ResponsiveContainer" not in section
+    assert "ResponsiveContainer" not in story
+    assert "ResizeObserver" in measured
+    assert "getBoundingClientRect" in measured
+    assert 'dataKey="best_utility"' in section
+    assert "absolute_utility_best_score ?? row.best_score" in page
+    assert "decisionHasCashEdge" in section
+    assert "decisionUsesAbsoluteUtility" in section

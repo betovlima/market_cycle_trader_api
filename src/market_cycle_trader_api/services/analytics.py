@@ -8,8 +8,10 @@ from typing import Any, Iterable
 from fastapi import HTTPException
 
 from ..infrastructure.persistence.mongo_repository import (
+    ALPACA_MARKET_BARS_COLLECTION,
     COMPARISONS_COLLECTION,
     JOBS_COLLECTION,
+    MARKET_BARS_COLLECTION,
     PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION,
     PAPER_TRADE_ORDERS_COLLECTION,
     PREDICTIONS_COLLECTION,
@@ -456,6 +458,296 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
     _assert_strategy_neutral(payload)
     return payload
 
+
+
+def _month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
+    start = datetime(int(year), int(month), 1, tzinfo=timezone.utc)
+    if int(month) == 12:
+        end = datetime(int(year) + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end = datetime(int(year), int(month) + 1, 1, tzinfo=timezone.utc)
+    return start, end
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _as_utc(parsed)
+
+
+def _market_price_rows(
+    db: Any,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    timestamp_filter = {"$gte": start, "$lt": end}
+    projection = {
+        "_id": 0,
+        "timestamp": 1,
+        "open": 1,
+        "high": 1,
+        "low": 1,
+        "close": 1,
+        "updated_at": 1,
+    }
+    sources = (
+        (
+            ALPACA_MARKET_BARS_COLLECTION,
+            {"symbol": symbol, "interval": "1Day", "timestamp": timestamp_filter},
+        ),
+        (
+            MARKET_BARS_COLLECTION,
+            {"symbol": symbol, "interval": "1d", "timestamp": timestamp_filter},
+        ),
+    )
+    rows: list[dict[str, Any]] = []
+    for collection_name, query in sources:
+        rows = list(db[collection_name].find(query, projection))
+        if rows:
+            break
+
+    latest_by_timestamp: dict[datetime, dict[str, Any]] = {}
+    rows.sort(
+        key=lambda row: (
+            _as_utc(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+            _as_utc(row.get("updated_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        )
+    )
+    for row in rows:
+        timestamp = _as_utc(row.get("timestamp"))
+        close = _as_float(row.get("close"))
+        if timestamp is None or close is None or not (start <= timestamp < end):
+            continue
+        latest_by_timestamp[timestamp] = {
+            "timestamp": iso_value(timestamp),
+            "open": _as_float(row.get("open")),
+            "high": _as_float(row.get("high")),
+            "low": _as_float(row.get("low")),
+            "close": close,
+        }
+    return [latest_by_timestamp[key] for key in sorted(latest_by_timestamp)]
+
+
+def _rotation_period_equity_rows(
+    db: Any,
+    job_id: str,
+    backend: str,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    rows = list(
+        db[PREDICTIONS_COLLECTION].find(
+            {
+                "job_id": job_id,
+                "symbol": "PORTFOLIO",
+                "backend": backend,
+                "timestamp": {"$gte": start, "$lt": end},
+            },
+            {"_id": 0, "timestamp": 1, "strategy_equity": 1},
+        )
+    )
+    output: list[dict[str, Any]] = []
+    for row in _sorted_rows(rows, "timestamp"):
+        timestamp = _as_utc(row.get("timestamp"))
+        value = _as_float(row.get("strategy_equity"))
+        if timestamp is None or value is None:
+            continue
+        output.append({"timestamp": iso_value(timestamp), "value": value})
+    return output
+
+
+def rotation_period_analysis(
+    db: Any,
+    job_id: str,
+    *,
+    year: int,
+    month: int,
+) -> dict[str, Any]:
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=422, detail="Month must be between 1 and 12.")
+
+    job = db[JOBS_COLLECTION].find_one(
+        {"id": job_id},
+        {"_id": 0, "id": 1, "status": 1},
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Backtest job not found.")
+    if str(job.get("status") or "").lower() != "completed":
+        raise HTTPException(status_code=409, detail="Analytics are available after the backtest completes.")
+
+    backend = _selected_backend(db, job_id)
+    start, end = _month_bounds(year, month)
+    if not backend:
+        return {
+            "job_id": job_id,
+            "year": year,
+            "month": month,
+            "period_start": iso_value(start),
+            "period_end": iso_value(end),
+            "assets": [],
+            "movements": [],
+            "position_segments": [],
+            "strategy_equity": [],
+            "default_asset": None,
+        }
+
+    rotation_payload = admin_job_rotations(db, job_id)
+    timed_movements: list[tuple[datetime, dict[str, Any]]] = []
+    current_asset = "CASH"
+    for raw in rotation_payload.get("rotations", []):
+        timestamp = _parse_utc(raw.get("executed_at"))
+        if timestamp is None:
+            continue
+        movement = dict(raw)
+        timed_movements.append((timestamp, movement))
+    timed_movements.sort(key=lambda item: item[0])
+
+    for timestamp, movement in timed_movements:
+        if timestamp >= start:
+            break
+        current_asset = str(movement.get("to_asset") or "CASH").upper()
+
+    monthly_movements = [
+        movement
+        for timestamp, movement in timed_movements
+        if start <= timestamp < end
+    ]
+    monthly_timed = [
+        (timestamp, movement)
+        for timestamp, movement in timed_movements
+        if start <= timestamp < end
+    ]
+    if (
+        current_asset == "CASH"
+        and monthly_movements
+        and str(monthly_movements[0].get("from_asset") or "CASH").upper() != "CASH"
+    ):
+        current_asset = str(monthly_movements[0].get("from_asset") or "CASH").upper()
+
+    strategy_equity = _rotation_period_equity_rows(db, job_id, backend, start, end)
+    effective_start = _parse_utc(strategy_equity[0].get("timestamp")) if strategy_equity else start
+    effective_end = end
+    if strategy_equity:
+        last_equity_at = _parse_utc(strategy_equity[-1].get("timestamp"))
+        if last_equity_at is not None:
+            effective_end = min(end, last_equity_at + timedelta(days=1))
+    effective_start = effective_start or start
+
+    position_segments: list[dict[str, Any]] = []
+    segment_asset = current_asset
+    segment_start = effective_start
+    for timestamp, movement in monthly_timed:
+        if timestamp < effective_start:
+            segment_asset = str(movement.get("to_asset") or "CASH").upper()
+            continue
+        segment_end = min(timestamp, effective_end)
+        if segment_end > segment_start:
+            position_segments.append(
+                {
+                    "asset": segment_asset,
+                    "start_at": iso_value(segment_start),
+                    "end_at": iso_value(segment_end),
+                }
+            )
+        segment_asset = str(movement.get("to_asset") or "CASH").upper()
+        segment_start = max(timestamp, effective_start)
+        if segment_start >= effective_end:
+            break
+    if effective_end > segment_start:
+        position_segments.append(
+            {
+                "asset": segment_asset,
+                "start_at": iso_value(segment_start),
+                "end_at": iso_value(effective_end),
+            }
+        )
+
+    asset_symbols = {
+        asset
+        for segment in position_segments
+        if (asset := str(segment.get("asset") or "CASH").upper()) != "CASH"
+    }
+    for movement in monthly_movements:
+        for field in ("from_asset", "to_asset"):
+            asset = str(movement.get(field) or "CASH").upper()
+            if asset != "CASH":
+                asset_symbols.add(asset)
+
+    strategy_sessions = [
+        _parse_utc(row.get("timestamp"))
+        for row in strategy_equity
+        if _parse_utc(row.get("timestamp")) is not None
+    ]
+    assets: list[dict[str, Any]] = []
+    for symbol in sorted(asset_symbols):
+        prices = _market_price_rows(db, symbol, start, end)
+        buys = [m for m in monthly_movements if str(m.get("to_asset") or "CASH").upper() == symbol]
+        sells = [m for m in monthly_movements if str(m.get("from_asset") or "CASH").upper() == symbol]
+        realized = [
+            value
+            for movement in sells
+            if (value := _as_float(movement.get("realized_pnl"))) is not None
+        ]
+        first_close = _as_float(prices[0].get("close")) if prices else None
+        last_close = _as_float(prices[-1].get("close")) if prices else None
+        held_sessions = 0
+        for session_at in strategy_sessions:
+            if session_at is None:
+                continue
+            if any(
+                str(segment.get("asset") or "CASH").upper() == symbol
+                and (_parse_utc(segment.get("start_at")) or start) <= session_at < (_parse_utc(segment.get("end_at")) or end)
+                for segment in position_segments
+            ):
+                held_sessions += 1
+        assets.append(
+            {
+                "symbol": symbol,
+                "prices": prices,
+                "first_close": first_close,
+                "last_close": last_close,
+                "period_return": (last_close / first_close - 1.0) if first_close not in {None, 0} and last_close is not None else None,
+                "buy_count": len(buys),
+                "sell_count": len(sells),
+                "realized_pnl": float(sum(realized)) if realized else 0.0,
+                "held_sessions": held_sessions,
+            }
+        )
+
+    assets.sort(
+        key=lambda item: (
+            -(int(item.get("buy_count") or 0) + int(item.get("sell_count") or 0)),
+            -int(item.get("held_sessions") or 0),
+            str(item.get("symbol") or ""),
+        )
+    )
+    strategy_return = None
+    if len(strategy_equity) >= 2:
+        first_equity = _as_float(strategy_equity[0].get("value"))
+        last_equity = _as_float(strategy_equity[-1].get("value"))
+        if first_equity not in {None, 0} and last_equity is not None:
+            strategy_return = last_equity / first_equity - 1.0
+
+    return {
+        "job_id": job_id,
+        "year": year,
+        "month": month,
+        "period_start": iso_value(start),
+        "period_end": iso_value(effective_end),
+        "assets": assets,
+        "movements": monthly_movements,
+        "position_segments": position_segments,
+        "strategy_equity": strategy_equity,
+        "strategy_return": strategy_return,
+        "default_asset": assets[0]["symbol"] if assets else None,
+    }
 
 def completed_backtests(db: Any, limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(500, int(limit)))

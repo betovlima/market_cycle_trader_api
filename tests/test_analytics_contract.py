@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from market_cycle_trader_api.services.analytics import backtest_analytics
+from market_cycle_trader_api.services.analytics import backtest_analytics, rotation_period_analysis
 
 
 class FakeCollection:
@@ -12,7 +12,21 @@ class FakeCollection:
 
     @staticmethod
     def _matches(row: dict[str, Any], query: dict[str, Any]) -> bool:
-        return all(row.get(key) == value for key, value in query.items())
+        for key, expected in query.items():
+            actual = row.get(key)
+            if isinstance(expected, dict):
+                if "$gte" in expected and (actual is None or actual < expected["$gte"]):
+                    return False
+                if "$gt" in expected and (actual is None or actual <= expected["$gt"]):
+                    return False
+                if "$lte" in expected and (actual is None or actual > expected["$lte"]):
+                    return False
+                if "$lt" in expected and (actual is None or actual >= expected["$lt"]):
+                    return False
+                continue
+            if actual != expected:
+                return False
+        return True
 
     @staticmethod
     def _project(row: dict[str, Any], projection: dict[str, int] | None) -> dict[str, Any]:
@@ -120,3 +134,94 @@ def test_backtest_analytics_is_useful_and_strategy_neutral() -> None:
     assert payload["monthly_returns"]
     forbidden = {"backend", "random_seed", "q_final_action", "effective_config", "decision_score"}
     assert not (_keys(payload) & forbidden)
+
+
+def _rotation_period_database() -> FakeDatabase:
+    job_id = "job-period"
+    backend = "protected-backend"
+    may_start = datetime(2025, 5, 1, tzinfo=timezone.utc)
+    predictions = [
+        {
+            "job_id": job_id,
+            "symbol": "PORTFOLIO",
+            "backend": backend,
+            "timestamp": may_start + timedelta(days=index),
+            "strategy_equity": 10000 + index * 100,
+            "buy_hold_equity": 10000 + index * 80,
+        }
+        for index in range(12)
+    ]
+    trades = [
+        {
+            "job_id": job_id, "symbol": "PORTFOLIO", "backend": backend,
+            "timestamp": datetime(2025, 4, 28, tzinfo=timezone.utc), "sequence": 1,
+            "action": "BUY", "asset": "AAPL", "rotation_id": "r0",
+            "rotation_from_asset": "CASH", "rotation_to_asset": "AAPL",
+            "execution_price": 198.0, "total_fee": 0.1,
+        },
+        {
+            "job_id": job_id, "symbol": "PORTFOLIO", "backend": backend,
+            "timestamp": datetime(2025, 5, 5, tzinfo=timezone.utc), "sequence": 2,
+            "action": "SELL", "asset": "AAPL", "rotation_id": "r1",
+            "rotation_from_asset": "AAPL", "rotation_to_asset": "NVDA",
+            "execution_price": 205.0, "holding_bars": 5, "position_return": .035,
+            "realized_pnl": 350.0, "total_fee": 0.1,
+        },
+        {
+            "job_id": job_id, "symbol": "PORTFOLIO", "backend": backend,
+            "timestamp": datetime(2025, 5, 5, tzinfo=timezone.utc), "sequence": 3,
+            "action": "BUY", "asset": "NVDA", "rotation_id": "r1",
+            "rotation_from_asset": "AAPL", "rotation_to_asset": "NVDA",
+            "execution_price": 112.0, "total_fee": 0.1,
+        },
+        {
+            "job_id": job_id, "symbol": "PORTFOLIO", "backend": backend,
+            "timestamp": datetime(2025, 5, 9, tzinfo=timezone.utc), "sequence": 4,
+            "action": "SELL", "asset": "NVDA", "rotation_id": "r2",
+            "rotation_from_asset": "NVDA", "rotation_to_asset": "CASH",
+            "execution_price": 119.0, "holding_bars": 4, "position_return": .0625,
+            "realized_pnl": 625.0, "total_fee": 0.1,
+        },
+    ]
+    market_bars = []
+    for index in range(12):
+        timestamp = may_start + timedelta(days=index)
+        market_bars.extend([
+            {
+                "symbol": "AAPL", "interval": "1Day", "timestamp": timestamp,
+                "open": 199 + index, "high": 201 + index, "low": 198 + index, "close": 200 + index,
+            },
+            {
+                "symbol": "NVDA", "interval": "1Day", "timestamp": timestamp,
+                "open": 109 + index, "high": 112 + index, "low": 108 + index, "close": 110 + index,
+            },
+        ])
+    return FakeDatabase({
+        "backtest_jobs": FakeCollection([{
+            "id": job_id, "status": "completed", "created_at": may_start, "finished_at": may_start + timedelta(days=12),
+        }]),
+        "backtest_comparisons": FakeCollection([{
+            "job_id": job_id,
+            "results": [{"portfolio_rotation": True, "backend": backend}],
+        }]),
+        "backtest_runs": FakeCollection([{
+            "job_id": job_id, "symbol": "PORTFOLIO", "backend": backend,
+        }]),
+        "backtest_predictions": FakeCollection(predictions),
+        "backtest_trades": FakeCollection(trades),
+        "alpaca_market_bars": FakeCollection(market_bars),
+        "market_bars": FakeCollection([]),
+    })
+
+
+def test_rotation_period_analysis_returns_operated_asset_prices_and_position_timeline() -> None:
+    payload = rotation_period_analysis(_rotation_period_database(), "job-period", year=2025, month=5)
+    assert payload["default_asset"] == "NVDA"
+    assert [item["symbol"] for item in payload["assets"]] == ["NVDA", "AAPL"]
+    assert len(payload["movements"]) == 2
+    assert payload["movements"][0]["sell_execution_price"] == 205.0
+    assert payload["movements"][0]["buy_execution_price"] == 112.0
+    assert payload["assets"][0]["prices"][-1]["close"] == 121.0
+    assert payload["assets"][1]["prices"][0]["close"] == 200.0
+    assert [segment["asset"] for segment in payload["position_segments"]] == ["AAPL", "NVDA", "CASH"]
+    assert payload["strategy_return"] == 11100 / 10000 - 1

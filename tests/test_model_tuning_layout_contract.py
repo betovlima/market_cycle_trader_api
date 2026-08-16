@@ -105,7 +105,7 @@ def test_backtest_monthly_capital_movement_heatmap_replaces_timeline_and_opens_m
     panel = (FRONT / "src" / "features" / "backtest" / "components" / "RotationPanel.jsx").read_text(encoding="utf-8")
     styles = (FRONT / "src" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'MonthlyCapitalMovementHeatmap rotations={rotations} equity={payload?.equity || []}' in panel
+    assert 'MonthlyCapitalMovementHeatmap jobId={jobId} rotations={rotations} equity={payload?.equity || []}' in panel
     assert 'Monthly Capital Movement Heatmap' in panel
     assert "['pnl', tr('Realized P/L')]" in panel
     assert "['movements', tr('Movements')]" in panel
@@ -120,6 +120,13 @@ def test_backtest_monthly_capital_movement_heatmap_replaces_timeline_and_opens_m
     assert '.rotation-monthly-heatmap-cell.cash' in styles
     assert '.rotation-month-dialog-backdrop' in styles
     assert '.rotation-month-equity-chart path.line' in styles
+    asset_panel = (FRONT / "src" / "features" / "backtest" / "components" / "MonthlyAssetAnalysis.jsx").read_text(encoding="utf-8")
+    assert 'rotation-period?year=' in asset_panel
+    assert 'Price + trades' in asset_panel
+    assert 'Strategy vs asset' in asset_panel
+    assert 'BUY / ROTATE IN' in asset_panel
+    assert 'Monthly allocation timeline' in asset_panel
+    assert '.rotation-month-asset-analysis' in styles
 
 
 def test_model_tuning_exposes_unified_caro_without_manual_hypercube_handoff() -> None:
@@ -311,3 +318,18 @@ def test_candidate_execution_title_uses_ripple_while_running_and_green_dot_when_
     assert '.model-tuning-caro-status-complete {' in styles
     assert 'background: #58e6a8;' in styles
 
+
+
+def test_mobile_layout_keeps_tuning_content_and_charts_inside_viewport() -> None:
+    styles = (FRONT / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "@media (max-width: 680px)" in styles
+    assert ".workspace-main {\n    width: calc(100% - 12px);" in styles
+    assert ".model-tuning-baseline-head {\n    display: grid;" in styles
+    assert ".model-tuning-context-grid > .model-tuning-context-card > strong," in styles
+    assert "overflow-wrap: anywhere;" in styles
+    assert ".recharts-responsive-container," in styles
+    assert ".recharts-default-legend {" in styles
+    assert ".recharts-tooltip-wrapper { max-width: calc(100vw - 20px); }" in styles
+    assert ".portfolio-chart-events," in styles
+    assert ".rotation-inspector-chart {" in styles

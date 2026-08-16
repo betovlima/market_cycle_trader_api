@@ -13,6 +13,7 @@ def test_viewer_capabilities_are_read_only_for_backtest_and_tuning() -> None:
     assert capabilities["backtest.view"] is True
     assert capabilities["tuning.view"] is True
     assert capabilities["research_models.view"] is True
+    assert capabilities["temporal_intelligence.view"] is True
     assert capabilities["analytics.view"] is True
     assert capabilities["backtest.start"] is False
     assert capabilities["backtest.export"] is False
@@ -21,6 +22,9 @@ def test_viewer_capabilities_are_read_only_for_backtest_and_tuning() -> None:
     assert capabilities["tuning.export"] is False
     assert capabilities["tuning.logs.view"] is False
     assert capabilities["tuning.promote"] is False
+    assert capabilities["temporal_intelligence.start"] is False
+    assert capabilities["temporal_intelligence.stop"] is False
+    assert capabilities["temporal_intelligence.export"] is False
     assert capabilities["portfolio.view"] is False
     assert capabilities["administration.view"] is False
     assert capabilities["settings.view"] is False
@@ -34,6 +38,9 @@ def test_trader_and_admin_capabilities_match_backend_access_policy() -> None:
     assert trader["portfolio.view"] is True
     assert trader["dashboard.strategy_intelligence.view"] is True
     assert trader["tuning.start"] is False
+    assert trader["temporal_intelligence.view"] is True
+    assert trader["temporal_intelligence.start"] is False
+    assert trader["temporal_intelligence.export"] is False
     assert trader["administration.view"] is False
 
     assert all(admin.values())
@@ -50,5 +57,6 @@ def test_session_response_returns_backend_capabilities() -> None:
     assert response.authenticated is True
     assert response.capabilities["backtest.view"] is True
     assert response.capabilities["tuning.view"] is True
+    assert response.capabilities["temporal_intelligence.view"] is True
     assert response.capabilities["backtest.start"] is False
     assert response.capabilities["portfolio.view"] is False

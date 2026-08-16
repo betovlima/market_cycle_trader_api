@@ -50,6 +50,9 @@ MODEL_RESEARCH_SETTINGS_COLLECTION = "model_research_settings"
 MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION = "model_research_settings_history"
 MODEL_TUNING_RUNS_COLLECTION = "model_tuning_runs"
 MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION = "model_tuning_market_snapshots"
+TEMPORAL_INTELLIGENCE_RUNS_COLLECTION = "temporal_intelligence_runs"
+TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION = "temporal_intelligence_observations"
+TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION = "temporal_intelligence_artifacts"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -274,6 +277,22 @@ def ensure_database(db: Database) -> None:
     db[MODEL_TUNING_RUNS_COLLECTION].create_index(
         [("strategy_profile_id", ASCENDING), ("created_at", DESCENDING)],
         name="ix_model_tuning_strategy_created",
+    )
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].create_index(
+        [("status", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_intelligence_status_created",
+    )
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].create_index(
+        [("strategy_profile_id", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_intelligence_strategy_created",
+    )
+    db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("timestamp", ASCENDING)],
+        name="ix_temporal_intelligence_observations_run_timestamp",
+    )
+    db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("kind", ASCENDING), ("sequence", ASCENDING)],
+        name="ix_temporal_intelligence_artifacts_run_kind_sequence",
     )
 
 

@@ -148,6 +148,12 @@ def test_protected_dashboard_exposes_strategy_forecast_and_risk_off_diagnostics(
             "current_asset": "NVDA",
             "best_asset": "MSFT",
             "best_score": 0.27,
+            "strategy_absolute_utility_cash_gate_enabled": True,
+            "absolute_utility_best_score": 0.27,
+            "absolute_utility_entry_threshold": 0.24,
+            "absolute_utility_exit_threshold": 0.19,
+            "absolute_utility_active_threshold": 0.19,
+            "absolute_utility_accepted": True,
             "current_cash_edge": -0.015,
             "best_cash_edge": -0.006,
             "cash_exit_threshold": 0.0,
@@ -205,6 +211,10 @@ def test_protected_dashboard_exposes_strategy_forecast_and_risk_off_diagnostics(
     row = payload["decision_history"]["rows"][0]
     assert row["current_cash_edge"] == -0.015
     assert row["best_cash_edge"] == -0.006
+    assert row["absolute_utility_best_score"] == 0.27
+    assert row["absolute_utility_entry_threshold"] == 0.24
+    assert row["absolute_utility_exit_threshold"] == 0.19
+    assert row["strategy_absolute_utility_cash_gate_enabled"] is True
     assert row["final_action_asset"] == "CASH"
     assert row["decision_reason"] == "CASH_THRESHOLD"
 
