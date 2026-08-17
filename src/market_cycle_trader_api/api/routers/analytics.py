@@ -6,11 +6,44 @@ from fastapi import APIRouter, Depends, Query
 
 from ...auth.security import SessionIdentity, require_portfolio_session, require_trader_session
 from ...core.runtime import database
-from ...services.analytics import backtest_analytics, completed_backtests, portfolio_analytics, rotation_period_analysis
+from ...services.analytics import (
+    backtest_analytics,
+    completed_backtests,
+    completed_processings,
+    portfolio_analytics,
+    processing_analytics,
+    processing_rotation_period_analysis,
+    rotation_period_analysis,
+)
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 AuthenticatedSession = Annotated[SessionIdentity, Depends(require_trader_session)]
 PortfolioSession = Annotated[SessionIdentity, Depends(require_portfolio_session)]
+
+
+
+
+@router.get("/processings")
+def list_completed_processings(
+    _: AuthenticatedSession,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, Any]:
+    return completed_processings(database(), limit=limit)
+
+
+@router.get("/processings/{processing_id}")
+def get_processing_analytics(processing_id: str, _: AuthenticatedSession) -> dict[str, Any]:
+    return processing_analytics(database(), processing_id)
+
+
+@router.get("/processings/{processing_id}/rotation-period")
+def get_processing_rotation_period(
+    processing_id: str,
+    _: AuthenticatedSession,
+    year: Annotated[int, Query(ge=2000, le=2200)],
+    month: Annotated[int, Query(ge=1, le=12)],
+) -> dict[str, Any]:
+    return processing_rotation_period_analysis(database(), processing_id, year=year, month=month)
 
 
 @router.get("/backtests")

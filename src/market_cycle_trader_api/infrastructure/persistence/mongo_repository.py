@@ -50,6 +50,7 @@ MODEL_RESEARCH_SETTINGS_COLLECTION = "model_research_settings"
 MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION = "model_research_settings_history"
 MODEL_TUNING_RUNS_COLLECTION = "model_tuning_runs"
 MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION = "model_tuning_market_snapshots"
+MODEL_TUNING_VALIDATIONS_COLLECTION = "model_tuning_validations"
 TEMPORAL_INTELLIGENCE_RUNS_COLLECTION = "temporal_intelligence_runs"
 TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION = "temporal_intelligence_observations"
 TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION = "temporal_intelligence_artifacts"
@@ -277,6 +278,20 @@ def ensure_database(db: Database) -> None:
     db[MODEL_TUNING_RUNS_COLLECTION].create_index(
         [("strategy_profile_id", ASCENDING), ("created_at", DESCENDING)],
         name="ix_model_tuning_strategy_created",
+    )
+    db[MODEL_TUNING_VALIDATIONS_COLLECTION].create_index(
+        [("id", ASCENDING)],
+        unique=True,
+        name="ux_model_tuning_validations_id",
+    )
+    db[MODEL_TUNING_VALIDATIONS_COLLECTION].create_index(
+        [("tuning_run_id", ASCENDING), ("candidate_id", ASCENDING)],
+        unique=True,
+        name="ux_model_tuning_validations_candidate",
+    )
+    db[MODEL_TUNING_VALIDATIONS_COLLECTION].create_index(
+        [("created_at", DESCENDING)],
+        name="ix_model_tuning_validations_created",
     )
     db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].create_index(
         [("status", ASCENDING), ("created_at", DESCENDING)],

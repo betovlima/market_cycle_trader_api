@@ -8,6 +8,12 @@ from fastapi.responses import Response
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
 from ...schemas.model_tuning import ModelTuningAdoptRequest, ModelTuningStartRequest
+from ...services.model_tuning_validation import (
+    ModelTuningValidationConflict,
+    ModelTuningValidationNotFound,
+    get_tuning_validation,
+    validate_temporal_policy_champion,
+)
 from ...services.model_tuning import (
     ModelTuningConflict,
     ModelTuningNotFound,
@@ -31,8 +37,10 @@ router = APIRouter(prefix="/api/admin/model-tuning", tags=["model-tuning"])
 def _translate_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ModelTuningNotFound):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    if isinstance(exc, ModelTuningConflict):
+    if isinstance(exc, (ModelTuningConflict, ModelTuningValidationConflict)):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, ModelTuningValidationNotFound):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
 
@@ -172,4 +180,33 @@ def adopt_tuning_candidate(
             actor_email=identity.email,
         )
     except (ModelTuningNotFound, ModelTuningConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{run_id}/candidates/{candidate_id}/validate-champion")
+def validate_tuning_champion(
+    run_id: str,
+    candidate_id: int,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    try:
+        return validate_temporal_policy_champion(
+            database(),
+            run_id,
+            candidate_id,
+            actor_email=identity.email,
+        )
+    except (ModelTuningValidationNotFound, ModelTuningValidationConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.get("/{run_id}/candidates/{candidate_id}/validation")
+def get_candidate_validation(
+    run_id: str,
+    candidate_id: int,
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any] | None:
+    try:
+        return get_tuning_validation(database(), run_id, candidate_id)
+    except (ModelTuningValidationNotFound, ModelTuningValidationConflict, ValueError, RuntimeError) as exc:
         raise _translate_error(exc) from exc
