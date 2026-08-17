@@ -21,6 +21,9 @@ class ChampionProbabilityConfig(BaseModel):
     initial_exploration_fraction: float = Field(default=0.45, ge=0.10, le=0.90)
     minimum_exploration_fraction: float = Field(default=0.20, ge=0.05, le=0.60)
     stagnation_recovery_trials: int = Field(default=4, ge=2, le=12)
+    adaptive_stopping_enabled: bool = True
+    no_improvement_trial_limit: int = Field(default=100, ge=10, le=5000)
+    minimum_meaningful_improvement: float = Field(default=0.0025, ge=0.0, le=0.25)
 
     @model_validator(mode="after")
     def validate_exploration_policy(self) -> "ChampionProbabilityConfig":
@@ -35,8 +38,8 @@ class ModelTuningStartRequest(BaseModel):
     # latin_hypercube_then_caro remains accepted only for backward compatibility
     # with v3.10 clients/history. New UI campaigns use Unified CARO.
     method: Literal["latin_hypercube", "champion_probability", "latin_hypercube_then_caro"] = "champion_probability"
-    candidate_count: int = Field(default=20, ge=4, le=60)
-    caro_candidate_count: int | None = Field(default=None, ge=1, le=60)
+    candidate_count: int = Field(default=20, ge=4, le=2000)
+    caro_candidate_count: int | None = Field(default=None, ge=1, le=2000)
     seed: int = Field(default=42, ge=0, le=2_147_483_647)
     baseline_job_id: str | None = Field(default=None, min_length=1, max_length=128)
     source_tuning_run_id: str | None = Field(default=None, min_length=1, max_length=128)

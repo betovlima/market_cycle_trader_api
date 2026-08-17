@@ -87,9 +87,12 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 13
+TUNING_SCHEMA_VERSION = 15
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
+TECHNICAL_RESEARCH_SEGMENT_MAX = 2000
+DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT = 100
+DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT = 0.0025
 
 
 
@@ -484,7 +487,10 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
         "joint_optimization": scope == ABSOLUTE_UTILITY_TUNING_SCOPE,
         "default_candidate_count": DEFAULT_CANDIDATE_COUNT,
         "candidate_count_min": 4,
-        "candidate_count_max": 60,
+        "candidate_count_max": TECHNICAL_RESEARCH_SEGMENT_MAX,
+        "research_budget_min": 4,
+        "research_budget_technical_segment_max": TECHNICAL_RESEARCH_SEGMENT_MAX,
+        "research_budget_unbounded_across_continuations": True,
         "default_seed": DEFAULT_SEED,
         "control_candidate_included": True,
         "control_execution_mode": "reuse_materialized_temporal_result" if temporal_scope else "reuse_certified_candidate_backtest",
@@ -503,8 +509,13 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
         "dedicated_worker": False,
         "execution_mode": ("full_temporal_lightgbm_retrain" if scope == TEMPORAL_MODEL_TUNING_SCOPE else "frozen_temporal_replay") if temporal_scope else "integrated_api_worker",
         "market_data_access": "frozen_temporal_snapshot_only" if temporal_scope else "database_only",
-        "prior_campaign_reuse": not temporal_scope,
+        "prior_campaign_reuse": True,
         "automatic_compatible_prior_observation_reuse": not temporal_scope,
+        "continue_research_available": True,
+        "historical_trial_retention": "active_campaign_only",
+        "durable_candidate_retention": "adopted_or_validated_only",
+        "technical_failure_retention": "campaign_counters_and_summary_only",
+        "historical_cleanup_trigger": "next_tuning_campaign_start",
         "automatic_lhs_to_caro_handoff": False,
         "unified_caro": True,
         "dynamic_exploration": True,
@@ -530,6 +541,9 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
             "default_min_worst_fold_return": 0.0,
             "default_candidate_pool_size": 2048,
             "default_exploration_weight": 0.15,
+            "default_adaptive_stopping_enabled": True,
+            "default_no_improvement_trial_limit": DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT,
+            "default_minimum_meaningful_improvement": DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT,
             "interpretation": "Estimated probability of outperforming the current research Champion under the frozen validation protocol; not a probability of future market profit.",
         },
     }
@@ -1225,6 +1239,240 @@ def _source_observations(document: dict[str, Any]) -> list[dict[str, Any]]:
     return observations
 
 
+def _continuation_observations(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return compact, de-duplicated observations for Continue Research.
+
+    Candidate ids are made negative so the next campaign can number its newly
+    executed candidates from 1 while preserving the original ids in metadata.
+    """
+    merged = list(document.get("prior_observations") or []) + list(document.get("candidates") or [])
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for item in merged:
+        if bool(item.get("is_control")):
+            continue
+        if item.get("status") != "completed" or not isinstance(item.get("settings"), dict) or not isinstance(item.get("metrics"), dict):
+            continue
+        fingerprint = str(item.get("settings_hash") or "") or _settings_hash(dict(item.get("settings") or {}))
+        if not fingerprint or fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        source_candidate_id = int(item.get("source_candidate_id") if item.get("source_candidate_id") is not None else item.get("candidate_id") or 0)
+        result.append({
+            "candidate_id": -(len(result) + 1),
+            "source_candidate_id": source_candidate_id,
+            "source_tuning_run_id": str(item.get("source_tuning_run_id") or document.get("id") or ""),
+            "source": "continue_research",
+            "kind": str(item.get("kind") or "historical_observation"),
+            "is_control": bool(item.get("is_control")),
+            "settings": deepcopy(item.get("settings") or {}),
+            "settings_hash": fingerprint,
+            "status": "completed",
+            "rank": item.get("rank"),
+            "metrics": deepcopy(item.get("metrics") or {}),
+            "champion_gate_passed": item.get("champion_gate_passed"),
+            "champion_gate": deepcopy(item.get("champion_gate") or None),
+        })
+    if len(result) < 4:
+        raise ModelTuningConflict("Continue Research requires at least four completed observations in the source campaign.")
+    return result
+
+
+
+
+def _retained_historical_candidate_ids(document: dict[str, Any]) -> set[int]:
+    """Candidates explicitly promoted into a durable research/lifecycle state.
+
+    Trial observations are useful while a campaign is active and when Continue
+    Research copies a source campaign. They are not permanent business records.
+    Once a later campaign starts, only candidates that were explicitly adopted
+    or validated are retained in the historical tuning document.
+    """
+    retained: set[int] = set()
+    for field in ("adopted_candidate_id", "validated_candidate_id"):
+        value = document.get(field)
+        if value is not None:
+            retained.add(int(value))
+    for item in document.get("adoption_history") or []:
+        if isinstance(item, dict) and item.get("candidate_id") is not None:
+            retained.add(int(item["candidate_id"]))
+    for value in document.get("retained_candidate_ids") or []:
+        if value is not None:
+            retained.add(int(value))
+    return retained
+
+
+def _compact_historical_tuning_document(document: dict[str, Any], *, next_run_id: str) -> dict[str, Any]:
+    retained_ids = _retained_historical_candidate_ids(document)
+    candidates = list(document.get("candidates") or [])
+    prior = list(document.get("prior_observations") or [])
+    retained_candidates = [
+        deepcopy(item)
+        for item in candidates
+        if item.get("candidate_id") is not None and int(item.get("candidate_id")) in retained_ids
+    ]
+    retained_ids_present = {
+        int(item.get("candidate_id")) for item in retained_candidates if item.get("candidate_id") is not None
+    }
+    champion_history = [
+        deepcopy(item)
+        for item in document.get("probability_champion_history") or []
+        if item.get("candidate_id") is not None and int(item.get("candidate_id")) in retained_ids_present
+    ]
+    event_log = [
+        deepcopy(item)
+        for item in document.get("event_log") or []
+        if item.get("candidate_id") is None or int(item.get("candidate_id")) in retained_ids_present
+    ]
+    successful_discarded = sum(
+        1
+        for item in candidates
+        if item.get("status") == "completed"
+        and not bool(item.get("is_control"))
+        and (item.get("candidate_id") is None or int(item.get("candidate_id")) not in retained_ids_present)
+    )
+    failed_discarded = sum(1 for item in candidates if item.get("status") == "failed")
+    cancelled_discarded = sum(1 for item in candidates if item.get("status") == "cancelled")
+    now = utc_now()
+    return {
+        "candidates": bson_value(retained_candidates),
+        "prior_observations": [],
+        "probability_champion_history": bson_value(champion_history),
+        "event_log": bson_value(event_log[-_TUNING_LOG_MAX_EVENTS:]),
+        "historical_trials_compacted": True,
+        "historical_trials_compacted_at": now,
+        "historical_trials_compacted_for_run_id": str(next_run_id),
+        "retained_candidate_ids": sorted(retained_ids_present),
+        "retained_candidate_count": len(retained_candidates),
+        "discarded_successful_trial_count": int(document.get("discarded_successful_trial_count") or 0) + successful_discarded + len(prior),
+        "discarded_failed_trial_count": int(document.get("discarded_failed_trial_count") or 0) + failed_discarded,
+        "discarded_cancelled_trial_count": int(document.get("discarded_cancelled_trial_count") or 0) + cancelled_discarded,
+        "best_candidate_id": (
+            int(document.get("best_candidate_id"))
+            if document.get("best_candidate_id") is not None and int(document.get("best_candidate_id")) in retained_ids_present
+            else None
+        ),
+        "best_exploratory_candidate_id": (
+            int(document.get("best_exploratory_candidate_id"))
+            if document.get("best_exploratory_candidate_id") is not None and int(document.get("best_exploratory_candidate_id")) in retained_ids_present
+            else None
+        ),
+        "best_champion_beating_candidate_id": (
+            int(document.get("best_champion_beating_candidate_id"))
+            if document.get("best_champion_beating_candidate_id") is not None and int(document.get("best_champion_beating_candidate_id")) in retained_ids_present
+            else None
+        ),
+        "updated_at": now,
+    }
+
+
+def _compact_historical_tuning_runs(db: Any, *, next_run_id: str) -> dict[str, int]:
+    """Prune transient trial observations when a new campaign is created.
+
+    The just-created campaign remains untouched. Completed/failed/stopped older
+    campaigns keep aggregate counters and only candidates that entered an
+    explicit durable lifecycle state (adopted or validated).
+    """
+    compacted_runs = 0
+    retained_candidates = 0
+    discarded_trials = 0
+    cursor = db[MODEL_TUNING_RUNS_COLLECTION].find({
+        "id": {"$ne": str(next_run_id)},
+        "status": {"$nin": list(_ACTIVE_STATUSES)},
+        "historical_trials_compacted": {"$ne": True},
+    })
+    for document in cursor:
+        before_candidates = len(document.get("candidates") or [])
+        before_prior = len(document.get("prior_observations") or [])
+        update = _compact_historical_tuning_document(document, next_run_id=next_run_id)
+        kept = len(update.get("candidates") or [])
+        db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+            {"id": str(document.get("id") or "")},
+            {"$set": update},
+        )
+        compacted_runs += 1
+        retained_candidates += kept
+        discarded_trials += max(0, before_candidates + before_prior - kept)
+    return {
+        "compacted_runs": compacted_runs,
+        "retained_candidates": retained_candidates,
+        "discarded_trials": discarded_trials,
+    }
+
+def _validate_temporal_continuation_source(
+    source: dict[str, Any],
+    *,
+    strategy: dict[str, Any],
+    tuning_scope: str,
+    search_space: list[dict[str, Any]],
+    source_temporal_run_id: str,
+    market_data_snapshot_id: str | None,
+) -> None:
+    if str(source.get("status") or "") != "completed":
+        raise ModelTuningConflict("Continue Research requires a completed source campaign.")
+    if str(source.get("method") or "") != PROBABILITY_METHOD:
+        raise ModelTuningConflict("Continue Research is available for Unified Adaptive CARO campaigns.")
+    if str(source.get("tuning_scope") or "") != str(tuning_scope):
+        raise ModelTuningConflict("The source campaign targets a different Temporal tuning scope.")
+    if str(source.get("strategy_profile_id") or "") != str(strategy.get("id") or ""):
+        raise ModelTuningConflict("The source campaign belongs to a different TEMPORAL Strategy.")
+    if int(source.get("strategy_profile_revision") or 0) != int(strategy.get("revision") or 0):
+        raise ModelTuningConflict("The source campaign belongs to a different TEMPORAL Strategy revision.")
+    if str(source.get("strategy_configuration_hash") or "") != str(strategy.get("configuration_hash") or ""):
+        raise ModelTuningConflict("The source campaign Strategy configuration hash does not match the selected TEMPORAL Strategy.")
+    if str(source.get("source_temporal_run_id") or "") != str(source_temporal_run_id):
+        raise ModelTuningConflict("The source campaign uses a different frozen Temporal Intelligence replay.")
+    if list(source.get("search_space") or []) != list(search_space):
+        raise ModelTuningConflict("The source campaign uses a different parameter search space.")
+    source_snapshot = str(source.get("market_data_snapshot_id") or source.get("expected_market_data_signature_sha256") or "").strip().lower()
+    expected_snapshot = str(market_data_snapshot_id or "").strip().lower()
+    if source_snapshot and expected_snapshot and source_snapshot != expected_snapshot:
+        raise ModelTuningConflict("The source campaign uses a different frozen market-data snapshot.")
+
+
+def _meaningful_no_improvement_streak(document: dict[str, Any]) -> int:
+    config = dict(document.get("probability_config") or {})
+    threshold = max(0.0, float(config.get("minimum_meaningful_improvement") or DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT))
+    starting_anchor = document.get("starting_probability_anchor") if isinstance(document.get("starting_probability_anchor"), dict) else document.get("probability_anchor")
+    anchor_metrics = (starting_anchor or {}).get("metrics") if isinstance(starting_anchor, dict) else None
+    best = float((anchor_metrics or {}).get("ending_capital") or 0.0)
+    if best <= 0:
+        control = next((item for item in document.get("candidates") or [] if bool(item.get("is_control")) and isinstance(item.get("metrics"), dict)), None)
+        best = float(((control or {}).get("metrics") or {}).get("ending_capital") or 0.0)
+    streak = 0
+    completed = [
+        item for item in document.get("candidates") or []
+        if not bool(item.get("is_control")) and item.get("status") == "completed" and isinstance(item.get("metrics"), dict)
+    ]
+    completed.sort(key=lambda item: int(item.get("candidate_id") or 0))
+    for item in completed:
+        capital = float((item.get("metrics") or {}).get("ending_capital") or 0.0)
+        if capital > 0 and (best <= 0 or capital >= best * (1.0 + threshold)):
+            best = max(best, capital)
+            streak = 0
+        else:
+            streak += 1
+    return streak
+
+
+def _adaptive_early_stop_reason(document: dict[str, Any]) -> str | None:
+    if str(document.get("method") or "") != PROBABILITY_METHOD:
+        return None
+    config = dict(document.get("probability_config") or {})
+    if not bool(config.get("adaptive_stopping_enabled", True)):
+        return None
+    limit = max(10, int(config.get("no_improvement_trial_limit") or DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT))
+    completed_trials = sum(1 for item in document.get("candidates") or [] if not bool(item.get("is_control")) and item.get("status") == "completed")
+    minimum_exploration = max(4, int(config.get("minimum_exploration_trials") or config.get("startup_trials") or 4))
+    if completed_trials < minimum_exploration:
+        return None
+    streak = _meaningful_no_improvement_streak(document)
+    if streak < limit:
+        return None
+    threshold = max(0.0, float(config.get("minimum_meaningful_improvement") or DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT))
+    return f"Adaptive early stopping: {streak} consecutive trials without at least {threshold * 100:.3f}% meaningful capital improvement."
+
+
 def _automatic_compatible_prior_observations(
     db: Any,
     *,
@@ -1313,11 +1561,49 @@ def _automatic_compatible_prior_observations(
 
 
 def _source_anchor(document: dict[str, Any], anchor_candidate_id: int | None) -> dict[str, Any]:
-    candidate_id = int(anchor_candidate_id) if anchor_candidate_id is not None else int(document.get("best_candidate_id") or -1)
+    probability_anchor = document.get("probability_anchor") if isinstance(document.get("probability_anchor"), dict) else None
+    if anchor_candidate_id is None and str(document.get("method") or "") == PROBABILITY_METHOD and probability_anchor:
+        if isinstance(probability_anchor.get("settings"), dict) and isinstance(probability_anchor.get("metrics"), dict):
+            return {
+                "candidate_id": int(probability_anchor.get("candidate_id") or 0),
+                "settings_hash": str(probability_anchor.get("settings_hash") or ""),
+                "settings": deepcopy(probability_anchor.get("settings") or {}),
+                "metrics": deepcopy(probability_anchor.get("metrics") or {}),
+                "status": "completed",
+                "is_control": False,
+                "source_tuning_run_id": probability_anchor.get("source_tuning_run_id"),
+            }
+
+    best_candidate_id = document.get("best_candidate_id")
+    candidate_id = int(anchor_candidate_id) if anchor_candidate_id is not None else (int(best_candidate_id) if best_candidate_id is not None else -1)
+
+    if probability_anchor and int(probability_anchor.get("candidate_id") or 0) == candidate_id:
+        if isinstance(probability_anchor.get("settings"), dict) and isinstance(probability_anchor.get("metrics"), dict):
+            return {
+                "candidate_id": candidate_id,
+                "settings_hash": str(probability_anchor.get("settings_hash") or ""),
+                "settings": deepcopy(probability_anchor.get("settings") or {}),
+                "metrics": deepcopy(probability_anchor.get("metrics") or {}),
+                "status": "completed",
+                "is_control": False,
+                "source_tuning_run_id": probability_anchor.get("source_tuning_run_id"),
+            }
+
     candidate = next(
         (item for item in document.get("candidates") or [] if int(item.get("candidate_id") or 0) == candidate_id),
         None,
     )
+    if candidate is None:
+        candidate = next(
+            (
+                item for item in document.get("prior_observations") or []
+                if (
+                    (item.get("candidate_id") is not None and int(item.get("candidate_id")) == candidate_id)
+                    or (item.get("source_candidate_id") is not None and int(item.get("source_candidate_id")) == candidate_id)
+                )
+            ),
+            None,
+        )
     if candidate is None or candidate.get("status") != "completed" or not isinstance(candidate.get("metrics"), dict):
         raise ModelTuningConflict("Select a completed source candidate as the CARO Champion anchor.")
     if not bool(candidate["metrics"].get("eligible")):
@@ -1595,6 +1881,13 @@ def _public_tuning_history_item(document: dict[str, Any]) -> dict[str, Any]:
         "best_candidate": best_public,
         "adopted_candidate_id": document.get("adopted_candidate_id"),
         "adopted_strategy_id": document.get("adopted_strategy_id"),
+        "validated_candidate_id": document.get("validated_candidate_id"),
+        "validation_processing_id": document.get("validation_processing_id"),
+        "validation_strategy_id": document.get("validation_strategy_id"),
+        "validated_at": document.get("validated_at"),
+        "adaptive_early_stopped": bool(document.get("adaptive_early_stopped")),
+        "adaptive_early_stop_reason": document.get("adaptive_early_stop_reason"),
+        "research_budget_used": document.get("research_budget_used"),
         "adoption_history": deepcopy(document.get("adoption_history") or []),
     })
 
@@ -1679,12 +1972,11 @@ def _start_temporal_tuning(
     seed: int,
     baseline_job_id: str | None,
     source_tuning_run_id: str | None,
+    anchor_candidate_id: int | None,
     probability_config: dict[str, Any] | None,
     actor_email: str | None,
     tuning_target_source: str,
 ) -> dict[str, Any]:
-    if source_tuning_run_id:
-        raise ModelTuningConflict("TEMPORAL tuning starts from the selected materialized TEMPORAL Strategy. Prior-campaign seeding is not used for this workflow.")
     temporal_model_scope = str(tuning_scope) == TEMPORAL_MODEL_TUNING_SCOPE
     plan = temporal_model_plan(strategy, model_snapshot) if temporal_model_scope else temporal_policy_plan(strategy)
     search_space = [dict(item) for item in plan["search_space"]]
@@ -1698,6 +1990,7 @@ def _start_temporal_tuning(
     probability: dict[str, Any]
     probability_anchor: dict[str, Any] | None = None
     prior_observations: list[dict[str, Any]] = []
+    continuation_source_id: str | None = None
 
     if method == PROBABILITY_METHOD:
         candidates = [control]
@@ -1711,10 +2004,30 @@ def _start_temporal_tuning(
             "settings": deepcopy(base_values),
             "metrics": deepcopy(baseline.get("metrics") or {}),
         }
+        if source_tuning_run_id:
+            source = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": str(source_tuning_run_id)})
+            if source is None:
+                raise ModelTuningNotFound("Source tuning campaign not found.")
+            source_snapshot_id = str((strategy.get("temporal_policy") or {}).get("market_data_snapshot_id") or "").strip().lower() or None
+            _validate_temporal_continuation_source(
+                source, strategy=strategy, tuning_scope=tuning_scope, search_space=search_space,
+                source_temporal_run_id=source_run_id, market_data_snapshot_id=source_snapshot_id,
+            )
+            prior_observations = _continuation_observations(source)
+            anchor = _source_anchor(source, anchor_candidate_id)
+            probability_anchor = {
+                "source": "continued_campaign_champion",
+                "source_tuning_run_id": str(source_tuning_run_id),
+                "candidate_id": int(anchor.get("candidate_id") or 0),
+                "settings_hash": str(anchor.get("settings_hash") or ""),
+                "settings": deepcopy(anchor.get("settings") or {}),
+                "metrics": deepcopy(anchor.get("metrics") or {}),
+            }
+            continuation_source_id = str(source_tuning_run_id)
         probability = {
             "startup_trials": minimum_exploration,
             "minimum_exploration_trials": minimum_exploration,
-            "imported_observation_count": 0,
+            "imported_observation_count": len(prior_observations),
             "min_capital_improvement": float(probability_input.get("min_capital_improvement", 0.03)),
             "sharpe_tolerance": float(probability_input.get("sharpe_tolerance", 0.05)),
             "drawdown_tolerance": float(probability_input.get("drawdown_tolerance", 0.03)),
@@ -1724,6 +2037,9 @@ def _start_temporal_tuning(
             "initial_exploration_fraction": float(probability_input.get("initial_exploration_fraction", 0.45)),
             "minimum_exploration_fraction": float(probability_input.get("minimum_exploration_fraction", 0.20)),
             "stagnation_recovery_trials": int(probability_input.get("stagnation_recovery_trials", 4)),
+            "adaptive_stopping_enabled": bool(probability_input.get("adaptive_stopping_enabled", True)),
+            "no_improvement_trial_limit": int(probability_input.get("no_improvement_trial_limit", DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT)),
+            "minimum_meaningful_improvement": float(probability_input.get("minimum_meaningful_improvement", DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT)),
             "space_filling_pool_size": int(probability_input.get("space_filling_pool_size", 1024)),
             "probability_model": PROBABILITY_MODEL,
             "source_mode": "temporal_lightgbm_retrain_unified" if temporal_model_scope else "temporal_frozen_replay_unified",
@@ -1811,14 +2127,15 @@ def _start_temporal_tuning(
         "baseline_execution": bson_value(baseline),
         "probability_config": bson_value(probability),
         "probability_anchor": bson_value(probability_anchor) if probability_anchor else None,
+        "starting_probability_anchor": bson_value(deepcopy(probability_anchor)) if probability_anchor else None,
         "probability_state": bson_value(initial_probability_state(prior_observations)) if method in _ADAPTIVE_METHODS else None,
         "probability_champion_history": [],
-        "source_tuning_run_id": None,
+        "source_tuning_run_id": continuation_source_id,
         "source_strategy_profile_id": strategy["id"],
         "source_strategy_profile_revision": int(strategy["revision"]),
         "source_temporal_run_id": source_run_id,
-        "prior_observations": [],
-        "imported_observation_count": 0,
+        "prior_observations": bson_value(prior_observations),
+        "imported_observation_count": len(prior_observations),
         "execution_mode": "full_temporal_lightgbm_retrain" if temporal_model_scope else "frozen_temporal_replay",
         "execution_request_snapshot": None,
         "execution_context_hash": None,
@@ -1846,7 +2163,7 @@ def _start_temporal_tuning(
                 "level": "info",
                 "stage": "created",
                 "message": _sanitize_tuning_log_line(
-                    f"TEMPORAL {'Model' if temporal_model_scope else 'Policy'} campaign created. method={method}; source_temporal_run={source_run_id}; total_candidates={int(total_candidates)}."
+                    f"TEMPORAL {'Model' if temporal_model_scope else 'Policy'} campaign created. method={method}; source_temporal_run={source_run_id}; total_candidates={int(total_candidates)}; imported_observations={len(prior_observations)}; continuation_source={continuation_source_id or 'none'}."
                 ),
                 "candidate_id": None,
                 "job_id": None,
@@ -1865,8 +2182,19 @@ def _start_temporal_tuning(
         "candidates": bson_value(candidates),
     }
     db[MODEL_TUNING_RUNS_COLLECTION].insert_one(document)
+    cleanup = _compact_historical_tuning_runs(db, next_run_id=run_id)
+    if cleanup["compacted_runs"]:
+        _append_campaign_event(
+            db, run_id,
+            message=(
+                f"Historical tuning storage compacted {cleanup['compacted_runs']} prior campaign(s): "
+                f"discarded {cleanup['discarded_trials']} transient trial observation(s) and retained "
+                f"{cleanup['retained_candidates']} adopted/validated candidate(s)."
+            ),
+            stage="historical_storage_cleanup",
+        )
     threading.Thread(target=run_model_tuning, args=(run_id,), daemon=True).start()
-    return public_model_tuning_run(db, document)
+    return public_model_tuning_run(db, db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or document)
 
 
 def start_model_tuning(
@@ -1918,6 +2246,7 @@ def start_model_tuning(
             seed=seed,
             baseline_job_id=baseline_job_id,
             source_tuning_run_id=source_tuning_run_id,
+            anchor_candidate_id=anchor_candidate_id,
             probability_config=probability_config,
             actor_email=actor_email,
             tuning_target_source=tuning_target_source,
@@ -2007,6 +2336,9 @@ def start_model_tuning(
             "initial_exploration_fraction": float(probability.get("initial_exploration_fraction", 0.45)),
             "minimum_exploration_fraction": float(probability.get("minimum_exploration_fraction", 0.20)),
             "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 4)),
+            "adaptive_stopping_enabled": bool(probability.get("adaptive_stopping_enabled", True)),
+            "no_improvement_trial_limit": int(probability.get("no_improvement_trial_limit", DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT)),
+            "minimum_meaningful_improvement": float(probability.get("minimum_meaningful_improvement", DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT)),
             "space_filling_pool_size": int(probability.get("space_filling_pool_size", 1024)),
             "probability_model": PROBABILITY_MODEL,
             "source_mode": "prior_campaign_unified",
@@ -2069,6 +2401,9 @@ def start_model_tuning(
                 "initial_exploration_fraction": float(probability.get("initial_exploration_fraction", 0.45)),
                 "minimum_exploration_fraction": float(probability.get("minimum_exploration_fraction", 0.20)),
                 "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 4)),
+                "adaptive_stopping_enabled": bool(probability.get("adaptive_stopping_enabled", True)),
+                "no_improvement_trial_limit": int(probability.get("no_improvement_trial_limit", DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT)),
+                "minimum_meaningful_improvement": float(probability.get("minimum_meaningful_improvement", DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT)),
                 "space_filling_pool_size": int(probability.get("space_filling_pool_size", 1024)),
                 "probability_model": PROBABILITY_MODEL,
                 "source_mode": ("standalone_unified_with_compatible_history" if prior_observations else "standalone_unified"),
@@ -2156,6 +2491,7 @@ def start_model_tuning(
         "baseline_execution": bson_value(baseline),
         "probability_config": bson_value(probability),
         "probability_anchor": bson_value(probability_anchor) if probability_anchor else None,
+        "starting_probability_anchor": bson_value(deepcopy(probability_anchor)) if probability_anchor else None,
         "probability_state": bson_value(initial_probability_state(prior_observations)) if normalized_method in _ADAPTIVE_METHODS else None,
         "probability_champion_history": [],
         "source_tuning_run_id": source_run_id,
@@ -2212,8 +2548,19 @@ def start_model_tuning(
         "candidates": bson_value(candidates),
     }
     db[MODEL_TUNING_RUNS_COLLECTION].insert_one(document)
+    cleanup = _compact_historical_tuning_runs(db, next_run_id=run_id)
+    if cleanup["compacted_runs"]:
+        _append_campaign_event(
+            db, run_id,
+            message=(
+                f"Historical tuning storage compacted {cleanup['compacted_runs']} prior campaign(s): "
+                f"discarded {cleanup['discarded_trials']} transient trial observation(s) and retained "
+                f"{cleanup['retained_candidates']} adopted/validated candidate(s)."
+            ),
+            stage="historical_storage_cleanup",
+        )
     threading.Thread(target=run_model_tuning, args=(run_id,), daemon=True).start()
-    return public_model_tuning_run(db, document)
+    return public_model_tuning_run(db, db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or document)
 
 
 def _ensure_campaign_market_snapshot(db: Any, document: dict[str, Any]) -> dict[str, Any]:
@@ -2306,6 +2653,28 @@ def _run_temporal_tuning(db: Any, run_id: str) -> None:
         candidates = list(document.get("candidates") or [])
         pending = next((item for item in candidates if item.get("status") == "pending"), None)
         method = str(document.get("method") or "")
+        if pending is None:
+            early_stop_reason = _adaptive_early_stop_reason(document)
+            if early_stop_reason:
+                completed_count = int(document.get("completed_candidates") or 0)
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                    {"id": run_id},
+                    {"$set": {
+                        "status": "completed",
+                        "phase": "adaptive_early_stopped",
+                        "adaptive_early_stopped": True,
+                        "adaptive_early_stop_reason": early_stop_reason,
+                        "research_budget_used": max(0, completed_count - 1),
+                        "total_candidates": completed_count,
+                        "finished_at": utc_now(),
+                        "updated_at": utc_now(),
+                        "current_candidate_id": None,
+                        "current_job_id": None,
+                    }},
+                )
+                _refresh_campaign_ranking(db, run_id)
+                _append_campaign_event(db, run_id, message=early_stop_reason, stage="adaptive_early_stopped")
+                return
         if pending is None and method in _ADAPTIVE_METHODS and len(candidates) < int(document.get("total_candidates") or 0):
             if method == PIPELINE_METHOD and not bool(document.get("pipeline_handoff_completed")):
                 failed_count = int(document.get("failed_candidates") or 0)
@@ -2427,7 +2796,7 @@ def _run_temporal_tuning(db: Any, run_id: str) -> None:
                 {"$set": {
                     "candidates.$.status": "completed",
                     "candidates.$.metrics": bson_value(summary),
-                    "candidates.$.equity_preview": bson_value(equity_preview),
+                    "candidates.$.equity_preview": [],
                     "candidates.$.champion_gate_passed": (bool(champion_gate.get("passed")) if champion_gate else None),
                     "candidates.$.champion_gate": bson_value(champion_gate) if champion_gate else None,
                     "candidates.$.finished_at": now,
@@ -2559,6 +2928,31 @@ def run_model_tuning(run_id: str) -> None:
             candidates = list(document.get("candidates") or [])
             pending = next((item for item in candidates if item.get("status") == "pending"), None)
             method = str(document.get("method") or "")
+            if pending is None:
+                early_stop_reason = _adaptive_early_stop_reason(document)
+                if early_stop_reason:
+                    completed_count = int(document.get("completed_candidates") or 0)
+                    reused_control_count = sum(
+                        1 for item in candidates if bool(item.get("is_control")) and bool(item.get("baseline_reused"))
+                    )
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {
+                            "status": "completed",
+                            "phase": "adaptive_early_stopped",
+                            "adaptive_early_stopped": True,
+                            "adaptive_early_stop_reason": early_stop_reason,
+                            "research_budget_used": max(0, completed_count - reused_control_count),
+                            "total_candidates": completed_count,
+                            "finished_at": utc_now(),
+                            "updated_at": utc_now(),
+                            "current_candidate_id": None,
+                            "current_job_id": None,
+                        }},
+                    )
+                    _refresh_campaign_ranking(db, run_id)
+                    _append_campaign_event(db, run_id, message=early_stop_reason, stage="adaptive_early_stopped")
+                    return
             if pending is None and method in _ADAPTIVE_METHODS and len(candidates) < int(document.get("total_candidates") or 0):
                 if method == PIPELINE_METHOD and not bool(document.get("pipeline_handoff_completed")):
                     failed_count = int(document.get("failed_candidates") or 0)
@@ -2875,7 +3269,7 @@ def run_model_tuning(run_id: str) -> None:
                         "$set": {
                             "candidates.$.status": "completed",
                             "candidates.$.metrics": bson_value(summary),
-                            "candidates.$.equity_preview": bson_value(equity_preview),
+                            "candidates.$.equity_preview": [],
                             "candidates.$.strategy_configuration_hash": job.get("strategy_configuration_hash"),
                             "candidates.$.champion_gate_passed": (bool(champion_gate.get("passed")) if champion_gate else None),
                             "candidates.$.champion_gate": bson_value(champion_gate) if champion_gate else None,
@@ -3589,6 +3983,7 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "tuned_strategy_parameters": deepcopy(document.get("tuned_strategy_parameters") or []),
         "probability_config": deepcopy(document.get("probability_config") or {}),
         "probability_anchor": deepcopy(document.get("probability_anchor") or None),
+        "starting_probability_anchor": deepcopy(document.get("starting_probability_anchor") or None),
         "probability_state": deepcopy(document.get("probability_state") or None),
         "probability_champion_history": deepcopy(document.get("probability_champion_history") or []),
         "source_tuning_run_id": document.get("source_tuning_run_id"),

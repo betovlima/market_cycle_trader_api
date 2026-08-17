@@ -12,6 +12,7 @@ from ..infrastructure.persistence.mongo_repository import (
     COMPARISONS_COLLECTION,
     JOBS_COLLECTION,
     MARKET_BARS_COLLECTION,
+    MODEL_TUNING_VALIDATIONS_COLLECTION,
     PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION,
     PAPER_TRADE_ORDERS_COLLECTION,
     PREDICTIONS_COLLECTION,
@@ -748,6 +749,276 @@ def rotation_period_analysis(
         "strategy_return": strategy_return,
         "default_asset": assets[0]["symbol"] if assets else None,
     }
+
+
+
+def _rotation_summary_from_rows(rotations: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    rows = [dict(row) for row in rotations]
+    pnl_values = [value for row in rows if (value := _as_float(row.get("realized_pnl"))) is not None]
+    fees = [value for row in rows if (value := _as_float(row.get("transaction_fees"))) is not None]
+    holdings = [value for row in rows if (value := _as_float(row.get("holding_days"))) is not None]
+    asset_to_asset = sum(
+        1 for row in rows
+        if str(row.get("from_asset") or "CASH").upper() != "CASH"
+        and str(row.get("to_asset") or "CASH").upper() != "CASH"
+    )
+    market_to_cash = sum(
+        1 for row in rows
+        if str(row.get("from_asset") or "CASH").upper() != "CASH"
+        and str(row.get("to_asset") or "CASH").upper() == "CASH"
+    )
+    cash_to_market = sum(
+        1 for row in rows
+        if str(row.get("from_asset") or "CASH").upper() == "CASH"
+        and str(row.get("to_asset") or "CASH").upper() != "CASH"
+    )
+    return {
+        "total_rotations": len(rows),
+        "asset_to_asset_rotations": asset_to_asset,
+        "market_to_cash_rotations": market_to_cash,
+        "cash_to_market_rotations": cash_to_market,
+        "profitable_rotations": sum(value > 0 for value in pnl_values),
+        "losing_rotations": sum(value < 0 for value in pnl_values),
+        "flat_rotations": sum(value == 0 for value in pnl_values),
+        "total_realized_pnl": float(sum(pnl_values)) if pnl_values else 0.0,
+        "total_transaction_fees": float(sum(fees)) if fees else 0.0,
+        "average_holding_days": float(fmean(holdings)) if holdings else None,
+    }
+
+
+def analytics_from_equity_rotations(
+    *,
+    processing_id: str,
+    equity: list[dict[str, Any]],
+    rotations: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    created_at: Any = None,
+    finished_at: Any = None,
+    processing_kind: str = "research_validation",
+    processing_label: str | None = None,
+    reference_label: str = "Reference",
+) -> dict[str, Any]:
+    clean_equity = [dict(row) for row in equity]
+    clean_rotations = [dict(row) for row in rotations]
+    monthly = _monthly_returns(clean_equity)
+    payload = {
+        "job_id": processing_id,
+        "processing_id": processing_id,
+        "processing_kind": processing_kind,
+        "processing_label": processing_label or processing_id,
+        "reference_label": reference_label,
+        "created_at": iso_value(created_at),
+        "finished_at": iso_value(finished_at),
+        "metrics": dict(metrics),
+        "rotation_summary": _rotation_summary_from_rows(clean_rotations),
+        "equity": clean_equity,
+        "monthly_returns": monthly,
+        "consistency": _consistency(monthly),
+        "drawdown_episodes": _drawdown_episodes(clean_equity),
+        "asset_attribution": [],
+        "transition_matrix": _transition_matrix(clean_rotations),
+        "holding_buckets": [],
+        "trade_dependency": {},
+        "rotations": clean_rotations,
+    }
+    _assert_strategy_neutral(payload)
+    return bson_value(payload)
+
+
+def _rotation_period_from_data(
+    db: Any,
+    processing_id: str,
+    *,
+    equity: list[dict[str, Any]],
+    rotations: list[dict[str, Any]],
+    year: int,
+    month: int,
+) -> dict[str, Any]:
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=422, detail="Month must be between 1 and 12.")
+    start, end = _month_bounds(year, month)
+    timed_movements: list[tuple[datetime, dict[str, Any]]] = []
+    current_asset = "CASH"
+    for raw in rotations:
+        timestamp = _parse_utc(raw.get("executed_at"))
+        if timestamp is None:
+            continue
+        timed_movements.append((timestamp, dict(raw)))
+    timed_movements.sort(key=lambda item: item[0])
+
+    for timestamp, movement in timed_movements:
+        if timestamp >= start:
+            break
+        current_asset = str(movement.get("to_asset") or "CASH").upper()
+
+    monthly_movements = [movement for timestamp, movement in timed_movements if start <= timestamp < end]
+    monthly_timed = [(timestamp, movement) for timestamp, movement in timed_movements if start <= timestamp < end]
+    if current_asset == "CASH" and monthly_movements and str(monthly_movements[0].get("from_asset") or "CASH").upper() != "CASH":
+        current_asset = str(monthly_movements[0].get("from_asset") or "CASH").upper()
+
+    strategy_equity = []
+    for row in equity:
+        timestamp = _parse_utc(row.get("timestamp"))
+        value = _as_float(row.get("simulation_equity"))
+        if timestamp is None or value is None or not (start <= timestamp < end):
+            continue
+        strategy_equity.append({"timestamp": iso_value(timestamp), "value": value})
+    strategy_equity.sort(key=lambda row: _parse_utc(row.get("timestamp")) or start)
+
+    effective_start = _parse_utc(strategy_equity[0].get("timestamp")) if strategy_equity else start
+    effective_end = end
+    if strategy_equity:
+        last_equity_at = _parse_utc(strategy_equity[-1].get("timestamp"))
+        if last_equity_at is not None:
+            effective_end = min(end, last_equity_at + timedelta(days=1))
+    effective_start = effective_start or start
+
+    position_segments: list[dict[str, Any]] = []
+    segment_asset = current_asset
+    segment_start = effective_start
+    for timestamp, movement in monthly_timed:
+        if timestamp < effective_start:
+            segment_asset = str(movement.get("to_asset") or "CASH").upper()
+            continue
+        segment_end = min(timestamp, effective_end)
+        if segment_end > segment_start:
+            position_segments.append({"asset": segment_asset, "start_at": iso_value(segment_start), "end_at": iso_value(segment_end)})
+        segment_asset = str(movement.get("to_asset") or "CASH").upper()
+        segment_start = max(timestamp, effective_start)
+        if segment_start >= effective_end:
+            break
+    if effective_end > segment_start:
+        position_segments.append({"asset": segment_asset, "start_at": iso_value(segment_start), "end_at": iso_value(effective_end)})
+
+    asset_symbols = {
+        str(segment.get("asset") or "CASH").upper()
+        for segment in position_segments
+        if str(segment.get("asset") or "CASH").upper() != "CASH"
+    }
+    for movement in monthly_movements:
+        for field in ("from_asset", "to_asset"):
+            asset = str(movement.get(field) or "CASH").upper()
+            if asset != "CASH":
+                asset_symbols.add(asset)
+
+    strategy_sessions = [_parse_utc(row.get("timestamp")) for row in strategy_equity]
+    assets: list[dict[str, Any]] = []
+    for symbol in sorted(asset_symbols):
+        prices = _market_price_rows(db, symbol, start, end)
+        buys = [m for m in monthly_movements if str(m.get("to_asset") or "CASH").upper() == symbol]
+        sells = [m for m in monthly_movements if str(m.get("from_asset") or "CASH").upper() == symbol]
+        realized = [value for movement in sells if (value := _as_float(movement.get("realized_pnl"))) is not None]
+        first_close = _as_float(prices[0].get("close")) if prices else None
+        last_close = _as_float(prices[-1].get("close")) if prices else None
+        held_sessions = 0
+        for session_at in strategy_sessions:
+            if session_at is None:
+                continue
+            if any(
+                str(segment.get("asset") or "CASH").upper() == symbol
+                and (_parse_utc(segment.get("start_at")) or start) <= session_at < (_parse_utc(segment.get("end_at")) or end)
+                for segment in position_segments
+            ):
+                held_sessions += 1
+        assets.append({
+            "symbol": symbol,
+            "prices": prices,
+            "first_close": first_close,
+            "last_close": last_close,
+            "period_return": (last_close / first_close - 1.0) if first_close not in {None, 0} and last_close is not None else None,
+            "buy_count": len(buys),
+            "sell_count": len(sells),
+            "realized_pnl": float(sum(realized)) if realized else 0.0,
+            "held_sessions": held_sessions,
+        })
+    assets.sort(key=lambda item: (-(int(item.get("buy_count") or 0) + int(item.get("sell_count") or 0)), -int(item.get("held_sessions") or 0), str(item.get("symbol") or "")))
+    strategy_return = None
+    if len(strategy_equity) >= 2:
+        first_equity = _as_float(strategy_equity[0].get("value"))
+        last_equity = _as_float(strategy_equity[-1].get("value"))
+        if first_equity not in {None, 0} and last_equity is not None:
+            strategy_return = last_equity / first_equity - 1.0
+    return {
+        "job_id": processing_id,
+        "processing_id": processing_id,
+        "year": year,
+        "month": month,
+        "period_start": iso_value(start),
+        "period_end": iso_value(effective_end),
+        "assets": assets,
+        "movements": monthly_movements,
+        "position_segments": position_segments,
+        "strategy_equity": strategy_equity,
+        "strategy_return": strategy_return,
+        "default_asset": assets[0]["symbol"] if assets else None,
+    }
+
+
+def completed_processings(db: Any, limit: int = 100) -> dict[str, Any]:
+    safe_limit = max(1, min(500, int(limit)))
+    backtests = completed_backtests(db, limit=safe_limit).get("items", [])
+    items = [
+        {**row, "processing_kind": "backtest", "processing_label": "Backtest"}
+        for row in backtests
+    ]
+    validation_rows = list(
+        db[MODEL_TUNING_VALIDATIONS_COLLECTION].find(
+            {"status": "completed"},
+            {"_id": 0, "id": 1, "created_at": 1, "finished_at": 1, "status": 1, "candidate_id": 1, "strategy_profile_name": 1, "tuning_scope": 1},
+        )
+    )
+    for row in validation_rows:
+        candidate_id = row.get("candidate_id")
+        items.append({
+            "id": str(row.get("id") or ""),
+            "status": "completed",
+            "created_at": iso_value(row.get("created_at")),
+            "finished_at": iso_value(row.get("finished_at")),
+            "processing_kind": "caro_champion",
+            "processing_label": f"CARO Champion #{candidate_id} · TEMPORAL",
+            "strategy_profile_name": row.get("strategy_profile_name"),
+            "candidate_id": candidate_id,
+            "tuning_scope": row.get("tuning_scope"),
+        })
+    items.sort(key=lambda row: _parse_utc(row.get("finished_at") or row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return {"items": items[:safe_limit]}
+
+
+def processing_analytics(db: Any, processing_id: str) -> dict[str, Any]:
+    validation = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one({"id": str(processing_id)}, {"_id": 0})
+    if validation is not None:
+        analytics = validation.get("analytics") if isinstance(validation.get("analytics"), dict) else None
+        if analytics is None:
+            raise HTTPException(status_code=409, detail="Validated Champion analytics are unavailable.")
+        return bson_value(dict(analytics))
+    payload = backtest_analytics(db, processing_id)
+    payload["processing_id"] = processing_id
+    payload["processing_kind"] = "backtest"
+    payload["processing_label"] = "Backtest"
+    payload["reference_label"] = "Reference"
+    return bson_value(payload)
+
+
+def processing_rotation_period_analysis(
+    db: Any,
+    processing_id: str,
+    *,
+    year: int,
+    month: int,
+) -> dict[str, Any]:
+    validation = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one({"id": str(processing_id)}, {"_id": 0, "analytics": 1})
+    if validation is None:
+        return rotation_period_analysis(db, processing_id, year=year, month=month)
+    analytics = validation.get("analytics") if isinstance(validation.get("analytics"), dict) else {}
+    return _rotation_period_from_data(
+        db,
+        processing_id,
+        equity=list(analytics.get("equity") or []),
+        rotations=list(analytics.get("rotations") or []),
+        year=year,
+        month=month,
+    )
+
 
 def completed_backtests(db: Any, limit: int = 100) -> dict[str, Any]:
     safe_limit = max(1, min(500, int(limit)))

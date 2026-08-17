@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from market_cycle_trader_api.schemas.model_tuning import ModelTuningStartRequest
 from market_cycle_trader_api.services.model_tuning import (
+    _compact_historical_tuning_document,
     _format_adopted_strategy_description,
     _sanitize_tuning_log_line,
     _source_anchor,
@@ -73,8 +74,10 @@ def test_tuning_request_bounds_candidate_count_and_prior_campaign_contract() -> 
     assert reused.anchor_candidate_id == 4
     with pytest.raises(ValidationError):
         ModelTuningStartRequest(candidate_count=3)
+    expanded = ModelTuningStartRequest(candidate_count=500)
+    assert expanded.candidate_count == 500
     with pytest.raises(ValidationError):
-        ModelTuningStartRequest(candidate_count=61)
+        ModelTuningStartRequest(candidate_count=2001)
     legacy_floor = ModelTuningStartRequest(method="champion_probability", candidate_count=8, probability={"startup_trials": 8})
     assert legacy_floor.probability.startup_trials == 8
     with pytest.raises(ValidationError):
@@ -84,6 +87,74 @@ def test_tuning_request_bounds_candidate_count_and_prior_campaign_contract() -> 
 
 
 
+
+
+
+def test_historical_tuning_compaction_keeps_only_adopted_or_validated_candidates() -> None:
+    document = {
+        "id": "run-old",
+        "best_candidate_id": 9,
+        "best_exploratory_candidate_id": 9,
+        "best_champion_beating_candidate_id": 7,
+        "adopted_candidate_id": 7,
+        "validated_candidate_id": 9,
+        "adoption_history": [{"candidate_id": 7, "strategy_id": "strategy-7"}],
+        "prior_observations": [
+            {"candidate_id": -1, "status": "completed", "settings": {"x": 1}, "metrics": {"ending_capital": 1}},
+            {"candidate_id": -2, "status": "completed", "settings": {"x": 2}, "metrics": {"ending_capital": 2}},
+        ],
+        "probability_champion_history": [
+            {"candidate_id": 5, "metrics": {"ending_capital": 105}},
+            {"candidate_id": 7, "metrics": {"ending_capital": 107}},
+            {"candidate_id": 9, "metrics": {"ending_capital": 109}},
+        ],
+        "event_log": [
+            {"candidate_id": None, "stage": "created"},
+            {"candidate_id": 5, "stage": "candidate_completed"},
+            {"candidate_id": 7, "stage": "champion_promoted"},
+            {"candidate_id": 9, "stage": "candidate_completed"},
+        ],
+        "candidates": [
+            {"candidate_id": 0, "is_control": True, "status": "completed", "settings": {}, "metrics": {"ending_capital": 100}},
+            {"candidate_id": 5, "status": "completed", "settings": {"x": 5}, "metrics": {"ending_capital": 105}},
+            {"candidate_id": 6, "status": "failed", "settings": {"x": 6}, "failure_message": "technical"},
+            {"candidate_id": 7, "status": "completed", "settings": {"x": 7}, "metrics": {"ending_capital": 107}},
+            {"candidate_id": 8, "status": "cancelled", "settings": {"x": 8}},
+            {"candidate_id": 9, "status": "completed", "settings": {"x": 9}, "metrics": {"ending_capital": 109}},
+        ],
+    }
+
+    update = _compact_historical_tuning_document(document, next_run_id="run-new")
+
+    assert [item["candidate_id"] for item in update["candidates"]] == [7, 9]
+    assert update["prior_observations"] == []
+    assert update["retained_candidate_ids"] == [7, 9]
+    assert update["retained_candidate_count"] == 2
+    assert update["discarded_successful_trial_count"] == 3  # one non-retained research success + 2 prior observations
+    assert update["discarded_failed_trial_count"] == 1
+    assert update["discarded_cancelled_trial_count"] == 1
+    assert [item["candidate_id"] for item in update["probability_champion_history"]] == [7, 9]
+    assert [item.get("candidate_id") for item in update["event_log"]] == [None, 7, 9]
+    assert update["best_candidate_id"] == 9
+    assert update["best_champion_beating_candidate_id"] == 7
+
+
+def test_historical_tuning_compaction_discards_unselected_research_trials() -> None:
+    document = {
+        "id": "run-old",
+        "best_candidate_id": 4,
+        "candidates": [
+            {"candidate_id": 0, "is_control": True, "status": "completed", "settings": {}, "metrics": {"ending_capital": 100}},
+            {"candidate_id": 4, "status": "completed", "settings": {"x": 4}, "metrics": {"ending_capital": 120}},
+        ],
+        "prior_observations": [],
+        "event_log": [{"candidate_id": None, "stage": "created"}],
+    }
+    update = _compact_historical_tuning_document(document, next_run_id="run-new")
+    assert update["candidates"] == []
+    assert update["retained_candidate_count"] == 0
+    assert update["best_candidate_id"] is None
+    assert update["discarded_successful_trial_count"] == 1
 
 
 def test_automatic_latin_hypercube_to_caro_request_contract() -> None:
@@ -194,6 +265,10 @@ def test_tuning_catalog_declares_integrated_worker_prior_reuse_and_reproducibili
     assert catalog["execution_mode"] == "integrated_api_worker"
     assert catalog["market_data_access"] == "database_only"
     assert catalog["prior_campaign_reuse"] is True
+    assert catalog["historical_trial_retention"] == "active_campaign_only"
+    assert catalog["durable_candidate_retention"] == "adopted_or_validated_only"
+    assert catalog["technical_failure_retention"] == "campaign_counters_and_summary_only"
+    assert catalog["historical_cleanup_trigger"] == "next_tuning_campaign_start"
     assert catalog["reproducibility_guard"] == "frozen_execution_snapshot_and_market_data_signature"
     assert catalog["probability"]["probability_model"] == PROBABILITY_MODEL
     assert catalog["recommended_method"] == "champion_probability"
@@ -345,19 +420,20 @@ def test_tuning_routes_and_integrated_execution_contract() -> None:
     assert '"tuning_summary_only": {"$ne": True}' in strategy_lab
 
 
-def test_frontend_uses_candidate_directly_without_clone_or_prior_campaign_controls() -> None:
+def test_frontend_uses_candidate_directly_and_reuses_prior_campaign_only_for_continue_research() -> None:
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
     assert "control?.candidate_strategy_id || control?.promoted_candidate_strategy_id || control?.research_strategy_id" in panel
     assert "/admin/model-tuning/sources?limit=20" not in panel
-    assert "source_tuning_run_id" not in panel
+    assert "source_tuning_run_id: run.id" in panel
     assert "anchor_candidate_id" not in panel
     assert "Clone the protected Strategy before starting model tuning." not in panel
     assert "Certified Candidate baseline" in panel
     assert "No clone, baseline selection or prior tuning campaign is required." in panel
+    assert "Continue Research" in panel
     assert "Advanced CARO settings" in panel
     assert "useState(PROBABILITY_METHOD)" in panel
     assert "Start Unified CARO" in panel
-    assert "catalog.search_space.map" in panel
+    assert "effectivePlan?.search_space || catalog.search_space" in panel
     assert "/admin/model-tuning/workers" not in panel
     for protected_key in (
         "n_estimators", "learning_rate", "max_depth", "num_leaves",
@@ -414,7 +490,7 @@ def test_tuning_workspace_is_not_rendered_inside_model_settings() -> None:
     assert "ModelTuningPanel" not in settings_panel
     assert "ModelTuningPanel" in backtest_page
     assert "Simulation Backtest" in backtest_page
-    assert "Model Tuning" in backtest_page
+    assert "Research Lab" in backtest_page
 
 
 def test_export_contains_caro_prior_evidence_and_anchor_metadata() -> None:
@@ -1387,6 +1463,6 @@ def test_tuning_control_reuses_certified_candidate_backtest_without_rerun(monkey
     assert control["equity_preview"] == [{"job": "certified-job-7"}]
 
     service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
-    assert '"control_execution_mode": "reuse_certified_candidate_backtest"' in service
+    assert '"reuse_certified_candidate_backtest"' in service
     assert 'initial_completed_candidates = sum(1 for item in candidates if item.get("status") == "completed")' in service
     assert 'expected_signature=expected or None' in service

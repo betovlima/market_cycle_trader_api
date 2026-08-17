@@ -103,9 +103,10 @@ def test_model_tuning_uses_standard_workspace_gutter_after_compaction() -> None:
 
 def test_backtest_monthly_capital_movement_heatmap_replaces_timeline_and_opens_month_detail() -> None:
     panel = (FRONT / "src" / "features" / "backtest" / "components" / "RotationPanel.jsx").read_text(encoding="utf-8")
+    dashboard = (FRONT / "src" / "features" / "dashboard" / "components" / "DashboardBacktestAnalyticsSection.jsx").read_text(encoding="utf-8")
     styles = (FRONT / "src" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'MonthlyCapitalMovementHeatmap jobId={jobId} rotations={rotations} equity={payload?.equity || []}' in panel
+    assert 'MonthlyCapitalMovementHeatmap jobId={jobId} processingId={jobId}' in dashboard
     assert 'Monthly Capital Movement Heatmap' in panel
     assert "['pnl', tr('Realized P/L')]" in panel
     assert "['movements', tr('Movements')]" in panel
@@ -239,7 +240,6 @@ def test_front_uses_backend_capabilities_instead_of_role_authorization_rules() -
     tuning = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
     header = (FRONT / "src" / "features" / "backtest" / "components" / "AppHeader.jsx").read_text(encoding="utf-8")
     dashboard = (FRONT / "src" / "features" / "dashboard" / "DashboardPage.jsx").read_text(encoding="utf-8")
-    analytics = (FRONT / "src" / "features" / "analytics" / "AnalyticsPage.jsx").read_text(encoding="utf-8")
 
     assert "session.role ===" not in app
     assert "session.role !==" not in app
@@ -258,8 +258,8 @@ def test_front_uses_backend_capabilities_instead_of_role_authorization_rules() -
     assert "hasCapability(capabilities, 'tuning.start')" in tuning
     assert "hasCapability(capabilities, 'tuning.export')" in tuning
     assert "hasCapability(capabilities, 'tuning.promote')" in tuning
-    assert "hasCapability(capabilities, 'dashboard.strategy_intelligence.view')" in dashboard
-    assert "hasCapability(capabilities, 'portfolio.view')" in analytics
+    assert "hasCapability(capabilities, 'backtest.start')" in dashboard
+    assert "hasCapability(capabilities, 'portfolio.view')" in app
 
 
 def test_viewer_read_only_actions_are_driven_by_backend_capabilities() -> None:
@@ -267,7 +267,8 @@ def test_viewer_read_only_actions_are_driven_by_backend_capabilities() -> None:
     tuning = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
 
     assert "researchWorkspaceMode === 'simulation' && canStartBacktest" in backtest
-    assert "researchWorkspaceMode === 'tuning' && canViewTuning" in backtest
+    assert "researchWorkspaceMode === 'research'" in backtest
+    assert "canViewTuning" in backtest
     assert "capabilities={capabilities}" in backtest
     assert "canStartTuning ? <button" in tuning
     assert "canStopTuning ? <button" in tuning
