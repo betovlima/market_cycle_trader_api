@@ -54,6 +54,10 @@ MODEL_TUNING_VALIDATIONS_COLLECTION = "model_tuning_validations"
 TEMPORAL_INTELLIGENCE_RUNS_COLLECTION = "temporal_intelligence_runs"
 TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION = "temporal_intelligence_observations"
 TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION = "temporal_intelligence_artifacts"
+TEMPORAL_ROTATION_QUALITY_RESEARCH_COLLECTION = "temporal_rotation_quality_research"
+TEMPORAL_ROTATION_QUALITY_VALIDATION_COLLECTION = "temporal_rotation_quality_validations"
+TEMPORAL_ROTATION_QUALITY_DIAGNOSTIC_COLLECTION = "temporal_rotation_quality_diagnostics"
+TEMPORAL_ROTATION_QUALITY_ANALYTICS_COLLECTION = "temporal_rotation_quality_analytics"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -308,6 +312,35 @@ def ensure_database(db: Database) -> None:
     db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].create_index(
         [("run_id", ASCENDING), ("kind", ASCENDING), ("sequence", ASCENDING)],
         name="ix_temporal_intelligence_artifacts_run_kind_sequence",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_RESEARCH_COLLECTION].create_index(
+        [("status", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_rotation_quality_research_status_created",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_VALIDATION_COLLECTION].create_index(
+        [("research_id", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_rotation_quality_validation_research_created",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_VALIDATION_COLLECTION].create_index(
+        [("status", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_rotation_quality_validation_status_created",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_DIAGNOSTIC_COLLECTION].create_index(
+        [("validation_id", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_rotation_quality_diagnostic_validation_created",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_DIAGNOSTIC_COLLECTION].create_index(
+        [("status", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_rotation_quality_diagnostic_status_created",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_ANALYTICS_COLLECTION].create_index(
+        [("processing_id", ASCENDING), ("candidate_id", ASCENDING)],
+        unique=True,
+        name="uq_temporal_rotation_quality_analytics_processing_candidate",
+    )
+    db[TEMPORAL_ROTATION_QUALITY_ANALYTICS_COLLECTION].create_index(
+        [("finished_at", DESCENDING), ("processing_kind", ASCENDING)],
+        name="ix_temporal_rotation_quality_analytics_finished_kind",
     )
 
 

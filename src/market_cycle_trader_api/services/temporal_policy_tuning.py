@@ -73,6 +73,24 @@ def _load_observations(db: Any, run_id: str) -> dict[str, dict[str, Any]]:
     return grouped
 
 
+def observations_from_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _timestamp_key(row.get("timestamp"))
+        symbol = str(row.get("symbol") or "").strip()
+        if not key or not symbol:
+            continue
+        payload = grouped.setdefault(key, {"fold_id": None, "rows_by_symbol": {}})
+        row_payload = dict(row)
+        row_payload.pop("timestamp", None)
+        payload["rows_by_symbol"][symbol] = row_payload
+        if payload.get("fold_id") is None and row.get("fold_id") is not None:
+            payload["fold_id"] = int(row["fold_id"])
+    return grouped
+
+
 def _source_run(db: Any, strategy: dict[str, Any]) -> dict[str, Any]:
     policy = strategy.get("temporal_policy") if isinstance(strategy.get("temporal_policy"), dict) else {}
     run_id = str(strategy.get("source_temporal_run_id") or policy.get("source_run_id") or "").strip()
@@ -179,8 +197,15 @@ def evaluate_temporal_policy_candidate(
     db: Any,
     strategy: dict[str, Any],
     settings: dict[str, Any],
+    *,
+    source_run_id_override: str | None = None,
 ) -> dict[str, Any]:
-    run = _source_run(db, strategy)
+    if source_run_id_override:
+        run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(source_run_id_override)})
+        if run is None or str(run.get("status") or "") != "completed":
+            raise ValueError("The fold-specific Temporal research cache is unavailable.")
+    else:
+        run = _source_run(db, strategy)
     run_id = str(run["id"])
     observations = _load_observations(db, run_id)
     winner_rows = _load_artifact_rows(db, run_id, "winner_reference_daily")

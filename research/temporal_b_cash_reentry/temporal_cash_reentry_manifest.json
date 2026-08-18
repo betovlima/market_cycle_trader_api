@@ -1,0 +1,130 @@
+{
+  "experiment": "temporal_absolute_opportunity_cash_reentry_counterfactual_v1",
+  "read_only": true,
+  "source": "mongo",
+  "source_temporal_run_id": "20260816T181543-temporal-a5afd924",
+  "trials": 1000,
+  "seed": 42,
+  "focus_month": "2026-06",
+  "timing_settings": {
+    "timing_base_weak_threshold": 0.5,
+    "timing_challenger_minimum": 0.6,
+    "timing_minimum_advantage": 0.25
+  },
+  "search_space": [
+    {
+      "name": "absolute_entry_threshold",
+      "min": 0.45,
+      "max": 0.75,
+      "type": "float"
+    },
+    {
+      "name": "absolute_exit_discount",
+      "min": 0.05,
+      "max": 0.3,
+      "type": "float"
+    },
+    {
+      "name": "cash_reentry_premium",
+      "min": 0.0,
+      "max": 0.1,
+      "type": "float"
+    },
+    {
+      "name": "minimum_risk_safety",
+      "min": 0.0,
+      "max": 0.3,
+      "type": "float"
+    },
+    {
+      "name": "minimum_horizon_agreement",
+      "min": 0.0,
+      "max": 0.75,
+      "type": "float"
+    },
+    {
+      "name": "reentry_confirmation_sessions",
+      "min": 1.0,
+      "max": 3.0,
+      "type": "int"
+    }
+  ],
+  "control": {
+    "candidate_id": 0,
+    "robust": true,
+    "beats_control_3pct_gate": false,
+    "ending_capital": 1318356.2872602101,
+    "capital_delta_vs_control": 0.0,
+    "capital_lift_vs_control": 0.0,
+    "cagr": 1.24755593953845,
+    "sharpe": 1.9658435084150165,
+    "maximum_drawdown": -0.30987408627901614,
+    "worst_fold_return": 1.1604735482697706,
+    "capital_rotations": 355,
+    "market_exposure": 1.0,
+    "cash_days": 0,
+    "loss_avoided_by_cash_usd": 0.0,
+    "profit_missed_by_cash_usd": 0.0,
+    "net_cash_edge_usd": 0.0,
+    "cash_intervention_sessions": 0,
+    "absolute_entry_threshold": 0.5,
+    "absolute_exit_discount": 0.1,
+    "absolute_exit_threshold": 0.4,
+    "cash_reentry_premium": 0.05,
+    "minimum_risk_safety": 0.2,
+    "minimum_horizon_agreement": 0.55,
+    "reentry_confirmation_sessions": 1,
+    "fold_1_return": 1.1604735482697706,
+    "fold_1_max_drawdown": -0.30987408627901614,
+    "fold_2_return": 8.015479993046188,
+    "fold_2_max_drawdown": -0.20920403296262158,
+    "fold_3_return": 5.768539805871221,
+    "fold_3_max_drawdown": -0.30275050844565476,
+    "is_control": true,
+    "rank": 1
+  },
+  "best": {
+    "candidate_id": 0,
+    "robust": true,
+    "beats_control_3pct_gate": false,
+    "ending_capital": 1318356.2872602101,
+    "capital_delta_vs_control": 0.0,
+    "capital_lift_vs_control": 0.0,
+    "cagr": 1.24755593953845,
+    "sharpe": 1.9658435084150165,
+    "maximum_drawdown": -0.30987408627901614,
+    "worst_fold_return": 1.1604735482697706,
+    "capital_rotations": 355,
+    "market_exposure": 1.0,
+    "cash_days": 0,
+    "loss_avoided_by_cash_usd": 0.0,
+    "profit_missed_by_cash_usd": 0.0,
+    "net_cash_edge_usd": 0.0,
+    "cash_intervention_sessions": 0,
+    "absolute_entry_threshold": 0.5,
+    "absolute_exit_discount": 0.1,
+    "absolute_exit_threshold": 0.4,
+    "cash_reentry_premium": 0.05,
+    "minimum_risk_safety": 0.2,
+    "minimum_horizon_agreement": 0.55,
+    "reentry_confirmation_sessions": 1,
+    "fold_1_return": 1.1604735482697706,
+    "fold_1_max_drawdown": -0.30987408627901614,
+    "fold_2_return": 8.015479993046188,
+    "fold_2_max_drawdown": -0.20920403296262158,
+    "fold_3_return": 5.768539805871221,
+    "fold_3_max_drawdown": -0.30275050844565476,
+    "is_control": true,
+    "rank": 1
+  },
+  "absolute_opportunity_weights": {
+    "short_profit_consensus": 0.45,
+    "all_horizon_risk_safety": 0.2,
+    "short_horizon_agreement": 0.12,
+    "long_profit_confirmation": 0.1,
+    "horizon_agreement": 0.08,
+    "long_trend_support": 0.05
+  },
+  "selection": "robustness gate first, then ending capital; robust requires all folds positive, Sharpe >= control-0.05, MaxDD >= control-0.03",
+  "created_at": "2026-08-17T23:10:52.428404+00:00"
+}

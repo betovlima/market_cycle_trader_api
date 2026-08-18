@@ -2775,16 +2775,23 @@ def run_temporal_intelligence(
     config: BacktestExecutionRequest,
     *,
     progress_callback: Callable[[float, str], None] | None = None,
+    cancel_callback: Callable[[], None] | None = None,
     winner_reference_override: dict[str, Any] | None = None,
     candidate_evaluation_only: bool = False,
 ) -> dict[str, Any]:
     if str(config.research_model_family) != "lightgbm_utility":
         raise ValueError("Temporal Decision Intelligence is restricted to a LightGBM Strategy snapshot.")
 
+    def ensure_not_cancelled() -> None:
+        if cancel_callback is not None:
+            cancel_callback()
+
+    ensure_not_cancelled()
     started = time.perf_counter()
     if progress_callback:
         progress_callback(18.0, "Building temporal decision feature panel")
     frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
+    ensure_not_cancelled()
     symbols = sorted(frames)
     horizons = sorted({int(value) for value in config.rotation_target_horizons})
     folds = _build_walk_forward_folds(common_dates, config)
@@ -2798,12 +2805,14 @@ def run_temporal_intelligence(
     completed_steps = 0
 
     for fold_position, fold in enumerate(folds, start=1):
+        ensure_not_cancelled()
         train_dates = common_dates[: int(fold["train_end_index"])]
         calibration_dates = common_dates[int(fold["calibration_start_index"]): int(fold["calibration_end_index"])]
         final_fit_dates = common_dates[: int(fold["final_fit_end_index"])]
         test_dates = common_dates[int(fold["test_start_index"]): int(fold["test_end_index"])]
 
         for horizon in horizons:
+            ensure_not_cancelled()
             targets = targets_by_horizon[horizon]
             if progress_callback:
                 progress_callback(
@@ -2813,6 +2822,7 @@ def run_temporal_intelligence(
 
             bundles: dict[str, _BinaryModelBundle] = {}
             for target_name in ("profit_before_loss", "bottom", "top", "trend_persistence"):
+                ensure_not_cancelled()
                 bundles[target_name] = _fit_calibrated_binary_bundle(
                     frames,
                     symbols,
@@ -2823,9 +2833,11 @@ def run_temporal_intelligence(
                     target_name,
                     config,
                 )
+                ensure_not_cancelled()
             drawdown_bundle = _fit_drawdown_bundle(
                 frames, symbols, train_dates, calibration_dates, final_fit_dates, targets, config
             )
+            ensure_not_cancelled()
 
             x_test, metadata = _pooled_features(frames, symbols, test_dates)
             if x_test.empty:
@@ -2878,6 +2890,7 @@ def run_temporal_intelligence(
             })
             completed_steps += 1
 
+    ensure_not_cancelled()
     combined_predictions_by_horizon: dict[int, pd.DataFrame] = {}
     for horizon in horizons:
         frames_for_horizon = all_predictions[horizon]
@@ -2926,6 +2939,7 @@ def run_temporal_intelligence(
         key=lambda row: (int(row["horizon"]), -(row.get("asset_rank_score") or -1e9), row["symbol"])
     )
 
+    ensure_not_cancelled()
     if progress_callback:
         progress_callback(92.0, "Combining horizons into one temporal decision policy")
     multi_horizon_frame = _multi_horizon_frame(
@@ -2944,6 +2958,7 @@ def run_temporal_intelligence(
     )
     multi_horizon_latest_forecasts = _multi_horizon_latest_rows(latest_multi_frame, horizons)
 
+    ensure_not_cancelled()
     if progress_callback:
         progress_callback(95.0, "Replaying immutable Winner and applying Temporal timing overlay")
     if winner_reference_override:
@@ -3041,6 +3056,7 @@ def run_temporal_intelligence(
     except Exception:
         lightgbm_version = None
 
+    ensure_not_cancelled()
     if progress_callback:
         progress_callback(99.0, "Finalizing Temporal Decision Intelligence v8 winner-anchored timing metrics")
     return {

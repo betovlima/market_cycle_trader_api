@@ -417,6 +417,64 @@ def _strategy_model_detail(document: dict[str, Any]) -> dict[str, Any] | None:
     return public
 
 
+def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
+    """Return the backend-owned live Trader compatibility contract for a Strategy.
+
+    Catalog status is intentionally not part of this decision. Lifecycle state still
+    controls when a compatible Strategy may be marked Candidate or promoted, but the
+    runtime capability is exclusively technical.
+    """
+    strategy_kind = str(document.get("strategy_kind") or "standard").strip().lower()
+    snapshot = (
+        document.get("research_model_snapshot")
+        if isinstance(document.get("research_model_snapshot"), dict)
+        else document.get("winner_model_snapshot")
+    )
+    model_family = str((snapshot or {}).get("family") or "").strip().lower() or None
+
+    if strategy_kind == "temporal_intelligence":
+        return {
+            "eligible": False,
+            "code": "temporal_live_runtime_unavailable",
+            "reason": (
+                "TEMPORAL policy snapshots are not executed by the installed Paper/Trader runtime. "
+                "Promotion is blocked until that runtime has live parity with Temporal Intelligence."
+            ),
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
+    if model_family == "iqn":
+        return {
+            "eligible": False,
+            "code": "iqn_live_runtime_unavailable",
+            "reason": "IQN does not have a protected live Trader engine yet.",
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
+    if model_family not in {"xgboost_utility", "lightgbm_utility"}:
+        return {
+            "eligible": False,
+            "code": "unsupported_live_model",
+            "reason": "The Strategy model is not supported by the installed protected live Trader engine.",
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
+    return {
+        "eligible": True,
+        "code": "protected_live_runtime_ready",
+        "reason": None,
+        "strategy_kind": strategy_kind,
+        "model_family": model_family,
+    }
+
+
+def _assert_trader_runtime_compatible(document: dict[str, Any]) -> dict[str, Any]:
+    compatibility = _trader_runtime_compatibility(document)
+    if not bool(compatibility.get("eligible")):
+        raise StrategyLabConflict(str(compatibility.get("reason") or "Strategy is not compatible with the installed Trader runtime."))
+    return compatibility
+
+
 def _public_profile(document: dict[str, Any], *, include_configuration: bool = True) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": str(document.get("_id")),
@@ -431,6 +489,7 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "source_strategy_revision": document.get("source_strategy_revision"),
         "strategy_kind": str(document.get("strategy_kind") or "standard"),
         "tuning_target": str(document.get("tuning_target") or "model_strategy"),
+        "trader_compatibility": _trader_runtime_compatibility(document),
         "source_temporal_run_id": document.get("source_temporal_run_id"),
         "source_temporal_experiment": document.get("source_temporal_experiment"),
         "temporal_policy_revision": document.get("temporal_policy_revision"),
@@ -1705,8 +1764,10 @@ def select_model_tuning_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    if str(profile.get("strategy_kind") or "standard") != "temporal_intelligence":
-        raise StrategyLabConflict("Only a materialized TEMPORAL Strategy can use the dedicated Temporal Model/Policy Tuning workflow.")
+    # Model Tuning selection is intentionally lifecycle-status agnostic.
+    # WINNER/CANDIDATE/DRAFT/SUPERSEDED are guidance only; the Model Tuning
+    # service validates the selected Strategy's technical compatibility when
+    # building its tuning plan and frozen baseline.
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},
@@ -1790,7 +1851,7 @@ def mark_strategy_as_candidate(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    _assert_standard_strategy_action(profile, "Candidate promotion")
+    _assert_trader_runtime_compatible(profile)
     if bool(profile.get("locked")):
         raise StrategyLabConflict(
             "Protected lifecycle snapshots cannot be marked as candidates. Clone the strategy first."
@@ -1811,10 +1872,6 @@ def mark_strategy_as_candidate(
         raise StrategyLabConflict(
             "The requested Candidate model differs from the model saved with this Strategy revision."
         )
-    if bound_model_family == "iqn":
-        raise StrategyLabConflict(
-            "IQN does not have a protected live Trader engine yet and cannot be promoted."
-        )
     completed_job, candidate_model_snapshot = _matching_completed_model_job(
         db, profile, bound_model_snapshot
     )
@@ -1825,9 +1882,7 @@ def mark_strategy_as_candidate(
     completed_job_id = str(completed_job.get("id") or "")
     completed_family = str(candidate_model_snapshot.get("family") or "")
     if completed_family not in {"xgboost_utility", "lightgbm_utility"}:
-        raise StrategyLabConflict(
-            "Only XGBoost and LightGBM currently have protected live Trader engines."
-        )
+        raise StrategyLabConflict("The certified Backtest model is not supported by the installed protected live Trader engine.")
     if not _same_model_values(candidate_model_snapshot, bound_model_snapshot):
         raise StrategyLabConflict(
             "Completed backtest model settings do not match the model saved with this Strategy."
@@ -1996,6 +2051,10 @@ def _assert_trader_safe_for_promotion(
 
 
     regular_market_open = _regular_market_is_open()
+    if regular_market_open:
+        raise StrategyLabConflict(
+            "Trader Winner promotion is allowed only while the XNYS regular market is closed."
+        )
 
     _assert_no_active_backtest(db)
 
@@ -2094,6 +2153,8 @@ def promote_strategy_to_trader(
     if str(control.get("candidate_strategy_id") or "") != strategy_id:
         raise StrategyLabConflict("Only the single active candidate can be promoted.")
 
+    runtime_compatibility = _assert_trader_runtime_compatible(source)
+
     candidate_backtest_id = str(source.get("candidate_backtest_id") or "")
     completed_job = (
         db[JOBS_COLLECTION].find_one(
@@ -2123,9 +2184,7 @@ def promote_strategy_to_trader(
     if winner_model_snapshot is None:
         raise StrategyLabConflict("Certified backtest does not contain a valid model snapshot.")
     if winner_model_snapshot["family"] not in {"xgboost_utility", "lightgbm_utility"}:
-        raise StrategyLabConflict(
-            "Only XGBoost and LightGBM currently have protected live Trader engines."
-        )
+        raise StrategyLabConflict("The certified Backtest model is not supported by the installed protected live Trader engine.")
     candidate_model_snapshot = source.get("candidate_model_snapshot")
     if isinstance(candidate_model_snapshot, dict) and not _same_model_values(
         candidate_model_snapshot, winner_model_snapshot
@@ -2187,6 +2246,16 @@ def promote_strategy_to_trader(
             "source_strategy_id": strategy_id,
             "source_strategy_revision": source_revision,
             "source_candidate_backtest_id": candidate_backtest_id,
+            "strategy_kind": str(source.get("strategy_kind") or "standard"),
+            "tuning_target": str(source.get("tuning_target") or "model_strategy"),
+            "source_temporal_run_id": source.get("source_temporal_run_id"),
+            "source_temporal_experiment": source.get("source_temporal_experiment"),
+            "temporal_policy_revision": source.get("temporal_policy_revision"),
+            **(
+                {"temporal_policy_snapshot": bson_value(source.get("temporal_policy_snapshot"))}
+                if isinstance(source.get("temporal_policy_snapshot"), dict)
+                else {}
+            ),
             "research_model_snapshot": bson_value(winner_model_snapshot),
             "winner_model_snapshot": bson_value(winner_model_snapshot),
             "winner_api_version": API_VERSION,
@@ -2199,6 +2268,7 @@ def promote_strategy_to_trader(
             "promoted_by": actor,
             "promotion_note": note,
             "promotion_mode": "metadata_only_operational_state_preserved",
+            "trader_compatibility": bson_value(runtime_compatibility),
             "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
             "broker_interaction_performed": False,
             "operational_state_preserved": True,
@@ -2299,6 +2369,7 @@ def promote_strategy_to_trader(
                     "model_profile_id": winner_model_snapshot["profile_id"],
                     "model_settings_revision": winner_model_snapshot["settings_revision"],
                     "model_settings_hash": winner_model_snapshot["settings_hash"],
+                    "trader_compatibility": bson_value(runtime_compatibility),
                     "assets_count": len(configuration.assets),
                     "note": note,
                     "promoted_at": now,
@@ -2384,6 +2455,7 @@ def promote_strategy_to_trader(
                 "next_scheduled_evaluation_uses_new_winner": True,
                 "next_scheduled_evaluation_assets_count": len(configuration.assets),
                 "winner_model": public_model_snapshot(winner_model_snapshot),
+                "trader_compatibility": bson_value(runtime_compatibility),
                 "promoted_candidate_strategy_id": strategy_id,
                 "previous_promoted_candidate_strategy_id": previous_promoted_candidate_id,
                 "winner_sequence": next_winner_sequence,

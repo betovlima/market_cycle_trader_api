@@ -33,6 +33,7 @@ from .api.routers import (
     strategy_lab,
     system_settings,
     temporal_intelligence,
+    temporal_rotation_quality,
 )
 from .core.config import API_VERSION, cors_origins
 from .auth.config import get_auth_settings
@@ -101,6 +102,7 @@ def create_app() -> FastAPI:
     application.include_router(model_research.router, dependencies=research_access)
     application.include_router(model_tuning.router, dependencies=research_access)
     application.include_router(temporal_intelligence.router)
+    application.include_router(temporal_rotation_quality.router)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)
     application.include_router(paper_market.router, dependencies=admin_required)

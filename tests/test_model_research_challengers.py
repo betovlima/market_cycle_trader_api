@@ -252,7 +252,7 @@ def test_model_parameter_selector_is_embedded_in_selected_strategy_box() -> None
     panel_source = (frontend_root / "ModelResearchSettingsPanel.jsx").read_text(encoding="utf-8")
     assert "<ModelResearchSettingsPanel" in strategy_source
     assert "strategy={selected}" in strategy_source
-    assert "onStrategyModelSaved={handleStrategyModelSaved}" in strategy_source
+    assert "onStrategyModelSaved={isTemporalStrategy ? null : handleStrategyModelSaved}" in strategy_source
     assert "ModelResearchSettingsPanel" not in system_source
     assert "MODEL PARAMETERS" in panel_source
     assert "Model saved with this Strategy" in panel_source

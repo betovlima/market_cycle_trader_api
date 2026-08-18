@@ -32,6 +32,22 @@ class ChampionProbabilityConfig(BaseModel):
         return self
 
 
+class ModelTuningFoldProtocol(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_folds: int = Field(default=3, ge=2)
+    validation_folds: int = Field(default=5, ge=2)
+    certification_folds: int = Field(default=7, ge=2)
+
+    @model_validator(mode="after")
+    def validate_stage_order(self) -> "ModelTuningFoldProtocol":
+        if self.validation_folds < self.research_folds:
+            raise ValueError("Validation folds must be greater than or equal to research folds.")
+        if self.certification_folds < self.validation_folds:
+            raise ValueError("Certification folds must be greater than or equal to validation folds.")
+        return self
+
+
 class ModelTuningStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -46,6 +62,8 @@ class ModelTuningStartRequest(BaseModel):
     anchor_candidate_id: int | None = Field(default=None, ge=0)
     tuning_target: Literal["temporal_model", "temporal_policy"] | None = None
     probability: ChampionProbabilityConfig | None = None
+    fold_protocol: ModelTuningFoldProtocol | None = None
+    explicit_start_confirmation: bool = False
 
     @model_validator(mode="after")
     def validate_probability_startup(self) -> "ModelTuningStartRequest":
