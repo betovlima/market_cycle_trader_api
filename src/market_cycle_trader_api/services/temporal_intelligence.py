@@ -19,7 +19,7 @@ from pydantic import ValidationError
 
 from ..core.config import SOURCE_ROOT
 from ..core.environment import build_subprocess_environment, load_project_environment
-from ..engine.market_data import resolve_backtest_analysis_end_date
+from ..engine.market_data import refresh_market_data_to_live_cutoff
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
@@ -39,6 +39,7 @@ from .strategy_lab import (
     get_trader_winner_context,
     get_trader_winner_model_snapshot,
     materialize_temporal_strategy,
+    update_trader_live_market_cutoff,
 )
 from .system_settings import apply_training_runtime_settings, get_system_settings
 
@@ -123,6 +124,9 @@ def public_temporal_run(document: dict[str, Any] | None, *, include_result: bool
         "market_data_snapshot_source_run_id": document.get("market_data_snapshot_source_run_id"),
         "deterministic_execution": bool((document.get("request") or {}).get("deterministic_execution")),
         "analysis_end_date": document.get("analysis_end_date"),
+        "certified_backtest_cutoff": document.get("certified_backtest_cutoff"),
+        "live_market_cutoff": document.get("live_market_cutoff"),
+        "research_snapshot_cutoff": document.get("research_snapshot_cutoff") or document.get("analysis_end_date"),
         "horizons": list(document.get("horizons") or []),
         "failure_message": document.get("failure_message"),
         "experiment": document.get("experiment") or (result.get("experiment") if isinstance(result, dict) else None),
@@ -134,7 +138,9 @@ def public_temporal_run(document: dict[str, Any] | None, *, include_result: bool
     }
 
 
-def _build_execution_request(db: Any) -> tuple[BacktestExecutionRequest, dict[str, Any], dict[str, Any]]:
+def _build_execution_request(
+    db: Any,
+) -> tuple[BacktestExecutionRequest, dict[str, Any], dict[str, Any], dict[str, Any]]:
     winner_configuration, winner_strategy = get_trader_winner_context(db)
     model_snapshot = get_trader_winner_model_snapshot(db)
     model_family = str(model_snapshot.get("family") or "")
@@ -149,7 +155,16 @@ def _build_execution_request(db: Any) -> tuple[BacktestExecutionRequest, dict[st
     anchors = list(locked.assets)
     reference = list(locked.assets)
     candidates: list[str] = []
-    resolved_end = resolve_backtest_analysis_end_date(locked)
+
+    # Research starts from current operational market data, not from the historical
+    # certification cutoff. Refresh once, then freeze that exact cutoff for the run.
+    live_refresh = refresh_market_data_to_live_cutoff(locked)
+    resolved_end = str(live_refresh["live_market_cutoff"])
+    update_trader_live_market_cutoff(
+        db,
+        cutoff=resolved_end,
+        source="temporal_research_boundary_refresh",
+    )
 
     request = BacktestExecutionRequest.model_validate({
         **locked.model_dump(mode="python"),
@@ -165,7 +180,12 @@ def _build_execution_request(db: Any) -> tuple[BacktestExecutionRequest, dict[st
         "xgb_n_jobs": 1,
         "numeric_thread_limit": 1,
     })
-    return request, winner_strategy, model_snapshot
+    market_context = {
+        "certified_backtest_cutoff": winner_strategy.get("certified_backtest_cutoff"),
+        "live_market_cutoff": resolved_end,
+        "research_snapshot_cutoff": resolved_end,
+    }
+    return request, winner_strategy, model_snapshot, market_context
 
 
 def _stable_temporal_market_snapshot(
@@ -217,7 +237,7 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         raise TemporalIntelligenceConflict("Model training is disabled in System Settings.")
 
     try:
-        request, strategy, model_snapshot = _build_execution_request(db)
+        request, strategy, model_snapshot, market_context = _build_execution_request(db)
         snapshot_id, source_run_id = _stable_temporal_market_snapshot(
             db,
             strategy_configuration_hash=str(strategy.get("configuration_hash") or ""),
@@ -267,6 +287,9 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         "market_data_snapshot_source": snapshot_source,
         "market_data_snapshot_source_run_id": source_run_id,
         "analysis_end_date": request.analysis_end_date,
+        "certified_backtest_cutoff": market_context.get("certified_backtest_cutoff"),
+        "live_market_cutoff": market_context.get("live_market_cutoff"),
+        "research_snapshot_cutoff": market_context.get("research_snapshot_cutoff"),
         "horizons": list(request.rotation_target_horizons),
         "request": bson_value(request.model_dump(mode="python")),
         "experiment": TEMPORAL_EXPERIMENT,
@@ -492,6 +515,9 @@ def _temporal_policy_strategy_snapshot(document: dict[str, Any]) -> dict[str, An
         "market_data_snapshot_source": document.get("market_data_snapshot_source"),
         "market_data_snapshot_source_run_id": document.get("market_data_snapshot_source_run_id"),
         "analysis_end_date": document.get("analysis_end_date"),
+        "certified_backtest_cutoff": document.get("certified_backtest_cutoff"),
+        "live_market_cutoff": document.get("live_market_cutoff"),
+        "research_snapshot_cutoff": document.get("research_snapshot_cutoff") or document.get("analysis_end_date"),
         "model_family": document.get("model_family"),
         "model_settings_hash": document.get("model_settings_hash"),
         "parameters": bson_value(parameters),
@@ -760,6 +786,9 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
         "market_data_snapshot_source_run_id": document.get("market_data_snapshot_source_run_id"),
         "deterministic_execution": bool((document.get("request") or {}).get("deterministic_execution")),
         "analysis_end_date": document.get("analysis_end_date"),
+        "certified_backtest_cutoff": document.get("certified_backtest_cutoff"),
+        "live_market_cutoff": document.get("live_market_cutoff"),
+        "research_snapshot_cutoff": document.get("research_snapshot_cutoff") or document.get("analysis_end_date"),
         "horizons": json.dumps(result.get("horizons") or document.get("horizons") or []),
         "asset_count": result.get("asset_count"),
         "feature_count": result.get("feature_count"),
@@ -811,7 +840,8 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
                 "experiment", "strategy_profile_id", "strategy_profile_name", "strategy_profile_revision", "strategy_configuration_hash",
                 "model_family", "model_label", "model_settings_hash", "model_settings_revision",
                 "market_data_snapshot_id", "market_data_snapshot_source", "market_data_snapshot_source_run_id",
-                "analysis_end_date", "horizons", "system_settings_revision", "shadow_only",
+                "analysis_end_date", "certified_backtest_cutoff", "live_market_cutoff", "research_snapshot_cutoff",
+                "horizons", "system_settings_revision", "shadow_only",
             )
         },
         "request": deepcopy(document.get("request") or {}),

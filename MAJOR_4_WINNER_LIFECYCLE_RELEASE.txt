@@ -1,0 +1,13 @@
+Market Cycle Trader API v4.0.0
+Major 4 — Trader Winner Lifecycle
+
+- Strategy status is no longer used as a Trader runtime capability rule.
+- API exposes trader_compatibility for every Strategy profile.
+- Candidate/Winner lifecycle checks the installed protected Trader runtime before promotion.
+- XGBoost Utility and LightGBM Utility standard Strategies remain live-compatible.
+- IQN and TEMPORAL policy snapshots remain technically blocked until their protected live runtime exists.
+- Winner promotion is allowed only while the XNYS regular market is closed.
+- Promotion remains metadata-only: no Alpaca request/order is issued by promotion.
+- Current position, cash, trade history, scheduler and armed next-session state remain preserved.
+- The next scheduled pre-market evaluation resolves the newly promoted Winner.
+- Promotion requests explicitly acknowledge market-closed and operational-state-preservation semantics.

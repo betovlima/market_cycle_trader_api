@@ -393,13 +393,13 @@ def test_promotion_creates_locked_snapshot_and_keeps_research_profile() -> None:
     assert promotion[0]["operational_snapshot"]["managed_symbol"] == "NVDA"
 
 
-def test_promotion_is_allowed_while_regular_market_is_open_when_pipeline_is_safe() -> None:
+def test_promotion_is_blocked_while_regular_market_is_open_even_when_pipeline_is_safe() -> None:
     db = _Database()
     install_winner_strategy_configuration(db, note="Install winner.", source="test")
     draft = create_strategy(
         db,
         name="Market-open safe promotion",
-        description="Metadata-only promotion must not depend on the regular-session clock.",
+        description="Metadata-only promotion must remain blocked during the regular session.",
         clone_from_strategy_id="winner-v1-13-2",
         actor_email="admin@example.com",
     )
@@ -442,21 +442,17 @@ def test_promotion_is_allowed_while_regular_market_is_open_when_pipeline_is_safe
     strategy_lab_service._regular_market_is_open = lambda: True
     try:
         control_revision = int(db[STRATEGY_CONTROL_COLLECTION].documents["default"]["revision"])
-        result = promote_strategy_to_trader(
-            db,
-            draft["id"],
-            expected_control_revision=control_revision,
-            expected_strategy_revision=1,
-            note="Promote safely during the regular session.",
-            actor_email="admin@example.com",
-        )
+        with pytest.raises(StrategyLabConflict, match="XNYS regular market is closed"):
+            promote_strategy_to_trader(
+                db,
+                draft["id"],
+                expected_control_revision=control_revision,
+                expected_strategy_revision=1,
+                note="Attempt promotion during the regular session.",
+                actor_email="admin@example.com",
+            )
     finally:
         strategy_lab_service._regular_market_is_open = previous_market_state
-
-    assert result["status"] == "promoted"
-    assert result["promotion"]["regular_market_open_at_promotion"] is True
-    assert result["promotion"]["broker_interaction_performed"] is False
-    assert result["promotion"]["operational_state_preserved"] is True
 
 
 def test_promotion_allows_multiple_historical_winners_from_same_api_release() -> None:

@@ -9,7 +9,7 @@ SRC = ROOT / "src" / "market_cycle_trader_api"
 def test_multi_horizon_engine_is_the_only_configured_engine() -> None:
     config = (SRC / "core" / "config.py").read_text(encoding="utf-8")
     assert 'ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"' in config
-    assert 'API_VERSION = "3.26.1"' in config
+    assert 'API_VERSION = "4.1.1"' in config
 
 
 def test_admin_strategy_routes_are_composed() -> None:
@@ -73,8 +73,10 @@ def test_winner_promotion_is_metadata_only_and_binds_next_plan_to_winner() -> No
     assert "broker_interaction_performed\": False" in strategy_lab
     assert "operational_state_preserved\": True" in strategy_lab
     assert "paper_state_reinitialization_required\": False" in strategy_lab
-    assert "confirm_market_closed: Literal[True] | None = None" in schema
-    assert "Winner promotion is allowed only while the XNYS regular market is closed" not in strategy_lab
+    assert '"trader_compatibility": _trader_runtime_compatibility(document)' in strategy_lab
+    assert '"protected_live_runtime_ready"' in strategy_lab
+    assert "confirm_market_closed: Literal[True]" in schema
+    assert "Trader Winner promotion is allowed only while the XNYS regular market is closed" in strategy_lab
     assert "confirm_preserve_operational_state: Literal[True]" in schema
     assert "winner_strategy_id=str(winner_profile[\"id\"])" in paper
     assert "winner_assets=list(strategy.assets)" in paper
@@ -176,9 +178,15 @@ def test_dashboard_is_the_single_frontend_home_for_the_retained_backtest_charts(
     portfolio = (front / "features" / "paperPortfolio" / "PaperPortfolioDashboard.jsx").read_text(encoding="utf-8")
     header = (front / "features" / "backtest" / "components" / "AppHeader.jsx").read_text(encoding="utf-8")
 
+    rotation_quality = (front / "features" / "dashboard" / "components" / "RotationQualityPerformanceSection.jsx").read_text(encoding="utf-8")
+
     assert "DashboardBacktestAnalyticsSection" in dashboard
+    assert "RotationQualityPerformanceSection" in dashboard
+    assert "BacktestHistorySection" not in dashboard
     assert "MonthlyCapitalMovementHeatmap" in analytics_hub
-    assert "BacktestPerformanceExplorer" in analytics_hub
+    assert "BacktestPerformanceExplorer" not in analytics_hub
+    assert "MonthlyReturnHeatmap" in rotation_quality
+    assert "Strategy" in rotation_quality and "Control" in rotation_quality and "S − C" in rotation_quality
     assert "Latest completed processing is selected by default." in analytics_hub
     assert '<ComposedChart' not in backtest
     assert '<ComposedChart' not in portfolio

@@ -23,6 +23,17 @@ from .temporal_policy_tuning import temporal_policy_baseline
 
 TEMPORAL_MODEL_TUNING_SCOPE = "temporal_model"
 TEMPORAL_MODEL_FAMILY = "lightgbm_utility"
+
+
+class TemporalModelTuningCancelled(RuntimeError):
+    pass
+
+
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and bool(cancel_check()):
+        raise TemporalModelTuningCancelled("Temporal Model Tuning cancelled by user.")
+
+
 TEMPORAL_MODEL_SEARCH_SPACE: tuple[dict[str, Any], ...] = (
     {"name": "n_estimators", "type": "integer", "min": 220, "max": 380},
     {"name": "learning_rate", "type": "number", "min": 0.020, "max": 0.050, "precision": 6},
@@ -114,6 +125,8 @@ def _candidate_request(
     source_run: dict[str, Any],
     model_snapshot: dict[str, Any],
     settings: dict[str, Any],
+    *,
+    fold_count: int | None = None,
 ) -> tuple[BacktestExecutionRequest, dict[str, Any]]:
     request_payload = deepcopy(source_run.get("request") or {})
     base_values = model_values_from_snapshot(model_snapshot)
@@ -138,6 +151,7 @@ def _candidate_request(
         "deterministic_execution": True,
         "numeric_thread_limit": 1,
         "xgb_n_jobs": 1,
+        "walk_forward_fold_count_override": (int(fold_count) if fold_count is not None else None),
     })
     request = BacktestExecutionRequest.model_validate(request_payload)
     return request, settings_snapshot
@@ -234,22 +248,31 @@ def evaluate_temporal_model_candidate(
     settings: dict[str, Any],
     *,
     progress_callback: Callable[[float, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    fold_count: int | None = None,
 ) -> dict[str, Any]:
     source_run = _source_run(db, strategy)
-    request, settings_snapshot = _candidate_request(source_run, model_snapshot, settings)
+    request, settings_snapshot = _candidate_request(
+        source_run, model_snapshot, settings, fold_count=fold_count
+    )
     bars_by_symbol: dict[str, pd.DataFrame] = {}
+    _raise_if_cancelled(cancel_check)
     for position, symbol in enumerate(request.assets, start=1):
+        _raise_if_cancelled(cancel_check)
         if progress_callback:
             progress_callback(2.0 + 12.0 * ((position - 1) / max(1, len(request.assets))), f"Loading frozen market data {position}/{len(request.assets)}")
         asset_request = request if symbol in set(request.calendar_anchor_assets) else request.model_copy(update={"market_data_require_complete_history": False})
         raw = load_market_bars(symbol, asset_request)
         bars_by_symbol[symbol] = validate_and_clean_bars(raw, asset_request)
+        _raise_if_cancelled(cancel_check)
 
     winner_override = _winner_override(db, source_run)
+    _raise_if_cancelled(cancel_check)
     result = run_temporal_intelligence(
         bars_by_symbol,
         request,
         progress_callback=progress_callback,
+        cancel_callback=(lambda: _raise_if_cancelled(cancel_check)) if cancel_check is not None else None,
         winner_reference_override=winner_override,
         candidate_evaluation_only=True,
     )
@@ -360,6 +383,9 @@ def persist_temporal_model_champion_cache(
         "market_data_snapshot_source": "temporal_model_tuning_champion",
         "market_data_snapshot_source_run_id": source_run.get("id"),
         "analysis_end_date": source_run.get("analysis_end_date") or request.get("analysis_end_date"),
+        "certified_backtest_cutoff": source_run.get("certified_backtest_cutoff"),
+        "live_market_cutoff": source_run.get("live_market_cutoff"),
+        "research_snapshot_cutoff": source_run.get("research_snapshot_cutoff") or source_run.get("analysis_end_date") or request.get("analysis_end_date"),
         "horizons": list(request.get("rotation_target_horizons") or []),
         "request": bson_value(request),
         "experiment": (evaluation.get("temporal_result") or {}).get("experiment") or source_run.get("experiment"),

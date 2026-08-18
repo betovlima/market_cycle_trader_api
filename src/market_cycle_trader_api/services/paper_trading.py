@@ -12,7 +12,12 @@ from pymongo import ReturnDocument
 
 from ..core.config import RESEARCH_ONLY_SWING_STRATEGY_MODES, SWING_STRATEGY_MODES
 from ..engine.live_model_signal import build_live_model_decision
-from ..engine.market_data import load_market_bars, validate_and_clean_bars
+from ..engine.market_data import (
+    latest_safe_completed_xnys_session,
+    load_market_bars,
+    refresh_market_data_to_live_cutoff,
+    validate_and_clean_bars,
+)
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_ORDERS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
@@ -50,6 +55,7 @@ from .strategy_lab import (
     get_trader_winner_model_snapshot,
     mark_trader_winner_state_initialized,
     trader_winner_requires_state_reinitialization,
+    update_trader_live_market_cutoff,
 )
 
 EASTERN = ZoneInfo("America/New_York")
@@ -133,6 +139,103 @@ def _validated_context(
     return strategy, settings, state, winner_profile, winner_model
 
 
+def refresh_trader_live_market_data(
+    db: Any,
+    *,
+    source: str,
+    force: bool = False,
+    now: datetime | pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    """Keep the operational Winner market data current without mutating the Winner snapshot."""
+    winner_configuration, winner_profile = get_trader_winner_context(db)
+    winner_model = get_trader_winner_model_snapshot(db)
+    strategy = apply_training_runtime_settings(db, winner_configuration)
+    strategy = apply_execution_profile(
+        strategy,
+        winner_model["family"],
+        winner_model.get("settings_snapshot") or {},
+    )
+    if strategy.market_data_provider != "alpaca":
+        raise RuntimeError("Trader live market refresh requires market_data_provider='alpaca'.")
+    if strategy.end_date is not None:
+        raise RuntimeError(
+            "Trader live market refresh requires end_date=None; the certified cutoff belongs to certification metadata, not the live Strategy window."
+        )
+
+    target = latest_safe_completed_xnys_session(now).date().isoformat()
+    control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
+    current_cutoff = str(control.get("live_market_cutoff") or "").strip()
+    current_winner = str(control.get("live_market_cutoff_winner_strategy_id") or "").strip()
+    winner_id = str(winner_profile.get("id") or "")
+    if not force and current_cutoff == target and current_winner == winner_id:
+        return {
+            "live_market_cutoff": target,
+            "target_session": target,
+            "refreshed": False,
+            "source": str(source),
+        }
+
+    now_utc = pd.Timestamp(now if now is not None else utc_now())
+    now_utc = now_utc.tz_localize("UTC") if now_utc.tzinfo is None else now_utc.tz_convert("UTC")
+    retry_target = str(control.get("live_market_refresh_target") or "").strip()
+    retry_at = control.get("live_market_refresh_next_retry_at")
+    retry_stamp = None
+    if retry_at is not None:
+        retry_stamp = pd.Timestamp(retry_at)
+        retry_stamp = retry_stamp.tz_localize("UTC") if retry_stamp.tzinfo is None else retry_stamp.tz_convert("UTC")
+    if not force and retry_target == target and retry_stamp is not None and now_utc < retry_stamp:
+        return {
+            "live_market_cutoff": current_cutoff or None,
+            "target_session": target,
+            "refreshed": False,
+            "pending_retry": True,
+            "next_retry_at": retry_stamp.isoformat(),
+            "source": str(source),
+        }
+
+    attempt_at = utc_now()
+    db[STRATEGY_CONTROL_COLLECTION].update_one(
+        {"_id": "default"},
+        {
+            "$set": {
+                "live_market_refresh_target": target,
+                "live_market_refresh_last_attempt_at": attempt_at,
+                "live_market_refresh_source": str(source),
+            },
+            "$unset": {"live_market_refresh_last_error": ""},
+        },
+    )
+    try:
+        refreshed = refresh_market_data_to_live_cutoff(strategy, now=now)
+        metadata = update_trader_live_market_cutoff(
+            db,
+            cutoff=str(refreshed["live_market_cutoff"]),
+            source=source,
+        )
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": "default"},
+            {
+                "$set": {"live_market_refresh_last_success_at": utc_now()},
+                "$unset": {
+                    "live_market_refresh_next_retry_at": "",
+                    "live_market_refresh_last_error": "",
+                },
+            },
+        )
+        return {**refreshed, **metadata, "refreshed": True}
+    except Exception as exc:
+        next_retry = utc_now() + timedelta(minutes=5)
+        db[STRATEGY_CONTROL_COLLECTION].update_one(
+            {"_id": "default"},
+            {
+                "$set": {
+                    "live_market_refresh_next_retry_at": next_retry,
+                    "live_market_refresh_last_error": str(exc)[:1000],
+                }
+            },
+        )
+        raise
+
 
 def paper_market_readiness(db: Any) -> dict[str, Any]:
     
@@ -157,6 +260,7 @@ def paper_market_readiness(db: Any) -> dict[str, Any]:
         "managed_symbol": state.managed_symbol,
         "holding_sessions": int(state.holding_sessions),
         "paper_account_id": account["id"],
+        "live_market_cutoff": (db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}).get("live_market_cutoff"),
     }
 
 def _trim_incomplete_daily_session(
@@ -331,6 +435,8 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
             "so the latest daily candle is complete."
         )
 
+    live_market = refresh_trader_live_market_data(db, source="premarket_plan_refresh", force=True)
+
     _assert_no_conflicting_orders(client, assets=strategy.assets)
     _reconcile_state_with_account(
         client,
@@ -431,6 +537,7 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         "effective_compute_device": decision.effective_compute_device,
         "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
+        "live_market_cutoff": live_market.get("live_market_cutoff"),
     }
     insert_paper_trade_plan(db, document, replace=replace)
     return document

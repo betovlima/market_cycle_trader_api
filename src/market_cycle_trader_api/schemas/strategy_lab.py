@@ -108,7 +108,7 @@ class StrategyPromoteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confirm_promote_to_trader: Literal[True]
-    confirm_market_closed: Literal[True] | None = None
+    confirm_market_closed: Literal[True]
     confirm_preserve_operational_state: Literal[True]
     expected_control_revision: int = Field(ge=1)
     expected_strategy_revision: int = Field(ge=1)

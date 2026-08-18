@@ -131,6 +131,7 @@ def freeze_tuning_market_snapshot(
         "row_count": total_rows,
         "start_date": config.start_date,
         "end_date": config.analysis_end_date or config.end_date,
+        "research_snapshot_cutoff": config.analysis_end_date or config.end_date,
         "interval": config.timeframe,
         "feed": config.alpaca_historical_feed,
         "adjustment": config.alpaca_adjustment,

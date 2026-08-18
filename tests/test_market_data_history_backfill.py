@@ -14,6 +14,7 @@ from market_cycle_trader_api.engine.market_data import (
     complete_market_history,
     inclusive_end_exclusive_boundary,
     latest_completed_xnys_session,
+    latest_safe_completed_xnys_session,
     load_mongo_market_bars,
     resolve_backtest_analysis_end_date,
     trim_downloaded_range,
@@ -320,6 +321,25 @@ def test_latest_completed_session_never_uses_current_open_session() -> None:
     
     result = latest_completed_xnys_session(datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc))
     assert result.date().isoformat() == "2026-08-11"
+
+
+def test_safe_live_cutoff_waits_for_daily_bar_buffer_after_close() -> None:
+    before_buffer = latest_safe_completed_xnys_session(
+        datetime(2026, 8, 18, 20, 10, tzinfo=timezone.utc)
+    )
+    after_buffer = latest_safe_completed_xnys_session(
+        datetime(2026, 8, 18, 20, 25, tzinfo=timezone.utc)
+    )
+
+    assert before_buffer.date().isoformat() == "2026-08-17"
+    assert after_buffer.date().isoformat() == "2026-08-18"
+
+
+def test_safe_live_cutoff_skips_weekends() -> None:
+    result = latest_safe_completed_xnys_session(
+        datetime(2026, 8, 22, 15, 0, tzinfo=timezone.utc)
+    )
+    assert result.date().isoformat() == "2026-08-21"
 
 
 def test_tuning_database_only_missing_asset_never_calls_alpaca() -> None:

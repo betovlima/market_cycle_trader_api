@@ -17,6 +17,7 @@ from ..infrastructure.persistence.mongo_repository import (
     PAPER_MARKET_AUTOMATION_COLLECTION,
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
+    STRATEGY_CONTROL_COLLECTION,
     bson_value,
     get_paper_trading_settings,
     update_paper_trade_plan,
@@ -33,6 +34,7 @@ from .paper_trading import (
     execute_prepared_paper_plan,
     paper_market_readiness,
     prepare_next_paper_plan,
+    refresh_trader_live_market_data,
 )
 
 EASTERN = ZoneInfo("America/New_York")
@@ -1112,8 +1114,17 @@ def _advance_one(db: Any, worker_id: str) -> None:
     controller = _automation_document(db) or {}
     if _control_mode(controller) in {"paused", "stopped"}:
         return
+
     run = _ensure_continuous_run(db)
     if run is None:
+        return
+
+    # Keep the immutable Winner's mutable market-data position current only when
+    # the Paper robot is actually armed/continuous. During the session this is a
+    # no-op (cutoff remains D-1); after close plus the daily-bar safety buffer it
+    # advances once to D.
+    live_market = refresh_trader_live_market_data(db, source="paper_scheduler_live_refresh")
+    if bool(live_market.get("pending_retry")):
         return
     status = str(run.get("status") or "")
     if status == "prepared" and not _prepared_run_has_valid_premarket_analysis(run):
@@ -1193,6 +1204,7 @@ _SCHEDULER = PaperMarketScheduler()
 
 def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any]:
     controller = _automation_document(db) or {}
+    strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
     active = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_KEY})
     latest = active or db[PAPER_MARKET_RUNS_COLLECTION].find_one({}, sort=[("created_at", -1)])
     runtime = _SCHEDULER.snapshot()
@@ -1223,6 +1235,8 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "latest_run": _public_robot_run(latest),
         "updated_at": bson_value(controller.get("updated_at")),
         "trader_winner": trader_winner,
+        "live_market_cutoff": strategy_control.get("live_market_cutoff"),
+        "live_market_cutoff_updated_at": bson_value(strategy_control.get("live_market_cutoff_updated_at")),
     }
     if not public:
         output.update({
@@ -1231,6 +1245,9 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
             "poll_seconds": runtime.get("poll_seconds"),
             "last_error": controller.get("last_error"),
             "next_retry_at": bson_value(controller.get("next_retry_at")),
+            "live_market_refresh_target": strategy_control.get("live_market_refresh_target"),
+            "live_market_refresh_next_retry_at": bson_value(strategy_control.get("live_market_refresh_next_retry_at")),
+            "live_market_refresh_last_error": strategy_control.get("live_market_refresh_last_error"),
         })
     return output
 

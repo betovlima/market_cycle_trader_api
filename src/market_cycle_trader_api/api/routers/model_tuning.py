@@ -11,6 +11,7 @@ from ...schemas.model_tuning import ModelTuningAdoptRequest, ModelTuningStartReq
 from ...services.model_tuning_validation import (
     ModelTuningValidationConflict,
     ModelTuningValidationNotFound,
+    certify_temporal_policy_candidate,
     get_tuning_validation,
     validate_temporal_policy_champion,
 )
@@ -101,6 +102,8 @@ def create_tuning(
             anchor_candidate_id=payload.anchor_candidate_id,
             tuning_target=payload.tuning_target,
             probability_config=payload.probability.model_dump(mode="python") if payload.probability is not None else None,
+            fold_protocol=payload.fold_protocol.model_dump(mode="python") if payload.fold_protocol is not None else None,
+            explicit_start_confirmation=payload.explicit_start_confirmation,
             actor_email=identity.email,
         )
     except (ModelTuningConflict, ValueError, RuntimeError) as exc:
@@ -191,6 +194,23 @@ def validate_tuning_champion(
 ) -> dict[str, Any]:
     try:
         return validate_temporal_policy_champion(
+            database(),
+            run_id,
+            candidate_id,
+            actor_email=identity.email,
+        )
+    except (ModelTuningValidationNotFound, ModelTuningValidationConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{run_id}/candidates/{candidate_id}/certify")
+def certify_tuning_candidate(
+    run_id: str,
+    candidate_id: int,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    try:
+        return certify_temporal_policy_candidate(
             database(),
             run_id,
             candidate_id,

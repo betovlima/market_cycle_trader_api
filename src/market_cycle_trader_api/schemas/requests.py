@@ -265,6 +265,7 @@ class BacktestExecutionRequest(BacktestRequest):
     research_market_data_mode: ResearchMarketDataMode = "database_only"
     expected_market_data_signature_sha256: str | None = None
     research_market_data_snapshot_id: str | None = None
+    walk_forward_fold_count_override: int | None = Field(default=None, ge=2)
 
     @field_validator("calendar_anchor_assets")
     @classmethod

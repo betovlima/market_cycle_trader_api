@@ -2380,14 +2380,6 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
-    
-
-
-
-
-
-
-
     purge = max(int(config.rotation_purge_days), max(int(item) for item in config.rotation_target_horizons))
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     test_days = int(config.rotation_walk_forward_test_days)
@@ -2404,26 +2396,70 @@ def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> li
             f'calibration={calibration_days}, purge={purge}.'
         )
 
+    requested_fold_count = getattr(config, 'walk_forward_fold_count_override', None)
+    explicit_test_ranges: list[tuple[int, int]] | None = None
+    if requested_fold_count is not None:
+        fold_count = int(requested_fold_count)
+        available_test_rows = int(len(common_dates) - first_test_start)
+        if available_test_rows < fold_count * min_test_days:
+            raise ValueError(
+                'Not enough out-of-sample history for the requested walk-forward fold count: '
+                f'folds={fold_count}, available_test_rows={available_test_rows}, '
+                f'minimum_test_rows_per_fold={min_test_days}.'
+            )
+        base_size, remainder = divmod(available_test_rows, fold_count)
+        explicit_test_ranges = []
+        cursor = int(first_test_start)
+        for index in range(fold_count):
+            size = base_size + (1 if index < remainder else 0)
+            test_end = cursor + size
+            explicit_test_ranges.append((cursor, test_end))
+            cursor = test_end
+
     folds: list[dict[str, Any]] = []
-    test_start = first_test_start
-    fold_id = 1
-    while test_start < len(common_dates):
-        test_end = min(len(common_dates), test_start + test_days)
+    ranges = explicit_test_ranges
+    if ranges is None:
+        ranges = []
+        test_start = first_test_start
+        while test_start < len(common_dates):
+            test_end = min(len(common_dates), test_start + test_days)
+            if test_end - test_start < min_test_days:
+                if ranges:
+                    previous_start, _ = ranges[-1]
+                    ranges[-1] = (previous_start, len(common_dates))
+                break
+            ranges.append((test_start, test_end))
+            test_start = test_end
+
+    for fold_id, (test_start, test_end) in enumerate(ranges, start=1):
         if test_end - test_start < min_test_days:
-            if folds:
-                folds[-1]['test_end_index'] = len(common_dates)
-                folds[-1]['test_end'] = common_dates[-1]
-                folds[-1]['decision_dates'] = common_dates[folds[-1]['test_start_index'] - 1:len(common_dates)]
-            break
+            raise ValueError(
+                f'Fold {fold_id}: test rows {test_end - test_start} < {min_test_days}.'
+            )
         calibration_end = test_start - purge
         calibration_start = calibration_end - calibration_days
         train_end = calibration_start - purge
         final_fit_end = test_start - purge
         if train_end < min_train:
             raise ValueError(f'Fold {fold_id}: training rows {train_end} < {min_train}.')
-        folds.append({'fold_id': fold_id, 'train_end_index': train_end, 'calibration_start_index': calibration_start, 'calibration_end_index': calibration_end, 'final_fit_end_index': final_fit_end, 'test_start_index': test_start, 'test_end_index': test_end, 'train_start': common_dates[0], 'train_end': common_dates[train_end - 1], 'calibration_start': common_dates[calibration_start], 'calibration_end': common_dates[calibration_end - 1], 'purge_start': common_dates[calibration_end], 'purge_end': common_dates[test_start - 1], 'test_start': common_dates[test_start], 'test_end': common_dates[test_end - 1], 'decision_dates': common_dates[test_start - 1:test_end]})
-        fold_id += 1
-        test_start = test_end
+        folds.append({
+            'fold_id': fold_id,
+            'train_end_index': train_end,
+            'calibration_start_index': calibration_start,
+            'calibration_end_index': calibration_end,
+            'final_fit_end_index': final_fit_end,
+            'test_start_index': test_start,
+            'test_end_index': test_end,
+            'train_start': common_dates[0],
+            'train_end': common_dates[train_end - 1],
+            'calibration_start': common_dates[calibration_start],
+            'calibration_end': common_dates[calibration_end - 1],
+            'purge_start': common_dates[calibration_end],
+            'purge_end': common_dates[test_start - 1],
+            'test_start': common_dates[test_start],
+            'test_end': common_dates[test_end - 1],
+            'decision_dates': common_dates[test_start - 1:test_end],
+        })
     if not folds:
         raise ValueError('No valid expanding walk-forward fold was created.')
     return folds

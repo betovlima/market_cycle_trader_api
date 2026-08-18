@@ -23,6 +23,10 @@ from ..infrastructure.persistence.mongo_repository import (
     FAILURES_COLLECTION,
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
+    MODEL_TUNING_VALIDATIONS_COLLECTION,
+    TEMPORAL_INTELLIGENCE_RUNS_COLLECTION,
+    TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION,
+    TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
     PREDICTIONS_COLLECTION,
     RUNS_COLLECTION,
     TRADES_COLLECTION,
@@ -62,6 +66,7 @@ from .temporal_policy_tuning import (
 from .temporal_model_tuning import (
     TEMPORAL_MODEL_FAMILY,
     TEMPORAL_MODEL_TUNING_SCOPE,
+    TemporalModelTuningCancelled,
     evaluate_temporal_model_candidate,
     persist_temporal_model_champion_cache,
     temporal_model_baseline,
@@ -87,12 +92,37 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 15
+TUNING_SCHEMA_VERSION = 16
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 TECHNICAL_RESEARCH_SEGMENT_MAX = 2000
 DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT = 100
 DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT = 0.0025
+DEFAULT_RESEARCH_FOLDS = 3
+DEFAULT_VALIDATION_FOLDS = 5
+DEFAULT_CERTIFICATION_FOLDS = 7
+
+
+def _normalized_fold_protocol(value: dict[str, Any] | None) -> dict[str, int]:
+    payload = dict(value or {})
+    research = int(payload.get("research_folds") or DEFAULT_RESEARCH_FOLDS)
+    validation = int(payload.get("validation_folds") or DEFAULT_VALIDATION_FOLDS)
+    certification = int(payload.get("certification_folds") or DEFAULT_CERTIFICATION_FOLDS)
+    if research < 2:
+        raise ModelTuningConflict("Research folds must be at least 2.")
+    if validation < 2:
+        raise ModelTuningConflict("Validation folds must be at least 2.")
+    if certification < 2:
+        raise ModelTuningConflict("Certification folds must be at least 2.")
+    if validation < research:
+        raise ModelTuningConflict("Validation folds must be greater than or equal to research folds.")
+    if certification < validation:
+        raise ModelTuningConflict("Certification folds must be greater than or equal to validation folds.")
+    return {
+        "research_folds": research,
+        "validation_folds": validation,
+        "certification_folds": certification,
+    }
 
 
 
@@ -138,12 +168,11 @@ class ModelTuningNotFound(RuntimeError):
 
 def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
     control = get_strategy_control(db)
-    temporal_strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()
-    if temporal_strategy_id:
-        strategy = get_strategy(db, temporal_strategy_id)
-        if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
-            model_snapshot = get_strategy_model_snapshot(db, temporal_strategy_id)
-            return strategy, model_snapshot, "temporal_tuning_selection"
+    selected_strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()
+    if selected_strategy_id:
+        strategy = get_strategy(db, selected_strategy_id)
+        model_snapshot = get_strategy_model_snapshot(db, selected_strategy_id)
+        return strategy, model_snapshot, "model_tuning_selection"
     candidates = (
         ("candidate", control.get("candidate_strategy_id")),
         ("promoted_candidate", control.get("promoted_candidate_strategy_id")),
@@ -160,7 +189,9 @@ def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], st
 
 
 def _tuning_target_allows_locked_strategy(strategy: dict[str, Any]) -> bool:
-    return str(strategy.get("status") or "") in {"candidate", "promoted_candidate"}
+    # Lifecycle status/locked protects governance and editing, not research eligibility.
+    # Technical compatibility is validated by the tuning plan and baseline checks.
+    return True
 
 
 def _sanitize_tuning_log_line(raw_line: Any) -> str:
@@ -462,6 +493,7 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     default_startup_trials = max(4, min(24, len(search_space) + 2))
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
+        "start_request_contract_version": 1,
         "method": PROBABILITY_METHOD,
         "methods": [
             {
@@ -516,6 +548,19 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
         "durable_candidate_retention": "adopted_or_validated_only",
         "technical_failure_retention": "campaign_counters_and_summary_only",
         "historical_cleanup_trigger": "next_tuning_campaign_start",
+        "fold_protocol": {
+            "supported": bool(temporal_scope),
+            "research_default": DEFAULT_RESEARCH_FOLDS,
+            "validation_default": DEFAULT_VALIDATION_FOLDS,
+            "certification_default": DEFAULT_CERTIFICATION_FOLDS,
+            "minimum": 2,
+            "technical_maximum": None,
+            "maximum_constraint": "available_out_of_sample_history_and_minimum_test_rows_per_fold",
+            "ordering_rule": "research <= validation <= certification",
+            "research_role": "candidate_search",
+            "validation_role": "full_temporal_retrain_finalist_validation",
+            "certification_role": "full_temporal_retrain_candidate_certification",
+        },
         "automatic_lhs_to_caro_handoff": False,
         "unified_caro": True,
         "dynamic_exploration": True,
@@ -1367,27 +1412,67 @@ def _compact_historical_tuning_document(document: dict[str, Any], *, next_run_id
 
 
 def _compact_historical_tuning_runs(db: Any, *, next_run_id: str) -> dict[str, int]:
-    """Prune transient trial observations when a new campaign is created.
+    """Prune transient research storage when a new campaign is created.
 
-    The just-created campaign remains untouched. Completed/failed/stopped older
-    campaigns keep aggregate counters and only candidates that entered an
-    explicit durable lifecycle state (adopted or validated).
+    The active campaign keeps every observation required by CARO. Historical
+    campaigns retain only candidates that entered a durable lifecycle state.
+    Failed validation records and temporary fold-specific Temporal caches are
+    also removed at this boundary so MongoDB growth follows useful research
+    outcomes instead of attempted trials.
     """
     compacted_runs = 0
     retained_candidates = 0
     discarded_trials = 0
+    discarded_validations = 0
+    removed_fold_caches = 0
     cursor = db[MODEL_TUNING_RUNS_COLLECTION].find({
         "id": {"$ne": str(next_run_id)},
         "status": {"$nin": list(_ACTIVE_STATUSES)},
         "historical_trials_compacted": {"$ne": True},
     })
     for document in cursor:
+        run_id = str(document.get("id") or "")
+        durable_validation_ids: list[int] = []
+        validation_rows = list(db[MODEL_TUNING_VALIDATIONS_COLLECTION].find(
+            {"tuning_run_id": run_id},
+            {"_id": 0, "candidate_id": 1, "validation_passed": 1, "certification_passed": 1},
+        ))
+        for validation in validation_rows:
+            candidate_id = validation.get("candidate_id")
+            if candidate_id is None:
+                continue
+            if bool(validation.get("validation_passed")) or bool(validation.get("certification_passed")):
+                durable_validation_ids.append(int(candidate_id))
+                continue
+            db[MODEL_TUNING_VALIDATIONS_COLLECTION].delete_many({
+                "tuning_run_id": run_id,
+                "candidate_id": int(candidate_id),
+            })
+            discarded_validations += 1
+
+        if durable_validation_ids:
+            document = deepcopy(document)
+            document["retained_candidate_ids"] = sorted(set(
+                [int(value) for value in document.get("retained_candidate_ids") or [] if value is not None]
+                + durable_validation_ids
+            ))
+
         before_candidates = len(document.get("candidates") or [])
         before_prior = len(document.get("prior_observations") or [])
         update = _compact_historical_tuning_document(document, next_run_id=next_run_id)
         kept = len(update.get("candidates") or [])
+
+        cache_run_id = str(document.get("research_fold_cache_run_id") or "").strip()
+        if cache_run_id:
+            db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].delete_many({"run_id": cache_run_id})
+            db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].delete_many({"run_id": cache_run_id})
+            db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].delete_many({"id": cache_run_id})
+            update["research_fold_cache_run_id"] = None
+            update["research_fold_cache_cleaned_at"] = utc_now()
+            removed_fold_caches += 1
+
         db[MODEL_TUNING_RUNS_COLLECTION].update_one(
-            {"id": str(document.get("id") or "")},
+            {"id": run_id},
             {"$set": update},
         )
         compacted_runs += 1
@@ -1397,7 +1482,10 @@ def _compact_historical_tuning_runs(db: Any, *, next_run_id: str) -> dict[str, i
         "compacted_runs": compacted_runs,
         "retained_candidates": retained_candidates,
         "discarded_trials": discarded_trials,
+        "discarded_validations": discarded_validations,
+        "removed_fold_caches": removed_fold_caches,
     }
+
 
 def _validate_temporal_continuation_source(
     source: dict[str, Any],
@@ -1407,6 +1495,7 @@ def _validate_temporal_continuation_source(
     search_space: list[dict[str, Any]],
     source_temporal_run_id: str,
     market_data_snapshot_id: str | None,
+    research_folds: int,
 ) -> None:
     if str(source.get("status") or "") != "completed":
         raise ModelTuningConflict("Continue Research requires a completed source campaign.")
@@ -1428,6 +1517,13 @@ def _validate_temporal_continuation_source(
     expected_snapshot = str(market_data_snapshot_id or "").strip().lower()
     if source_snapshot and expected_snapshot and source_snapshot != expected_snapshot:
         raise ModelTuningConflict("The source campaign uses a different frozen market-data snapshot.")
+    source_protocol = dict(source.get("fold_protocol") or {})
+    source_research_folds = int(source_protocol.get("research_folds") or DEFAULT_RESEARCH_FOLDS)
+    if source_research_folds != int(research_folds):
+        raise ModelTuningConflict(
+            "Continue Research requires the same research fold count as the source campaign. "
+            "Start a new campaign to change the research fold protocol."
+        )
 
 
 def _meaningful_no_improvement_streak(document: dict[str, Any]) -> int:
@@ -1753,6 +1849,7 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
         "anchor_candidate_id": (document.get("probability_anchor") or {}).get("candidate_id") if isinstance(document.get("probability_anchor"), dict) else None,
         "anchor_ending_capital": ((document.get("probability_anchor") or {}).get("metrics") or {}).get("ending_capital") if isinstance((document.get("probability_anchor") or {}).get("metrics"), dict) else None,
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),
+        "research_snapshot_cutoff": document.get("market_data_cutoff_date"),
         "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
         "market_data_snapshot_id": document.get("market_data_snapshot_id"),
         "control_candidate_id": document.get("control_candidate_id"),
@@ -1763,6 +1860,8 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
         "best_sharpe": ranked[0].get("sharpe") if ranked else None,
         "best_maximum_drawdown": ranked[0].get("maximum_drawdown") if ranked else None,
         "created_at": document.get("created_at"),
+        "created_by": document.get("created_by"),
+        "explicit_start_confirmation": bool(document.get("explicit_start_confirmation")),
         "started_at": document.get("started_at"),
         "finished_at": document.get("finished_at"),
     }
@@ -1817,6 +1916,7 @@ def build_model_tuning_export(db: Any, run_id: str) -> bytes:
             "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
             "market_data_snapshot_id": document.get("market_data_snapshot_id"),
             "market_data_cutoff_date": document.get("market_data_cutoff_date"),
+            "research_snapshot_cutoff": document.get("market_data_cutoff_date"),
             "adoption_context_compatible": document.get("adoption_context_compatible"),
             "control_candidate_id": document.get("control_candidate_id"),
             "best_candidate_id": best_row.get("candidate_id") if best_row else None,
@@ -1868,9 +1968,12 @@ def _public_tuning_history_item(document: dict[str, Any]) -> dict[str, Any]:
         "strategy_profile_revision": int(document.get("strategy_profile_revision") or 0),
         "strategy_profile_status": document.get("strategy_profile_status"),
         "created_at": document.get("created_at"),
+        "created_by": document.get("created_by"),
+        "explicit_start_confirmation": bool(document.get("explicit_start_confirmation")),
         "started_at": document.get("started_at"),
         "finished_at": document.get("finished_at"),
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),
+        "research_snapshot_cutoff": document.get("market_data_cutoff_date"),
         "candidate_count": int(document.get("candidate_count") or 0),
         "total_candidates": int(document.get("total_candidates") or len(document.get("candidates") or [])),
         "completed_candidates": int(document.get("completed_candidates") or 0),
@@ -1974,10 +2077,13 @@ def _start_temporal_tuning(
     source_tuning_run_id: str | None,
     anchor_candidate_id: int | None,
     probability_config: dict[str, Any] | None,
+    fold_protocol: dict[str, Any] | None,
+    explicit_start_confirmation: bool,
     actor_email: str | None,
     tuning_target_source: str,
 ) -> dict[str, Any]:
     temporal_model_scope = str(tuning_scope) == TEMPORAL_MODEL_TUNING_SCOPE
+    protocol = _normalized_fold_protocol(fold_protocol)
     plan = temporal_model_plan(strategy, model_snapshot) if temporal_model_scope else temporal_policy_plan(strategy)
     search_space = [dict(item) for item in plan["search_space"]]
     base_values = deepcopy(plan["base_values"])
@@ -1986,6 +2092,13 @@ def _start_temporal_tuning(
     if baseline_job_id and str(baseline_job_id) != source_run_id:
         raise ModelTuningConflict("The selected TEMPORAL baseline does not match the Strategy source Temporal run.")
     control = _temporal_control_candidate(strategy, baseline, base_values)
+    baseline_fold_count = len((baseline.get("metrics") or {}).get("folds") or [])
+    research_cache_required = bool(protocol["research_folds"] != baseline_fold_count and baseline_fold_count > 0)
+    if research_cache_required:
+        control["status"] = "pending"
+        control["metrics"] = None
+        control["baseline_reused"] = False
+        control["research_fold_rebuild"] = True
     probability_input = dict(probability_config or {})
     probability: dict[str, Any]
     probability_anchor: dict[str, Any] | None = None
@@ -2002,7 +2115,7 @@ def _start_temporal_tuning(
             "candidate_id": 0,
             "settings_hash": control["settings_hash"],
             "settings": deepcopy(base_values),
-            "metrics": deepcopy(baseline.get("metrics") or {}),
+            "metrics": deepcopy(control.get("metrics") or baseline.get("metrics") or {}),
         }
         if source_tuning_run_id:
             source = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": str(source_tuning_run_id)})
@@ -2012,6 +2125,7 @@ def _start_temporal_tuning(
             _validate_temporal_continuation_source(
                 source, strategy=strategy, tuning_scope=tuning_scope, search_space=search_space,
                 source_temporal_run_id=source_run_id, market_data_snapshot_id=source_snapshot_id,
+                research_folds=protocol["research_folds"],
             )
             prior_observations = _continuation_observations(source)
             anchor = _source_anchor(source, anchor_candidate_id)
@@ -2107,6 +2221,10 @@ def _start_temporal_tuning(
         "failed_candidates": 0,
         "cancelled_candidates": 0,
         "seed": int(seed),
+        "fold_protocol": bson_value(protocol),
+        "source_research_fold_count": int(baseline_fold_count or protocol["research_folds"]),
+        "research_fold_cache_required": bool(research_cache_required),
+        "research_fold_cache_run_id": None,
         "search_space": search_space,
         "tuned_parameters": list(plan["tuned_parameters"]),
         "tuned_model_parameters": list(plan.get("tuned_model_parameters") or []),
@@ -2150,6 +2268,7 @@ def _start_temporal_tuning(
         "started_at": None,
         "finished_at": None,
         "created_by": (actor_email or "").strip().lower() or None,
+        "explicit_start_confirmation": bool(explicit_start_confirmation),
         "stop_requested": False,
         "current_candidate_id": None,
         "current_job_id": None,
@@ -2209,6 +2328,8 @@ def start_model_tuning(
     anchor_candidate_id: int | None = None,
     tuning_target: str | None = None,
     probability_config: dict[str, Any] | None = None,
+    fold_protocol: dict[str, Any] | None = None,
+    explicit_start_confirmation: bool = False,
     actor_email: str | None = None,
 ) -> dict[str, Any]:
     normalized_method = str(method or TUNING_METHOD).strip().lower()
@@ -2235,6 +2356,8 @@ def start_model_tuning(
         requested_temporal_target = str(tuning_target or TEMPORAL_MODEL_TUNING_SCOPE).strip().lower()
         if requested_temporal_target not in {TEMPORAL_MODEL_TUNING_SCOPE, TEMPORAL_POLICY_TUNING_SCOPE}:
             raise ModelTuningConflict("TEMPORAL Strategies support only Temporal Model Tuning or Temporal Policy Tuning.")
+        if requested_temporal_target == TEMPORAL_MODEL_TUNING_SCOPE and not bool(explicit_start_confirmation):
+            raise ModelTuningConflict("Temporal Model Tuning requires explicit start confirmation.")
         return _start_temporal_tuning(
             db,
             strategy=strategy,
@@ -2248,14 +2371,13 @@ def start_model_tuning(
             source_tuning_run_id=source_tuning_run_id,
             anchor_candidate_id=anchor_candidate_id,
             probability_config=probability_config,
+            fold_protocol=fold_protocol,
+            explicit_start_confirmation=explicit_start_confirmation,
             actor_email=actor_email,
             tuning_target_source=tuning_target_source,
         )
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
         raise ModelTuningConflict("The current tuning target must use LightGBM before model tuning can start.")
-    if bool(strategy.get("locked")) and not _tuning_target_allows_locked_strategy(strategy):
-        raise ModelTuningConflict("The current protected Strategy is not a Candidate tuning target.")
-
     tuning_plan = _tuning_plan(strategy, model_snapshot)
     tuning_scope = str(tuning_plan["scope"])
     tuning_scope_label = str(tuning_plan["scope_label"])
@@ -2767,21 +2889,79 @@ def _run_temporal_tuning(db: Any, run_id: str) -> None:
         _append_campaign_event(db, run_id, message=(f"Temporal candidate #{candidate_id} started full LightGBM retraining." if temporal_model_scope else f"Temporal candidate #{candidate_id} started frozen replay."), stage="running_candidate", candidate_id=candidate_id)
         try:
             strategy = get_strategy(db, str(document.get("strategy_profile_id") or ""))
+            protocol = _normalized_fold_protocol(document.get("fold_protocol") if isinstance(document.get("fold_protocol"), dict) else None)
+            research_fold_count = int(protocol["research_folds"])
             if temporal_model_scope:
                 model_snapshot = get_strategy_model_snapshot(db, str(strategy.get("id") or ""))
+
+                def temporal_cancel_requested() -> bool:
+                    state = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}, {"stop_requested": 1}) or {}
+                    return bool(state.get("stop_requested"))
+
                 def temporal_progress(percent: float, stage: str) -> None:
+                    if temporal_cancel_requested():
+                        raise TemporalModelTuningCancelled("Temporal Model Tuning cancelled by user.")
                     db[MODEL_TUNING_RUNS_COLLECTION].update_one(
                         {"id": run_id},
                         {"$set": {"current_candidate_progress": max(0.0, min(100.0, float(percent))), "current_candidate_stage": str(stage), "updated_at": utc_now()}},
                     )
                 evaluation = evaluate_temporal_model_candidate(
-                    db, strategy, model_snapshot, dict(pending.get("settings") or {}), progress_callback=temporal_progress
+                    db, strategy, model_snapshot, dict(pending.get("settings") or {}),
+                    progress_callback=temporal_progress,
+                    cancel_check=temporal_cancel_requested,
+                    fold_count=research_fold_count,
                 )
             else:
-                evaluation = evaluate_temporal_policy_candidate(db, strategy, dict(pending.get("settings") or {}))
+                research_cache_run_id = str(document.get("research_fold_cache_run_id") or "").strip() or None
+                if bool(document.get("research_fold_cache_required")) and research_cache_run_id is None:
+                    model_snapshot = get_strategy_model_snapshot(db, str(strategy.get("id") or ""))
+                    _append_campaign_event(
+                        db, run_id,
+                        message=f"Building fold-specific Temporal research cache with {research_fold_count} folds before Policy CARO replay.",
+                        stage="research_fold_cache_build", candidate_id=candidate_id,
+                    )
+                    cache_evaluation = evaluate_temporal_model_candidate(
+                        db, strategy, model_snapshot, {}, fold_count=research_fold_count
+                    )
+                    research_cache_run_id = persist_temporal_model_champion_cache(
+                        db, tuning_run_id=run_id, candidate_id=0, strategy=strategy, evaluation=cache_evaluation
+                    )
+                    db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                        {"id": run_id},
+                        {"$set": {"research_fold_cache_run_id": research_cache_run_id, "updated_at": utc_now()}},
+                    )
+                    document["research_fold_cache_run_id"] = research_cache_run_id
+                    _append_campaign_event(
+                        db, run_id,
+                        message=f"Fold-specific Temporal research cache ready: {research_fold_count} folds.",
+                        stage="research_fold_cache_ready", candidate_id=candidate_id,
+                    )
+                evaluation = evaluate_temporal_policy_candidate(
+                    db, strategy, dict(pending.get("settings") or {}),
+                    source_run_id_override=research_cache_run_id,
+                )
             summary = dict(evaluation.get("metrics") or {})
             equity_preview = list(evaluation.get("equity_preview") or [])
             is_control = bool(pending.get("is_control"))
+            if is_control and method in _ADAPTIVE_METHODS:
+                fresh_anchor = {
+                    "source": "research_fold_control",
+                    "source_temporal_run_id": str(document.get("research_fold_cache_run_id") or document.get("source_temporal_run_id") or ""),
+                    "candidate_id": candidate_id,
+                    "settings_hash": str(pending.get("settings_hash") or ""),
+                    "settings": deepcopy(pending.get("settings") or {}),
+                    "metrics": deepcopy(summary),
+                }
+                db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                    {"id": run_id},
+                    {"$set": {
+                        "probability_anchor": bson_value(fresh_anchor),
+                        "starting_probability_anchor": bson_value(fresh_anchor),
+                        "updated_at": utc_now(),
+                    }},
+                )
+                document["probability_anchor"] = fresh_anchor
+                document["starting_probability_anchor"] = fresh_anchor
             champion_gate = (
                 champion_gate_evaluation(document, summary)
                 if method in _ADAPTIVE_METHODS and not is_control
@@ -2862,6 +3042,32 @@ def _run_temporal_tuning(db: Any, run_id: str) -> None:
                     )
                     _append_campaign_event(db, run_id, message=f"Temporal model candidate #{candidate_id} became the cached model Champion.", stage="temporal_model_champion_cached", candidate_id=candidate_id)
             _append_campaign_event(db, run_id, message=f"Temporal candidate #{candidate_id} completed successfully.", stage="candidate_completed", candidate_id=candidate_id)
+        except TemporalModelTuningCancelled:
+            now = utc_now()
+            db[MODEL_TUNING_RUNS_COLLECTION].update_one(
+                {"id": run_id, "candidates.candidate_id": candidate_id},
+                {"$set": {
+                    "candidates.$.status": "cancelled",
+                    "candidates.$.finished_at": now,
+                    "candidates.$.error": None,
+                    "candidates.$.failure_type": None,
+                    "candidates.$.failure_message": None,
+                    "status": "stopped",
+                    "phase": "stopped",
+                    "finished_at": now,
+                    "updated_at": now,
+                    "current_candidate_id": None,
+                    "current_job_id": None,
+                    "current_candidate_stage": "Cancelled",
+                }, "$inc": {"cancelled_candidates": 1}},
+            )
+            _refresh_campaign_ranking(db, run_id)
+            _append_campaign_event(
+                db, run_id,
+                message=f"Temporal model candidate #{candidate_id} cancelled and campaign stopped by user request.",
+                stage="candidate_cancelled", candidate_id=candidate_id,
+            )
+            return
         except Exception as exc:
             now = utc_now()
             failure_message = _sanitize_tuning_log_line(str(exc))[:500]
@@ -3403,6 +3609,7 @@ def recover_integrated_model_tuning_runs(db: Any) -> int:
                 "$or": [
                     {"execution_mode": "integrated_api_worker"},
                     {"execution_mode": "frozen_temporal_replay"},
+                    {"execution_mode": "full_temporal_lightgbm_retrain"},
                     {"execution_mode": {"$exists": False}},
                 ],
             }
@@ -3507,12 +3714,14 @@ def request_model_tuning_stop(db: Any, run_id: str) -> dict[str, Any]:
         )
         _append_campaign_event(db, run_id, message="Campaign stopped before another candidate started.", stage="stopped")
     else:
+        temporal_model_run = str(document.get("tuning_scope") or "") == TEMPORAL_MODEL_TUNING_SCOPE
+        cancel_phase = "cancelling_temporal_model_candidate" if temporal_model_run and not current_job_id else "cancelling_active_candidate"
         updated = db[MODEL_TUNING_RUNS_COLLECTION].find_one_and_update(
             {"id": run_id},
             {"$set": {
                 "stop_requested": True,
                 "status": "stop_requested",
-                "phase": "cancelling_active_candidate",
+                "phase": cancel_phase,
                 "updated_at": now,
             }},
             return_document=ReturnDocument.AFTER,
@@ -3524,9 +3733,11 @@ def request_model_tuning_stop(db: Any, run_id: str) -> dict[str, Any]:
             message=(
                 f"Stop requested. Cancelling active candidate job {current_job_id}."
                 if current_job_id else
+                "Stop requested. Cancelling the active Temporal LightGBM candidate at the next model checkpoint."
+                if temporal_model_run else
                 "Stop requested. The active candidate will be cancelled before execution continues."
             ),
-            stage="cancelling_active_candidate",
+            stage=cancel_phase,
             candidate_id=document.get("current_candidate_id"),
             job_id=current_job_id or None,
         )
@@ -3878,7 +4089,11 @@ def adopt_model_tuning_candidate(
         "auto_candidate_after_backtest": True,
     }
 
-def _public_candidate(candidate: dict[str, Any], current_jobs: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def _public_candidate(
+    candidate: dict[str, Any],
+    current_jobs: dict[str, dict[str, Any]] | None = None,
+    validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = {
         "candidate_id": int(candidate.get("candidate_id") or 0),
         "kind": str(candidate.get("kind") or "latin_hypercube"),
@@ -3906,6 +4121,21 @@ def _public_candidate(candidate: dict[str, Any], current_jobs: dict[str, dict[st
         "failure_type": candidate.get("failure_type"),
         "failure_message": candidate.get("failure_message"),
         "has_diagnostic_log": bool(candidate.get("diagnostic_log") or candidate.get("job_id")),
+        "validation": ({
+            "processing_id": validation.get("id"),
+            "fold_count": validation.get("validation_fold_count"),
+            "passed": validation.get("validation_passed"),
+            "gate": deepcopy(validation.get("validation_gate") or None),
+            "completed_at": validation.get("validation_completed_at"),
+            "strategy_profile_id": validation.get("strategy_profile_id"),
+        } if validation else None),
+        "certification": ({
+            "processing_id": validation.get("certification_processing_id"),
+            "fold_count": validation.get("certification_fold_count"),
+            "passed": validation.get("certification_passed"),
+            "gate": deepcopy(validation.get("certification_gate") or None),
+            "completed_at": validation.get("certification_completed_at"),
+        } if validation and validation.get("certification_completed_at") else None),
     }
     job_id = str(candidate.get("job_id") or "")
     current_job = (current_jobs or {}).get(job_id) if job_id else None
@@ -3931,7 +4161,22 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
             {"_id": 0, "id": 1, "status": 1, "stage": 1, "progress": 1},
         ):
             current_jobs[str(job.get("id") or "")] = job
-    candidates = [_public_candidate(item, current_jobs) for item in raw_candidates]
+    validation_map: dict[int, dict[str, Any]] = {}
+    run_id = str(document.get("id") or "")
+    if run_id:
+        for row in db[MODEL_TUNING_VALIDATIONS_COLLECTION].find(
+            {"tuning_run_id": run_id},
+            {"_id": 0, "candidate_id": 1, "id": 1, "validation_fold_count": 1, "validation_passed": 1,
+             "validation_gate": 1, "validation_completed_at": 1, "strategy_profile_id": 1,
+             "certification_processing_id": 1, "certification_fold_count": 1, "certification_passed": 1,
+             "certification_gate": 1, "certification_completed_at": 1},
+        ):
+            if row.get("candidate_id") is not None:
+                validation_map[int(row["candidate_id"])] = row
+    candidates = [
+        _public_candidate(item, current_jobs, validation_map.get(int(item.get("candidate_id") or 0)))
+        for item in raw_candidates
+    ]
     total = max(1, int(document.get("total_candidates") or len(candidates) or 1))
     reused_control_count = sum(
         1 for item in raw_candidates if bool(item.get("is_control")) and bool(item.get("baseline_reused"))
@@ -3977,6 +4222,11 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "cancelled_candidates": int(document.get("cancelled_candidates") or 0),
         "progress": progress,
         "seed": int(document.get("seed") or DEFAULT_SEED),
+        "fold_protocol": deepcopy(document.get("fold_protocol") or {
+            "research_folds": DEFAULT_RESEARCH_FOLDS,
+            "validation_folds": DEFAULT_VALIDATION_FOLDS,
+            "certification_folds": DEFAULT_CERTIFICATION_FOLDS,
+        }),
         "search_space": deepcopy(document.get("search_space") or []),
         "tuned_parameters": deepcopy(document.get("tuned_parameters") or []),
         "tuned_model_parameters": deepcopy(document.get("tuned_model_parameters") or []),
@@ -3990,6 +4240,7 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "source_temporal_run_id": document.get("source_temporal_run_id"),
         "imported_observation_count": int(document.get("imported_observation_count") or 0),
         "market_data_cutoff_date": document.get("market_data_cutoff_date"),
+        "research_snapshot_cutoff": document.get("market_data_cutoff_date"),
         "expected_market_data_signature_sha256": document.get("expected_market_data_signature_sha256"),
         "market_data_snapshot_id": document.get("market_data_snapshot_id"),
         "execution_context_hash": document.get("execution_context_hash"),
@@ -4000,6 +4251,8 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "strategy_profile_status": document.get("strategy_profile_status"),
         "tuning_target_source": document.get("tuning_target_source"),
         "created_at": document.get("created_at"),
+        "created_by": document.get("created_by"),
+        "explicit_start_confirmation": bool(document.get("explicit_start_confirmation")),
         "started_at": document.get("started_at"),
         "finished_at": document.get("finished_at"),
         "failure_type": document.get("failure_type"),
@@ -4018,6 +4271,11 @@ def public_model_tuning_run(db: Any, document: dict[str, Any] | None) -> dict[st
         "best_exploratory_candidate_id": int(public_best_exploratory["candidate_id"]) if public_best_exploratory is not None else None,
         "best_champion_beating_candidate_id": int(public_best_champion["candidate_id"]) if public_best_champion is not None else None,
         "control_candidate_id": int(document["control_candidate_id"]) if document.get("control_candidate_id") is not None else None,
+        "validated_candidate_id": document.get("validated_candidate_id"),
+        "validation_processing_id": document.get("validation_processing_id"),
+        "validation_strategy_id": document.get("validation_strategy_id"),
+        "certified_candidate_id": document.get("certified_candidate_id"),
+        "certification_processing_id": document.get("certification_processing_id"),
         "adopted_candidate_id": document.get("adopted_candidate_id"),
         "adopted_strategy_id": document.get("adopted_strategy_id"),
         "adoption_history": deepcopy(document.get("adoption_history") or []),

@@ -85,7 +85,7 @@ def test_tuning_header_is_compact_and_moves_long_explanations_to_hints() -> None
     assert 'model-tuning-hint-execution' in panel
     assert 'model-tuning-hint-baseline' in panel
     assert 'model-tuning-hint-method' in panel
-    assert 'Certified Candidate baseline' in panel
+    assert 'Selected Strategy baseline' in panel
     assert 'model-tuning-baseline-metrics-compact' in panel
     assert 'model-tuning-method-selector-compact' in panel
     assert '.model-tuning-context-grid > .model-tuning-context-card > strong' in styles

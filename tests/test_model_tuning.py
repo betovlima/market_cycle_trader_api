@@ -420,15 +420,19 @@ def test_tuning_routes_and_integrated_execution_contract() -> None:
     assert '"tuning_summary_only": {"$ne": True}' in strategy_lab
 
 
-def test_frontend_uses_candidate_directly_and_reuses_prior_campaign_only_for_continue_research() -> None:
+def test_frontend_uses_strategy_catalog_as_research_baseline_and_keeps_advanced_controls_optional() -> None:
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
-    assert "control?.candidate_strategy_id || control?.promoted_candidate_strategy_id || control?.research_strategy_id" in panel
-    assert "/admin/model-tuning/sources?limit=20" not in panel
+    assert "control?.model_tuning_strategy_id || control?.candidate_strategy_id" in panel
+    assert "apiFetch(`${API}/admin/strategies`)" in panel
+    assert "select-for-model-tuning" in panel
+    assert "strategyStatusFilter" in panel
+    assert "All statuses" in panel
+    assert "Choose any Strategy from the catalog. Lifecycle status is guidance, not a research gate." in panel
+    assert "1. BASELINE" in panel and "2. RESEARCH" in panel and "3. TUNING" in panel and "4. RESULTS" in panel
     assert "source_tuning_run_id: run.id" in panel
     assert "anchor_candidate_id" not in panel
     assert "Clone the protected Strategy before starting model tuning." not in panel
-    assert "Certified Candidate baseline" in panel
-    assert "No clone, baseline selection or prior tuning campaign is required." in panel
+    assert "Selected Strategy baseline" in panel
     assert "Continue Research" in panel
     assert "Advanced CARO settings" in panel
     assert "useState(PROBABILITY_METHOD)" in panel
@@ -442,36 +446,39 @@ def test_frontend_uses_candidate_directly_and_reuses_prior_campaign_only_for_con
         assert protected_key not in panel
 
 
-def test_tuning_target_prefers_active_candidate_and_allows_promoted_candidate_lock(monkeypatch) -> None:
+def test_tuning_target_prefers_explicit_catalog_selection_and_status_does_not_gate_research(monkeypatch) -> None:
     monkeypatch.setattr(
         "market_cycle_trader_api.services.model_tuning.get_strategy_control",
         lambda _db: {
+            "model_tuning_strategy_id": "winner-1",
             "candidate_strategy_id": "candidate-1",
-            "promoted_candidate_strategy_id": "promoted-1",
             "research_strategy_id": "research-1",
         },
     )
     monkeypatch.setattr(
         "market_cycle_trader_api.services.model_tuning.get_strategy",
-        lambda _db, strategy_id: {"id": strategy_id, "status": "candidate", "locked": False},
+        lambda _db, strategy_id: {"id": strategy_id, "status": "winner", "locked": True},
     )
     monkeypatch.setattr(
         "market_cycle_trader_api.services.model_tuning.get_strategy_model_snapshot",
         lambda _db, strategy_id: {"family": "lightgbm_utility", "profile_id": strategy_id},
     )
     strategy, snapshot, source = _tuning_target_strategy(object())
-    assert strategy["id"] == "candidate-1"
-    assert snapshot["profile_id"] == "candidate-1"
-    assert source == "candidate"
+    assert strategy["id"] == "winner-1"
+    assert snapshot["profile_id"] == "winner-1"
+    assert source == "model_tuning_selection"
     assert _tuning_target_allows_locked_strategy({"status": "promoted_candidate", "locked": True}) is True
-    assert _tuning_target_allows_locked_strategy({"status": "winner", "locked": True}) is False
+    assert _tuning_target_allows_locked_strategy({"status": "winner", "locked": True}) is True
+    assert _tuning_target_allows_locked_strategy({"status": "superseded", "locked": True}) is True
 
 
-def test_caro_baseline_remains_pinned_to_active_candidate_certified_backtest() -> None:
+def test_caro_baseline_is_resolved_from_selected_strategy_by_technical_compatibility() -> None:
     service = (SRC / "services" / "model_tuning.py").read_text(encoding="utf-8")
-    assert '("candidate", control.get("candidate_strategy_id"))' in service
-    assert 'preferred_job_id = str(strategy.get("candidate_backtest_id") or strategy.get("last_backtest_id") or "")' in service
-    assert 'query["id"] = preferred_job_id' in service
+    assert 'selected_strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()' in service
+    assert '"strategy_profile_id": str(strategy["id"])' in service
+    assert '"strategy_configuration_hash": strategy.get("configuration_hash")' in service
+    assert '"research_model_settings_hash": model_snapshot.get("settings_hash")' in service
+    assert 'The current protected Strategy is not a Candidate tuning target.' not in service
 
 
 def test_tuning_adoption_always_preserves_source_by_creating_working_strategy() -> None:
@@ -633,7 +640,8 @@ def test_v206_model_tuning_stop_cancels_active_candidate_and_front_is_explicit()
     panel = (FRONT / "src" / "features" / "ModelTuningPanel.jsx").read_text(encoding="utf-8")
 
     assert "request_job_cancel(current_job_id" in service
-    assert '"phase": "cancelling_active_candidate"' in service
+    assert '"cancelling_active_candidate"' in service
+    assert '"cancelling_temporal_model_candidate"' in service
     assert '"candidates.$.status": "cancelled"' in service
     assert '"cancelled_candidates": int(document.get("cancelled_candidates") or 0)' in service
     assert "_ACTIVE_JOB_PROCESSES" in jobs

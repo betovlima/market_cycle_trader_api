@@ -36,6 +36,7 @@ def effective_execution_end_date(config: Any) -> str | None:
 
 
 EASTERN = ZoneInfo("America/New_York")
+SAFE_DAILY_BAR_DELAY_MINUTES = 20
 
 
 def normalize_end_date(value: str | None) -> str | None:
@@ -70,6 +71,30 @@ def latest_completed_xnys_session(now: datetime | pd.Timestamp | None = None) ->
     if calendar.is_session(local_day):
         close_at = calendar.session_close(local_day)
         if stamp >= close_at:
+            return local_day
+        return pd.Timestamp(calendar.previous_session(local_day))
+    return pd.Timestamp(calendar.date_to_session(local_day, direction="previous"))
+
+
+def latest_safe_completed_xnys_session(
+    now: datetime | pd.Timestamp | None = None,
+    *,
+    data_delay_minutes: int = SAFE_DAILY_BAR_DELAY_MINUTES,
+) -> pd.Timestamp:
+    """Return the latest XNYS session whose daily bar is safe to consume.
+
+    A session becomes operationally complete only after the regular close plus a
+    small data-availability buffer.  This prevents the Trader or a new research
+    campaign from treating an in-flight/just-closed daily candle as final.
+    """
+    stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    local_day = pd.Timestamp(stamp.tz_convert(EASTERN).date())
+    calendar = xcals.get_calendar("XNYS")
+    delay = pd.Timedelta(minutes=max(0, int(data_delay_minutes)))
+    if calendar.is_session(local_day):
+        close_at = calendar.session_close(local_day)
+        if stamp >= close_at + delay:
             return local_day
         return pd.Timestamp(calendar.previous_session(local_day))
     return pd.Timestamp(calendar.date_to_session(local_day, direction="previous"))
@@ -185,6 +210,119 @@ def resolve_backtest_analysis_end_date(
         client.close()
 
     return target.date().isoformat()
+
+
+def resolve_live_market_cutoff(
+    config: Any,
+    *,
+    now: datetime | pd.Timestamp | None = None,
+) -> str:
+    """Resolve the latest common cached session for the operational Winner.
+
+    Unlike the certified backtest cutoff, this deliberately ignores config.end_date.
+    The live Winner advances with completed XNYS sessions while its model/parameters
+    remain immutable.
+    """
+    calendar = xcals.get_calendar("XNYS")
+    target = latest_safe_completed_xnys_session(now)
+    client = create_client()
+    try:
+        collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
+        target = _latest_common_cached_session(collection, config, target, calendar)
+    finally:
+        client.close()
+    return target.date().isoformat()
+
+
+def refresh_market_data_to_live_cutoff(
+    config: Any,
+    *,
+    now: datetime | pd.Timestamp | None = None,
+) -> dict[str, Any]:
+    """Refresh the Winner universe through the latest SIP-safe XNYS session.
+
+    This function is intentionally called only at operational/research boundaries.
+    Model tuning continues to use a frozen MongoDB snapshot and never reaches Alpaca.
+    """
+    calendar = xcals.get_calendar("XNYS")
+    target = latest_safe_completed_xnys_session(now)
+    target_date = target.date().isoformat()
+    assets = [str(item).strip().upper() for item in list(getattr(config, "assets", []) or []) if str(item).strip()]
+    if not assets:
+        raise RuntimeError("The live Winner has no assets to refresh.")
+
+    client = create_client()
+    rows_by_symbol: dict[str, int] = {}
+    try:
+        db = get_database(client)
+        collection = db[ALPACA_MARKET_BARS_COLLECTION]
+        from pymongo import ASCENDING
+
+        collection.create_index(
+            [
+                ("symbol", ASCENDING),
+                ("interval", ASCENDING),
+                ("feed", ASCENDING),
+                ("adjustment", ASCENDING),
+                ("timestamp", ASCENDING),
+            ],
+            unique=True,
+            name="uq_alpaca_market_bar",
+        )
+
+        for symbol in assets:
+            identity = _market_data_identity(symbol, config)
+            latest = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", -1)])
+            latest_session = None
+            if latest and latest.get("timestamp") is not None:
+                latest_stamp = _utc_timestamp(latest["timestamp"])
+                latest_session = pd.Timestamp(
+                    calendar.date_to_session(pd.Timestamp(latest_stamp.date()), direction="previous")
+                )
+            if latest_session is not None and latest_session >= target and _cache_has_session(collection, identity, target):
+                rows_by_symbol[symbol] = 0
+                continue
+
+            if latest_session is None:
+                refresh_start = str(getattr(config, "start_date", None) or target_date)
+            else:
+                # Re-fetch a small tail so the latest daily bar can be safely replaced
+                # if the provider revised it after the first observation.
+                refresh_start = max(
+                    pd.Timestamp(str(getattr(config, "start_date", None) or latest_session.date().isoformat())),
+                    latest_session - pd.Timedelta(days=7),
+                ).date().isoformat()
+            downloaded = _download_alpaca_bars(symbol, config, refresh_start, target_date)
+            if downloaded is not None and not downloaded.empty:
+                _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
+                rows_by_symbol[symbol] = int(len(downloaded))
+            else:
+                rows_by_symbol[symbol] = 0
+
+        missing = [
+            symbol
+            for symbol in assets
+            if not _cache_has_session(collection, _market_data_identity(symbol, config), target)
+        ]
+        if missing:
+            raise RuntimeError(
+                "LiveMarketDataIncomplete: latest completed XNYS session "
+                f"{target_date} is missing for: {', '.join(missing)}."
+            )
+        common = _latest_common_cached_session(collection, config, target, calendar)
+        if common != target:
+            raise RuntimeError(
+                f"LiveMarketDataIncomplete: common market cutoff is {common.date().isoformat()}, expected {target_date}."
+            )
+    finally:
+        client.close()
+
+    return {
+        "live_market_cutoff": target_date,
+        "target_session": target_date,
+        "rows_refreshed": rows_by_symbol,
+        "data_delay_minutes": SAFE_DAILY_BAR_DELAY_MINUTES,
+    }
 
 
 def _utc_timestamp(value: Any) -> pd.Timestamp:

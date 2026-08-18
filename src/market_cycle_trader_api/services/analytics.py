@@ -964,32 +964,61 @@ def completed_processings(db: Any, limit: int = 100) -> dict[str, Any]:
     validation_rows = list(
         db[MODEL_TUNING_VALIDATIONS_COLLECTION].find(
             {"status": "completed"},
-            {"_id": 0, "id": 1, "created_at": 1, "finished_at": 1, "status": 1, "candidate_id": 1, "strategy_profile_name": 1, "tuning_scope": 1},
+            {"_id": 0, "id": 1, "created_at": 1, "finished_at": 1, "status": 1, "candidate_id": 1, "strategy_profile_name": 1, "tuning_scope": 1,
+             "validation_fold_count": 1, "validation_passed": 1, "certification_processing_id": 1,
+             "certification_fold_count": 1, "certification_passed": 1, "certification_completed_at": 1},
         )
     )
     for row in validation_rows:
         candidate_id = row.get("candidate_id")
+        validation_folds = row.get("validation_fold_count")
         items.append({
             "id": str(row.get("id") or ""),
             "status": "completed",
             "created_at": iso_value(row.get("created_at")),
             "finished_at": iso_value(row.get("finished_at")),
-            "processing_kind": "caro_champion",
-            "processing_label": f"CARO Champion #{candidate_id} · TEMPORAL",
+            "processing_kind": "caro_validation",
+            "processing_label": f"CARO Finalist #{candidate_id} · Validation" + (f" · {validation_folds} folds" if validation_folds else ""),
             "strategy_profile_name": row.get("strategy_profile_name"),
             "candidate_id": candidate_id,
             "tuning_scope": row.get("tuning_scope"),
+            "fold_count": validation_folds,
+            "passed": row.get("validation_passed"),
         })
+        certification_id = str(row.get("certification_processing_id") or "").strip()
+        if certification_id:
+            certification_folds = row.get("certification_fold_count")
+            items.append({
+                "id": certification_id,
+                "status": "completed",
+                "created_at": iso_value(row.get("certification_completed_at") or row.get("finished_at")),
+                "finished_at": iso_value(row.get("certification_completed_at") or row.get("finished_at")),
+                "processing_kind": "caro_certification",
+                "processing_label": f"CARO Candidate #{candidate_id} · Certification" + (f" · {certification_folds} folds" if certification_folds else ""),
+                "strategy_profile_name": row.get("strategy_profile_name"),
+                "candidate_id": candidate_id,
+                "tuning_scope": row.get("tuning_scope"),
+                "fold_count": certification_folds,
+                "passed": row.get("certification_passed"),
+            })
     items.sort(key=lambda row: _parse_utc(row.get("finished_at") or row.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return {"items": items[:safe_limit]}
 
 
 def processing_analytics(db: Any, processing_id: str) -> dict[str, Any]:
+    certification = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one(
+        {"certification_processing_id": str(processing_id)}, {"_id": 0, "certification_analytics": 1}
+    )
+    if certification is not None:
+        analytics = certification.get("certification_analytics") if isinstance(certification.get("certification_analytics"), dict) else None
+        if analytics is None:
+            raise HTTPException(status_code=409, detail="CARO certification analytics are unavailable.")
+        return bson_value(dict(analytics))
     validation = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one({"id": str(processing_id)}, {"_id": 0})
     if validation is not None:
         analytics = validation.get("analytics") if isinstance(validation.get("analytics"), dict) else None
         if analytics is None:
-            raise HTTPException(status_code=409, detail="Validated Champion analytics are unavailable.")
+            raise HTTPException(status_code=409, detail="CARO validation analytics are unavailable.")
         return bson_value(dict(analytics))
     payload = backtest_analytics(db, processing_id)
     payload["processing_id"] = processing_id
@@ -1006,10 +1035,16 @@ def processing_rotation_period_analysis(
     year: int,
     month: int,
 ) -> dict[str, Any]:
-    validation = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one({"id": str(processing_id)}, {"_id": 0, "analytics": 1})
+    validation = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one(
+        {"$or": [{"id": str(processing_id)}, {"certification_processing_id": str(processing_id)}]},
+        {"_id": 0, "id": 1, "analytics": 1, "certification_processing_id": 1, "certification_analytics": 1},
+    )
     if validation is None:
         return rotation_period_analysis(db, processing_id, year=year, month=month)
-    analytics = validation.get("analytics") if isinstance(validation.get("analytics"), dict) else {}
+    if str(validation.get("certification_processing_id") or "") == str(processing_id):
+        analytics = validation.get("certification_analytics") if isinstance(validation.get("certification_analytics"), dict) else {}
+    else:
+        analytics = validation.get("analytics") if isinstance(validation.get("analytics"), dict) else {}
     return _rotation_period_from_data(
         db,
         processing_id,
