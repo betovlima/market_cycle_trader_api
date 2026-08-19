@@ -1,8 +1,0 @@
-Market Cycle Trader API v4.1.0
-
-Major 4 structural market-time separation.
-- Adds latest_safe_completed_xnys_session with a 20-minute daily-bar availability buffer.
-- Adds refresh_market_data_to_live_cutoff for operational/research-boundary Alpaca refresh.
-- Trader scheduler advances live_market_cutoff before the session (D-1) and after close+buffer (D).
-- Temporal Intelligence refreshes once, then freezes research_snapshot_cutoff; tuning stays MongoDB-only.
-- Winner certification metadata is kept separately as certified_backtest_cutoff.

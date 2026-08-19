@@ -1,5 +1,0 @@
-Market Cycle Trader API v4.1.1
-
-- Adds an explicit Model Tuning start-request contract version to the tuning catalog.
-- Keeps strict Pydantic request validation (extra=forbid).
-- Prevents silent API/Front drift from being mistaken for a CARO engine failure.
