@@ -1,0 +1,2 @@
+class TemporalModelTuningCancelled(RuntimeError):
+    pass

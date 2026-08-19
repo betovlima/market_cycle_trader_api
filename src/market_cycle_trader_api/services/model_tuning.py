@@ -69,6 +69,7 @@ from .temporal_model_tuning import (
     TemporalModelTuningCancelled,
     evaluate_temporal_model_candidate,
     persist_temporal_model_champion_cache,
+    prepare_temporal_model_campaign_context,
     temporal_model_baseline,
     temporal_model_plan,
 )
@@ -2761,6 +2762,7 @@ def _run_temporal_tuning(db: Any, run_id: str) -> None:
         message="Temporal LightGBM model tuning worker started." if temporal_model_scope else "Frozen Temporal Policy tuning worker started.",
         stage="running",
     )
+    temporal_model_campaign_context: dict[str, Any] | None = None
 
     while True:
         document = db[MODEL_TUNING_RUNS_COLLECTION].find_one({"id": run_id}) or {}
@@ -2905,11 +2907,28 @@ def _run_temporal_tuning(db: Any, run_id: str) -> None:
                         {"id": run_id},
                         {"$set": {"current_candidate_progress": max(0.0, min(100.0, float(percent))), "current_candidate_stage": str(stage), "updated_at": utc_now()}},
                     )
+                if temporal_model_campaign_context is None:
+                    temporal_progress(1.0, "Preparing reusable Temporal campaign context")
+                    temporal_model_campaign_context = prepare_temporal_model_campaign_context(
+                        db, strategy, model_snapshot,
+                        fold_count=research_fold_count,
+                        progress_callback=temporal_progress,
+                        cancel_check=temporal_cancel_requested,
+                    )
+                    _append_campaign_event(
+                        db, run_id,
+                        message="Reusable Temporal LightGBM campaign context prepared.",
+                        stage="temporal_model_context_ready",
+                        candidate_id=candidate_id,
+                    )
+                else:
+                    temporal_progress(18.0, "Reusing Temporal campaign context")
                 evaluation = evaluate_temporal_model_candidate(
                     db, strategy, model_snapshot, dict(pending.get("settings") or {}),
                     progress_callback=temporal_progress,
                     cancel_check=temporal_cancel_requested,
                     fold_count=research_fold_count,
+                    prepared_context=temporal_model_campaign_context,
                 )
             else:
                 research_cache_run_id = str(document.get("research_fold_cache_run_id") or "").strip() or None

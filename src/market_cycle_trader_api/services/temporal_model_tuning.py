@@ -8,7 +8,6 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ..engine.market_data import load_market_bars, validate_and_clean_bars
 from ..engine.temporal_intelligence import run_temporal_intelligence
 from ..infrastructure.persistence.mongo_repository import (
     TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
@@ -17,16 +16,13 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     utc_now,
 )
-from ..schemas.requests import BacktestExecutionRequest
-from .model_research import execution_settings_from_values, model_execution_snapshot, model_values_from_snapshot
+from .model_research import model_execution_snapshot, model_values_from_snapshot
 from .temporal_policy_tuning import temporal_policy_baseline
+from .temporal_model.constants import TEMPORAL_MODEL_FAMILY, TEMPORAL_MODEL_TUNING_SCOPE
+from .temporal_model.context import prepare_campaign_context
+from .temporal_model.inputs import candidate_request
+from .temporal_model.errors import TemporalModelTuningCancelled
 
-TEMPORAL_MODEL_TUNING_SCOPE = "temporal_model"
-TEMPORAL_MODEL_FAMILY = "lightgbm_utility"
-
-
-class TemporalModelTuningCancelled(RuntimeError):
-    pass
 
 
 def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
@@ -85,76 +81,8 @@ def temporal_model_baseline(strategy: dict[str, Any], model_snapshot: dict[str, 
     return baseline
 
 
-def _source_run(db: Any, strategy: dict[str, Any]) -> dict[str, Any]:
-    policy = strategy.get("temporal_policy") if isinstance(strategy.get("temporal_policy"), dict) else {}
-    run_id = str(strategy.get("source_temporal_run_id") or policy.get("source_run_id") or "").strip()
-    if not run_id:
-        raise ValueError("TEMPORAL Strategy does not reference its source Temporal Intelligence run.")
-    run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": run_id})
-    if run is None or str(run.get("status") or "") != "completed":
-        raise ValueError("The source Temporal Intelligence run is unavailable or not completed.")
-    return run
 
 
-def _artifact_rows(db: Any, run_id: str, kind: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    cursor = db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].find(
-        {"run_id": str(run_id), "kind": str(kind)},
-        {"_id": 0, "sequence": 1, "encoding": 1, "payload": 1, "rows": 1},
-    ).sort("sequence", 1)
-    for item in cursor:
-        artifact_rows = item.get("rows") or []
-        if item.get("encoding") == "zlib-json-v1" and item.get("payload"):
-            artifact_rows = json.loads(zlib.decompress(bytes(item["payload"])).decode("utf-8"))
-        rows.extend(dict(row) for row in artifact_rows if isinstance(row, dict))
-    return rows
-
-
-def _winner_override(db: Any, source_run: dict[str, Any]) -> dict[str, Any]:
-    result = source_run.get("result") if isinstance(source_run.get("result"), dict) else {}
-    summary = deepcopy(result.get("winner_reference") or {})
-    run_id = str(source_run.get("id") or "")
-    daily_rows = _artifact_rows(db, run_id, "winner_reference_daily")
-    trade_rows = _artifact_rows(db, run_id, "winner_reference_trades")
-    if not summary or not daily_rows:
-        raise ValueError("The source Temporal run does not contain the immutable Winner replay required by Temporal Model Tuning.")
-    return {"summary": summary, "daily_rows": daily_rows, "trade_rows": trade_rows}
-
-
-def _candidate_request(
-    source_run: dict[str, Any],
-    model_snapshot: dict[str, Any],
-    settings: dict[str, Any],
-    *,
-    fold_count: int | None = None,
-) -> tuple[BacktestExecutionRequest, dict[str, Any]]:
-    request_payload = deepcopy(source_run.get("request") or {})
-    base_values = model_values_from_snapshot(model_snapshot)
-    values = deepcopy(base_values)
-    values.update(deepcopy(settings))
-    revision = max(1, int(model_snapshot.get("settings_revision") or 1))
-    settings_snapshot = execution_settings_from_values(
-        TEMPORAL_MODEL_FAMILY,
-        values,
-        settings_revision=revision,
-        profile_id="temporal-tuning",
-    )
-    snapshot_id = str(source_run.get("market_data_snapshot_id") or request_payload.get("research_market_data_snapshot_id") or "").strip().lower()
-    if not snapshot_id:
-        raise ValueError("The source Temporal run does not contain a frozen market-data snapshot id.")
-    request_payload.update({
-        "research_model_family": TEMPORAL_MODEL_FAMILY,
-        "research_model_settings": settings_snapshot,
-        "research_market_data_mode": "database_only",
-        "research_market_data_snapshot_id": snapshot_id,
-        "expected_market_data_signature_sha256": snapshot_id,
-        "deterministic_execution": True,
-        "numeric_thread_limit": 1,
-        "xgb_n_jobs": 1,
-        "walk_forward_fold_count_override": (int(fold_count) if fold_count is not None else None),
-    })
-    request = BacktestExecutionRequest.model_validate(request_payload)
-    return request, settings_snapshot
 
 
 def _metrics_from_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -250,35 +178,32 @@ def evaluate_temporal_model_candidate(
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     fold_count: int | None = None,
+    prepared_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    source_run = _source_run(db, strategy)
-    request, settings_snapshot = _candidate_request(
+    campaign_context = prepared_context
+    if campaign_context is None:
+        campaign_context = prepare_campaign_context(
+            db, strategy, model_snapshot, fold_count=fold_count,
+            progress_callback=progress_callback, cancel_check=cancel_check,
+        )
+    source_run = campaign_context["source_run"]
+    request, settings_snapshot = candidate_request(
         source_run, model_snapshot, settings, fold_count=fold_count
     )
-    bars_by_symbol: dict[str, pd.DataFrame] = {}
     _raise_if_cancelled(cancel_check)
-    for position, symbol in enumerate(request.assets, start=1):
-        _raise_if_cancelled(cancel_check)
-        if progress_callback:
-            progress_callback(2.0 + 12.0 * ((position - 1) / max(1, len(request.assets))), f"Loading frozen market data {position}/{len(request.assets)}")
-        asset_request = request if symbol in set(request.calendar_anchor_assets) else request.model_copy(update={"market_data_require_complete_history": False})
-        raw = load_market_bars(symbol, asset_request)
-        bars_by_symbol[symbol] = validate_and_clean_bars(raw, asset_request)
-        _raise_if_cancelled(cancel_check)
-
-    winner_override = _winner_override(db, source_run)
-    _raise_if_cancelled(cancel_check)
+    winner_reference = campaign_context["winner_override"]
     result = run_temporal_intelligence(
-        bars_by_symbol,
+        campaign_context["bars_by_symbol"],
         request,
         progress_callback=progress_callback,
         cancel_callback=(lambda: _raise_if_cancelled(cancel_check)) if cancel_check is not None else None,
-        winner_reference_override=winner_override,
+        winner_reference_override=winner_reference,
         candidate_evaluation_only=True,
+        prepared_context=campaign_context["training"],
     )
     observation_rows = list(result.pop("_multi_horizon_observations", []) or [])
-    winner_daily_rows = list(result.pop("_winner_reference_daily_rows", []) or winner_override["daily_rows"])
-    winner_trade_rows = list(result.pop("_winner_reference_trade_rows", []) or winner_override["trade_rows"])
+    winner_daily_rows = list(result.pop("_winner_reference_daily_rows", []) or winner_reference["daily_rows"])
+    winner_trade_rows = list(result.pop("_winner_reference_trade_rows", []) or winner_reference["trade_rows"])
     model_execution = model_execution_snapshot(TEMPORAL_MODEL_FAMILY, settings_snapshot)
     metrics = _metrics_from_result(result)
     metrics["market_data_signature_sha256"] = str(source_run.get("market_data_snapshot_id") or "") or None
@@ -313,6 +238,21 @@ def _compressed_artifact_documents(run_id: str, kind: str, rows: list[dict[str, 
         })
     return documents
 
+
+
+def prepare_temporal_model_campaign_context(
+    db: Any,
+    strategy: dict[str, Any],
+    model_snapshot: dict[str, Any],
+    *,
+    fold_count: int | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    return prepare_campaign_context(
+        db, strategy, model_snapshot, fold_count=fold_count,
+        progress_callback=progress_callback, cancel_check=cancel_check,
+    )
 
 def persist_temporal_model_champion_cache(
     db: Any,

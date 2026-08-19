@@ -1,9 +1,0 @@
-Market Cycle Trader API v3.31.0
-Strategy Catalog Research Baseline
-
-- model_tuning_strategy_id is now the explicit first-choice tuning target for every Strategy kind/status.
-- WINNER, CANDIDATE, DRAFT, SUPERSEDED and locked lifecycle state do not gate research eligibility.
-- Lifecycle lock remains a governance/editing protection; technical compatibility and frozen-baseline validation decide whether tuning can start.
-- Compatible standard Strategies require a completed Backtest matching Strategy id, configuration hash, LightGBM family and model settings hash.
-- Temporal Strategies continue to use their materialized frozen Temporal baseline.
-- Model tuning runs continue to freeze Strategy id/revision/status/configuration and baseline execution into the campaign document.

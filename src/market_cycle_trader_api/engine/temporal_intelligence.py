@@ -628,6 +628,16 @@ def _latest_models_and_forecasts(
 
 
 
+def _prepared_xy(split: dict[str, Any], target_name: str) -> tuple[pd.DataFrame, np.ndarray]:
+    x = split["x"]
+    y = np.asarray(split["targets"][target_name], dtype=float)
+    valid = np.isfinite(y)
+    if bool(valid.all()):
+        return x, y
+    indices = np.flatnonzero(valid)
+    return x.iloc[indices], y[indices]
+
+
 def _fit_calibrated_binary_bundle(
     frames: dict[str, pd.DataFrame],
     symbols: list[str],
@@ -637,10 +647,18 @@ def _fit_calibrated_binary_bundle(
     targets: dict[str, Any],
     target_name: str,
     config: Any,
+    *,
+    prepared_datasets: dict[str, dict[str, Any]] | None = None,
 ) -> _BinaryModelBundle:
-    x_train, y_train, _ = _pooled_dataset(frames, symbols, train_dates, targets, target_name)
+    if prepared_datasets is None:
+        x_train, y_train, _ = _pooled_dataset(frames, symbols, train_dates, targets, target_name)
+    else:
+        x_train, y_train = _prepared_xy(prepared_datasets["train"], target_name)
     calibration_model = _fit_binary_classifier_relaxed(x_train, y_train, config)
-    x_calibration, y_calibration, _ = _pooled_dataset(frames, symbols, calibration_dates, targets, target_name)
+    if prepared_datasets is None:
+        x_calibration, y_calibration, _ = _pooled_dataset(frames, symbols, calibration_dates, targets, target_name)
+    else:
+        x_calibration, y_calibration = _prepared_xy(prepared_datasets["calibration"], target_name)
     raw_calibration = calibration_model.predict_proba(x_calibration)[:, 1]
     train_baseline_probability = float(np.clip(np.mean(y_train > 0.0), 1e-6, 1.0 - 1e-6))
     baseline_calibration = np.full(len(y_calibration), train_baseline_probability, dtype=float)
@@ -648,7 +666,10 @@ def _fit_calibrated_binary_bundle(
     baseline_metrics = _classification_metrics(y_calibration, baseline_calibration)
     validation_brier_skill = _skill_score(raw_metrics.get("brier"), baseline_metrics.get("brier"))
     calibrator = _fit_platt_calibrator(raw_calibration, y_calibration)
-    x_final, y_final, _ = _pooled_dataset(frames, symbols, final_fit_dates, targets, target_name)
+    if prepared_datasets is None:
+        x_final, y_final, _ = _pooled_dataset(frames, symbols, final_fit_dates, targets, target_name)
+    else:
+        x_final, y_final = _prepared_xy(prepared_datasets["final_fit"], target_name)
     model = _fit_binary_classifier_relaxed(x_final, y_final, config)
     return _BinaryModelBundle(
         model=model,
@@ -668,16 +689,27 @@ def _fit_drawdown_bundle(
     final_fit_dates: pd.DatetimeIndex,
     targets: dict[str, Any],
     config: Any,
+    *,
+    prepared_datasets: dict[str, dict[str, Any]] | None = None,
 ) -> _DrawdownModelBundle:
-    x_train, y_train, _ = _pooled_dataset(frames, symbols, train_dates, targets, "drawdown")
+    if prepared_datasets is None:
+        x_train, y_train, _ = _pooled_dataset(frames, symbols, train_dates, targets, "drawdown")
+    else:
+        x_train, y_train = _prepared_xy(prepared_datasets["train"], "drawdown")
     validation_model = _fit_regressor(x_train, y_train, config, objective="regression_l1")
-    x_calibration, y_calibration, _ = _pooled_dataset(frames, symbols, calibration_dates, targets, "drawdown")
+    if prepared_datasets is None:
+        x_calibration, y_calibration, _ = _pooled_dataset(frames, symbols, calibration_dates, targets, "drawdown")
+    else:
+        x_calibration, y_calibration = _prepared_xy(prepared_datasets["calibration"], "drawdown")
     predicted_calibration = np.clip(validation_model.predict(x_calibration), 0.0, 1.0)
     training_baseline = float(max(0.0, np.mean(y_train)))
     baseline_calibration = np.full(len(y_calibration), training_baseline, dtype=float)
     validation = _regression_metrics(y_calibration, predicted_calibration)
     validation_baseline = _regression_metrics(y_calibration, baseline_calibration)
-    x_final, y_final, _ = _pooled_dataset(frames, symbols, final_fit_dates, targets, "drawdown")
+    if prepared_datasets is None:
+        x_final, y_final, _ = _pooled_dataset(frames, symbols, final_fit_dates, targets, "drawdown")
+    else:
+        x_final, y_final = _prepared_xy(prepared_datasets["final_fit"], "drawdown")
     model = _fit_regressor(x_final, y_final, config, objective="regression_l1")
     return _DrawdownModelBundle(
         model=model,
@@ -2778,6 +2810,7 @@ def run_temporal_intelligence(
     cancel_callback: Callable[[], None] | None = None,
     winner_reference_override: dict[str, Any] | None = None,
     candidate_evaluation_only: bool = False,
+    prepared_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if str(config.research_model_family) != "lightgbm_utility":
         raise ValueError("Temporal Decision Intelligence is restricted to a LightGBM Strategy snapshot.")
@@ -2788,21 +2821,37 @@ def run_temporal_intelligence(
 
     ensure_not_cancelled()
     started = time.perf_counter()
-    if progress_callback:
-        progress_callback(18.0, "Building temporal decision feature panel")
-    frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
-    ensure_not_cancelled()
-    symbols = sorted(frames)
-    horizons = sorted({int(value) for value in config.rotation_target_horizons})
-    folds = _build_walk_forward_folds(common_dates, config)
-    targets_by_horizon = _future_target_matrices(frames, common_dates, symbols, horizons)
-    open_prices = _open_price_matrix(frames, common_dates, symbols)
+    if prepared_context is None:
+        if progress_callback:
+            progress_callback(18.0, "Building temporal decision feature panel")
+        frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
+        ensure_not_cancelled()
+        symbols = sorted(frames)
+        horizons = sorted({int(value) for value in config.rotation_target_horizons})
+        folds = _build_walk_forward_folds(common_dates, config)
+        targets_by_horizon = _future_target_matrices(frames, common_dates, symbols, horizons)
+        open_prices = _open_price_matrix(frames, common_dates, symbols)
+    else:
+        frames = prepared_context["frames"]
+        common_dates = prepared_context["common_dates"]
+        symbols = list(prepared_context["symbols"])
+        horizons = list(prepared_context["horizons"])
+        folds = list(prepared_context["folds"])
+        targets_by_horizon = prepared_context["targets_by_horizon"]
+        open_prices = prepared_context["open_prices"]
+        requested_horizons = sorted({int(value) for value in config.rotation_target_horizons})
+        if requested_horizons != horizons:
+            raise ValueError("Prepared Temporal training context does not match the candidate horizons.")
+        if progress_callback:
+            progress_callback(18.0, "Reusing campaign temporal training context")
     one_side_cost = max(0.0, float(config.slippage_bps) / 10_000.0) + max(0.0, float(config.commission_rate))
 
     all_predictions: dict[int, list[pd.DataFrame]] = {horizon: [] for horizon in horizons}
     fold_summaries: list[dict[str, Any]] = []
     total_steps = max(1, len(folds) * len(horizons))
     completed_steps = 0
+    total_fit_bundles = max(1, len(folds) * len(horizons) * 5)
+    completed_fit_bundles = 0
 
     for fold_position, fold in enumerate(folds, start=1):
         ensure_not_cancelled()
@@ -2814,15 +2863,34 @@ def run_temporal_intelligence(
         for horizon in horizons:
             ensure_not_cancelled()
             targets = targets_by_horizon[horizon]
-            if progress_callback:
-                progress_callback(
-                    22.0 + 54.0 * (completed_steps / total_steps),
-                    f"Temporal Decision Intelligence v8 fold {fold_position}/{len(folds)} · {horizon} sessions",
-                )
+            prepared_datasets = None
+            prepared_test = None
+            prepared_realized = None
+            if prepared_context is not None:
+                fold_context = prepared_context["fold_contexts"][int(fold["fold_id"])]
+                prepared_datasets = {
+                    split_name: {
+                        "x": fold_context["splits"][split_name]["x"],
+                        "targets": fold_context["targets"][horizon][split_name],
+                    }
+                    for split_name in ("train", "calibration", "final_fit")
+                }
+                prepared_test = fold_context["splits"]["test"]
+                prepared_realized = fold_context["targets"][horizon]["test"]
+
+            def report_bundle(target_name: str) -> None:
+                nonlocal completed_fit_bundles
+                if progress_callback:
+                    progress_callback(
+                        22.0 + 54.0 * (completed_fit_bundles / total_fit_bundles),
+                        f"Fold {fold_position}/{len(folds)} · {horizon} sessions · {target_name}",
+                    )
+                completed_fit_bundles += 1
 
             bundles: dict[str, _BinaryModelBundle] = {}
             for target_name in ("profit_before_loss", "bottom", "top", "trend_persistence"):
                 ensure_not_cancelled()
+                report_bundle(target_name)
                 bundles[target_name] = _fit_calibrated_binary_bundle(
                     frames,
                     symbols,
@@ -2832,21 +2900,30 @@ def run_temporal_intelligence(
                     targets,
                     target_name,
                     config,
+                    prepared_datasets=prepared_datasets,
                 )
                 ensure_not_cancelled()
+            report_bundle("drawdown")
             drawdown_bundle = _fit_drawdown_bundle(
-                frames, symbols, train_dates, calibration_dates, final_fit_dates, targets, config
+                frames, symbols, train_dates, calibration_dates, final_fit_dates, targets, config,
+                prepared_datasets=prepared_datasets,
             )
             ensure_not_cancelled()
 
-            x_test, metadata = _pooled_features(frames, symbols, test_dates)
+            if prepared_test is None:
+                x_test, metadata = _pooled_features(frames, symbols, test_dates)
+            else:
+                x_test, metadata = prepared_test["x"], prepared_test["metadata"]
             if x_test.empty:
                 completed_steps += 1
                 continue
-            realized = {
-                name: _align_test_targets(metadata, targets[name])
-                for name in ("profit_before_loss", "bottom", "top", "trend_persistence", "trend_direction", "drawdown")
-            }
+            if prepared_realized is None:
+                realized = {
+                    name: _align_test_targets(metadata, targets[name])
+                    for name in ("profit_before_loss", "bottom", "top", "trend_persistence", "trend_direction", "drawdown")
+                }
+            else:
+                realized = prepared_realized
 
             classifier_predictions: dict[str, tuple[np.ndarray, np.ndarray, _BinaryModelBundle]] = {}
             for target_name, bundle in bundles.items():
