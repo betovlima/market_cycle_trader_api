@@ -380,3 +380,78 @@ class BacktestExecutionRequest(BacktestRequest):
 
 
 LOCKED_CONFIGURATION_FIELDS = frozenset(BacktestRequest.model_fields)
+
+
+
+class TemporalPolicySearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    end_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    processing_id: str | None = None
+    lhs_trials: int = Field(default=24, ge=4)
+    caro_trials: int = Field(default=12, ge=1)
+    seed: int = Field(default=42, ge=0)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "TemporalPolicySearchRequest":
+        if self.end_month < self.start_month:
+            raise ValueError("end_month must be greater than or equal to start_month.")
+        return self
+
+class WinnerTransitionRiskSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    end_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    processing_id: str = Field(min_length=1)
+    seed: int = Field(default=42, ge=0)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "WinnerTransitionRiskSearchRequest":
+        if self.end_month < self.start_month:
+            raise ValueError("end_month must be greater than or equal to start_month.")
+        return self
+
+class WinnerTransitionInterventionSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    end_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    processing_id: str = Field(min_length=1)
+    seed: int = Field(default=42, ge=0)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "WinnerTransitionInterventionSearchRequest":
+        if self.end_month < self.start_month:
+            raise ValueError("end_month must be greater than or equal to start_month.")
+        return self
+
+
+
+class WinnerTransitionConfidenceCalibrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    end_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    processing_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "WinnerTransitionConfidenceCalibrationRequest":
+        if self.end_month < self.start_month:
+            raise ValueError("end_month must be greater than or equal to start_month.")
+        return self
+
+
+class WinnerTransitionStatefulReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    end_month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    processing_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "WinnerTransitionStatefulReplayRequest":
+        if self.end_month < self.start_month:
+            raise ValueError("end_month must be greater than or equal to start_month.")
+        return self

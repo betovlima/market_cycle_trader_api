@@ -28,6 +28,7 @@ from ..infrastructure.persistence.mongo_repository import (
 from ..schemas.requests import BacktestExecutionRequest
 from .capital_rotation import ROTATION_FEATURES, _build_walk_forward_folds, prepare_rotation_panel
 from .market_data import load_market_bars, validate_and_clean_bars
+from .temporal_runtime import run_independent_fit_tasks, temporal_fit_worker_count
 
 load_project_environment()
 
@@ -2878,36 +2879,56 @@ def run_temporal_intelligence(
                 prepared_test = fold_context["splits"]["test"]
                 prepared_realized = fold_context["targets"][horizon]["test"]
 
-            def report_bundle(target_name: str) -> None:
+            binary_targets = ("profit_before_loss", "bottom", "top", "trend_persistence")
+            fit_tasks: dict[str, Callable[[], Any]] = {
+                target_name: (
+                    lambda name=target_name: _fit_calibrated_binary_bundle(
+                        frames,
+                        symbols,
+                        train_dates,
+                        calibration_dates,
+                        final_fit_dates,
+                        targets,
+                        name,
+                        config,
+                        prepared_datasets=prepared_datasets,
+                    )
+                )
+                for target_name in binary_targets
+            }
+            fit_tasks["drawdown"] = lambda: _fit_drawdown_bundle(
+                frames,
+                symbols,
+                train_dates,
+                calibration_dates,
+                final_fit_dates,
+                targets,
+                config,
+                prepared_datasets=prepared_datasets,
+            )
+            worker_count = temporal_fit_worker_count(len(fit_tasks))
+            if progress_callback:
+                progress_callback(
+                    22.0 + 54.0 * (completed_fit_bundles / total_fit_bundles),
+                    f"Fold {fold_position}/{len(folds)} · {horizon} sessions · training {len(fit_tasks)} model bundles on {worker_count} worker(s)",
+                )
+
+            def fit_completed(target_name: str, _position: int, _total: int) -> None:
                 nonlocal completed_fit_bundles
+                completed_fit_bundles += 1
                 if progress_callback:
                     progress_callback(
                         22.0 + 54.0 * (completed_fit_bundles / total_fit_bundles),
-                        f"Fold {fold_position}/{len(folds)} · {horizon} sessions · {target_name}",
+                        f"Fold {fold_position}/{len(folds)} · {horizon} sessions · completed {target_name}",
                     )
-                completed_fit_bundles += 1
 
-            bundles: dict[str, _BinaryModelBundle] = {}
-            for target_name in ("profit_before_loss", "bottom", "top", "trend_persistence"):
-                ensure_not_cancelled()
-                report_bundle(target_name)
-                bundles[target_name] = _fit_calibrated_binary_bundle(
-                    frames,
-                    symbols,
-                    train_dates,
-                    calibration_dates,
-                    final_fit_dates,
-                    targets,
-                    target_name,
-                    config,
-                    prepared_datasets=prepared_datasets,
-                )
-                ensure_not_cancelled()
-            report_bundle("drawdown")
-            drawdown_bundle = _fit_drawdown_bundle(
-                frames, symbols, train_dates, calibration_dates, final_fit_dates, targets, config,
-                prepared_datasets=prepared_datasets,
+            fitted = run_independent_fit_tasks(
+                fit_tasks,
+                cancel_check=ensure_not_cancelled,
+                completed_callback=fit_completed,
             )
+            bundles = {name: fitted[name] for name in binary_targets}
+            drawdown_bundle = fitted["drawdown"]
             ensure_not_cancelled()
 
             if prepared_test is None:

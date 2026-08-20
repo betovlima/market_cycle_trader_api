@@ -1,8 +1,0 @@
-{
-  "confirm_update": true,
-  "changes": {
-    "rotation_accelerator": "cpu"
-  },
-  "note": "Force XGBoost execution on CPU.",
-  "expected_revision": 1
-}

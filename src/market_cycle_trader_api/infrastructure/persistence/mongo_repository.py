@@ -54,6 +54,11 @@ MODEL_TUNING_VALIDATIONS_COLLECTION = "model_tuning_validations"
 TEMPORAL_INTELLIGENCE_RUNS_COLLECTION = "temporal_intelligence_runs"
 TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION = "temporal_intelligence_observations"
 TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION = "temporal_intelligence_artifacts"
+TEMPORAL_POLICY_SEARCH_COLLECTION = "temporal_policy_search_runs"
+TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION = "temporal_winner_transition_risk_research"
+TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION = "temporal_winner_transition_intervention_research"
+TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION = "temporal_winner_transition_confidence_research"
+TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION = "temporal_winner_transition_stateful_research"
 TEMPORAL_ROTATION_QUALITY_RESEARCH_COLLECTION = "temporal_rotation_quality_research"
 TEMPORAL_ROTATION_QUALITY_VALIDATION_COLLECTION = "temporal_rotation_quality_validations"
 TEMPORAL_ROTATION_QUALITY_DIAGNOSTIC_COLLECTION = "temporal_rotation_quality_diagnostics"
@@ -312,6 +317,52 @@ def ensure_database(db: Database) -> None:
     db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].create_index(
         [("run_id", ASCENDING), ("kind", ASCENDING), ("sequence", ASCENDING)],
         name="ix_temporal_intelligence_artifacts_run_kind_sequence",
+    )
+
+    db[TEMPORAL_POLICY_SEARCH_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_policy_search_run_created",
+    )
+    db[TEMPORAL_POLICY_SEARCH_COLLECTION].create_index(
+        [("id", ASCENDING)],
+        unique=True,
+        name="uq_temporal_policy_search_id",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("processing_id", ASCENDING), ("period_start", ASCENDING), ("period_end", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_winner_transition_risk_scope_created",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].create_index(
+        [("id", ASCENDING)],
+        unique=True,
+        name="uq_temporal_winner_transition_risk_id",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("processing_id", ASCENDING), ("period_start", ASCENDING), ("period_end", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_winner_transition_intervention_scope_created",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION].create_index(
+        [("id", ASCENDING)],
+        unique=True,
+        name="uq_temporal_winner_transition_intervention_id",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("processing_id", ASCENDING), ("period_start", ASCENDING), ("period_end", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_winner_transition_confidence_scope_created",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION].create_index(
+        [("id", ASCENDING)],
+        unique=True,
+        name="uq_temporal_winner_transition_confidence_id",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].create_index(
+        [("run_id", ASCENDING), ("processing_id", ASCENDING), ("period_start", ASCENDING), ("period_end", ASCENDING), ("created_at", DESCENDING)],
+        name="ix_temporal_winner_transition_stateful_scope_created",
+    )
+    db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].create_index(
+        [("id", ASCENDING)],
+        unique=True,
+        name="uq_temporal_winner_transition_stateful_id",
     )
     db[TEMPORAL_ROTATION_QUALITY_RESEARCH_COLLECTION].create_index(
         [("status", ASCENDING), ("created_at", DESCENDING)],

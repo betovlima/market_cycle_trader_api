@@ -1,5 +1,0 @@
-{
-  "confirm_delete_existing_strategy_data": true,
-  "note": "DISASTER RECOVERY ONLY: replace strategy data and install bundled winner-v1.13.2.json.",
-  "confirm_install_winner_v1_13_2": true
-}
