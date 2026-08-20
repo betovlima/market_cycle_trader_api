@@ -20,12 +20,7 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 from .analytics import processing_analytics
 from .temporal_winner_transition_attribution import get_winner_transition_attribution
-
-SEVERE_THRESHOLD = -0.05
-RISK_QUANTILES = (0.70, 0.75, 0.80, 0.85, 0.90)
-MIN_OUTER_TRAIN_ROWS = 50
-MIN_INNER_TRAIN_ROWS = 24
-MIN_TRAIN_SEVERE = 3
+from .temporal_research_settings import temporal_research_settings_snapshot
 
 FAMILY_FEATURES = {
     "temporal_rejection": (
@@ -124,6 +119,8 @@ def _features(transition: dict[str, Any]) -> dict[str, float | None]:
 def build_transition_risk_dataset(
     transition_attribution: dict[str, Any],
     rotations: list[dict[str, Any]],
+    *,
+    severe_threshold: float,
 ) -> list[dict[str, Any]]:
     rotation_map: dict[tuple[str, str, str], dict[str, Any]] = {}
     for rotation in rotations:
@@ -155,7 +152,7 @@ def build_transition_risk_dataset(
             "from_asset": str(transition.get("from_asset") or "").upper(),
             "to_asset": str(transition.get("to_asset") or "").upper(),
             "rotation_value_added": value_added,
-            "severe": int(value_added <= SEVERE_THRESHOLD),
+            "severe": int(value_added <= float(severe_threshold)),
             "one_interval_value_added": _finite(interval.get("value_added")),
             "one_interval_target_return": _finite(interval.get("target_return")),
             "one_interval_incumbent_return": _finite(interval.get("incumbent_return")),
@@ -175,11 +172,11 @@ def _pipeline(seed: int) -> Pipeline:
     ])
 
 
-def _can_fit(frame: pd.DataFrame, *, minimum_rows: int) -> bool:
+def _can_fit(frame: pd.DataFrame, *, minimum_rows: int, min_train_severe: int) -> bool:
     if len(frame) < minimum_rows:
         return False
     counts = frame["severe"].value_counts()
-    return int(counts.get(1, 0)) >= MIN_TRAIN_SEVERE and int(counts.get(0, 0)) >= MIN_TRAIN_SEVERE
+    return int(counts.get(1, 0)) >= min_train_severe and int(counts.get(0, 0)) >= min_train_severe
 
 
 def _auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
@@ -239,7 +236,15 @@ def _fit_score(
     return test_scores, flags, threshold
 
 
-def _inner_predictions(train: pd.DataFrame, family: str, quantile: float, seed: int) -> tuple[pd.DataFrame, np.ndarray, np.ndarray] | None:
+def _inner_predictions(
+    train: pd.DataFrame,
+    family: str,
+    quantile: float,
+    seed: int,
+    *,
+    min_inner_train_rows: int,
+    min_train_severe: int,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray] | None:
     years = sorted(int(value) for value in train["year"].unique())
     pieces: list[pd.DataFrame] = []
     scores: list[np.ndarray] = []
@@ -247,7 +252,9 @@ def _inner_predictions(train: pd.DataFrame, family: str, quantile: float, seed: 
     for year in years:
         inner_train = train[train["year"] < year]
         inner_test = train[train["year"] == year]
-        if not len(inner_test) or not _can_fit(inner_train, minimum_rows=MIN_INNER_TRAIN_ROWS):
+        if not len(inner_test) or not _can_fit(
+            inner_train, minimum_rows=min_inner_train_rows, min_train_severe=min_train_severe
+        ):
             continue
         fold_scores, fold_flags, _ = _fit_score(inner_train, inner_test, family, quantile, seed + year)
         pieces.append(inner_test)
@@ -258,18 +265,33 @@ def _inner_predictions(train: pd.DataFrame, family: str, quantile: float, seed: 
     return pd.concat(pieces, axis=0), np.concatenate(scores), np.concatenate(flags)
 
 
-def _select_candidate(train: pd.DataFrame, seed: int) -> dict[str, Any]:
+def _select_candidate(
+    train: pd.DataFrame,
+    seed: int,
+    *,
+    risk_quantiles: list[float],
+    default_risk_quantile: float,
+    min_inner_train_rows: int,
+    min_train_severe: int,
+) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     for family in FAMILY_FEATURES:
-        for quantile in RISK_QUANTILES:
-            predicted = _inner_predictions(train, family, quantile, seed)
+        for quantile in risk_quantiles:
+            predicted = _inner_predictions(
+                train,
+                family,
+                quantile,
+                seed,
+                min_inner_train_rows=min_inner_train_rows,
+                min_train_severe=min_train_severe,
+            )
             if predicted is None:
                 continue
             frame, scores, flags = predicted
             metrics = _classification_metrics(frame, scores, flags)
             candidates.append({"family": family, "risk_quantile": quantile, "metrics": metrics})
     if not candidates:
-        return {"family": "temporal_rejection", "risk_quantile": 0.75, "metrics": {}}
+        return {"family": "temporal_rejection", "risk_quantile": float(default_risk_quantile), "metrics": {}}
     return max(
         candidates,
         key=lambda item: (
@@ -281,14 +303,24 @@ def _select_candidate(train: pd.DataFrame, seed: int) -> dict[str, Any]:
     )
 
 
-def _family_oos(frame: pd.DataFrame, family: str, seed: int, quantile: float = 0.75) -> dict[str, Any]:
+def _family_oos(
+    frame: pd.DataFrame,
+    family: str,
+    seed: int,
+    *,
+    quantile: float,
+    min_outer_train_rows: int,
+    min_train_severe: int,
+) -> dict[str, Any]:
     pieces: list[pd.DataFrame] = []
     scores: list[np.ndarray] = []
     flags: list[np.ndarray] = []
     for year in sorted(int(value) for value in frame["year"].unique()):
         train = frame[frame["year"] < year]
         test = frame[frame["year"] == year]
-        if not len(test) or not _can_fit(train, minimum_rows=MIN_OUTER_TRAIN_ROWS):
+        if not len(test) or not _can_fit(
+            train, minimum_rows=min_outer_train_rows, min_train_severe=min_train_severe
+        ):
             continue
         fold_scores, fold_flags, _ = _fit_score(train, test, family, quantile, seed + year)
         pieces.append(test)
@@ -447,20 +479,45 @@ def run_transition_risk_search_from_payloads(
     end_month: str,
     transition_attribution: dict[str, Any],
     analytics: dict[str, Any],
+    research_settings: dict[str, Any],
     seed: int = 42,
 ) -> dict[str, Any]:
-    dataset = build_transition_risk_dataset(transition_attribution, list(analytics.get("rotations") or []))
-    if len(dataset) < MIN_OUTER_TRAIN_ROWS:
-        raise WinnerTransitionRiskError("Not enough attributed Winner transitions are available for chronological risk research.")
+    settings_payload = research_settings.get("settings") if isinstance(research_settings.get("settings"), dict) else research_settings
+    risk_settings = settings_payload.get("risk") if isinstance(settings_payload.get("risk"), dict) else {}
+    severe_threshold = float(risk_settings["severe_threshold"])
+    risk_quantiles = [float(value) for value in risk_settings["risk_quantiles"]]
+    default_risk_quantile = float(risk_settings["default_risk_quantile"])
+    min_outer_train_rows = int(risk_settings["min_outer_train_rows"])
+    min_inner_train_rows = int(risk_settings["min_inner_train_rows"])
+    min_train_severe = int(risk_settings["min_train_severe"])
+    dataset = build_transition_risk_dataset(
+        transition_attribution,
+        list(analytics.get("rotations") or []),
+        severe_threshold=severe_threshold,
+    )
+    if len(dataset) < min_outer_train_rows:
+        raise WinnerTransitionRiskError(
+            f"Not enough attributed Winner transitions are available for chronological risk research: "
+            f"found {len(dataset)}, requires at least {min_outer_train_rows}."
+        )
     frame = pd.DataFrame(dataset)
     outer_results: list[dict[str, Any]] = []
     scored_rows: list[dict[str, Any]] = []
     for year in sorted(int(value) for value in frame["year"].unique()):
         train = frame[frame["year"] < year]
         test = frame[frame["year"] == year]
-        if not len(test) or not _can_fit(train, minimum_rows=MIN_OUTER_TRAIN_ROWS):
+        if not len(test) or not _can_fit(
+            train, minimum_rows=min_outer_train_rows, min_train_severe=min_train_severe
+        ):
             continue
-        candidate = _select_candidate(train, seed + year)
+        candidate = _select_candidate(
+            train,
+            seed + year,
+            risk_quantiles=risk_quantiles,
+            default_risk_quantile=default_risk_quantile,
+            min_inner_train_rows=min_inner_train_rows,
+            min_train_severe=min_train_severe,
+        )
         family = str(candidate["family"])
         quantile = float(candidate["risk_quantile"])
         scores, flags, threshold = _fit_score(train, test, family, quantile, seed + year)
@@ -512,9 +569,26 @@ def run_transition_risk_search_from_payloads(
     oos_flags = scored_frame["high_risk"].to_numpy(dtype=bool)
     overall = _classification_metrics(scored_frame, oos_scores, oos_flags)
     shadow = _shadow_replay(analytics, scored_rows)
-    family_comparison = [_family_oos(frame, family, seed) for family in FAMILY_FEATURES]
+    family_comparison = [
+        _family_oos(
+            frame,
+            family,
+            seed,
+            quantile=default_risk_quantile,
+            min_outer_train_rows=min_outer_train_rows,
+            min_train_severe=min_train_severe,
+        )
+        for family in FAMILY_FEATURES
+    ]
 
-    final_candidate = _select_candidate(frame, seed + 100000)
+    final_candidate = _select_candidate(
+        frame,
+        seed + 100000,
+        risk_quantiles=risk_quantiles,
+        default_risk_quantile=default_risk_quantile,
+        min_inner_train_rows=min_inner_train_rows,
+        min_train_severe=min_train_severe,
+    )
     final_family = str(final_candidate["family"])
     final_quantile = float(final_candidate["risk_quantile"])
     final_model = _pipeline(seed + 100001)
@@ -536,16 +610,19 @@ def run_transition_risk_search_from_payloads(
         "period_end": end_month,
         "created_at": utc_now(),
         "status": "completed",
+        "research_settings": research_settings,
         "research_target": {
             "name": "severe_winner_anchor_transition",
-            "rotation_value_added_lte": SEVERE_THRESHOLD,
+            "rotation_value_added_lte": severe_threshold,
             "intervention": "keep_incumbent_until_next_control_transition_shadow",
         },
         "protocol": {
             "validation": "expanding_chronological_yearly_outer_folds",
-            "outer_min_train_rows": MIN_OUTER_TRAIN_ROWS,
-            "inner_min_train_rows": MIN_INNER_TRAIN_ROWS,
-            "risk_quantiles": list(RISK_QUANTILES),
+            "outer_min_train_rows": min_outer_train_rows,
+            "inner_min_train_rows": min_inner_train_rows,
+            "min_train_severe": min_train_severe,
+            "risk_quantiles": risk_quantiles,
+            "default_risk_quantile": default_risk_quantile,
             "seed": int(seed),
             "future_information_in_features": False,
             "shadow_replay_research_only": True,
@@ -594,6 +671,7 @@ def run_winner_transition_risk_search(
 ) -> dict[str, Any]:
     attribution = get_winner_transition_attribution(db, run_id, start_month=start_month, end_month=end_month)
     analytics = processing_analytics(db, processing_id)
+    research_settings = temporal_research_settings_snapshot(db)
     result = run_transition_risk_search_from_payloads(
         run_id=run_id,
         processing_id=processing_id,
@@ -601,6 +679,7 @@ def run_winner_transition_risk_search(
         end_month=end_month,
         transition_attribution=attribution,
         analytics=analytics,
+        research_settings=research_settings,
         seed=seed,
     )
     db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].insert_one(dict(result))

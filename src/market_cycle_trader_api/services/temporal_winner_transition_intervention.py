@@ -16,6 +16,7 @@ from ..infrastructure.persistence.mongo_repository import (
 from .analytics import processing_analytics
 from .temporal_winner_transition_attribution import get_winner_transition_attribution
 from .temporal_winner_transition_risk import run_transition_risk_search_from_payloads
+from .temporal_research_settings import temporal_research_settings_snapshot
 
 
 class WinnerTransitionInterventionError(RuntimeError):
@@ -481,14 +482,19 @@ def run_transition_intervention_search_from_payloads(
     analytics: dict[str, Any],
     seed: int = 42,
     risk_search: dict[str, Any] | None = None,
+    research_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     risk = risk_search if isinstance(risk_search, dict) else None
     reusable = bool(
         risk
         and ((risk.get("oos") or {}).get("scored_transitions"))
         and (((risk.get("shadow_replay") or {}).get("equity") or {}).get("shadow"))
+        and isinstance(risk.get("research_settings"), dict)
     )
+    frozen_research_settings = (risk or {}).get("research_settings") if isinstance((risk or {}).get("research_settings"), dict) else research_settings
     if not reusable:
+        if not isinstance(frozen_research_settings, dict):
+            raise WinnerTransitionInterventionError("Temporal research settings snapshot is required.")
         risk = run_transition_risk_search_from_payloads(
             run_id=run_id,
             processing_id=processing_id,
@@ -496,8 +502,10 @@ def run_transition_intervention_search_from_payloads(
             end_month=end_month,
             transition_attribution=transition_attribution,
             analytics=analytics,
+            research_settings=frozen_research_settings,
             seed=seed,
         )
+    frozen_research_settings = risk.get("research_settings") if isinstance(risk.get("research_settings"), dict) else frozen_research_settings
     oos = risk.get("oos") if isinstance(risk.get("oos"), dict) else {}
     scored_rows = [dict(row) for row in oos.get("scored_transitions") or [] if isinstance(row, dict)]
     if not scored_rows:
@@ -555,6 +563,7 @@ def run_transition_intervention_search_from_payloads(
         "period_end": end_month,
         "created_at": utc_now(),
         "status": "completed",
+        "research_settings": frozen_research_settings,
         "protocol": {
             "source_detector_family": "temporal_rejection",
             "source_detector": "winner_anchor_transition_risk_search_oos",
@@ -602,6 +611,7 @@ def run_winner_transition_intervention_search(
         {"_id": 0},
         sort=[("created_at", -1)],
     )
+    research_settings = temporal_research_settings_snapshot(db)
     result = run_transition_intervention_search_from_payloads(
         run_id=run_id,
         processing_id=processing_id,
@@ -611,6 +621,7 @@ def run_winner_transition_intervention_search(
         analytics=analytics,
         seed=seed,
         risk_search=bson_value(stored_risk) if stored_risk is not None else None,
+        research_settings=research_settings,
     )
     db[TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION].insert_one(dict(result))
     return result
@@ -651,9 +662,6 @@ def get_latest_winner_transition_intervention_search(
     return bson_value(document)
 
 
-CONFIDENCE_MARGIN_QUANTILES = (0.0, 0.25, 0.5, 0.75)
-MIN_CONFIDENCE_ALERTS = 4
-
 
 def _risk_margin(row: dict[str, Any]) -> float | None:
     score = _finite(row.get("risk_score"))
@@ -691,6 +699,9 @@ def _confidence_candidate(
     analytics: dict[str, Any],
     scored_rows: list[dict[str, Any]],
     prior_years: list[int],
+    *,
+    margin_quantiles: list[float],
+    min_alerts: int,
 ) -> dict[str, Any]:
     if not prior_years:
         return {
@@ -709,7 +720,7 @@ def _confidence_candidate(
         and bool(row.get("high_risk"))
         and _risk_margin(row) is not None
     ]
-    if len(alerts) < MIN_CONFIDENCE_ALERTS:
+    if len(alerts) < min_alerts:
         return {
             "selected_mode": "control",
             "reason": "insufficient_prior_oos_alerts",
@@ -721,7 +732,7 @@ def _confidence_candidate(
 
     margins = pd.Series([float(_risk_margin(row)) for row in alerts], dtype="float64")
     candidates: list[dict[str, Any]] = []
-    for quantile in CONFIDENCE_MARGIN_QUANTILES:
+    for quantile in margin_quantiles:
         threshold = float(margins.quantile(quantile))
         gated = _confidence_gated_rows(
             scored_rows,
@@ -835,6 +846,13 @@ def run_transition_confidence_calibration_from_payloads(
     risk_search: dict[str, Any],
     intervention_search: dict[str, Any],
 ) -> dict[str, Any]:
+    research_settings = risk_search.get("research_settings") if isinstance(risk_search.get("research_settings"), dict) else {}
+    settings_payload = research_settings.get("settings") if isinstance(research_settings.get("settings"), dict) else research_settings
+    confidence_settings = settings_payload.get("confidence") if isinstance(settings_payload.get("confidence"), dict) else {}
+    if not confidence_settings:
+        raise WinnerTransitionInterventionError("The source risk search does not contain a frozen temporal research settings snapshot. Run the risk search again.")
+    margin_quantiles = [float(value) for value in confidence_settings["margin_quantiles"]]
+    min_alerts = int(confidence_settings["min_alerts"])
     oos = risk_search.get("oos") if isinstance(risk_search.get("oos"), dict) else {}
     scored_rows = [dict(row) for row in oos.get("scored_transitions") or [] if isinstance(row, dict)]
     if not scored_rows:
@@ -844,7 +862,13 @@ def run_transition_confidence_calibration_from_payloads(
     selections: list[dict[str, Any]] = []
     for test_year in oos_years:
         prior_years = [year for year in oos_years if year < test_year]
-        decision = _confidence_candidate(analytics, scored_rows, prior_years)
+        decision = _confidence_candidate(
+            analytics,
+            scored_rows,
+            prior_years,
+            margin_quantiles=margin_quantiles,
+            min_alerts=min_alerts,
+        )
         if decision["selected_mode"] == "confidence_calibrated_one_session":
             threshold = _finite(decision.get("selected_margin_threshold"))
             test_rows = _confidence_gated_rows(
@@ -884,12 +908,13 @@ def run_transition_confidence_calibration_from_payloads(
         "period_end": end_month,
         "created_at": utc_now(),
         "status": "completed",
+        "research_settings": research_settings,
         "protocol": {
             "source_detector_family": "temporal_rejection",
             "source_intervention": "defer_one_session_then_rejoin",
             "confidence_measure": "risk_score_minus_fold_risk_threshold",
-            "margin_quantiles": list(CONFIDENCE_MARGIN_QUANTILES),
-            "minimum_prior_alerts": MIN_CONFIDENCE_ALERTS,
+            "margin_quantiles": margin_quantiles,
+            "minimum_prior_alerts": min_alerts,
             "validation": "expanding_prior_oos_year_confidence_calibration",
             "selection_rule": "max_prior_oos_capital_subject_to_tail_safety_and_no_negative_prior_oos_year",
             "future_information_in_selection": False,

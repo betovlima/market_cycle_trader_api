@@ -33,6 +33,7 @@ from .api.routers import (
     strategy_lab,
     system_settings,
     temporal_intelligence,
+    temporal_research_settings,
     temporal_rotation_quality,
 )
 from .core.config import API_VERSION, cors_origins
@@ -50,12 +51,14 @@ from .services.asset_discovery_scheduler import (
 )
 from .services.model_tuning import recover_integrated_model_tuning_runs
 from .services.temporal_intelligence import recover_temporal_intelligence_runs
+from .services.temporal_research_settings import ensure_temporal_research_settings
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     initialize_mongo()
     if bool(MONGO_STATUS.get("available")):
+        ensure_temporal_research_settings(database())
         recover_integrated_model_tuning_runs(database())
         recover_temporal_intelligence_runs(database())
     get_auth_settings().validate_runtime()
@@ -114,6 +117,7 @@ def create_app() -> FastAPI:
     application.include_router(strategy_lab.router, dependencies=research_access)
     application.include_router(asset_discovery.router, dependencies=admin_required)
     application.include_router(system_settings.router, dependencies=admin_required)
+    application.include_router(temporal_research_settings.router, dependencies=admin_required)
     application.include_router(admin_setup.router, dependencies=admin_required)
     return application
 

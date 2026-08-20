@@ -54,7 +54,6 @@ FAMILY_FEATURES = {
     ),
 }
 FAMILY_FEATURES["combined"] = tuple(dict.fromkeys(FAMILY_FEATURES["temporal_rejection"] + FAMILY_FEATURES["fragile_leader"]))
-SEVERE_THRESHOLD = -0.05
 
 
 def _mean(values: list[Any]) -> float | None:
@@ -112,7 +111,12 @@ def _transition_key(executed_at: Any, from_asset: Any, to_asset: Any) -> tuple[s
     return (stamp.isoformat(), source, target)
 
 
-def _build_transition_dataset(attribution: dict[str, Any], rotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_transition_dataset(
+    attribution: dict[str, Any],
+    rotations: list[dict[str, Any]],
+    *,
+    severe_threshold: float,
+) -> list[dict[str, Any]]:
     rotation_map = {}
     for rotation in rotations:
         key = _transition_key(rotation.get("executed_at"), rotation.get("from_asset"), rotation.get("to_asset"))
@@ -131,7 +135,7 @@ def _build_transition_dataset(attribution: dict[str, Any], rotations: list[dict[
             continue
         row = {
             "year": int(stamp.year),
-            "severe": int(value_added <= SEVERE_THRESHOLD),
+            "severe": int(value_added <= float(severe_threshold)),
             "rotation_value_added": value_added,
         }
         row.update(_risk_features(transition))
@@ -843,7 +847,17 @@ def run_stateful_transition_replay_from_payloads(
     initial_capital = float(source_metrics.get("initial_capital") or request.get("initial_capital") or 10_000.0)
     one_side_cost = max(0.0, float(request.get("slippage_bps") or 0.0) / 10_000.0) + max(0.0, float(request.get("commission_rate") or 0.0))
     settings = base_settings(run)
-    dataset = _build_transition_dataset(transition_attribution, list(analytics.get("rotations") or []))
+    research_settings = risk_search.get("research_settings") if isinstance(risk_search.get("research_settings"), dict) else {}
+    settings_payload = research_settings.get("settings") if isinstance(research_settings.get("settings"), dict) else research_settings
+    risk_settings = settings_payload.get("risk") if isinstance(settings_payload.get("risk"), dict) else {}
+    if "severe_threshold" not in risk_settings:
+        raise WinnerTransitionStatefulReplayError("The source risk search does not contain a frozen temporal research settings snapshot.")
+    severe_threshold = float(risk_settings["severe_threshold"])
+    dataset = _build_transition_dataset(
+        transition_attribution,
+        list(analytics.get("rotations") or []),
+        severe_threshold=severe_threshold,
+    )
     models = _risk_models(dataset, risk_search)
     confidence_years = _confidence_by_year(confidence)
     control_path = _processing_control_path(analytics, start_month=start_month, end_month=end_month)
@@ -885,6 +899,7 @@ def run_stateful_transition_replay_from_payloads(
         "period_end": end_month,
         "created_at": utc_now(),
         "status": "completed" if parity.get("status") == "passed" else "blocked",
+        "research_settings": research_settings,
         "protocol": {
             "base_policy": "processing_control_path_parity_anchor",
             "detector": "chronological_winner_transition_risk_models",

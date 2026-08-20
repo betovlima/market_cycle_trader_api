@@ -59,6 +59,8 @@ TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION = "temporal_winner_transitio
 TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION = "temporal_winner_transition_intervention_research"
 TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION = "temporal_winner_transition_confidence_research"
 TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION = "temporal_winner_transition_stateful_research"
+TEMPORAL_RESEARCH_SETTINGS_COLLECTION = "temporal_research_settings"
+TEMPORAL_RESEARCH_SETTINGS_HISTORY_COLLECTION = "temporal_research_settings_history"
 TEMPORAL_ROTATION_QUALITY_RESEARCH_COLLECTION = "temporal_rotation_quality_research"
 TEMPORAL_ROTATION_QUALITY_VALIDATION_COLLECTION = "temporal_rotation_quality_validations"
 TEMPORAL_ROTATION_QUALITY_DIAGNOSTIC_COLLECTION = "temporal_rotation_quality_diagnostics"
@@ -279,6 +281,14 @@ def ensure_database(db: Database) -> None:
     db[MODEL_RESEARCH_SETTINGS_HISTORY_COLLECTION].create_index(
         [("settings_id", ASCENDING), ("updated_at", DESCENDING)],
         name="ix_model_research_settings_history",
+    )
+    db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].create_index(
+        [("updated_at", DESCENDING)],
+        name="ix_temporal_research_settings_updated",
+    )
+    db[TEMPORAL_RESEARCH_SETTINGS_HISTORY_COLLECTION].create_index(
+        [("settings_id", ASCENDING), ("updated_at", DESCENDING)],
+        name="ix_temporal_research_settings_history",
     )
     db[MODEL_TUNING_RUNS_COLLECTION].create_index(
         [("status", ASCENDING), ("created_at", DESCENDING)],
