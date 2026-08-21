@@ -212,6 +212,7 @@ def replay_search_policy(
     weak_threshold = float(normalized["timing_base_weak_threshold"])
     challenger_minimum = float(normalized["timing_challenger_minimum"])
     minimum_advantage = float(normalized["timing_minimum_advantage"])
+    maximum_advantage = float(normalized.get("timing_maximum_advantage", 1.0))
     lookback = int(normalized["trajectory_lookback_sessions"])
     minimum_signals = int(normalized["trajectory_min_signals"])
     late_exit_advantage = float(normalized["late_exit_min_challenger_advantage"])
@@ -263,6 +264,7 @@ def replay_search_policy(
                 and base_short < weak_threshold
                 and challenger_short >= challenger_minimum
                 and (challenger_short - base_short) >= minimum_advantage
+                and (challenger_short - base_short) <= maximum_advantage
             )
         proposed_symbol = challenger_symbol if timing_override else base_symbol
         target_symbol = proposed_symbol

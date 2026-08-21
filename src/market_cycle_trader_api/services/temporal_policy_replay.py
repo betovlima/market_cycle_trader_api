@@ -47,6 +47,7 @@ def _replay_rows(
     weak_threshold = float(settings["timing_base_weak_threshold"])
     challenger_minimum = float(settings["timing_challenger_minimum"])
     minimum_advantage = float(settings["timing_minimum_advantage"])
+    maximum_advantage = float(settings.get("timing_maximum_advantage", 1.0))
     returns: list[float] = []
     return_folds: list[int] = []
     return_dates: list[str] = []
@@ -94,6 +95,7 @@ def _replay_rows(
                 and base_short < weak_threshold
                 and challenger_short >= challenger_minimum
                 and (challenger_short - base_short) >= minimum_advantage
+                and (challenger_short - base_short) <= maximum_advantage
             )
         target_symbol = challenger_symbol if override else base_symbol
 
@@ -237,6 +239,7 @@ def replay_temporal_policy_details(
     weak_threshold = float(settings["timing_base_weak_threshold"])
     challenger_minimum = float(settings["timing_challenger_minimum"])
     minimum_advantage = float(settings["timing_minimum_advantage"])
+    maximum_advantage = float(settings.get("timing_maximum_advantage", 1.0))
 
     returns: list[float] = []
     intervals: list[dict[str, Any]] = []
@@ -279,6 +282,7 @@ def replay_temporal_policy_details(
                 and base_short < weak_threshold
                 and challenger_short >= challenger_minimum
                 and (challenger_short - base_short) >= minimum_advantage
+                and (challenger_short - base_short) <= maximum_advantage
             )
         target_symbol = challenger_symbol if override else base_symbol
 

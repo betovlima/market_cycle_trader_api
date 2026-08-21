@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
+import zlib
 from datetime import datetime, timedelta, timezone
 from statistics import fmean, median
 from typing import Any, Iterable
@@ -18,6 +20,8 @@ from ..infrastructure.persistence.mongo_repository import (
     PREDICTIONS_COLLECTION,
     RUNS_COLLECTION,
     STRATEGY_PROFILES_COLLECTION,
+    TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
+    TEMPORAL_INTELLIGENCE_RUNS_COLLECTION,
     TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION,
     TRADES_COLLECTION,
     bson_value,
@@ -29,6 +33,168 @@ from .serialization import iso_value
 
 
 _STATEFUL_STRATEGY_PROCESSING_PREFIX = "strategy-stateful:"
+_TEMPORAL_STRATEGY_PROCESSING_PREFIX = "strategy-temporal:"
+
+
+def temporal_strategy_processing_id(strategy_id: str) -> str:
+    normalized = str(strategy_id or "").strip()
+    if not normalized:
+        raise ValueError("Temporal Strategy id is required.")
+    return f"{_TEMPORAL_STRATEGY_PROCESSING_PREFIX}{normalized}"
+
+
+def _temporal_strategy_id_from_processing(processing_id: str) -> str | None:
+    value = str(processing_id or "").strip()
+    if not value.startswith(_TEMPORAL_STRATEGY_PROCESSING_PREFIX):
+        return None
+    strategy_id = value[len(_TEMPORAL_STRATEGY_PROCESSING_PREFIX):].strip()
+    return strategy_id or None
+
+
+def _decode_temporal_artifact_rows(db: Any, run_id: str, artifact_kind: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    cursor = db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].find(
+        {"run_id": str(run_id), "kind": "decision_diagnostics"},
+        {"_id": 0, "sequence": 1, "encoding": 1, "payload": 1, "rows": 1},
+    ).sort("sequence", 1)
+    for document in cursor:
+        payload = document.get("rows") or []
+        if document.get("encoding") == "zlib-json-v1" and document.get("payload"):
+            payload = json.loads(zlib.decompress(bytes(document["payload"])).decode("utf-8"))
+        for row in payload:
+            if isinstance(row, dict) and str(row.get("artifact_kind") or "") == str(artifact_kind):
+                rows.append(dict(row))
+    return rows
+
+
+def _temporal_strategy_processing_analytics(db: Any, processing_id: str) -> dict[str, Any] | None:
+    strategy_id = _temporal_strategy_id_from_processing(processing_id)
+    if not strategy_id:
+        return None
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one(
+        {"_id": strategy_id},
+        {
+            "_id": 1, "name": 1, "revision": 1, "configuration_hash": 1,
+            "strategy_kind": 1, "tuning_target": 1, "temporal_strategy_variant": 1,
+            "source_temporal_run_id": 1, "temporal_policy_snapshot": 1,
+        },
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Strategy Research Temporal processing source was not found.")
+    if str(profile.get("strategy_kind") or "") != "temporal_intelligence":
+        raise HTTPException(status_code=409, detail="The selected Strategy Research profile is not a Temporal Strategy.")
+    is_stateful = (
+        str(profile.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+        and str(profile.get("tuning_target") or "") == "stateful_transition"
+    )
+    if is_stateful:
+        raise HTTPException(status_code=409, detail="Stateful Temporal Strategies use the Stateful processing source.")
+    policy = profile.get("temporal_policy_snapshot") if isinstance(profile.get("temporal_policy_snapshot"), dict) else {}
+    run_id = str(profile.get("source_temporal_run_id") or policy.get("source_run_id") or "").strip()
+    if not run_id:
+        raise HTTPException(status_code=409, detail="The selected Temporal Strategy does not contain its source run binding.")
+    run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+        {"id": run_id, "status": "completed"},
+        {"_id": 0, "id": 1, "result": 1, "created_at": 1, "finished_at": 1},
+    )
+    if run is None:
+        raise HTTPException(status_code=409, detail="The selected Temporal Strategy source run is unavailable.")
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    multi = result.get("multi_horizon_metrics") if isinstance(result.get("multi_horizon_metrics"), dict) else {}
+    capital = multi.get("shadow_capital") if isinstance(multi.get("shadow_capital"), dict) else {}
+    curve = _decode_temporal_artifact_rows(db, run_id, "multi_horizon_equity_curve")
+    curve.sort(key=lambda row: str(row.get("execution_date") or row.get("decision_timestamp") or ""))
+    if not curve:
+        raise HTTPException(status_code=409, detail="The selected Temporal Strategy source run does not contain its exact economic replay curve.")
+
+    initial_capital = _as_float(capital.get("initial_capital")) or 0.0
+    equity: list[dict[str, Any]] = []
+    rotations: list[dict[str, Any]] = []
+    last_rotation_index: int | None = None
+    for row in curve:
+        timestamp = row.get("execution_date") or row.get("timestamp")
+        value = _as_float(row.get("strategy_equity"))
+        if timestamp is None or value is None:
+            continue
+        target = str(row.get("target_symbol") or "CASH").upper() or "CASH"
+        current = str(row.get("current_symbol") or "CASH").upper() or "CASH"
+        action = str(row.get("action") or "HOLD").upper()
+        equity.append({
+            "timestamp": iso_value(timestamp),
+            "simulation_equity": value,
+            "reference_equity": value,
+            "starting_value": initial_capital or None,
+            "drawdown": _as_float(row.get("strategy_drawdown")),
+            "selected_asset": target,
+            "trade_action": action,
+            "temporal_timing_override": bool(row.get("temporal_timing_override")),
+        })
+        if current != target:
+            rotation = {
+                "sequence": len(rotations) + 1,
+                "executed_at": iso_value(timestamp),
+                "from_asset": current,
+                "to_asset": target,
+                "holding_days": None,
+                "position_return": None,
+                "realized_pnl": None,
+                "transaction_fees": 0.0,
+                "sell_reason": str(row.get("reason") or "temporal_strategy_replay"),
+                "buy_reason": str(row.get("reason") or "temporal_strategy_replay"),
+                "temporal_timing_override": bool(row.get("temporal_timing_override")),
+            }
+            if last_rotation_index is not None:
+                previous = rotations[last_rotation_index]
+                previous["holding_days"] = _duration_days(previous.get("executed_at"), timestamp)
+            rotations.append(rotation)
+            last_rotation_index = len(rotations) - 1
+
+    monthly = _monthly_returns(equity)
+    worst_month = min(
+        (row for row in monthly if _as_float(row.get("return")) is not None),
+        key=lambda row: float(row["return"]),
+        default=None,
+    )
+    metrics = {
+        "initial_capital": _as_float(capital.get("initial_capital")),
+        "ending_capital": _as_float(capital.get("ending_capital")),
+        "strategy_return": _as_float(capital.get("total_return")),
+        "cagr": _as_float(capital.get("cagr")),
+        "sharpe": _as_float(capital.get("sharpe")),
+        "maximum_drawdown": _as_float(capital.get("max_drawdown")),
+        "capital_rotations": int(capital.get("switch_count") or len(rotations)),
+        "market_exposure": _as_float(capital.get("exposure")),
+        "cash_days": int(capital.get("cash_days") or 0),
+        "timing_override_count": int(capital.get("timing_override_count") or 0),
+        "monthly_returns": monthly,
+        "worst_month": worst_month,
+    }
+    payload = {
+        "job_id": str(processing_id),
+        "processing_id": str(processing_id),
+        "processing_kind": "strategy_research_temporal",
+        "processing_label": "Strategy Research · Temporal",
+        "reference_label": "Source Temporal Strategy",
+        "created_at": iso_value(run.get("created_at")),
+        "finished_at": iso_value(run.get("finished_at")),
+        "strategy_profile_id": strategy_id,
+        "strategy_profile_name": str(profile.get("name") or "Temporal Strategy"),
+        "strategy_profile_revision": int(profile.get("revision") or 1),
+        "strategy_configuration_hash": str(profile.get("configuration_hash") or ""),
+        "source_temporal_run_id": run_id,
+        "metrics": metrics,
+        "equity": equity,
+        "monthly_returns": monthly,
+        "consistency": _consistency(monthly),
+        "drawdown_episodes": _drawdown_episodes(equity),
+        "rotation_summary": {"rotation_count": len(rotations)},
+        "asset_attribution": [],
+        "transition_matrix": _transition_matrix(rotations),
+        "holding_buckets": [],
+        "trade_dependency": _trade_dependency([]),
+        "rotations": rotations,
+    }
+    return bson_value(payload)
 
 
 def stateful_strategy_processing_id(strategy_id: str) -> str:
@@ -50,10 +216,14 @@ def _stateful_strategy_processing_analytics(db: Any, processing_id: str) -> dict
     strategy_id = _stateful_strategy_id_from_processing(processing_id)
     if not strategy_id:
         return None
-    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id}, {"_id": 1, "name": 1, "revision": 1, "configuration_hash": 1, "strategy_kind": 1, "temporal_strategy_variant": 1, "source_stateful_replay_id": 1, "stateful_candidate_key": 1})
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id}, {"_id": 1, "name": 1, "revision": 1, "configuration_hash": 1, "strategy_kind": 1, "tuning_target": 1, "temporal_strategy_variant": 1, "source_stateful_replay_id": 1, "stateful_candidate_key": 1})
     if profile is None:
         raise HTTPException(status_code=404, detail="Strategy Research Stateful processing source was not found.")
-    if str(profile.get("strategy_kind") or "") != "temporal_intelligence" or str(profile.get("temporal_strategy_variant") or "") != "winner_transition_stateful":
+    if (
+        str(profile.get("strategy_kind") or "") != "temporal_intelligence"
+        or str(profile.get("temporal_strategy_variant") or "") != "winner_transition_stateful"
+        or str(profile.get("tuning_target") or "") != "stateful_transition"
+    ):
         raise HTTPException(status_code=409, detail="The selected Strategy Research profile is not a Stateful Temporal Strategy.")
     replay_id = str(profile.get("source_stateful_replay_id") or "").strip()
     candidate_key = str(profile.get("stateful_candidate_key") or "a").strip().lower() or "a"
@@ -1062,6 +1232,9 @@ def completed_processings(db: Any, limit: int = 100) -> dict[str, Any]:
 
 
 def processing_analytics(db: Any, processing_id: str) -> dict[str, Any]:
+    temporal = _temporal_strategy_processing_analytics(db, processing_id)
+    if temporal is not None:
+        return temporal
     stateful = _stateful_strategy_processing_analytics(db, processing_id)
     if stateful is not None:
         return stateful
@@ -1094,6 +1267,12 @@ def processing_rotation_period_analysis(
     year: int,
     month: int,
 ) -> dict[str, Any]:
+    temporal = _temporal_strategy_processing_analytics(db, processing_id)
+    if temporal is not None:
+        return _rotation_period_from_data(
+            db, processing_id, equity=list(temporal.get("equity") or []),
+            rotations=list(temporal.get("rotations") or []), year=year, month=month,
+        )
     stateful = _stateful_strategy_processing_analytics(db, processing_id)
     if stateful is not None:
         return _rotation_period_from_data(

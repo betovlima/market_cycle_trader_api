@@ -11,7 +11,7 @@ from .requests import BacktestRequest, normalize_assets_input
 class StrategyCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=3, max_length=120)
+    name: str = Field(default="", max_length=120)
     description: str = Field(default="", max_length=500)
     clone_from_strategy_id: str | None = Field(default=None, min_length=1, max_length=160)
 
@@ -27,7 +27,7 @@ class StrategyUpdateRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     configuration: dict[str, Any]
     assets_input: str | None = Field(default=None, min_length=1, max_length=20_000)
-    name: str = Field(min_length=3, max_length=120)
+    name: str = Field(default="", max_length=120)
     description: str = Field(default="", max_length=500)
     note: str | None = Field(default=None, max_length=500)
 

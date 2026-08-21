@@ -51,6 +51,7 @@ from ...services.temporal_intelligence import (
     list_temporal_intelligence_history,
     control_strategy_research_pipeline,
     get_strategy_research_pipeline_state,
+    get_strategy_research_pipeline_snapshot,
     materialize_temporal_intelligence_strategy,
     request_strategy_research_pipeline_pause,
     request_strategy_research_pipeline_stop,
@@ -492,6 +493,17 @@ def create_temporal_intelligence(
     try:
         return start_temporal_intelligence(database(), actor_email=identity.email)
     except (TemporalIntelligenceConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.get("/{run_id}/strategy-research/pipeline/snapshot")
+def strategy_research_pipeline_snapshot(
+    run_id: str,
+    _identity: Annotated[SessionIdentity, Depends(require_temporal_view)],
+) -> dict[str, Any]:
+    try:
+        return get_strategy_research_pipeline_snapshot(database(), run_id)
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
         raise _translate_error(exc) from exc
 
 

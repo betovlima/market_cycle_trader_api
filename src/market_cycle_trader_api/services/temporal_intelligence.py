@@ -22,6 +22,7 @@ from ..core.environment import build_subprocess_environment, load_project_enviro
 from ..engine.market_data import refresh_market_data_to_live_cutoff
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
+    STRATEGY_PROFILES_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
     TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
     TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION,
@@ -34,7 +35,7 @@ from ..infrastructure.persistence.mongo_repository import (
     utc_now,
 )
 from ..schemas.requests import BacktestExecutionRequest
-from .analytics import stateful_strategy_processing_id
+from .analytics import stateful_strategy_processing_id, temporal_strategy_processing_id
 from .model_research import apply_execution_profile, model_execution_snapshot
 from .model_tuning_market_snapshot import freeze_tuning_market_snapshot, market_snapshot_exists
 from .strategy_lab import (
@@ -62,6 +63,7 @@ _ACTIVE_LOCK = threading.Lock()
 STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "risk", "confidence", "stateful", "validation")
 STRATEGY_RESEARCH_PIPELINE_STAGE_STATES = frozenset({"waiting", "running", "completed", "paused", "stopped", "failed", "skipped"})
 STRATEGY_RESEARCH_PIPELINE_STATUSES = frozenset({"idle", "running", "pause_requested", "paused", "stop_requested", "stopped", "completed", "failed"})
+STRATEGY_RESEARCH_HISTORY_KEEP = 5
 
 
 class TemporalIntelligenceConflict(RuntimeError):
@@ -233,6 +235,7 @@ def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str
     is_stateful = (
         str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
         and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+        and str(strategy.get("tuning_target") or "") == "stateful_transition"
     )
     if is_stateful:
         from .temporal_winner_transition_stateful import build_stateful_live_runtime_bundle
@@ -249,6 +252,25 @@ def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str
             bundle,
         )
 
+    if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
+        source_run_id = str(strategy.get("source_temporal_run_id") or "").strip()
+        policy = strategy.get("temporal_policy") if isinstance(strategy.get("temporal_policy"), dict) else {}
+        source_run_id = source_run_id or str(policy.get("source_run_id") or "").strip()
+        if source_run_id:
+            source_run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+                {"id": source_run_id, "status": "completed"}, {"_id": 0, "id": 1}
+            )
+            if source_run is None:
+                raise TemporalIntelligenceConflict(
+                    "The selected Temporal Strategy Research source run is unavailable."
+                )
+            return (
+                temporal_strategy_processing_id(strategy_id),
+                "strategy_research_temporal",
+                "Strategy Research · Temporal",
+                None,
+            )
+
     exact_job = db[JOBS_COLLECTION].find_one(
         {
             "status": "completed",
@@ -261,6 +283,61 @@ def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str
     )
     processing_id = str((exact_job or {}).get("id") or "").strip() or None
     return processing_id, ("backtest" if processing_id else None), ("Simulation Backtest" if processing_id else None), None
+
+
+def _strategy_research_run_is_protected(db: Any, run_id: str) -> bool:
+    return db[STRATEGY_PROFILES_COLLECTION].find_one(
+        {"source_temporal_run_id": str(run_id)},
+        {"_id": 1},
+    ) is not None
+
+
+def _delete_strategy_research_run_data(db: Any, run_id: str, *, delete_run: bool) -> dict[str, int]:
+    run_key = str(run_id)
+    deleted = {
+        "observations": int(db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "artifacts": int(db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "risk": int(db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "intervention": int(db[TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "confidence": int(db[TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "decision_policy": int(db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+    }
+    deleted["runs"] = int(db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].delete_many({"id": run_key}).deleted_count or 0) if delete_run else 0
+    return deleted
+
+
+def purge_strategy_research_history(
+    db: Any,
+    *,
+    strategy_profile_id: str | None,
+    keep: int = STRATEGY_RESEARCH_HISTORY_KEEP,
+    exclude_run_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    strategy_id = str(strategy_profile_id or "").strip()
+    if not strategy_id:
+        return {"purged_runs": 0, "deleted_total": 0, "run_ids": []}
+    excluded = {str(value) for value in (exclude_run_ids or set()) if str(value)}
+    cursor = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find(
+        {
+            "strategy_profile_id": strategy_id,
+            "status": {"$in": ["completed", "failed", "interrupted", "cancelled", "stopped"]},
+        },
+        {"_id": 0, "id": 1, "created_at": 1},
+    ).sort("created_at", -1)
+    retained_unprotected = 0
+    purged_ids: list[str] = []
+    deleted_total = 0
+    for item in cursor:
+        candidate_id = str(item.get("id") or "").strip()
+        if not candidate_id or candidate_id in excluded or _strategy_research_run_is_protected(db, candidate_id):
+            continue
+        if retained_unprotected < max(0, int(keep)):
+            retained_unprotected += 1
+            continue
+        counts = _delete_strategy_research_run_data(db, candidate_id, delete_run=True)
+        purged_ids.append(candidate_id)
+        deleted_total += sum(counts.values())
+    return {"purged_runs": len(purged_ids), "deleted_total": int(deleted_total), "run_ids": purged_ids}
 
 
 def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_thread: bool = True) -> dict[str, Any]:
@@ -315,6 +392,12 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         raise TemporalIntelligenceConflict(str(exc)) from exc
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-temporal-" + uuid.uuid4().hex[:8]
+    purge_strategy_research_history(
+        db,
+        strategy_profile_id=str(strategy.get("id") or ""),
+        keep=STRATEGY_RESEARCH_HISTORY_KEEP,
+        exclude_run_ids={value for value in (run_id, source_run_id) if value},
+    )
     now = utc_now()
     document = {
         "id": run_id,
@@ -555,6 +638,7 @@ def _temporal_policy_strategy_snapshot(document: dict[str, Any]) -> dict[str, An
         "timing_base_weak_threshold": capital.get("timing_base_weak_threshold"),
         "timing_challenger_minimum": capital.get("timing_challenger_minimum"),
         "timing_minimum_advantage": capital.get("timing_minimum_advantage"),
+        "timing_maximum_advantage": capital.get("timing_maximum_advantage"),
         "entry_horizons": list(multi.get("entry_horizons") or []),
         "hold_horizons": list(multi.get("hold_horizons") or []),
         "risk_horizons": list(multi.get("risk_horizons") or []),
@@ -1055,14 +1139,138 @@ def _strategy_research_pipeline_state(document: dict[str, Any] | None) -> dict[s
     }
 
 
+def _persist_strategy_research_pipeline_state(
+    db: Any,
+    run_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    now = utc_now()
+    update = {
+        "status": state.get("status") or "idle",
+        "current_stage": state.get("current_stage"),
+        "stage_states": dict(state.get("stage_states") or _default_strategy_research_stage_states()),
+        "start_month": state.get("start_month"),
+        "end_month": state.get("end_month"),
+        "failure_message": state.get("failure_message"),
+        "updated_at": now,
+    }
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
+        {"id": str(run_id)},
+        {"$set": {"strategy_research_pipeline": update, "updated_at": now}},
+    )
+    return {"run_id": str(run_id), **_strategy_research_pipeline_state({"strategy_research_pipeline": update})}
+
+
+def _reconcile_detached_strategy_research_pipeline(
+    db: Any,
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    run_id = str(document.get("id") or "")
+    state = _strategy_research_pipeline_state(document)
+    pipeline_status = str(state.get("status") or "idle").lower()
+    current_stage = state.get("current_stage")
+    if current_stage != "temporal" or pipeline_status not in {"running", "pause_requested", "stop_requested"}:
+        return {"run_id": run_id, **state}
+
+    temporal_status = str(document.get("status") or "").lower()
+    if temporal_status in {"queued", "running", "stop_requested"}:
+        return {"run_id": run_id, **state}
+
+    stage_states = dict(state.get("stage_states") or _default_strategy_research_stage_states())
+    failure_message = state.get("failure_message")
+    next_status = pipeline_status
+    next_stage = current_stage
+
+    if temporal_status == "completed":
+        stage_states["temporal"] = "completed"
+        next_stage = None
+        next_status = "stopped" if pipeline_status == "stop_requested" else "paused"
+    elif pipeline_status == "stop_requested" or temporal_status == "cancelled":
+        stage_states["temporal"] = "stopped"
+        next_status = "stopped"
+    elif pipeline_status == "pause_requested":
+        stage_states["temporal"] = "paused"
+        next_status = "paused"
+    else:
+        stage_states["temporal"] = "failed"
+        next_status = "failed"
+        failure_message = str(
+            document.get("failure_message")
+            or document.get("stage")
+            or "Temporal Intelligence was interrupted before the pipeline could continue."
+        )
+
+    return _persist_strategy_research_pipeline_state(
+        db,
+        run_id,
+        {
+            **state,
+            "status": next_status,
+            "current_stage": next_stage,
+            "stage_states": stage_states,
+            "failure_message": failure_message,
+        },
+    )
+
+
 def get_strategy_research_pipeline_state(db: Any, run_id: str) -> dict[str, Any]:
     document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
         {"id": str(run_id)},
-        {"_id": 0, "id": 1, "strategy_research_pipeline": 1},
+        {"_id": 0, "id": 1, "status": 1, "stage": 1, "failure_message": 1, "strategy_research_pipeline": 1},
     )
     if document is None:
         raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
-    return {"run_id": str(run_id), **_strategy_research_pipeline_state(document)}
+    return _reconcile_detached_strategy_research_pipeline(db, document)
+
+
+def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, Any]:
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+        {"id": str(run_id)},
+        {
+            "_id": 0, "id": 1, "status": 1, "research_processing_id": 1,
+            "strategy_research_pipeline": 1, "result": 1, "analysis_end_date": 1,
+        },
+    )
+    if document is None:
+        raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
+    processing_id = str(document.get("research_processing_id") or "").strip()
+    pipeline = _strategy_research_pipeline_state(document)
+    result = document.get("result") if isinstance(document.get("result"), dict) else {}
+    period_start = str(pipeline.get("start_month") or "").strip()
+    period_end = str(pipeline.get("end_month") or "").strip()
+    if not period_start:
+        period_start = str(result.get("oos_start") or "")[:7]
+    if not period_end:
+        period_end = str(result.get("oos_end") or document.get("analysis_end_date") or "")[:7]
+
+    query: dict[str, Any] = {"run_id": str(run_id)}
+    if processing_id:
+        query["processing_id"] = processing_id
+    if period_start:
+        query["period_start"] = period_start
+    if period_end:
+        query["period_end"] = period_end
+
+    def latest(collection: str, statuses: tuple[str, ...] = ("completed",)) -> dict[str, Any] | None:
+        row = db[collection].find_one(
+            {**query, "status": {"$in": list(statuses)}},
+            {"_id": 0},
+            sort=[("created_at", -1)],
+        )
+        return bson_value(row) if row is not None else None
+
+    return bson_value({
+        "schema_version": 1,
+        "run_id": str(run_id),
+        "processing_id": processing_id or None,
+        "period_start": period_start or None,
+        "period_end": period_end or None,
+        "pipeline": pipeline,
+        "risk": latest(TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION),
+        "intervention": latest(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION),
+        "confidence": latest(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION),
+        "stateful": latest(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION, ("completed", "blocked")),
+    })
 
 
 def control_strategy_research_pipeline(
@@ -1091,8 +1299,8 @@ def control_strategy_research_pipeline(
         current_stage = None
         failure_message = None
     elif action == "resume":
-        if next_status not in {"paused", "stopped", "pause_requested", "stop_requested", "failed", "running"}:
-            raise TemporalIntelligenceConflict("Only an unfinished Strategy Research pipeline can be resumed.")
+        if next_status not in {"paused", "pause_requested", "failed", "running"}:
+            raise TemporalIntelligenceConflict("Only a paused or failed Strategy Research pipeline can be resumed.")
         next_status = "running"
         failure_message = None
         if current_stage and stage_states.get(current_stage) in {"paused", "stopped", "failed"}:
@@ -1123,11 +1331,7 @@ def control_strategy_research_pipeline(
     elif action == "checkpoint":
         if stage not in STRATEGY_RESEARCH_PIPELINE_STAGES:
             raise TemporalIntelligenceConflict("Unknown Strategy Research stage.")
-        if next_status == "pause_requested":
-            next_status = "paused"
-            current_stage = stage
-            stage_states[stage] = "paused"
-        elif next_status == "stop_requested":
+        if next_status == "stop_requested":
             next_status = "stopped"
             current_stage = stage
             stage_states[stage] = "stopped"
@@ -1164,6 +1368,28 @@ def request_strategy_research_pipeline_pause(db: Any, run_id: str) -> dict[str, 
     current = _strategy_research_pipeline_state(document)
     if current["status"] in {"paused", "pause_requested"}:
         return {"run_id": str(run_id), **current}
+
+    temporal_status = str(document.get("status") or "").lower()
+    temporal_active = temporal_status in {"queued", "running", "stop_requested"}
+    if temporal_active and current["status"] not in {"running", "stop_requested"}:
+        stage_states = dict(current.get("stage_states") or _default_strategy_research_stage_states())
+        stage_states["reference"] = "completed" if stage_states.get("reference") != "waiting" else stage_states["reference"]
+        stage_states["temporal"] = "running"
+        for stage in ("risk", "confidence", "stateful", "validation"):
+            stage_states[stage] = "waiting"
+        repaired = _persist_strategy_research_pipeline_state(
+            db,
+            run_id,
+            {
+                **current,
+                "status": "running",
+                "current_stage": "temporal",
+                "stage_states": stage_states,
+                "failure_message": None,
+            },
+        )
+        current = {key: value for key, value in repaired.items() if key != "run_id"}
+
     if current["status"] not in {"running", "stop_requested"}:
         raise TemporalIntelligenceConflict("Only a running Strategy Research pipeline can be paused.")
     now = utc_now()
@@ -1179,49 +1405,95 @@ def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, A
     if document is None:
         raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
     current = _strategy_research_pipeline_state(document)
-    if current["status"] in {"stopped", "stop_requested"}:
+    if current["status"] == "stopped":
         return {"run_id": str(run_id), **current}
-    if current["status"] not in {"running", "pause_requested", "paused"}:
+
+    temporal_status = str(document.get("status") or "").lower()
+    temporal_active = temporal_status in {"queued", "running", "stop_requested"}
+    current_stage = current.get("current_stage")
+
+    if temporal_active and current["status"] not in {"running", "pause_requested", "paused", "stop_requested"}:
+        stage_states = dict(current.get("stage_states") or _default_strategy_research_stage_states())
+        if stage_states.get("reference") == "waiting":
+            stage_states["reference"] = "completed"
+        stage_states["temporal"] = "running"
+        for stage in ("risk", "confidence", "stateful", "validation"):
+            stage_states[stage] = "waiting"
+        repaired = _persist_strategy_research_pipeline_state(
+            db,
+            run_id,
+            {
+                **current,
+                "status": "running",
+                "current_stage": "temporal",
+                "stage_states": stage_states,
+                "failure_message": None,
+            },
+        )
+        current = {key: value for key, value in repaired.items() if key != "run_id"}
+        current_stage = "temporal"
+
+    if current["status"] == "completed":
+        return {"run_id": str(run_id), **current}
+    if current["status"] not in {"running", "pause_requested", "paused", "stop_requested"}:
         raise TemporalIntelligenceConflict("Only an unfinished Strategy Research pipeline can be stopped.")
-    now = utc_now()
-    if current["status"] == "paused":
-        next_status = "stopped"
-    else:
-        next_status = "stop_requested"
-    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
-        {"id": str(run_id)},
-        {"$set": {"strategy_research_pipeline.status": next_status, "strategy_research_pipeline.updated_at": now, "updated_at": now}},
+
+    if current_stage == "temporal" and temporal_active:
+        try:
+            stop_temporal_intelligence(db, run_id)
+        except TemporalIntelligenceConflict:
+            pass
+
+    stage_states = dict(current.get("stage_states") or _default_strategy_research_stage_states())
+    if current_stage and stage_states.get(current_stage) not in {"completed", "skipped"}:
+        stage_states[current_stage] = "stopped"
+    return _persist_strategy_research_pipeline_state(
+        db,
+        run_id,
+        {
+            **current,
+            "status": "stopped",
+            "current_stage": current_stage,
+            "stage_states": stage_states,
+            "failure_message": None,
+        },
     )
-    return get_strategy_research_pipeline_state(db, run_id)
 
 
 def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
-    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0, "id": 1, "status": 1})
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+        {"id": str(run_id)},
+        {"_id": 0, "id": 1, "status": 1, "strategy_profile_id": 1},
+    )
     if document is None:
         raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
     status = str(document.get("status") or "").lower()
     if status in {"queued", "running", "stop_requested"}:
-        raise TemporalIntelligenceConflict("Pause or stop the active Temporal Intelligence run before restarting Strategy Research.")
+        raise TemporalIntelligenceConflict("Stop the active Temporal Intelligence run before restarting Strategy Research.")
 
-    collections = {
-        "risk": TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION,
-        "intervention": TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION,
-        "confidence": TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION,
-        "stateful": TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION,
-    }
-    deleted = {}
-    for key, collection_name in collections.items():
-        result = db[collection_name].delete_many({"run_id": str(run_id)})
-        deleted[key] = int(getattr(result, "deleted_count", 0) or 0)
-    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
-        {"id": str(run_id)},
-        {"$unset": {"strategy_research_pipeline": ""}, "$set": {"updated_at": utc_now()}},
+    protected = _strategy_research_run_is_protected(db, run_id)
+    if protected:
+        db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
+            {"id": str(run_id)},
+            {"$unset": {"strategy_research_pipeline": ""}, "$set": {"updated_at": utc_now()}},
+        )
+        deleted = {"observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0, "decision_policy": 0, "runs": 0}
+    else:
+        deleted = _delete_strategy_research_run_data(db, run_id, delete_run=True)
+
+    retention = purge_strategy_research_history(
+        db,
+        strategy_profile_id=str(document.get("strategy_profile_id") or ""),
+        keep=STRATEGY_RESEARCH_HISTORY_KEEP,
+        exclude_run_ids=set(),
     )
     return {
         "run_id": str(run_id),
         "status": "reset",
+        "protected": bool(protected),
         "deleted": deleted,
         "deleted_total": int(sum(deleted.values())),
+        "history_purge": retention,
     }
 
 
@@ -1247,5 +1519,48 @@ def recover_temporal_intelligence_runs(db: Any) -> int:
     result = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_many(
         {"status": {"$in": ["queued", "running", "stop_requested"]}},
         {"$set": {"status": "interrupted", "stage": "Interrupted after API restart", "failure_message": "The Temporal Intelligence process was interrupted by an API restart.", "finished_at": now, "updated_at": now}, "$unset": {"process_id": ""}},
+    )
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_many(
+        {
+            "status": "interrupted",
+            "strategy_research_pipeline.current_stage": "temporal",
+            "strategy_research_pipeline.status": "stop_requested",
+        },
+        {
+            "$set": {
+                "strategy_research_pipeline.status": "stopped",
+                "strategy_research_pipeline.stage_states.temporal": "stopped",
+                "strategy_research_pipeline.updated_at": now,
+            }
+        },
+    )
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_many(
+        {
+            "status": "interrupted",
+            "strategy_research_pipeline.current_stage": "temporal",
+            "strategy_research_pipeline.status": "pause_requested",
+        },
+        {
+            "$set": {
+                "strategy_research_pipeline.status": "paused",
+                "strategy_research_pipeline.stage_states.temporal": "paused",
+                "strategy_research_pipeline.updated_at": now,
+            }
+        },
+    )
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_many(
+        {
+            "status": "interrupted",
+            "strategy_research_pipeline.current_stage": "temporal",
+            "strategy_research_pipeline.status": "running",
+        },
+        {
+            "$set": {
+                "strategy_research_pipeline.status": "failed",
+                "strategy_research_pipeline.stage_states.temporal": "failed",
+                "strategy_research_pipeline.failure_message": "Temporal Intelligence was interrupted by an API restart.",
+                "strategy_research_pipeline.updated_at": now,
+            }
+        },
     )
     return int(getattr(result, "modified_count", 0) or 0)

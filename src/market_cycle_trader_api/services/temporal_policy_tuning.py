@@ -21,6 +21,7 @@ TEMPORAL_POLICY_SEARCH_SPACE: tuple[dict[str, Any], ...] = (
     {"name": "timing_base_weak_threshold", "type": "number", "min": 0.30, "max": 0.70, "precision": 6},
     {"name": "timing_challenger_minimum", "type": "number", "min": 0.40, "max": 0.80, "precision": 6},
     {"name": "timing_minimum_advantage", "type": "number", "min": 0.05, "max": 0.40, "precision": 6},
+    {"name": "timing_maximum_advantage", "type": "number", "min": 0.45, "max": 1.00, "precision": 6},
 )
 
 
@@ -109,6 +110,7 @@ def _base_parameters(strategy: dict[str, Any]) -> dict[str, float]:
         "timing_base_weak_threshold": 0.50,
         "timing_challenger_minimum": 0.60,
         "timing_minimum_advantage": 0.25,
+        "timing_maximum_advantage": 1.00,
     }
     return {
         name: float(parameters.get(name) if _finite(parameters.get(name)) is not None else default)
@@ -121,7 +123,7 @@ def temporal_policy_plan(strategy: dict[str, Any]) -> dict[str, Any]:
     return {
         "scope": TEMPORAL_POLICY_TUNING_SCOPE,
         "scope_label": "Temporal Policy — Winner-Anchored Timing",
-        "description": "Tune the three causal Top-1/Top-2 Temporal timing thresholds against the immutable frozen Temporal replay without retraining the Winner model or downloading market data.",
+        "description": "Tune the causal Top-1/Top-2 Temporal timing thresholds and the overconfidence ceiling against the immutable frozen Temporal replay without retraining the Winner model or downloading market data.",
         "search_space": [dict(item) for item in TEMPORAL_POLICY_SEARCH_SPACE],
         "tuned_parameters": [item["name"] for item in TEMPORAL_POLICY_SEARCH_SPACE],
         "tuned_model_parameters": [],

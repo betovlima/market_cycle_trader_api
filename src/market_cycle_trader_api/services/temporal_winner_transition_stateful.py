@@ -234,6 +234,7 @@ def _policy_target(
             and base_short < float(settings["timing_base_weak_threshold"])
             and challenger_short >= float(settings["timing_challenger_minimum"])
             and (challenger_short - base_short) >= float(settings["timing_minimum_advantage"])
+            and (challenger_short - base_short) <= float(settings.get("timing_maximum_advantage", 1.0))
         )
     proposed = challenger_symbol if override else base_symbol
     return {

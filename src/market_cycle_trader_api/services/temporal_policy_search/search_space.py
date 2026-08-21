@@ -51,6 +51,14 @@ TEMPORAL_POLICY_SEARCH_SPACE: tuple[dict[str, Any], ...] = (
         "role": "short_horizon_advantage",
     },
     {
+        "name": "timing_maximum_advantage",
+        "type": "number",
+        "min": 0.45,
+        "max": 1.00,
+        "precision": 4,
+        "role": "short_horizon_overconfidence_ceiling",
+    },
+    {
         "name": "trajectory_lookback_sessions",
         "type": "integer",
         "min": 1,
@@ -98,6 +106,7 @@ def base_settings(run: dict[str, Any]) -> dict[str, Any]:
         "timing_base_weak_threshold": 0.50,
         "timing_challenger_minimum": 0.60,
         "timing_minimum_advantage": 0.25,
+        "timing_maximum_advantage": 1.00,
     }
     values: dict[str, Any] = {
         name: float(capital.get(name)) if _finite(capital.get(name)) is not None else default

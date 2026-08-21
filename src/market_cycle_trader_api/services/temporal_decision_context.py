@@ -121,6 +121,7 @@ _DIAGNOSTIC_FIELDS = (
     "timing_base_weak_threshold",
     "timing_challenger_minimum",
     "timing_minimum_advantage",
+    "timing_maximum_advantage",
 )
 
 

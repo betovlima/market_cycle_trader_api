@@ -306,6 +306,66 @@ def _holding_interval_outcome(
     }
 
 
+def _reference_context(row: dict[str, Any]) -> dict[str, Any] | None:
+    decision_at = _as_utc(row.get("decision_date"))
+    execution_at = _as_utc(row.get("timestamp") or row.get("execution_date"))
+    if decision_at is None or execution_at is None:
+        return None
+    current_symbol = _asset(row, "current_asset") or _asset(row, "previous_asset") or "CASH"
+    target_symbol = _asset(row, "selected_asset") or _asset(row, "final_action_asset") or current_symbol
+    if current_symbol == target_symbol:
+        action = "HOLD"
+    elif current_symbol == "CASH" and target_symbol != "CASH":
+        action = "BUY"
+    elif current_symbol != "CASH" and target_symbol == "CASH":
+        action = "SELL"
+    else:
+        action = "ROTATE"
+    return {
+        "fold_id": row.get("walk_forward_fold"),
+        "decision_at": decision_at,
+        "execution_at": execution_at,
+        "current_symbol": current_symbol,
+        "target_symbol": target_symbol,
+        "action": action,
+        "reason": str(row.get("trade_reason") or "strategy_research_reference"),
+    }
+
+
+def _reference_contexts(
+    winner_rows: list[dict[str, Any]],
+    *,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    for row in winner_rows:
+        context = _reference_context(row)
+        if context is None:
+            continue
+        execution_at = _as_utc(context.get("execution_at"))
+        if execution_at is None or execution_at < start or execution_at >= end:
+            continue
+        contexts.append(context)
+    contexts.sort(key=lambda item: _as_utc(item.get("decision_at")) or datetime.min.replace(tzinfo=timezone.utc))
+    return contexts
+
+
+def _period_bounds(start_month: str, end_month: str) -> tuple[datetime, datetime]:
+    try:
+        start = datetime.strptime(str(start_month), "%Y-%m").replace(tzinfo=timezone.utc)
+        end_start = datetime.strptime(str(end_month), "%Y-%m").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise TemporalDecisionContextError("Period must use YYYY-MM format.") from exc
+    if end_start < start:
+        raise TemporalDecisionContextError("Period end must be greater than or equal to period start.")
+    if end_start.month == 12:
+        end = datetime(end_start.year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end = datetime(end_start.year, end_start.month + 1, 1, tzinfo=timezone.utc)
+    return start, end
+
+
 def get_winner_transition_attribution(
     db: Any,
     run_id: str,
@@ -320,27 +380,32 @@ def get_winner_transition_attribution(
     if run is None:
         raise TemporalDecisionContextNotFound("Temporal Intelligence run not found.")
     if str(run.get("status") or "").lower() != "completed":
-        raise TemporalDecisionContextError("Winner transition attribution is available only for a completed Temporal Intelligence run.")
+        raise TemporalDecisionContextError("Research transition attribution is available only for a completed Temporal Intelligence run.")
 
-    decision_context = get_temporal_decision_context(
-        db,
-        run_id,
-        start_month=start_month,
-        end_month=end_month,
-    )
-    contexts = [item for item in decision_context.get("items") or [] if isinstance(item, dict)]
+    start, end = _period_bounds(start_month, end_month)
     winner_rows = _artifact_rows(db, run_id, "winner_reference_daily")
     winner_rows = [row for row in winner_rows if _as_utc(row.get("decision_date")) is not None]
     winner_rows.sort(key=lambda row: _as_utc(row.get("decision_date")) or datetime.min.replace(tzinfo=timezone.utc))
+    contexts = _reference_contexts(winner_rows, start=start, end=end)
+
+    if not contexts:
+        decision_context = get_temporal_decision_context(
+            db,
+            run_id,
+            start_month=start_month,
+            end_month=end_month,
+        )
+        contexts = [item for item in decision_context.get("items") or [] if isinstance(item, dict)]
 
     decision_times = [_as_utc(item.get("decision_at")) for item in contexts]
     decision_times = [value for value in decision_times if value is not None]
     if not decision_times:
         return bson_value({
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": str(run_id),
             "period_start": start_month,
             "period_end": end_month,
+            "source": "strategy_research_reference",
             "lookback_windows": list(_LOOKBACK_WINDOWS),
             "count": 0,
             "items": [],
@@ -350,9 +415,6 @@ def get_winner_transition_attribution(
     items: list[dict[str, Any]] = []
     for context_index, context in enumerate(contexts):
         if str(context.get("action") or "").upper() != "ROTATE":
-            continue
-        reason = str(context.get("reason") or "")
-        if not reason.startswith("winner_anchor"):
             continue
         incumbent_symbol = str(context.get("current_symbol") or "").upper()
         target_symbol = str(context.get("target_symbol") or "").upper()
@@ -423,9 +485,11 @@ def get_winner_transition_attribution(
             str(window): _window_summary(sessions[-window:], target_symbol, incumbent_symbol)
             for window in _LOOKBACK_WINDOWS
         }
-        outcome = context.get("outcome") if isinstance(context.get("outcome"), dict) else {}
-        target_interval = _finite(outcome.get("gross_interval_return"))
-        incumbent_interval = _finite(outcome.get("counterfactual_current_interval_return"))
+        decision_rows = observations.get(decision_at.isoformat()) or []
+        target_row = _temporal_row(decision_rows, target_symbol)
+        incumbent_row = _temporal_row(decision_rows, incumbent_symbol)
+        target_interval = _finite((target_row or {}).get("open_to_open_return"))
+        incumbent_interval = _finite((incumbent_row or {}).get("open_to_open_return"))
         holding_interval = _holding_interval_outcome(
             contexts,
             context_index,
@@ -440,8 +504,12 @@ def get_winner_transition_attribution(
             "execution_at": context.get("execution_at"),
             "from_asset": incumbent_symbol,
             "to_asset": target_symbol,
-            "reason": reason,
-            "winner_top1_top2_score_gap": context.get("winner_top1_top2_score_gap"),
+            "reason": str(context.get("reason") or "strategy_research_reference"),
+            "winner_top1_top2_score_gap": (
+                windows.get("1", {}).get("top1_top2_gap_latest")
+                if isinstance(windows.get("1"), dict)
+                else None
+            ),
             "one_interval_outcome": {
                 "target_return": target_interval,
                 "incumbent_return": incumbent_interval,
@@ -459,10 +527,11 @@ def get_winner_transition_attribution(
         }))
 
     return bson_value({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": str(run_id),
         "period_start": start_month,
         "period_end": end_month,
+        "source": "strategy_research_reference",
         "lookback_windows": list(_LOOKBACK_WINDOWS),
         "count": len(items),
         "items": items,

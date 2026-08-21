@@ -16,6 +16,7 @@ import pandas as pd
 
 from ..core.environment import load_project_environment
 from ..infrastructure.persistence.mongo_repository import (
+    JOBS_COLLECTION,
     TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
     TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION,
     TEMPORAL_INTELLIGENCE_RUNS_COLLECTION,
@@ -2434,6 +2435,7 @@ def _cost_stress_metrics(
 _WINNER_TIMING_BASE_WEAK_THRESHOLD = 0.50
 _WINNER_TIMING_CHALLENGER_MINIMUM = 0.60
 _WINNER_TIMING_MINIMUM_ADVANTAGE = 0.25
+_WINNER_TIMING_MAXIMUM_ADVANTAGE = 0.65
 
 
 def _reference_asset(value: Any) -> str:
@@ -2578,6 +2580,7 @@ def _strategy_research_reference_study(
                 and float(base_short) < _WINNER_TIMING_BASE_WEAK_THRESHOLD
                 and float(challenger_short) >= _WINNER_TIMING_CHALLENGER_MINIMUM
                 and temporal_advantage >= _WINNER_TIMING_MINIMUM_ADVANTAGE
+                and temporal_advantage <= _WINNER_TIMING_MAXIMUM_ADVANTAGE
             )
             override = bool(enable_timing_override and timing_candidate)
 
@@ -2678,6 +2681,7 @@ def _strategy_research_reference_study(
                 "timing_base_weak_threshold": _WINNER_TIMING_BASE_WEAK_THRESHOLD,
                 "timing_challenger_minimum": _WINNER_TIMING_CHALLENGER_MINIMUM,
                 "timing_minimum_advantage": _WINNER_TIMING_MINIMUM_ADVANTAGE,
+                "timing_maximum_advantage": _WINNER_TIMING_MAXIMUM_ADVANTAGE,
             })
 
         if index < len(aligned) - 1:
@@ -2760,6 +2764,7 @@ def _strategy_research_reference_study(
         "timing_base_weak_threshold": _WINNER_TIMING_BASE_WEAK_THRESHOLD,
         "timing_challenger_minimum": _WINNER_TIMING_CHALLENGER_MINIMUM,
         "timing_minimum_advantage": _WINNER_TIMING_MINIMUM_ADVANTAGE,
+        "timing_maximum_advantage": _WINNER_TIMING_MAXIMUM_ADVANTAGE,
         "reference_coverage_start": bson_value(_reference_timestamp(aligned[0][0].get("timestamp"))),
         "reference_coverage_end": bson_value(_reference_timestamp(aligned[-1][0].get("timestamp"))),
         "reference_equity_sessions": int(len(aligned)),
@@ -2866,6 +2871,7 @@ def _winner_anchored_temporal_study(
                     and float(base_short) < _WINNER_TIMING_BASE_WEAK_THRESHOLD
                     and float(challenger_short) >= _WINNER_TIMING_CHALLENGER_MINIMUM
                     and temporal_advantage >= _WINNER_TIMING_MINIMUM_ADVANTAGE
+                    and temporal_advantage <= _WINNER_TIMING_MAXIMUM_ADVANTAGE
                 )
                 override = bool(enable_timing_override and timing_candidate)
 
@@ -2977,6 +2983,7 @@ def _winner_anchored_temporal_study(
                     "timing_base_weak_threshold": _WINNER_TIMING_BASE_WEAK_THRESHOLD,
                     "timing_challenger_minimum": _WINNER_TIMING_CHALLENGER_MINIMUM,
                     "timing_minimum_advantage": _WINNER_TIMING_MINIMUM_ADVANTAGE,
+                    "timing_maximum_advantage": _WINNER_TIMING_MAXIMUM_ADVANTAGE,
                 })
 
             if include_economic_curve:
@@ -3046,6 +3053,7 @@ def _winner_anchored_temporal_study(
         "timing_base_weak_threshold": _WINNER_TIMING_BASE_WEAK_THRESHOLD,
         "timing_challenger_minimum": _WINNER_TIMING_CHALLENGER_MINIMUM,
         "timing_minimum_advantage": _WINNER_TIMING_MINIMUM_ADVANTAGE,
+        "timing_maximum_advantage": _WINNER_TIMING_MAXIMUM_ADVANTAGE,
         "cost_stress": _cost_stress_metrics(
             gross_return_history,
             cost_sides_history,
@@ -3292,50 +3300,79 @@ def _bind_strategy_research_reference_analytics(
     equity_rows = [
         dict(row) for row in (reference_analytics.get("equity") or [])
         if isinstance(row, dict) and _reference_timestamp(row.get("timestamp")) is not None
+        and _finite(row.get("simulation_equity")) is not None
     ]
     equity_rows.sort(key=lambda row: _reference_timestamp(row.get("timestamp")))
     if len(equity_rows) < 2:
         raise ValueError("Selected Strategy Research reference replay does not contain enough equity sessions.")
-    reference_by_execution = {
-        _reference_timestamp(row.get("timestamp")): row
-        for row in equity_rows
-        if _reference_timestamp(row.get("timestamp")) is not None
+
+    rotations = [
+        dict(row) for row in (reference_analytics.get("rotations") or [])
+        if isinstance(row, dict) and _reference_timestamp(row.get("executed_at")) is not None
+    ]
+    rotations.sort(key=lambda row: _reference_timestamp(row.get("executed_at")))
+    winner_by_execution = {
+        _reference_timestamp(row.get("timestamp")): dict(row)
+        for row in winner_daily_rows
+        if isinstance(row, dict) and _reference_timestamp(row.get("timestamp")) is not None
     }
-    bound_rows: list[dict[str, Any]] = []
-    previous_asset = "CASH"
-    rotations = [dict(row) for row in (reference_analytics.get("rotations") or []) if isinstance(row, dict)]
+
     first_stamp = _reference_timestamp(equity_rows[0].get("timestamp"))
     first_rotation = next(
         (row for row in rotations if _reference_timestamp(row.get("executed_at")) == first_stamp),
         None,
     )
-    if first_rotation is not None:
-        previous_asset = _reference_asset(first_rotation.get("from_asset"))
-    for source in sorted(
-        (dict(row) for row in winner_daily_rows if isinstance(row, dict)),
-        key=lambda row: _reference_timestamp(row.get("timestamp")) or pd.Timestamp.min.tz_localize("UTC"),
-    ):
-        execution_stamp = _reference_timestamp(source.get("timestamp"))
-        reference = reference_by_execution.get(execution_stamp)
-        if reference is None:
+    current_asset = _reference_asset((first_rotation or {}).get("from_asset"))
+    rotation_index = 0
+    synthetic_context_sessions = 0
+    bound_rows: list[dict[str, Any]] = []
+    last_fold_id = 0
+
+    for reference in equity_rows:
+        execution_stamp = _reference_timestamp(reference.get("timestamp"))
+        if execution_stamp is None:
             continue
-        selected_asset = _reference_asset(reference.get("selected_asset"))
-        source["strategy_research_control_asset"] = selected_asset
+        previous_asset = current_asset
+        while rotation_index < len(rotations):
+            rotation_stamp = _reference_timestamp(rotations[rotation_index].get("executed_at"))
+            if rotation_stamp is None or rotation_stamp > execution_stamp:
+                break
+            current_asset = _reference_asset(rotations[rotation_index].get("to_asset"))
+            rotation_index += 1
+
+        source = deepcopy(winner_by_execution.get(execution_stamp) or {})
+        if not source:
+            synthetic_context_sessions += 1
+            source = {
+                "timestamp": execution_stamp,
+                "decision_date": None,
+                "walk_forward_fold": last_fold_id,
+                "decision_fold_id": last_fold_id,
+            }
+        else:
+            last_fold_id = int(
+                source.get("walk_forward_fold")
+                or source.get("decision_fold_id")
+                or source.get("fold_id")
+                or last_fold_id
+                or 0
+            )
+
+        source["strategy_research_control_asset"] = current_asset
         source["strategy_research_control_previous_asset"] = previous_asset
         source["previous_asset"] = previous_asset
         if "current_asset" in source:
             source["current_asset"] = previous_asset
-        source["selected_asset"] = selected_asset
-        source["final_action_asset"] = selected_asset
+        source["selected_asset"] = current_asset
+        source["final_action_asset"] = current_asset
         source["strategy_equity"] = _finite(reference.get("simulation_equity"))
-        source["strategy_research_reference_source"] = "exact_stateful_processing_analytics"
+        source["strategy_research_reference_source"] = "exact_processing_analytics"
         bound_rows.append(source)
-        previous_asset = selected_asset
 
     if len(bound_rows) != len(equity_rows):
         raise ValueError(
-            "Selected Strategy Research reference replay is not aligned with the frozen Temporal market snapshot "
-            f"({len(bound_rows)}/{len(equity_rows)} sessions aligned)."
+            "Selected Strategy Research reference replay could not bind every reference equity session "
+            f"({len(bound_rows)}/{len(equity_rows)} sessions bound)."
         )
 
     fold_equity: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
@@ -3363,7 +3400,7 @@ def _bind_strategy_research_reference_analytics(
         years = max((len(values) - 1) / 252.0, 1.0 / 252.0)
         fold_return = float(values[-1] / values[0] - 1.0)
         fold_cagr = float((values[-1] / values[0]) ** (1.0 / years) - 1.0) if values[-1] > 0 else -1.0
-        assets = [_reference_asset(item[1].get("selected_asset")) for item in items]
+        assets = [_reference_asset(item[0].get("selected_asset")) for item in items]
         cash_days = sum(asset == "CASH" for asset in assets)
         switches = sum(assets[index] != assets[index - 1] for index in range(1, len(assets)))
         exact_folds.append({
@@ -3380,26 +3417,37 @@ def _bind_strategy_research_reference_analytics(
         })
 
     updated = deepcopy(winner_reference)
+    initial_capital = _finite(metrics.get("initial_capital"))
+    if initial_capital is None:
+        initial_capital = _finite(metrics.get("starting_capital"))
     ending_capital = _finite(metrics.get("ending_capital"))
+    strategy_return = _finite(metrics.get("strategy_return"))
+    if strategy_return is None:
+        strategy_return = _finite(metrics.get("simulation_return"))
+    switch_count_value = metrics.get("capital_rotations")
+    if switch_count_value is None:
+        switch_count_value = metrics.get("position_changes")
+    switch_count = int(switch_count_value if switch_count_value is not None else len(rotations))
     coverage_start = _reference_timestamp(equity_rows[0].get("timestamp"))
     coverage_end = _reference_timestamp(equity_rows[-1].get("timestamp"))
     updated.update({
-        "reference_type": "selected_strategy_research_stateful_exact_replay",
+        "reference_type": "selected_strategy_research_exact_processing_replay",
         "same_frozen_market_snapshot": True,
-        "initial_capital": _finite(metrics.get("initial_capital")) or updated.get("initial_capital"),
+        "initial_capital": initial_capital or updated.get("initial_capital"),
         "ending_capital": ending_capital,
-        "total_return": _finite(metrics.get("strategy_return")),
+        "total_return": strategy_return,
         "cagr": _finite(metrics.get("cagr")),
         "sharpe": _finite(metrics.get("sharpe")),
         "max_drawdown": _finite(metrics.get("maximum_drawdown")),
         "exposure": _finite(metrics.get("market_exposure")),
         "cash_days": int(metrics.get("cash_days") or 0),
-        "switch_count": int(metrics.get("capital_rotations") or len(rotations)),
+        "switch_count": switch_count,
         "folds": exact_folds,
         "oos_start": bson_value(coverage_start),
         "oos_end": bson_value(coverage_end),
         "reference_equity_sessions": int(len(equity_rows)),
-        "reference_uncovered_market_sessions": int(max(0, len(winner_daily_rows) - len(bound_rows))),
+        "reference_context_sessions": int(len(winner_by_execution)),
+        "reference_uncovered_market_sessions": int(synthetic_context_sessions),
         "reference_coverage_start": bson_value(coverage_start),
         "reference_coverage_end": bson_value(coverage_end),
         "reference_processing_id": reference_analytics.get("processing_id") or reference_analytics.get("job_id"),
@@ -4144,24 +4192,47 @@ def execute_temporal_run(run_id: str, db: Any) -> dict[str, Any]:
         bars_by_symbol[symbol] = validate_and_clean_bars(raw, asset_config)
 
     strategy_research_reference_analytics = None
-    if str(run.get("research_processing_kind") or "") == "strategy_research_stateful":
-        processing_id = str(run.get("research_processing_id") or "").strip()
-        if not processing_id:
-            raise ValueError("Selected Stateful Strategy Research is missing its reference processing binding.")
+    processing_id = str(run.get("research_processing_id") or "").strip()
+    processing_kind = str(run.get("research_processing_kind") or "").strip()
+    strategy_kind = str(run.get("strategy_kind") or "standard").strip() or "standard"
+    if strategy_kind == "standard" and not processing_id:
+        raise ValueError(
+            "Selected standard Strategy Research requires its completed Reference Replay before Temporal Intelligence."
+        )
+    if processing_id and processing_kind in {"backtest", "strategy_research_stateful", "strategy_research_temporal"}:
         from ..services.analytics import processing_analytics
         strategy_research_reference_analytics = processing_analytics(db, processing_id)
         expected_strategy_id = str(run.get("strategy_profile_id") or "").strip()
-        actual_strategy_id = str(strategy_research_reference_analytics.get("strategy_profile_id") or "").strip()
         expected_revision = int(run.get("strategy_profile_revision") or 1)
-        actual_revision = int(strategy_research_reference_analytics.get("strategy_profile_revision") or 1)
         expected_hash = str(run.get("strategy_configuration_hash") or "").strip()
-        actual_hash = str(strategy_research_reference_analytics.get("strategy_configuration_hash") or "").strip()
+
+        if processing_kind == "backtest":
+            source = db[JOBS_COLLECTION].find_one(
+                {"id": processing_id},
+                {
+                    "_id": 0,
+                    "strategy_profile_id": 1,
+                    "strategy_profile_revision": 1,
+                    "strategy_configuration_hash": 1,
+                },
+            ) or {}
+            actual_strategy_id = str(source.get("strategy_profile_id") or "").strip()
+            actual_revision = int(source.get("strategy_profile_revision") or 1)
+            actual_hash = str(source.get("strategy_configuration_hash") or "").strip()
+        else:
+            actual_strategy_id = str(strategy_research_reference_analytics.get("strategy_profile_id") or "").strip()
+            actual_revision = int(strategy_research_reference_analytics.get("strategy_profile_revision") or 1)
+            actual_hash = str(strategy_research_reference_analytics.get("strategy_configuration_hash") or "").strip()
+
         if (
             actual_strategy_id != expected_strategy_id
             or actual_revision != expected_revision
             or (expected_hash and actual_hash != expected_hash)
         ):
-            raise ValueError("Selected Stateful Strategy Research reference does not match the frozen Strategy snapshot.")
+            raise ValueError("Selected Strategy Research reference does not match the frozen Strategy snapshot.")
+        strategy_research_reference_analytics["strategy_profile_id"] = expected_strategy_id
+        strategy_research_reference_analytics["strategy_profile_revision"] = expected_revision
+        strategy_research_reference_analytics["strategy_configuration_hash"] = expected_hash
 
     result = run_temporal_intelligence(
         bars_by_symbol,
