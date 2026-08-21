@@ -28,6 +28,7 @@ from ...schemas.requests import TemporalPolicySearchRequest, WinnerTransitionCon
 from ...services.temporal_winner_transition_stateful import (
     WinnerTransitionStatefulReplayError,
     get_latest_winner_transition_stateful_replay,
+    materialize_winner_transition_stateful_candidate_a_strategy,
     run_winner_transition_stateful_replay,
 )
 from ...services.temporal_policy_search import (
@@ -51,6 +52,7 @@ from ...services.temporal_intelligence import (
     materialize_temporal_intelligence_strategy,
     start_temporal_intelligence,
     stop_temporal_intelligence,
+    validate_temporal_research_processing,
 )
 
 router = APIRouter(prefix="/api/temporal-intelligence", tags=["temporal-intelligence"])
@@ -66,7 +68,7 @@ def _translate_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, TemporalIntelligenceConflict):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
 
 
 @router.get("/latest")
@@ -113,7 +115,7 @@ def temporal_intelligence_decision_context(
     except TemporalDecisionContextNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except TemporalDecisionContextError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/winner-transition-attribution")
@@ -133,7 +135,7 @@ def temporal_intelligence_winner_transition_attribution(
     except TemporalDecisionContextNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except TemporalDecisionContextError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/winner-transition-risk-search/latest")
@@ -144,8 +146,13 @@ def latest_winner_transition_risk_research(
     start_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
     end_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
 ) -> dict[str, Any] | None:
+    db = database()
+    try:
+        validate_temporal_research_processing(db, run_id, processing_id)
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     return get_latest_winner_transition_risk_search(
-        database(),
+        db,
         run_id,
         processing_id=processing_id,
         start_month=start_month,
@@ -159,17 +166,21 @@ def winner_transition_risk_research(
     payload: WinnerTransitionRiskSearchRequest,
     _identity: Annotated[SessionIdentity, Depends(require_temporal_start)],
 ) -> dict[str, Any]:
+    db = database()
     try:
+        validate_temporal_research_processing(db, run_id, payload.processing_id)
         return run_winner_transition_risk_search(
-            database(),
+            db,
             run_id,
             processing_id=payload.processing_id,
             start_month=payload.start_month,
             end_month=payload.end_month,
             seed=payload.seed,
         )
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     except (WinnerTransitionRiskError, TemporalDecisionContextError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/winner-transition-intervention-search/latest")
@@ -180,8 +191,13 @@ def latest_winner_transition_intervention_research(
     start_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
     end_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
 ) -> dict[str, Any] | None:
+    db = database()
+    try:
+        validate_temporal_research_processing(db, run_id, processing_id)
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     return get_latest_winner_transition_intervention_search(
-        database(),
+        db,
         run_id,
         processing_id=processing_id,
         start_month=start_month,
@@ -195,17 +211,21 @@ def winner_transition_intervention_research(
     payload: WinnerTransitionInterventionSearchRequest,
     _identity: Annotated[SessionIdentity, Depends(require_temporal_start)],
 ) -> dict[str, Any]:
+    db = database()
     try:
+        validate_temporal_research_processing(db, run_id, payload.processing_id)
         return run_winner_transition_intervention_search(
-            database(),
+            db,
             run_id,
             processing_id=payload.processing_id,
             start_month=payload.start_month,
             end_month=payload.end_month,
             seed=payload.seed,
         )
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     except (WinnerTransitionInterventionError, WinnerTransitionRiskError, TemporalDecisionContextError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/winner-transition-confidence-calibration/latest")
@@ -216,8 +236,13 @@ def latest_winner_transition_confidence_research(
     start_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
     end_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
 ) -> dict[str, Any] | None:
+    db = database()
+    try:
+        validate_temporal_research_processing(db, run_id, processing_id)
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     return get_latest_winner_transition_confidence_calibration(
-        database(),
+        db,
         run_id,
         processing_id=processing_id,
         start_month=start_month,
@@ -231,16 +256,20 @@ def winner_transition_confidence_research(
     payload: WinnerTransitionConfidenceCalibrationRequest,
     _identity: Annotated[SessionIdentity, Depends(require_temporal_start)],
 ) -> dict[str, Any]:
+    db = database()
     try:
+        validate_temporal_research_processing(db, run_id, payload.processing_id)
         return run_winner_transition_confidence_calibration(
-            database(),
+            db,
             run_id,
             processing_id=payload.processing_id,
             start_month=payload.start_month,
             end_month=payload.end_month,
         )
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     except (WinnerTransitionInterventionError, WinnerTransitionRiskError, TemporalDecisionContextError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/winner-transition-stateful-replay/latest")
@@ -251,8 +280,13 @@ def latest_winner_transition_stateful_research(
     start_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
     end_month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
 ) -> dict[str, Any] | None:
+    db = database()
+    try:
+        validate_temporal_research_processing(db, run_id, processing_id)
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     return get_latest_winner_transition_stateful_replay(
-        database(),
+        db,
         run_id,
         processing_id=processing_id,
         start_month=start_month,
@@ -266,16 +300,39 @@ def winner_transition_stateful_research(
     payload: WinnerTransitionStatefulReplayRequest,
     _identity: Annotated[SessionIdentity, Depends(require_temporal_start)],
 ) -> dict[str, Any]:
+    db = database()
     try:
+        validate_temporal_research_processing(db, run_id, payload.processing_id)
         return run_winner_transition_stateful_replay(
-            database(),
+            db,
             run_id,
             processing_id=payload.processing_id,
             start_month=payload.start_month,
             end_month=payload.end_month,
         )
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
     except (WinnerTransitionStatefulReplayError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
+
+@router.post("/{run_id}/winner-transition-stateful-replay/{replay_id}/candidate-a/strategy", status_code=201)
+def create_strategy_from_stateful_candidate_a(
+    run_id: str,
+    replay_id: str,
+    identity: Annotated[SessionIdentity, Depends(require_temporal_materialize_strategy)],
+) -> dict[str, Any]:
+    try:
+        return materialize_winner_transition_stateful_candidate_a_strategy(
+            database(),
+            run_id,
+            replay_id,
+            actor_email=identity.email,
+        )
+    except (TemporalIntelligenceConflict, TemporalIntelligenceNotFound) as exc:
+        raise _translate_error(exc) from exc
+    except (WinnerTransitionStatefulReplayError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/policy-search/latest")
@@ -293,7 +350,7 @@ def latest_temporal_policy_search(
             end_month=end_month,
         )
     except TemporalPolicySearchError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/policy-search/{search_id}")
@@ -326,7 +383,7 @@ def prepare_temporal_policy_search(
             seed=payload.seed,
         )
     except TemporalPolicySearchError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/{run_id}/policy-search/{search_id}/sampling")
@@ -338,7 +395,7 @@ def temporal_policy_search_sampling(
     try:
         return run_temporal_policy_sampling(database(), run_id, search_id)
     except (TemporalPolicySearchError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/{run_id}/policy-search/{search_id}/caro")
@@ -350,7 +407,7 @@ def temporal_policy_search_caro(
     try:
         return run_temporal_policy_caro(database(), run_id, search_id)
     except (TemporalPolicySearchError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/{run_id}/policy-search/{search_id}/validation")
@@ -362,7 +419,7 @@ def temporal_policy_search_validation(
     try:
         return run_temporal_policy_validation(database(), run_id, search_id)
     except (TemporalPolicySearchError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/{run_id}/policy-search/{search_id}/comparison")
@@ -374,7 +431,7 @@ def temporal_policy_search_comparison(
     try:
         return run_temporal_policy_comparison(database(), run_id, search_id)
     except (TemporalPolicySearchError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.post("/{run_id}/policy-search/{search_id}/study")
@@ -386,16 +443,23 @@ def temporal_policy_search_study(
     try:
         return run_temporal_policy_study(database(), run_id, search_id)
     except (TemporalPolicySearchError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 @router.get("/{run_id}/export.zip")
 def export_temporal_intelligence(
     run_id: str,
     _identity: Annotated[SessionIdentity, Depends(require_temporal_export)],
+    start_month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$"),
+    end_month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$"),
 ) -> Response:
     try:
-        content = build_temporal_intelligence_export(database(), run_id)
+        content = build_temporal_intelligence_export(
+            database(),
+            run_id,
+            start_month=start_month,
+            end_month=end_month,
+        )
     except (TemporalIntelligenceNotFound, TemporalIntelligenceConflict) as exc:
         raise _translate_error(exc) from exc
     return Response(

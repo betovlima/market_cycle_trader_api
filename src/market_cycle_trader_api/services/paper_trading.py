@@ -71,6 +71,37 @@ def _et_date(value: Any) -> str:
     return stamp.tz_convert(EASTERN).date().isoformat()
 
 
+def _acquire_live_market_refresh_lock(db: Any, *, source: str) -> bool:
+    locked = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {
+            "_id": "default",
+            "winner_promotion_in_progress": {"$ne": True},
+            "live_market_refresh_in_progress": {"$ne": True},
+        },
+        {
+            "$set": {
+                "live_market_refresh_in_progress": True,
+                "live_market_refresh_started_at": utc_now(),
+                "live_market_refresh_source": str(source),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    return locked is not None
+
+
+def _release_live_market_refresh_lock(db: Any) -> None:
+    db[STRATEGY_CONTROL_COLLECTION].update_one(
+        {"_id": "default", "live_market_refresh_in_progress": True},
+        {
+            "$set": {
+                "live_market_refresh_in_progress": False,
+                "live_market_refresh_started_at": None,
+            }
+        },
+    )
+
+
 def _validated_context(
     db: Any,
 ) -> tuple[BacktestRequest, PaperTradingSettings, PaperTradingState, dict[str, Any], dict[str, Any]]:
@@ -147,27 +178,12 @@ def refresh_trader_live_market_data(
     now: datetime | pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     """Keep the operational Winner market data current without mutating the Winner snapshot."""
-    winner_configuration, winner_profile = get_trader_winner_context(db)
-    winner_model = get_trader_winner_model_snapshot(db)
-    strategy = apply_training_runtime_settings(db, winner_configuration)
-    strategy = apply_execution_profile(
-        strategy,
-        winner_model["family"],
-        winner_model.get("settings_snapshot") or {},
-    )
-    if strategy.market_data_provider != "alpaca":
-        raise RuntimeError("Trader live market refresh requires market_data_provider='alpaca'.")
-    if strategy.end_date is not None:
-        raise RuntimeError(
-            "Trader live market refresh requires end_date=None; the certified cutoff belongs to certification metadata, not the live Strategy window."
-        )
-
     target = latest_safe_completed_xnys_session(now).date().isoformat()
     control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
     current_cutoff = str(control.get("live_market_cutoff") or "").strip()
     current_winner = str(control.get("live_market_cutoff_winner_strategy_id") or "").strip()
-    winner_id = str(winner_profile.get("id") or "")
-    if not force and current_cutoff == target and current_winner == winner_id:
+    trader_winner_id = str(control.get("trader_winner_strategy_id") or "").strip()
+    if not force and trader_winner_id and current_cutoff == target and current_winner == trader_winner_id:
         return {
             "live_market_cutoff": target,
             "target_session": target,
@@ -193,48 +209,93 @@ def refresh_trader_live_market_data(
             "source": str(source),
         }
 
-    attempt_at = utc_now()
-    db[STRATEGY_CONTROL_COLLECTION].update_one(
-        {"_id": "default"},
-        {
-            "$set": {
-                "live_market_refresh_target": target,
-                "live_market_refresh_last_attempt_at": attempt_at,
-                "live_market_refresh_source": str(source),
-            },
-            "$unset": {"live_market_refresh_last_error": ""},
-        },
-    )
+    if not _acquire_live_market_refresh_lock(db, source=source):
+        current = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
+        return {
+            "live_market_cutoff": current.get("live_market_cutoff"),
+            "target_session": target,
+            "refreshed": False,
+            "pending_retry": True,
+            "blocked_by": (
+                "winner_promotion"
+                if bool(current.get("winner_promotion_in_progress"))
+                else "temporal_market_series_update"
+            ),
+            "source": str(source),
+        }
+
     try:
-        refreshed = refresh_market_data_to_live_cutoff(strategy, now=now)
-        metadata = update_trader_live_market_cutoff(
-            db,
-            cutoff=str(refreshed["live_market_cutoff"]),
-            source=source,
+        control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
+        current_cutoff = str(control.get("live_market_cutoff") or "").strip()
+        current_winner = str(control.get("live_market_cutoff_winner_strategy_id") or "").strip()
+        trader_winner_id = str(control.get("trader_winner_strategy_id") or "").strip()
+        if not force and trader_winner_id and current_cutoff == target and current_winner == trader_winner_id:
+            return {
+                "live_market_cutoff": target,
+                "target_session": target,
+                "refreshed": False,
+                "source": str(source),
+            }
+
+        winner_configuration, winner_profile = get_trader_winner_context(db)
+        winner_model = get_trader_winner_model_snapshot(db)
+        strategy = apply_training_runtime_settings(db, winner_configuration)
+        strategy = apply_execution_profile(
+            strategy,
+            winner_model["family"],
+            winner_model.get("settings_snapshot") or {},
         )
-        db[STRATEGY_CONTROL_COLLECTION].update_one(
-            {"_id": "default"},
-            {
-                "$set": {"live_market_refresh_last_success_at": utc_now()},
-                "$unset": {
-                    "live_market_refresh_next_retry_at": "",
-                    "live_market_refresh_last_error": "",
-                },
-            },
-        )
-        return {**refreshed, **metadata, "refreshed": True}
-    except Exception as exc:
-        next_retry = utc_now() + timedelta(minutes=5)
+        if strategy.market_data_provider != "alpaca":
+            raise RuntimeError("Trader live market refresh requires market_data_provider='alpaca'.")
+        if strategy.end_date is not None:
+            raise RuntimeError(
+                "Trader live market refresh requires end_date=None; the certified cutoff belongs to certification metadata, not the live Strategy window."
+            )
+
+        attempt_at = utc_now()
         db[STRATEGY_CONTROL_COLLECTION].update_one(
             {"_id": "default"},
             {
                 "$set": {
-                    "live_market_refresh_next_retry_at": next_retry,
-                    "live_market_refresh_last_error": str(exc)[:1000],
-                }
+                    "live_market_refresh_target": target,
+                    "live_market_refresh_last_attempt_at": attempt_at,
+                    "live_market_refresh_source": str(source),
+                },
+                "$unset": {"live_market_refresh_last_error": ""},
             },
         )
-        raise
+        try:
+            refreshed = refresh_market_data_to_live_cutoff(strategy, now=now)
+            metadata = update_trader_live_market_cutoff(
+                db,
+                cutoff=str(refreshed["live_market_cutoff"]),
+                source=source,
+            )
+            db[STRATEGY_CONTROL_COLLECTION].update_one(
+                {"_id": "default"},
+                {
+                    "$set": {"live_market_refresh_last_success_at": utc_now()},
+                    "$unset": {
+                        "live_market_refresh_next_retry_at": "",
+                        "live_market_refresh_last_error": "",
+                    },
+                },
+            )
+            return {**refreshed, **metadata, "refreshed": True}
+        except Exception as exc:
+            next_retry = utc_now() + timedelta(minutes=5)
+            db[STRATEGY_CONTROL_COLLECTION].update_one(
+                {"_id": "default"},
+                {
+                    "$set": {
+                        "live_market_refresh_next_retry_at": next_retry,
+                        "live_market_refresh_last_error": str(exc)[:1000],
+                    }
+                },
+            )
+            raise
+    finally:
+        _release_live_market_refresh_lock(db)
 
 
 def paper_market_readiness(db: Any) -> dict[str, Any]:
@@ -459,6 +520,24 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         current_asset=state.managed_symbol,
         holding_sessions=state.holding_sessions,
     )
+    stateful_decision = None
+    if (
+        str(winner_profile.get("strategy_kind") or "") == "temporal_intelligence"
+        and str(winner_profile.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+    ):
+        from .temporal_winner_transition_stateful import build_stateful_candidate_a_live_decision
+        stateful_decision = build_stateful_candidate_a_live_decision(
+            db,
+            bars_by_symbol=bars_by_symbol,
+            strategy=strategy,
+            current_asset=state.managed_symbol,
+            holding_sessions=state.holding_sessions,
+            winner_profile=winner_profile,
+            winner_model=winner_model,
+            cooldown=bool(state.stateful_defer_cooldown),
+        )
+        if _et_date(stateful_decision["decision_date"]) != _et_date(decision.decision_date):
+            raise RuntimeError("Stateful and base live decisions resolved different completed sessions.")
     decision_date = _et_date(decision.decision_date)
     expected_open = pd.Timestamp(clock["next_open"])
     expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
@@ -483,7 +562,7 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         )
 
     current = decision.current_asset
-    target = decision.target_asset
+    target = str((stateful_decision or {}).get("target_asset") or decision.target_asset).upper()
     if current == target and target == "CASH":
         action = "stay_in_cash"
     elif current == target:
@@ -538,6 +617,15 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
         "live_market_cutoff": live_market.get("live_market_cutoff"),
+        "stateful_intervention": bool((stateful_decision or {}).get("stateful_intervention")),
+        "stateful_control_target_asset": (stateful_decision or {}).get("control_target_asset"),
+        "stateful_defer_cooldown_before": bool((stateful_decision or {}).get("stateful_cooldown_before")),
+        "stateful_defer_cooldown_after": bool((stateful_decision or {}).get("stateful_cooldown_after")),
+        "stateful_risk_score": (stateful_decision or {}).get("risk_score"),
+        "stateful_risk_threshold": (stateful_decision or {}).get("risk_threshold"),
+        "stateful_confidence_margin": (stateful_decision or {}).get("confidence_margin"),
+        "stateful_confidence_threshold": (stateful_decision or {}).get("confidence_threshold"),
+        "stateful_risk_family": (stateful_decision or {}).get("risk_family"),
     }
     insert_paper_trade_plan(db, document, replace=replace)
     return document
@@ -862,6 +950,12 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
             update={
                 "last_decision_date": str(plan["decision_date"]),
                 "last_execution_session": str(plan["execution_session"]),
+                "stateful_defer_cooldown": bool(plan.get("stateful_defer_cooldown_after")),
+                "stateful_last_intervention_date": (
+                    str(plan["decision_date"])
+                    if bool(plan.get("stateful_intervention"))
+                    else state.stateful_last_intervention_date
+                ),
             }
         )
         replace_paper_trading_state(db, state.model_dump(mode="python"))

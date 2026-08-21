@@ -141,6 +141,26 @@ def replace_strategy_model(
         raise _translate_error(exc) from exc
 
 
+@router.post("/{strategy_id}/select-for-strategy-research")
+def select_strategy_for_strategy_research(
+    strategy_id: str,
+    payload: StrategySelectRequest,
+    identity: AdminIdentity,
+) -> dict[str, Any]:
+    try:
+        result = select_research_strategy(
+            database(),
+            strategy_id,
+            expected_control_revision=payload.expected_control_revision,
+            note=payload.note,
+            actor_email=identity.email,
+        )
+        refresh_locked_configuration_status()
+        return result
+    except (StrategyLabError, ValidationError) as exc:
+        raise _translate_error(exc) from exc
+
+
 @router.post("/{strategy_id}/select-for-model-tuning")
 def select_strategy_for_model_tuning(
     strategy_id: str,

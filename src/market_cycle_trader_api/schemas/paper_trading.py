@@ -64,6 +64,8 @@ class PaperTradingState(BaseModel):
     realized_pnl: float
     last_decision_date: str | None
     last_execution_session: str | None
+    stateful_defer_cooldown: bool = False
+    stateful_last_intervention_date: str | None = None
 
     @model_validator(mode="after")
     def validate_position(self) -> "PaperTradingState":

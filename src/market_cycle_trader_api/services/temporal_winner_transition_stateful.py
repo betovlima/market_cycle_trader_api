@@ -32,7 +32,13 @@ from .temporal_winner_transition_attribution import (
     _winner_score,
 )
 from .temporal_winner_transition_attribution import get_winner_transition_attribution
-
+from .model_research import model_execution_snapshot
+from .strategy_lab import (
+    StrategyLabConflict,
+    StrategyLabError,
+    StrategyLabNotFound,
+    materialize_temporal_stateful_strategy,
+)
 
 
 FAMILY_FEATURES = {
@@ -127,9 +133,13 @@ def _build_transition_dataset(
         if not isinstance(transition, dict):
             continue
         key = _transition_key(transition.get("execution_at"), transition.get("from_asset"), transition.get("to_asset"))
-        if key is None or key not in rotation_map:
+        if key is None:
             continue
-        value_added = _finite(rotation_map[key].get("rotation_value_added"))
+        rotation = rotation_map.get(key)
+        holding_interval = transition.get("holding_interval_outcome") if isinstance(transition.get("holding_interval_outcome"), dict) else {}
+        rotation_value_added = _finite(rotation.get("rotation_value_added")) if rotation else None
+        attributed_value_added = _finite(holding_interval.get("value_added"))
+        value_added = rotation_value_added if rotation_value_added is not None else attributed_value_added
         stamp = _timestamp(transition.get("execution_at"))
         if value_added is None or stamp is None:
             continue
@@ -353,6 +363,110 @@ def _risk_score(model_payload: dict[str, Any] | None, feature_row: dict[str, Any
         return None
     frame = pd.DataFrame([{name: feature_row.get(name) for name in features}])
     return float(model.predict_proba(frame[features])[:, 1][0])
+
+
+def _serialize_risk_model(model_payload: dict[str, Any]) -> dict[str, Any]:
+    model = model_payload.get("model")
+    if model is None:
+        raise WinnerTransitionStatefulReplayError("Stateful risk model is unavailable.")
+    imputer = model.named_steps.get("imputer")
+    scaler = model.named_steps.get("scaler")
+    classifier = model.named_steps.get("model")
+    if imputer is None or scaler is None or classifier is None:
+        raise WinnerTransitionStatefulReplayError("Stateful risk model pipeline is incomplete.")
+    return {
+        "family": model_payload.get("family"),
+        "features": list(model_payload.get("features") or []),
+        "risk_threshold": _finite(model_payload.get("risk_threshold")),
+        "imputer_statistics": [float(value) for value in np.asarray(imputer.statistics_, dtype=float)],
+        "scaler_mean": [float(value) for value in np.asarray(scaler.mean_, dtype=float)],
+        "scaler_scale": [float(value) for value in np.asarray(scaler.scale_, dtype=float)],
+        "coef": [float(value) for value in np.asarray(classifier.coef_[0], dtype=float)],
+        "intercept": float(np.asarray(classifier.intercept_, dtype=float)[0]),
+    }
+
+
+def build_stateful_live_runtime_bundle(db: Any, strategy: dict[str, Any]) -> dict[str, Any]:
+    policy = strategy.get("temporal_policy_snapshot") if isinstance(strategy.get("temporal_policy_snapshot"), dict) else {}
+    stateful = policy.get("stateful_policy") if isinstance(policy.get("stateful_policy"), dict) else {}
+    replay_id = str(strategy.get("source_stateful_replay_id") or stateful.get("source_stateful_replay_id") or policy.get("source_stateful_replay_id") or "").strip()
+    run_id = str(strategy.get("source_temporal_run_id") or policy.get("source_run_id") or "").strip()
+    processing_id = str(strategy.get("source_stateful_processing_id") or policy.get("source_processing_id") or "").strip()
+    if not replay_id or not run_id or not processing_id:
+        raise WinnerTransitionStatefulReplayError("Stateful Strategy is missing its source replay binding.")
+    replay = db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].find_one(
+        {"id": replay_id, "run_id": run_id, "status": "completed"},
+        {"_id": 0},
+    )
+    if replay is None:
+        raise WinnerTransitionStatefulReplayError("Stateful source replay is unavailable.")
+    parity = replay.get("control_parity") if isinstance(replay.get("control_parity"), dict) else {}
+    if str(parity.get("status") or "").lower() != "passed":
+        raise WinnerTransitionStatefulReplayError("Stateful source replay does not have Control parity.")
+    risk_id = str(replay.get("source_risk_search_id") or stateful.get("source_risk_search_id") or "").strip()
+    confidence_id = str(replay.get("source_confidence_calibration_id") or stateful.get("source_confidence_calibration_id") or "").strip()
+    risk = db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].find_one({"id": risk_id}, {"_id": 0}) if risk_id else None
+    confidence = db[TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION].find_one({"id": confidence_id}, {"_id": 0}) if confidence_id else None
+    run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": run_id}, {"_id": 0})
+    if risk is None or confidence is None or run is None:
+        raise WinnerTransitionStatefulReplayError("Stateful source risk, confidence, or Temporal run is unavailable.")
+    research_settings = risk.get("research_settings") if isinstance(risk.get("research_settings"), dict) else {}
+    settings_payload = research_settings.get("settings") if isinstance(research_settings.get("settings"), dict) else research_settings
+    risk_settings = settings_payload.get("risk") if isinstance(settings_payload.get("risk"), dict) else {}
+    if "severe_threshold" not in risk_settings:
+        raise WinnerTransitionStatefulReplayError("Stateful source risk settings are incomplete.")
+    from .analytics import processing_analytics
+    start_month = str(replay.get("period_start") or policy.get("period_start") or "").strip()
+    end_month = str(replay.get("period_end") or policy.get("period_end") or "").strip()
+    attribution = get_winner_transition_attribution(db, run_id, start_month=start_month, end_month=end_month)
+    analytics = processing_analytics(db, processing_id)
+    dataset = _build_transition_dataset(
+        attribution,
+        list(analytics.get("rotations") or []),
+        severe_threshold=float(risk_settings["severe_threshold"]),
+    )
+    models = _risk_models(dataset, risk)
+    if not models:
+        raise WinnerTransitionStatefulReplayError("Stateful source risk models cannot be reconstructed.")
+    serialized_models = {str(year): _serialize_risk_model(payload) for year, payload in models.items()}
+    confidence_years = _confidence_by_year(confidence)
+    return bson_value({
+        "schema_version": 1,
+        "mode": "conservative_one_session",
+        "risk_models": serialized_models,
+        "confidence_by_year": {str(year): payload for year, payload in confidence_years.items()},
+        "policy_settings": base_settings(run),
+        "source_replay_id": replay_id,
+        "source_risk_search_id": risk_id,
+        "source_confidence_calibration_id": confidence_id,
+        "source_processing_id": processing_id,
+        "source_run_id": run_id,
+        "research_settings": research_settings,
+        "control_parity": parity,
+    })
+
+
+def _serialized_risk_score(model_payload: dict[str, Any] | None, feature_row: dict[str, Any]) -> float | None:
+    if not isinstance(model_payload, dict):
+        return None
+    features = list(model_payload.get("features") or [])
+    statistics = list(model_payload.get("imputer_statistics") or [])
+    means = list(model_payload.get("scaler_mean") or [])
+    scales = list(model_payload.get("scaler_scale") or [])
+    coefficients = list(model_payload.get("coef") or [])
+    if not features or not (len(features) == len(statistics) == len(means) == len(scales) == len(coefficients)):
+        return None
+    linear = float(model_payload.get("intercept") or 0.0)
+    for index, name in enumerate(features):
+        value = _finite(feature_row.get(name))
+        raw = float(statistics[index]) if value is None else float(value)
+        scale = float(scales[index])
+        normalized = (raw - float(means[index])) / (scale if abs(scale) > 1e-12 else 1.0)
+        linear += float(coefficients[index]) * normalized
+    if linear >= 0:
+        return float(1.0 / (1.0 + math.exp(-linear)))
+    exp_value = math.exp(linear)
+    return float(exp_value / (1.0 + exp_value))
 
 
 def _period_key(value: Any) -> str:
@@ -978,6 +1092,126 @@ def run_winner_transition_stateful_replay(
     return result
 
 
+def materialize_winner_transition_stateful_candidate_a_strategy(
+    db: Any,
+    run_id: str,
+    replay_id: str,
+    *,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)})
+    if run is None or str(run.get("status") or "").lower() != "completed":
+        raise WinnerTransitionStatefulReplayError("A completed Temporal Intelligence run is required.")
+    replay = db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].find_one(
+        {"id": str(replay_id), "run_id": str(run_id), "status": "completed"},
+        {"_id": 0},
+    )
+    if replay is None:
+        raise WinnerTransitionStatefulReplayError("Completed Stateful transition replay not found.")
+    parity = replay.get("control_parity") if isinstance(replay.get("control_parity"), dict) else {}
+    if str(parity.get("status") or "").lower() != "passed":
+        raise WinnerTransitionStatefulReplayError("Candidate A can create a Strategy only after Control parity passes.")
+    candidate = replay.get("candidate_a") if isinstance(replay.get("candidate_a"), dict) else None
+    if candidate is None:
+        raise WinnerTransitionStatefulReplayError("Candidate A is unavailable in this Stateful replay.")
+    if str(candidate.get("mode") or "") != "conservative_one_session":
+        raise WinnerTransitionStatefulReplayError("Candidate A does not contain the expected Conservative Stateful policy.")
+
+    from .temporal_intelligence import _temporal_policy_strategy_snapshot
+
+    base_snapshot = _temporal_policy_strategy_snapshot(run)
+    candidate_analytics = candidate.get("analytics") if isinstance(candidate.get("analytics"), dict) else {}
+    candidate_metrics = candidate_analytics.get("metrics") if isinstance(candidate_analytics.get("metrics"), dict) else {}
+    control_replay = replay.get("control_replay") if isinstance(replay.get("control_replay"), dict) else {}
+    control_analytics = control_replay.get("analytics") if isinstance(control_replay.get("analytics"), dict) else {}
+    control_metrics = control_analytics.get("metrics") if isinstance(control_analytics.get("metrics"), dict) else {}
+    control_capital = _finite(control_metrics.get("ending_capital"))
+    candidate_capital = _finite(candidate_metrics.get("ending_capital"))
+    delta_rate = (
+        float(candidate_capital / control_capital - 1.0)
+        if candidate_capital is not None and control_capital not in {None, 0.0}
+        else None
+    )
+    research_settings = replay.get("research_settings") if isinstance(replay.get("research_settings"), dict) else {}
+    policy_snapshot = {
+        **base_snapshot,
+        "schema_version": 2,
+        "family": "winner_anchored_temporal_stateful",
+        "label": "Candidate A — Conservative Stateful",
+        "experiment": "winner_transition_stateful_conservative",
+        "base_temporal_experiment": base_snapshot.get("experiment"),
+        "strategy_variant": "winner_transition_stateful_candidate_a",
+        "source_stateful_replay_id": str(replay_id),
+        "source_processing_id": str(replay.get("processing_id") or ""),
+        "period_start": replay.get("period_start"),
+        "period_end": replay.get("period_end"),
+        "stateful_policy": {
+            "candidate": "a",
+            "mode": "conservative_one_session",
+            "max_consecutive_defer_sessions": 1,
+            "stateful_incumbent": True,
+            "control_target_re_evaluated_each_session": True,
+            "cash_path_preserved": True,
+            "future_control_transition_used_for_rejoin": False,
+            "source_risk_search_id": replay.get("source_risk_search_id"),
+            "source_confidence_calibration_id": replay.get("source_confidence_calibration_id"),
+            "research_settings": bson_value(research_settings),
+        },
+        "stateful_validation": {
+            "control_parity": bson_value(parity),
+            "control_metrics": bson_value(control_metrics),
+            "candidate_metrics": bson_value(candidate_metrics),
+            "candidate_delta_vs_control_rate": delta_rate,
+        },
+    }
+
+    request_payload = run.get("request") if isinstance(run.get("request"), dict) else {}
+    research_model_snapshot = None
+    research_model_settings = request_payload.get("research_model_settings") if isinstance(request_payload.get("research_model_settings"), dict) else {}
+    model_family = str(run.get("model_family") or request_payload.get("research_model_family") or "")
+    if model_family and research_model_settings:
+        research_model_snapshot = model_execution_snapshot(model_family, research_model_settings)
+
+    period_end = str(replay.get("period_end") or run.get("analysis_end_date") or "").strip()
+    replay_suffix = str(replay_id).split("-")[-1][:8]
+    name_suffix = period_end if period_end else str(run_id).split("-")[-1][:8]
+    name = f"Candidate A — Conservative Stateful — {name_suffix} — {replay_suffix}"
+    description = f"Generated from Stateful transition replay {replay_id} of Temporal Intelligence run {run_id}."
+    try:
+        materialized = materialize_temporal_stateful_strategy(
+            db,
+            run_id=str(run_id),
+            replay_id=str(replay_id),
+            processing_id=str(replay.get("processing_id") or ""),
+            candidate_key="a",
+            candidate_label="Conservative Stateful",
+            source_strategy_id=str(run.get("strategy_profile_id") or ""),
+            source_strategy_revision=int(run.get("strategy_profile_revision") or 0) or None,
+            source_configuration_hash=str(run.get("strategy_configuration_hash") or "") or None,
+            name=name,
+            description=description,
+            experiment="winner_transition_stateful_conservative",
+            policy_snapshot=policy_snapshot,
+            actor_email=actor_email,
+            research_model_snapshot=research_model_snapshot,
+        )
+    except (StrategyLabConflict, StrategyLabNotFound, StrategyLabError, ValueError) as exc:
+        raise WinnerTransitionStatefulReplayError(str(exc)) from exc
+
+    strategy = materialized["strategy"]
+    now = utc_now()
+    db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].update_one(
+        {"id": str(replay_id), "run_id": str(run_id)},
+        {"$set": {
+            "candidate_a_materialized_strategy_id": strategy.get("id"),
+            "candidate_a_materialized_strategy_name": strategy.get("name"),
+            "candidate_a_materialized_strategy_at": now,
+            "updated_at": now,
+        }},
+    )
+    return materialized
+
+
 def get_latest_winner_transition_stateful_replay(
     db: Any,
     run_id: str,
@@ -991,3 +1225,158 @@ def get_latest_winner_transition_stateful_replay(
         {"_id": 0}, sort=[("created_at", -1)],
     )
     return bson_value(row) if row is not None else None
+
+
+def build_stateful_candidate_a_live_decision(
+    db: Any,
+    *,
+    bars_by_symbol: dict[str, pd.DataFrame],
+    strategy: Any,
+    current_asset: str | None,
+    holding_sessions: int,
+    winner_profile: dict[str, Any],
+    winner_model: dict[str, Any],
+    cooldown: bool,
+) -> dict[str, Any]:
+    policy = (
+        winner_profile.get("temporal_policy_snapshot")
+        if isinstance(winner_profile.get("temporal_policy_snapshot"), dict)
+        else winner_profile.get("temporal_policy")
+        if isinstance(winner_profile.get("temporal_policy"), dict)
+        else {}
+    )
+    stateful = policy.get("stateful_policy") if isinstance(policy.get("stateful_policy"), dict) else {}
+    bundle = stateful.get("live_runtime") if isinstance(stateful.get("live_runtime"), dict) else None
+    if bundle is None:
+        raise WinnerTransitionStatefulReplayError("The Stateful Winner does not contain its live runtime bundle.")
+    if str(bundle.get("mode") or "") != "conservative_one_session":
+        raise WinnerTransitionStatefulReplayError("The installed Stateful runtime supports Candidate A Conservative Stateful only.")
+
+    from ..engine.temporal_intelligence import run_temporal_intelligence
+    from ..schemas.requests import BacktestExecutionRequest
+
+    dates = None
+    for frame in bars_by_symbol.values():
+        index = pd.DatetimeIndex(frame.index)
+        dates = index if dates is None else dates.intersection(index)
+    if dates is None or len(dates) < 2:
+        raise WinnerTransitionStatefulReplayError("Stateful live evaluation requires aligned completed market sessions.")
+    latest_date = pd.Timestamp(dates[-1])
+    latest_iso = latest_date.date().isoformat()
+    execution_request = BacktestExecutionRequest.model_validate({
+        **strategy.model_dump(mode="python"),
+        "analysis_start_date": strategy.start_date,
+        "analysis_end_date": latest_iso,
+        "calendar_anchor_assets": list(strategy.assets),
+        "research_reference_assets": list(strategy.assets),
+        "research_candidate_assets": [],
+        "research_model_family": str(winner_model.get("family") or "lightgbm_utility"),
+        "research_model_settings": dict(winner_model.get("settings_snapshot") or {}),
+        "research_market_data_mode": "database_only",
+        "deterministic_execution": True,
+        "xgb_n_jobs": 1,
+        "numeric_thread_limit": 1,
+    })
+    temporal = run_temporal_intelligence(bars_by_symbol, execution_request)
+    latest_rows = [row for row in temporal.get("multi_horizon_latest_forecasts") or [] if isinstance(row, dict)]
+    if not latest_rows:
+        raise WinnerTransitionStatefulReplayError("Temporal live evaluation produced no latest forecasts.")
+    decision_stamp = max((_timestamp(row.get("as_of")) for row in latest_rows), default=None)
+    if decision_stamp is None:
+        raise WinnerTransitionStatefulReplayError("Temporal live evaluation did not resolve a decision date.")
+    decision_key = decision_stamp.isoformat()
+    current_rows = {
+        str(row.get("symbol") or "").strip().upper(): row
+        for row in latest_rows
+        if str(row.get("symbol") or "").strip()
+    }
+    winner_rows = [row for row in temporal.get("_winner_reference_daily_rows") or [] if isinstance(row, dict)]
+    eligible_winner_rows = [
+        row for row in winner_rows
+        if _timestamp(row.get("decision_date")) is not None and _timestamp(row.get("decision_date")) <= decision_stamp
+    ]
+    if not eligible_winner_rows:
+        raise WinnerTransitionStatefulReplayError("Temporal live evaluation produced no Winner anchor for the latest decision.")
+    winner_row = max(eligible_winner_rows, key=lambda row: _timestamp(row.get("decision_date")))
+    settings = bundle.get("policy_settings") if isinstance(bundle.get("policy_settings"), dict) else {}
+    proposed = _policy_target(current_rows, winner_row, settings)
+    control_target = _asset_name(proposed.get("proposed_symbol"))
+    incumbent = _asset_name(current_asset)
+
+    next_cooldown = False
+    intervention = False
+    risk_score = None
+    risk_threshold = None
+    confidence_margin = None
+    confidence_threshold = None
+    risk_family = None
+
+    gate_allowed = bool(
+        not cooldown
+        and incumbent != "CASH"
+        and control_target != "CASH"
+        and incumbent != control_target
+        and not bool(proposed.get("timing_override"))
+        and control_target == _asset_name(proposed.get("base_symbol"))
+        and control_target == _asset_name(proposed.get("top1_symbol"))
+    )
+    year = int(decision_stamp.year)
+    confidence_by_year = bundle.get("confidence_by_year") if isinstance(bundle.get("confidence_by_year"), dict) else {}
+    confidence = confidence_by_year.get(str(year)) if isinstance(confidence_by_year.get(str(year)), dict) else {}
+    model_by_year = bundle.get("risk_models") if isinstance(bundle.get("risk_models"), dict) else {}
+    model_payload = model_by_year.get(str(year)) if isinstance(model_by_year.get(str(year)), dict) else None
+    gate_allowed = bool(gate_allowed and confidence.get("active") and model_payload is not None)
+
+    if gate_allowed:
+        observations: dict[str, dict[str, Any]] = {}
+        for row in temporal.get("_multi_horizon_observations") or []:
+            if not isinstance(row, dict):
+                continue
+            key = _timestamp_key(row.get("timestamp"))
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not key or not symbol:
+                continue
+            observations.setdefault(key, {"rows_by_symbol": {}})["rows_by_symbol"][symbol] = row
+        observations[decision_key] = {"rows_by_symbol": current_rows}
+        history_rows = sorted(
+            [row for row in eligible_winner_rows if _timestamp(row.get("decision_date")) <= decision_stamp],
+            key=lambda row: _timestamp(row.get("decision_date")),
+        )[-10:]
+        feature_row = _dynamic_transition_features(
+            history_rows=history_rows,
+            observations=observations,
+            target_symbol=control_target,
+            incumbent_symbol=incumbent,
+        )
+        risk_score = _serialized_risk_score(model_payload, feature_row)
+        risk_threshold = _finite(model_payload.get("risk_threshold"))
+        confidence_threshold = _finite(confidence.get("margin_threshold"))
+        if risk_score is not None and risk_threshold is not None:
+            confidence_margin = float(risk_score - risk_threshold)
+            intervention = bool(
+                confidence_threshold is not None
+                and confidence_margin >= confidence_threshold
+            )
+            risk_family = model_payload.get("family")
+
+    target = incumbent if intervention else control_target
+    if intervention:
+        next_cooldown = True
+    elif cooldown:
+        next_cooldown = False
+
+    return {
+        "decision_date": decision_stamp,
+        "current_asset": incumbent,
+        "control_target_asset": control_target,
+        "target_asset": target,
+        "stateful_intervention": intervention,
+        "stateful_cooldown_before": bool(cooldown),
+        "stateful_cooldown_after": bool(next_cooldown),
+        "risk_score": risk_score,
+        "risk_threshold": risk_threshold,
+        "confidence_margin": confidence_margin,
+        "confidence_threshold": confidence_threshold,
+        "risk_family": risk_family,
+        "temporal_result": temporal,
+    }

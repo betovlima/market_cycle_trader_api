@@ -283,6 +283,7 @@ def dashboard_summary(db: Any, *, limit: int = 10) -> dict[str, Any]:
         "last_backtest": last_backtest,
         "recent_backtests": recent_backtests,
         "selected_backtest_strategy_name": _selected_backtest_strategy_name(db),
+        "selected_strategy_research_name": _selected_backtest_strategy_name(db),
     }
 
 

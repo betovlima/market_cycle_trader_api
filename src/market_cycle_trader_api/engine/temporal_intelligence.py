@@ -2776,6 +2776,230 @@ def _winner_reference_replay(
     }
 
 
+def _stateful_strategy_reference_rows(
+    winner_daily_rows: list[dict[str, Any]],
+    observation_rows: list[dict[str, Any]],
+    stateful_reference_bundle: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    if not winner_daily_rows:
+        return [], [], 0
+    if not isinstance(stateful_reference_bundle, dict):
+        return deepcopy(winner_daily_rows), [], 0
+
+    from ..services.temporal_policy_tuning import observations_from_rows
+    from ..services.temporal_winner_transition_stateful import (
+        _dynamic_transition_features,
+        _policy_target,
+        _serialized_risk_score,
+        _winner_history_by_decision,
+    )
+
+    def ts(value: Any) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        try:
+            stamp = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            return None
+        return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+
+    def key(value: Any) -> str | None:
+        stamp = ts(value)
+        return stamp.isoformat() if stamp is not None else None
+
+    def asset(value: Any) -> str:
+        symbol = str(value or "CASH").strip().upper()
+        return symbol or "CASH"
+
+    observations = observations_from_rows(observation_rows)
+    histories = _winner_history_by_decision(winner_daily_rows)
+    risk_models = {int(year): dict(payload) for year, payload in (stateful_reference_bundle.get("risk_models") or {}).items() if isinstance(payload, dict)}
+    confidence_by_year = {int(year): dict(payload) for year, payload in (stateful_reference_bundle.get("confidence_by_year") or {}).items() if isinstance(payload, dict)}
+    settings = dict(stateful_reference_bundle.get("policy_settings") or {})
+    mode = str(stateful_reference_bundle.get("mode") or "conservative_one_session")
+
+    required_settings = ("timing_base_weak_threshold", "timing_challenger_minimum", "timing_minimum_advantage")
+    if any(name not in settings for name in required_settings):
+        raise ValueError("Selected Stateful Strategy Research policy is missing timing settings.")
+
+    ordered = sorted(
+        (deepcopy(row) for row in winner_daily_rows if isinstance(row, dict)),
+        key=lambda row: (int(row.get("fold_id") or 0), ts(row.get("decision_date")) or pd.Timestamp.min.tz_localize("UTC")),
+    )
+    output: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    current_by_fold: dict[int, str] = {}
+    cooldown_by_fold: dict[int, bool] = {}
+    interventions = 0
+
+    for row in ordered:
+        decision_key = key(row.get("decision_date"))
+        if decision_key is None:
+            output.append(row)
+            continue
+        fold_id = int(row.get("fold_id") or 0)
+        payload = observations.get(decision_key) or {}
+        rows_by_symbol = payload.get("rows_by_symbol") or {}
+        base_value = row.get("selected_asset") or row.get("final_action_asset") or row.get("top_1_asset") or row.get("raw_best_asset") or row.get("best_asset")
+        control_target = asset(base_value)
+        if fold_id in current_by_fold:
+            previous = current_by_fold[fold_id]
+        else:
+            previous = asset(row.get("previous_asset") or row.get("current_asset") or control_target)
+        target = control_target
+        intervention = False
+        risk_score = None
+        risk_threshold = None
+        confidence_margin = None
+        confidence_threshold = None
+        reason = "strategy_research_stateful_control"
+
+        sample = next((item for item in rows_by_symbol.values() if isinstance(item, dict)), None)
+        execution_stamp = ts((sample or {}).get("execution_date")) or ts(row.get("decision_date"))
+        year = int(execution_stamp.year) if execution_stamp is not None else 0
+        confidence = confidence_by_year.get(year) or {"active": False, "margin_threshold": None}
+        model_payload = risk_models.get(year)
+        cooldown = bool(cooldown_by_fold.get(fold_id, False))
+
+        gate_allowed = bool(
+            previous != "CASH"
+            and control_target != "CASH"
+            and previous != control_target
+            and bool(confidence.get("active"))
+            and rows_by_symbol
+            and rows_by_symbol.get(previous) is not None
+            and rows_by_symbol.get(control_target) is not None
+            and _finite((rows_by_symbol.get(previous) or {}).get("open_to_open_return")) is not None
+            and _finite((rows_by_symbol.get(control_target) or {}).get("open_to_open_return")) is not None
+        )
+        if gate_allowed:
+            proposed = _policy_target(rows_by_symbol, row, settings)
+            gate_allowed = bool(
+                not proposed.get("timing_override")
+                and control_target == asset(proposed.get("base_symbol"))
+                and control_target == asset(proposed.get("top1_symbol"))
+            )
+        if mode == "conservative_one_session" and cooldown:
+            gate_allowed = False
+
+        if gate_allowed and model_payload:
+            feature_row = _dynamic_transition_features(
+                history_rows=histories.get(decision_key) or [row],
+                observations=observations,
+                target_symbol=control_target,
+                incumbent_symbol=previous,
+            )
+            risk_score = _serialized_risk_score(model_payload, feature_row)
+            risk_threshold = _finite(model_payload.get("risk_threshold"))
+            confidence_threshold = _finite(confidence.get("margin_threshold"))
+            if risk_score is not None and risk_threshold is not None:
+                confidence_margin = float(risk_score - risk_threshold)
+                intervention = bool(confidence_threshold is not None and confidence_margin >= confidence_threshold)
+
+        if intervention:
+            target = previous
+            interventions += 1
+            reason = "strategy_research_stateful_confidence_defer"
+            if mode == "conservative_one_session":
+                cooldown_by_fold[fold_id] = True
+        elif mode == "conservative_one_session" and cooldown:
+            cooldown_by_fold[fold_id] = False
+
+        row["strategy_research_control_asset"] = control_target
+        row["strategy_research_control_previous_asset"] = asset(row.get("previous_asset") or row.get("current_asset") or previous)
+        row["previous_asset"] = previous
+        if "current_asset" in row:
+            row["current_asset"] = previous
+        row["selected_asset"] = target
+        row["final_action_asset"] = target
+        row["stateful_intervention"] = bool(intervention)
+        row["stateful_reason"] = reason
+        row["stateful_risk_score"] = _finite(risk_score)
+        row["stateful_risk_threshold"] = _finite(risk_threshold)
+        row["stateful_confidence_margin"] = _finite(confidence_margin)
+        row["stateful_confidence_threshold"] = _finite(confidence_threshold)
+        output.append(row)
+
+        if target != previous:
+            transitions.append({
+                "decision_date": row.get("decision_date"),
+                "executed_at": row.get("timestamp") or (sample or {}).get("execution_date"),
+                "fold_id": fold_id,
+                "from_asset": previous,
+                "to_asset": target,
+                "reason": reason,
+                "stateful_intervention": bool(intervention),
+                "risk_score": _finite(risk_score),
+                "risk_threshold": _finite(risk_threshold),
+                "confidence_margin": _finite(confidence_margin),
+                "confidence_threshold": _finite(confidence_threshold),
+            })
+        current_by_fold[fold_id] = target
+
+    return output, transitions, interventions
+
+
+def _replace_reference_with_stateful_strategy(
+    *,
+    winner_reference: dict[str, Any],
+    winner_daily_rows: list[dict[str, Any]],
+    multi_horizon_frame: pd.DataFrame,
+    folds: list[dict[str, Any]],
+    open_prices: pd.DataFrame,
+    common_dates: pd.DatetimeIndex,
+    config: BacktestExecutionRequest,
+    stateful_reference_bundle: dict[str, Any],
+    observation_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    stateful_rows, stateful_trades, intervention_count = _stateful_strategy_reference_rows(
+        winner_daily_rows, observation_rows, stateful_reference_bundle
+    )
+    if not stateful_rows or multi_horizon_frame.empty:
+        raise ValueError("Selected Stateful Strategy Research could not be replayed on the frozen Temporal snapshot.")
+    replay = _winner_anchored_temporal_study(
+        multi_horizon_frame, stateful_rows, open_prices, common_dates, config, enable_timing_override=False
+    )
+    if not replay:
+        raise ValueError("Selected Stateful Strategy Research replay produced no reference metrics.")
+
+    updated = deepcopy(winner_reference)
+    updated.update({
+        "reference_type": "selected_strategy_research_stateful_replay",
+        "ending_capital": _finite(replay.get("ending_capital")),
+        "total_return": _finite(replay.get("total_return")),
+        "cagr": _finite(replay.get("cagr")),
+        "sharpe": _finite(replay.get("sharpe")),
+        "max_drawdown": _finite(replay.get("max_drawdown")),
+        "exposure": _finite(replay.get("exposure")),
+        "switch_count": int(replay.get("switch_count") or 0),
+        "stateful_intervention_count": int(intervention_count),
+        "stateful_policy_mode": stateful_reference_bundle.get("mode"),
+        "stateful_source_replay_id": stateful_reference_bundle.get("source_replay_id"),
+        "stateful_source_run_id": stateful_reference_bundle.get("source_run_id"),
+    })
+
+    old_folds = {int(item.get("fold_id") or 0): dict(item) for item in (updated.get("folds") or []) if isinstance(item, dict)}
+    new_folds: list[dict[str, Any]] = []
+    for fold in folds:
+        fold_id = int(fold.get("fold_id") or 0)
+        fold_frame = multi_horizon_frame.loc[multi_horizon_frame["fold_id"] == fold_id].copy()
+        fold_replay = _winner_anchored_temporal_study(
+            fold_frame, stateful_rows, open_prices, common_dates, config, enable_timing_override=False
+        ) if not fold_frame.empty else {}
+        item = old_folds.get(fold_id, {"fold_id": fold_id, "test_start": fold.get("test_start"), "test_end": fold.get("test_end")})
+        if fold_replay:
+            item["strategy_return"] = _finite(fold_replay.get("total_return"))
+            item["strategy_ending_capital"] = _finite(fold_replay.get("ending_capital"))
+            item["strategy_cagr"] = _finite(fold_replay.get("cagr"))
+            item["strategy_sharpe"] = _finite(fold_replay.get("sharpe"))
+            item["strategy_maximum_drawdown"] = _finite(fold_replay.get("max_drawdown"))
+            item["market_exposure"] = _finite(fold_replay.get("exposure"))
+            item["capital_rotations"] = int(fold_replay.get("switch_count") or 0)
+        new_folds.append(item)
+    updated["folds"] = new_folds
+    return updated, stateful_rows, stateful_trades
+
+
 def _attach_winner_reference(
     horizon_summaries: list[dict[str, Any]],
     fold_summaries: list[dict[str, Any]],
@@ -2812,6 +3036,7 @@ def run_temporal_intelligence(
     winner_reference_override: dict[str, Any] | None = None,
     candidate_evaluation_only: bool = False,
     prepared_context: dict[str, Any] | None = None,
+    stateful_reference_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if str(config.research_model_family) != "lightgbm_utility":
         raise ValueError("Temporal Decision Intelligence is restricted to a LightGBM Strategy snapshot.")
@@ -3058,7 +3283,7 @@ def run_temporal_intelligence(
 
     ensure_not_cancelled()
     if progress_callback:
-        progress_callback(95.0, "Replaying immutable Winner and applying Temporal timing overlay")
+        progress_callback(95.0, "Replaying selected Strategy Research and applying Temporal timing overlay")
     if winner_reference_override:
         winner_reference = deepcopy(winner_reference_override.get("summary") or {})
         winner_reference_daily_rows = deepcopy(winner_reference_override.get("daily_rows") or [])
@@ -3067,6 +3292,22 @@ def run_temporal_intelligence(
         winner_reference = _winner_reference_replay(bars_by_symbol, config, progress_callback=progress_callback)
         winner_reference_daily_rows = winner_reference.pop("_daily_rows", [])
         winner_reference_trade_rows = winner_reference.pop("_trade_rows", [])
+
+    observation_rows = _multi_horizon_observation_rows(
+        multi_horizon_frame, horizons, frames_by_symbol=frames, common_dates=common_dates
+    )
+    if stateful_reference_bundle:
+        winner_reference, winner_reference_daily_rows, winner_reference_trade_rows = _replace_reference_with_stateful_strategy(
+            winner_reference=winner_reference,
+            winner_daily_rows=winner_reference_daily_rows,
+            multi_horizon_frame=multi_horizon_frame,
+            folds=folds,
+            open_prices=open_prices,
+            common_dates=common_dates,
+            config=config,
+            stateful_reference_bundle=stateful_reference_bundle,
+            observation_rows=observation_rows,
+        )
     _attach_winner_reference(horizon_summaries, fold_summaries, winner_reference)
 
     winner_anchor_replay = _winner_anchored_temporal_study(
@@ -3208,9 +3449,7 @@ def run_temporal_intelligence(
         "multi_horizon_metrics": multi_horizon_metrics,
         "multi_horizon_fold_metrics": multi_horizon_fold_metrics,
         "multi_horizon_latest_forecasts": multi_horizon_latest_forecasts,
-        "_multi_horizon_observations": _multi_horizon_observation_rows(
-            multi_horizon_frame, horizons, frames_by_symbol=frames, common_dates=common_dates
-        ),
+        "_multi_horizon_observations": observation_rows,
         "_winner_reference_daily_rows": winner_reference_daily_rows,
         "_winner_reference_trade_rows": winner_reference_trade_rows,
         "winner_reference": winner_reference,
@@ -3328,6 +3567,7 @@ def execute_temporal_run(run_id: str, db: Any) -> dict[str, Any]:
         bars_by_symbol,
         config,
         progress_callback=lambda percent, stage: _emit_progress(db, run_id, percent, stage),
+        stateful_reference_bundle=(run.get("stateful_reference_bundle") if isinstance(run.get("stateful_reference_bundle"), dict) else None),
     )
     observation_rows = result.pop("_multi_horizon_observations", [])
     winner_reference_daily_rows = result.pop("_winner_reference_daily_rows", [])

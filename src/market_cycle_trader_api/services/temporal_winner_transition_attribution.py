@@ -232,6 +232,80 @@ def _window_summary(sessions: list[dict[str, Any]], target_symbol: str, incumben
     }
 
 
+def _holding_interval_outcome(
+    contexts: list[dict[str, Any]],
+    start_index: int,
+    observations: dict[str, list[dict[str, Any]]],
+    *,
+    fold_id: Any,
+    incumbent_symbol: str,
+    target_symbol: str,
+) -> dict[str, Any]:
+    target_factor = 1.0
+    incumbent_factor = 1.0
+    holding_sessions = 0
+    exit_execution_at = None
+
+    for index in range(start_index, len(contexts)):
+        context = contexts[index]
+        if index > start_index:
+            current_fold = context.get("fold_id")
+            if fold_id is not None and current_fold is not None:
+                try:
+                    if int(current_fold) != int(fold_id):
+                        break
+                except (TypeError, ValueError):
+                    pass
+            current_symbol = str(context.get("current_symbol") or "").upper()
+            next_symbol = str(context.get("target_symbol") or "").upper()
+            action = str(context.get("action") or "").upper()
+            if current_symbol == target_symbol and action in {"ROTATE", "SELL"} and next_symbol != target_symbol:
+                exit_execution_at = context.get("execution_at")
+                break
+            if current_symbol not in {"", target_symbol}:
+                break
+
+        decision_key = _timestamp_key(context.get("decision_at"))
+        rows = observations.get(decision_key or "") or []
+        target_row = _temporal_row(rows, target_symbol)
+        incumbent_row = _temporal_row(rows, incumbent_symbol)
+        target_return = _finite((target_row or {}).get("open_to_open_return"))
+        incumbent_return = _finite((incumbent_row or {}).get("open_to_open_return"))
+        if target_return is None or incumbent_return is None:
+            return {
+                "complete": False,
+                "holding_sessions": holding_sessions,
+                "exit_execution_at": exit_execution_at,
+                "target_return": None,
+                "incumbent_return": None,
+                "value_added": None,
+            }
+        target_factor *= max(1e-9, 1.0 + target_return)
+        incumbent_factor *= max(1e-9, 1.0 + incumbent_return)
+        holding_sessions += 1
+
+    if exit_execution_at is None or holding_sessions <= 0:
+        return {
+            "complete": False,
+            "holding_sessions": holding_sessions,
+            "exit_execution_at": exit_execution_at,
+            "target_return": None,
+            "incumbent_return": None,
+            "value_added": None,
+        }
+
+    target_return = float(target_factor - 1.0)
+    incumbent_return = float(incumbent_factor - 1.0)
+    return {
+        "complete": True,
+        "holding_sessions": holding_sessions,
+        "exit_execution_at": exit_execution_at,
+        "target_return": target_return,
+        "incumbent_return": incumbent_return,
+        "value_added": float(target_return - incumbent_return),
+    }
+
+
 def get_winner_transition_attribution(
     db: Any,
     run_id: str,
@@ -274,7 +348,7 @@ def get_winner_transition_attribution(
     observations = _observation_rows(db, run_id, min(decision_times), max(decision_times) + timedelta(days=2))
 
     items: list[dict[str, Any]] = []
-    for context in contexts:
+    for context_index, context in enumerate(contexts):
         if str(context.get("action") or "").upper() != "ROTATE":
             continue
         reason = str(context.get("reason") or "")
@@ -352,6 +426,14 @@ def get_winner_transition_attribution(
         outcome = context.get("outcome") if isinstance(context.get("outcome"), dict) else {}
         target_interval = _finite(outcome.get("gross_interval_return"))
         incumbent_interval = _finite(outcome.get("counterfactual_current_interval_return"))
+        holding_interval = _holding_interval_outcome(
+            contexts,
+            context_index,
+            observations,
+            fold_id=fold_id,
+            incumbent_symbol=incumbent_symbol,
+            target_symbol=target_symbol,
+        )
         items.append(bson_value({
             "fold_id": fold_id,
             "decision_at": context.get("decision_at"),
@@ -369,6 +451,7 @@ def get_winner_transition_attribution(
                     else None
                 ),
             },
+            "holding_interval_outcome": holding_interval,
             "trajectory": {
                 "sessions": sessions,
                 "windows": windows,

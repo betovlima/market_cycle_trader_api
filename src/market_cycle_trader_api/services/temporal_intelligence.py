@@ -26,18 +26,23 @@ from ..infrastructure.persistence.mongo_repository import (
     TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
     TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION,
     TEMPORAL_INTELLIGENCE_RUNS_COLLECTION,
+    TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION,
+    TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION,
+    TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION,
+    TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION,
     bson_value,
     utc_now,
 )
 from ..schemas.requests import BacktestExecutionRequest
+from .analytics import stateful_strategy_processing_id
 from .model_research import apply_execution_profile, model_execution_snapshot
 from .model_tuning_market_snapshot import freeze_tuning_market_snapshot, market_snapshot_exists
 from .strategy_lab import (
     StrategyLabConflict,
     StrategyLabError,
     StrategyLabNotFound,
-    get_trader_winner_context,
-    get_trader_winner_model_snapshot,
+    get_research_strategy_context,
+    get_research_strategy_model_snapshot,
     materialize_temporal_strategy,
     update_trader_live_market_cutoff,
 )
@@ -116,6 +121,11 @@ def public_temporal_run(document: dict[str, Any] | None, *, include_result: bool
         "strategy_profile_name": document.get("strategy_profile_name"),
         "strategy_profile_revision": document.get("strategy_profile_revision"),
         "strategy_configuration_hash": document.get("strategy_configuration_hash"),
+        "strategy_kind": document.get("strategy_kind") or "standard",
+        "temporal_strategy_variant": document.get("temporal_strategy_variant"),
+        "research_processing_id": document.get("research_processing_id"),
+        "research_processing_kind": document.get("research_processing_kind"),
+        "research_processing_label": document.get("research_processing_label"),
         "model_family": document.get("model_family"),
         "model_label": document.get("model_label"),
         "model_settings_hash": document.get("model_settings_hash"),
@@ -141,12 +151,12 @@ def public_temporal_run(document: dict[str, Any] | None, *, include_result: bool
 def _build_execution_request(
     db: Any,
 ) -> tuple[BacktestExecutionRequest, dict[str, Any], dict[str, Any], dict[str, Any]]:
-    winner_configuration, winner_strategy = get_trader_winner_context(db)
-    model_snapshot = get_trader_winner_model_snapshot(db)
+    winner_configuration, winner_strategy = get_research_strategy_context(db)
+    model_snapshot = get_research_strategy_model_snapshot(db)
     model_family = str(model_snapshot.get("family") or "")
     if model_family != "lightgbm_utility":
         raise TemporalIntelligenceConflict(
-            "Temporal Decision Intelligence v8 requires the immutable Trader Winner to use LightGBM."
+            "Temporal Decision Intelligence v8 requires the selected Strategy Research baseline to use LightGBM."
         )
     model_settings = deepcopy(model_snapshot.get("settings_snapshot") or {})
 
@@ -213,6 +223,41 @@ def _stable_temporal_market_snapshot(
     return None, None
 
 
+def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
+    strategy_id = str(strategy.get("id") or "").strip()
+    is_stateful = (
+        str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
+        and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+    )
+    if is_stateful:
+        from .temporal_winner_transition_stateful import build_stateful_live_runtime_bundle
+        try:
+            bundle = build_stateful_live_runtime_bundle(db, strategy)
+        except Exception as exc:
+            raise TemporalIntelligenceConflict(
+                f"Unable to execute the selected Stateful Strategy Research snapshot: {exc}"
+            ) from exc
+        return (
+            stateful_strategy_processing_id(strategy_id),
+            "strategy_research_stateful",
+            "Strategy Research · Stateful",
+            bundle,
+        )
+
+    exact_job = db[JOBS_COLLECTION].find_one(
+        {
+            "status": "completed",
+            "strategy_profile_id": strategy_id,
+            "strategy_profile_revision": int(strategy.get("revision") or 1),
+            "strategy_configuration_hash": str(strategy.get("configuration_hash") or ""),
+        },
+        {"_id": 0, "id": 1},
+        sort=[("finished_at", -1), ("created_at", -1)],
+    )
+    processing_id = str((exact_job or {}).get("id") or "").strip() or None
+    return processing_id, ("backtest" if processing_id else None), ("Simulation Backtest" if processing_id else None), None
+
+
 def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_thread: bool = True) -> dict[str, Any]:
     active = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
         {"status": {"$in": ["queued", "running", "stop_requested"]}}, {"_id": 0, "id": 1}
@@ -238,6 +283,7 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
 
     try:
         request, strategy, model_snapshot, market_context = _build_execution_request(db)
+        research_processing_id, research_processing_kind, research_processing_label, stateful_reference_bundle = _research_processing_context(db, strategy)
         snapshot_id, source_run_id = _stable_temporal_market_snapshot(
             db,
             strategy_configuration_hash=str(strategy.get("configuration_hash") or ""),
@@ -279,6 +325,12 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         "strategy_profile_name": strategy.get("name"),
         "strategy_profile_revision": strategy.get("revision"),
         "strategy_configuration_hash": strategy.get("configuration_hash"),
+        "strategy_kind": strategy.get("strategy_kind") or "standard",
+        "temporal_strategy_variant": strategy.get("temporal_strategy_variant"),
+        "research_processing_id": research_processing_id,
+        "research_processing_kind": research_processing_kind,
+        "research_processing_label": research_processing_label,
+        "stateful_reference_bundle": bson_value(stateful_reference_bundle) if isinstance(stateful_reference_bundle, dict) else None,
         "model_family": model_snapshot.get("family"),
         "model_label": model_snapshot.get("label"),
         "model_settings_hash": model_snapshot.get("settings_hash"),
@@ -392,6 +444,26 @@ def _run_temporal_process(db: Any, run_id: str) -> None:
         db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
             {"id": run_id},
             {"$set": {"status": "failed", "stage": "Temporal Intelligence failed", "failure_message": "Temporal Intelligence execution failed. Check protected server logs.", "technical_error": str(exc)[:2000], "finished_at": utc_now(), "updated_at": utc_now()}, "$unset": {"process_id": ""}},
+        )
+
+
+def validate_temporal_research_processing(db: Any, run_id: str, processing_id: str) -> None:
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+        {"id": str(run_id)},
+        {"_id": 0, "research_processing_id": 1, "strategy_profile_name": 1},
+    )
+    if document is None:
+        raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
+    expected = str(document.get("research_processing_id") or "").strip()
+    supplied = str(processing_id or "").strip()
+    if not expected:
+        raise TemporalIntelligenceConflict(
+            "This Temporal Intelligence run predates the unified Strategy Research source binding and cannot start a new full analysis."
+        )
+    if supplied != expected:
+        strategy_name = str(document.get("strategy_profile_name") or "the selected Strategy Research")
+        raise TemporalIntelligenceConflict(
+            f"Full analysis must use the processing bound to {strategy_name}. Expected {expected}."
         )
 
 
@@ -587,7 +659,13 @@ def materialize_temporal_intelligence_strategy(db: Any, run_id: str, *, actor_em
     return materialized
 
 
-def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
+def build_temporal_intelligence_export(
+    db: Any,
+    run_id: str,
+    *,
+    start_month: str | None = None,
+    end_month: str | None = None,
+) -> bytes:
     document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0})
     if document is None:
         raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
@@ -848,6 +926,65 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
         "result": manifest_result,
     })
 
+    pipeline_period_start = str(start_month or "").strip() or None
+    pipeline_period_end = str(end_month or "").strip() or None
+    processing_id = str(document.get("research_processing_id") or "").strip() or None
+    pipeline_query: dict[str, Any] = {"run_id": str(run_id)}
+    if processing_id:
+        pipeline_query["processing_id"] = processing_id
+    if pipeline_period_start:
+        pipeline_query["period_start"] = pipeline_period_start
+    if pipeline_period_end:
+        pipeline_query["period_end"] = pipeline_period_end
+
+    def latest_pipeline_document(collection_name: str) -> dict[str, Any] | None:
+        row = db[collection_name].find_one(pipeline_query, {"_id": 0}, sort=[("created_at", -1)])
+        return bson_value(row) if row is not None else None
+
+    pipeline_risk = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION)
+    pipeline_intervention = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION)
+    pipeline_confidence = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION)
+    pipeline_stateful = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION)
+    pipeline_reference_analytics = None
+    if processing_id:
+        try:
+            from .analytics import processing_analytics
+            pipeline_reference_analytics = bson_value(processing_analytics(db, processing_id))
+        except Exception as exc:
+            pipeline_reference_analytics = {"status": "unavailable", "failure_message": str(exc)}
+
+    pipeline_attribution = None
+    if pipeline_period_start and pipeline_period_end:
+        try:
+            from .temporal_winner_transition_attribution import get_winner_transition_attribution
+            pipeline_attribution = get_winner_transition_attribution(
+                db,
+                run_id,
+                start_month=pipeline_period_start,
+                end_month=pipeline_period_end,
+            )
+        except Exception as exc:
+            pipeline_attribution = {"status": "unavailable", "failure_message": str(exc)}
+
+    pipeline_manifest = bson_value({
+        "schema_version": 1,
+        "run_id": str(run_id),
+        "processing_id": processing_id,
+        "period_start": pipeline_period_start,
+        "period_end": pipeline_period_end,
+        "strategy_profile_id": document.get("strategy_profile_id"),
+        "strategy_profile_name": document.get("strategy_profile_name"),
+        "strategy_profile_revision": document.get("strategy_profile_revision"),
+        "strategy_configuration_hash": document.get("strategy_configuration_hash"),
+        "strategy_kind": document.get("strategy_kind"),
+        "temporal_strategy_variant": document.get("temporal_strategy_variant"),
+        "risk_status": (pipeline_risk or {}).get("status"),
+        "risk_failure_message": (pipeline_risk or {}).get("failure_message"),
+        "intervention_status": (pipeline_intervention or {}).get("status"),
+        "confidence_status": (pipeline_confidence or {}).get("status"),
+        "stateful_status": (pipeline_stateful or {}).get("status"),
+    })
+
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("temporal_intelligence_summary.csv", _csv_text([summary_row]))
@@ -874,6 +1011,19 @@ def build_temporal_intelligence_export(db: Any, run_id: str) -> bytes:
         archive.writestr("temporal_intelligence_winner_reference_trades.csv", _csv_text(winner_reference_trade_rows))
         archive.writestr("temporal_intelligence_latest_forecasts.csv", _csv_text(forecast_rows))
         archive.writestr("temporal_intelligence_manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False, default=str))
+        archive.writestr("strategy_research_pipeline_manifest.json", json.dumps(pipeline_manifest, indent=2, ensure_ascii=False, default=str))
+        if pipeline_reference_analytics is not None:
+            archive.writestr("strategy_research_reference_analytics.json", json.dumps(pipeline_reference_analytics, indent=2, ensure_ascii=False, default=str))
+        if pipeline_attribution is not None:
+            archive.writestr("strategy_research_transition_attribution.json", json.dumps(bson_value(pipeline_attribution), indent=2, ensure_ascii=False, default=str))
+        if pipeline_risk is not None:
+            archive.writestr("strategy_research_risk.json", json.dumps(pipeline_risk, indent=2, ensure_ascii=False, default=str))
+        if pipeline_intervention is not None:
+            archive.writestr("strategy_research_intervention.json", json.dumps(pipeline_intervention, indent=2, ensure_ascii=False, default=str))
+        if pipeline_confidence is not None:
+            archive.writestr("strategy_research_confidence.json", json.dumps(pipeline_confidence, indent=2, ensure_ascii=False, default=str))
+        if pipeline_stateful is not None:
+            archive.writestr("strategy_research_stateful.json", json.dumps(pipeline_stateful, indent=2, ensure_ascii=False, default=str))
     return archive_buffer.getvalue()
 
 def stop_temporal_intelligence(db: Any, run_id: str) -> dict[str, Any]:

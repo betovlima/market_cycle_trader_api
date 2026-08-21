@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import uuid
+from copy import deepcopy
 from typing import Any
 
 import exchange_calendars as xcals
@@ -14,6 +15,7 @@ from ..core.config import API_VERSION
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
+    TEMPORAL_INTELLIGENCE_RUNS_COLLECTION,
     PAPER_MARKET_AUTOMATION_COLLECTION,
     PAPER_MARKET_RUNS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
@@ -433,12 +435,20 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     model_family = str((snapshot or {}).get("family") or "").strip().lower() or None
 
     if strategy_kind == "temporal_intelligence":
+        stateful = str(document.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+        if stateful and model_family == "lightgbm_utility" and str(document.get("source_stateful_replay_id") or "").strip():
+            return {
+                "eligible": True,
+                "code": "stateful_conservative_live_runtime_ready",
+                "reason": None,
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
         return {
             "eligible": False,
             "code": "temporal_live_runtime_unavailable",
             "reason": (
-                "TEMPORAL policy snapshots are not executed by the installed Paper/Trader runtime. "
-                "Promotion is blocked until that runtime has live parity with Temporal Intelligence."
+                "Temporal Intelligence strategies require a supported live execution policy before Trader Winner promotion."
             ),
             "strategy_kind": strategy_kind,
             "model_family": model_family,
@@ -492,6 +502,11 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "trader_compatibility": _trader_runtime_compatibility(document),
         "source_temporal_run_id": document.get("source_temporal_run_id"),
         "source_temporal_experiment": document.get("source_temporal_experiment"),
+        "temporal_strategy_variant": document.get("temporal_strategy_variant"),
+        "source_stateful_replay_id": document.get("source_stateful_replay_id"),
+        "source_stateful_processing_id": document.get("source_stateful_processing_id"),
+        "stateful_candidate_key": document.get("stateful_candidate_key"),
+        "stateful_candidate_label": document.get("stateful_candidate_label"),
         "temporal_policy_revision": document.get("temporal_policy_revision"),
         "temporal_policy": (
             bson_value(document.get("temporal_policy_snapshot"))
@@ -607,6 +622,7 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     return {
         "revision": int(control.get("revision") or 1),
         "research_strategy_id": research_id,
+        "strategy_research_strategy_id": research_id,
         "research_reference_strategy_id": reference_id,
         "candidate_strategy_id": candidate_id or None,
         "promoted_candidate_strategy_id": promoted_candidate_id or None,
@@ -614,6 +630,7 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "trader_winner_strategy_id": winner_id,
         "winner_sequence": int(control.get("winner_sequence") or 0),
         "research_strategy": _public_profile(research, include_configuration=False),
+        "strategy_research_strategy": _public_profile(research, include_configuration=False),
         "research_reference_strategy": (
             _public_profile(reference, include_configuration=False)
             if reference is not None
@@ -650,6 +667,9 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "live_market_cutoff_updated_at": bson_value(control.get("live_market_cutoff_updated_at")),
         "live_market_cutoff_source": control.get("live_market_cutoff_source"),
         "live_market_cutoff_winner_strategy_id": control.get("live_market_cutoff_winner_strategy_id"),
+        "live_market_refresh_in_progress": bool(control.get("live_market_refresh_in_progress")),
+        "live_market_refresh_started_at": bson_value(control.get("live_market_refresh_started_at")),
+        "live_market_refresh_source": control.get("live_market_refresh_source"),
     }
 
 
@@ -886,6 +906,43 @@ def _normalize_single_candidate_and_winner(
         control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or control
     return control
 
+def _normalize_stateful_temporal_profiles(db: Any) -> None:
+    db[STRATEGY_PROFILES_COLLECTION].update_many(
+        {
+            "strategy_kind": "temporal_intelligence",
+            "temporal_strategy_variant": "winner_transition_stateful",
+            "tuning_target": {"$ne": "stateful_transition"},
+        },
+        {
+            "$set": {
+                "tuning_target": "stateful_transition",
+                "updated_at": utc_now(),
+            }
+        },
+    )
+
+
+def _normalize_model_tuning_selection(db: Any, control: dict[str, Any]) -> dict[str, Any]:
+    research_id = str(control.get("research_strategy_id") or "").strip()
+    selected_id = str(control.get("model_tuning_strategy_id") or "").strip()
+    if not research_id or selected_id == research_id:
+        return control
+    now = utc_now()
+    updated = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {"_id": CONTROL_ID, "revision": int(control.get("revision") or 1)},
+        {
+            "$set": {
+                "model_tuning_strategy_id": research_id,
+                "updated_at": now,
+                "last_model_tuning_selection_note": "Synchronized with the shared Strategy Research selection.",
+            },
+            "$inc": {"revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    return updated or control
+
+
 def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
     control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID})
     if control is not None:
@@ -896,7 +953,9 @@ def ensure_strategy_catalog(db: Any) -> dict[str, Any]:
             {"_id": str(control.get("trader_winner_strategy_id") or "")}
         )
         if research is not None and winner is not None:
+            _normalize_stateful_temporal_profiles(db)
             normalized_control = _normalize_single_candidate_and_winner(db, control)
+            normalized_control = _normalize_model_tuning_selection(db, normalized_control)
             _ensure_strategy_model_bindings(db)
             return normalized_control
 
@@ -1077,7 +1136,7 @@ def get_research_strategy_context(db: Any) -> tuple[BacktestRequest, dict[str, A
     strategy_id = str(control["research_strategy_id"])
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
-        raise StrategyLabNotFound("Selected backtest strategy does not exist.")
+        raise StrategyLabNotFound("Selected Strategy Research baseline does not exist.")
     configuration = BacktestRequest.model_validate(profile.get("configuration") or {})
     return configuration, _public_profile(profile, include_configuration=False)
 
@@ -1087,7 +1146,7 @@ def get_research_strategy_model_snapshot(db: Any) -> dict[str, Any]:
     strategy_id = str(control["research_strategy_id"])
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
-        raise StrategyLabNotFound("Selected backtest strategy does not exist.")
+        raise StrategyLabNotFound("Selected Strategy Research baseline does not exist.")
     return _resolved_strategy_model_snapshot(db, profile)
 
 
@@ -1195,6 +1254,17 @@ def create_strategy(
         "research_model_snapshot": bson_value(source_model_snapshot),
         "research_model_revision": 1,
         "research_reference_assets": source_reference_assets,
+        "strategy_kind": str(source.get("strategy_kind") or "standard"),
+        "tuning_target": str(source.get("tuning_target") or "model_strategy"),
+        "source_temporal_run_id": source.get("source_temporal_run_id"),
+        "source_temporal_experiment": source.get("source_temporal_experiment"),
+        "temporal_strategy_variant": source.get("temporal_strategy_variant"),
+        "source_stateful_replay_id": source.get("source_stateful_replay_id"),
+        "source_stateful_processing_id": source.get("source_stateful_processing_id"),
+        "stateful_candidate_key": source.get("stateful_candidate_key"),
+        "stateful_candidate_label": source.get("stateful_candidate_label"),
+        "temporal_policy_revision": source.get("temporal_policy_revision"),
+        "temporal_policy_snapshot": bson_value(deepcopy(source.get("temporal_policy_snapshot"))) if isinstance(source.get("temporal_policy_snapshot"), dict) else None,
         "created_at": now,
         "updated_at": now,
         "created_by": (actor_email or "").strip().lower() or None,
@@ -1219,7 +1289,10 @@ def materialize_temporal_strategy(
     research_model_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_strategy_catalog(db)
-    existing = db[STRATEGY_PROFILES_COLLECTION].find_one({"source_temporal_run_id": str(run_id)})
+    existing = db[STRATEGY_PROFILES_COLLECTION].find_one({
+        "source_temporal_run_id": str(run_id),
+        "source_stateful_replay_id": {"$exists": False},
+    })
     if existing is not None:
         return {"created": False, "strategy": _public_profile(existing)}
 
@@ -1260,6 +1333,78 @@ def materialize_temporal_strategy(
     )
     if updated is None:
         raise StrategyLabConflict("Unable to materialize the Temporal Intelligence Strategy.")
+    return {"created": True, "strategy": _public_profile(updated)}
+
+
+def materialize_temporal_stateful_strategy(
+    db: Any,
+    *,
+    run_id: str,
+    replay_id: str,
+    processing_id: str,
+    candidate_key: str,
+    candidate_label: str,
+    source_strategy_id: str,
+    source_strategy_revision: int | None,
+    source_configuration_hash: str | None,
+    name: str,
+    description: str,
+    experiment: str,
+    policy_snapshot: dict[str, Any],
+    actor_email: str | None,
+    research_model_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ensure_strategy_catalog(db)
+    normalized_candidate_key = str(candidate_key or "").strip().lower()
+    existing = db[STRATEGY_PROFILES_COLLECTION].find_one({
+        "source_stateful_replay_id": str(replay_id),
+        "stateful_candidate_key": normalized_candidate_key,
+    })
+    if existing is not None:
+        return {"created": False, "strategy": _public_profile(existing)}
+
+    source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": str(source_strategy_id)})
+    if source is None:
+        raise StrategyLabNotFound("The Strategy used by this Temporal Intelligence run is no longer available in the catalog.")
+    expected_revision = int(source_strategy_revision or 0)
+    if expected_revision and int(source.get("revision") or 1) != expected_revision:
+        raise StrategyLabConflict("The source Strategy revision no longer matches the completed Temporal Intelligence run.")
+    expected_hash = str(source_configuration_hash or "").strip()
+    if expected_hash and str(source.get("configuration_hash") or "") != expected_hash:
+        raise StrategyLabConflict("The source Strategy configuration no longer matches the completed Temporal Intelligence run.")
+
+    created = create_strategy(
+        db,
+        name=name,
+        description=description,
+        clone_from_strategy_id=str(source_strategy_id),
+        actor_email=actor_email,
+    )
+    now = utc_now()
+    updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+        {"_id": created["id"], "revision": int(created["revision"])},
+        {
+            "$set": {
+                "strategy_kind": "temporal_intelligence",
+                "tuning_target": "stateful_transition",
+                "source_temporal_run_id": str(run_id),
+                "source_temporal_experiment": str(experiment),
+                "temporal_strategy_variant": "winner_transition_stateful",
+                "source_stateful_replay_id": str(replay_id),
+                "source_stateful_processing_id": str(processing_id),
+                "stateful_candidate_key": normalized_candidate_key,
+                "stateful_candidate_label": str(candidate_label),
+                "temporal_policy_revision": 1,
+                "temporal_policy_snapshot": bson_value(policy_snapshot),
+                **({"research_model_snapshot": bson_value(research_model_snapshot)} if isinstance(research_model_snapshot, dict) else {}),
+                "updated_at": now,
+                "updated_by": (actor_email or "").strip().lower() or None,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise StrategyLabConflict("Unable to materialize the Stateful Temporal Strategy.")
     return {"created": True, "strategy": _public_profile(updated)}
 
 
@@ -1709,6 +1854,14 @@ def _assert_no_active_backtest(db: Any) -> None:
         raise StrategyLabConflict(
             f"Wait for model tuning {active_tuning.get('id', 'unknown')} to finish before changing strategy selection or Trader lifecycle."
         )
+    active_temporal = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+        {"status": {"$in": ["queued", "running", "stop_requested"]}},
+        {"_id": 0, "id": 1},
+    )
+    if active_temporal is not None:
+        raise StrategyLabConflict(
+            f"Wait for Temporal Intelligence {active_temporal.get('id', 'unknown')} to finish before changing the Strategy Research selection."
+        )
 
 
 def select_research_strategy(
@@ -1729,17 +1882,18 @@ def select_research_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    _assert_standard_strategy_action(profile, "Backtest selection")
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},
         {
             "$set": {
                 "research_strategy_id": strategy_id,
-                "model_tuning_strategy_id": None,
+                "model_tuning_strategy_id": strategy_id,
                 "updated_at": now,
                 "updated_by": (actor_email or "").strip().lower() or None,
                 "last_selection_note": note,
+                "last_strategy_research_selection_note": note,
+                "last_model_tuning_selection_note": note,
             },
             "$inc": {"revision": 1},
         },
@@ -1751,6 +1905,15 @@ def select_research_strategy(
 
 
 
+def _is_stateful_temporal_strategy(profile: dict[str, Any] | None) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    return (
+        str(profile.get("strategy_kind") or "") == "temporal_intelligence"
+        and str(profile.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+    )
+
+
 def select_model_tuning_strategy(
     db: Any,
     strategy_id: str,
@@ -1759,37 +1922,13 @@ def select_model_tuning_strategy(
     note: str,
     actor_email: str | None,
 ) -> dict[str, Any]:
-    _assert_no_active_backtest(db)
-    control = ensure_strategy_catalog(db)
-    current_revision = int(control.get("revision") or 1)
-    if current_revision != expected_control_revision:
-        raise StrategyLabConflict(
-            f"Expected selection revision {expected_control_revision}, current revision {current_revision}."
-        )
-    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
-    if profile is None:
-        raise StrategyLabNotFound("Strategy profile not found.")
-    # Model Tuning selection is intentionally lifecycle-status agnostic.
-    # WINNER/CANDIDATE/DRAFT/SUPERSEDED are guidance only; the Model Tuning
-    # service validates the selected Strategy's technical compatibility when
-    # building its tuning plan and frozen baseline.
-    now = utc_now()
-    updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
-        {"_id": CONTROL_ID, "revision": current_revision},
-        {
-            "$set": {
-                "model_tuning_strategy_id": strategy_id,
-                "updated_at": now,
-                "updated_by": (actor_email or "").strip().lower() or None,
-                "last_model_tuning_selection_note": note,
-            },
-            "$inc": {"revision": 1},
-        },
-        return_document=ReturnDocument.AFTER,
+    return select_research_strategy(
+        db,
+        strategy_id,
+        expected_control_revision=expected_control_revision,
+        note=note,
+        actor_email=actor_email,
     )
-    if updated_control is None:
-        raise StrategyLabConflict("Model Tuning strategy selection changed before this update was applied.")
-    return _control_response(db, updated_control)
 
 
 def create_tuned_temporal_strategy(
@@ -2007,6 +2146,7 @@ def _acquire_winner_promotion_lock(
             "_id": CONTROL_ID,
             "revision": expected_control_revision,
             "winner_promotion_in_progress": {"$ne": True},
+            "live_market_refresh_in_progress": {"$ne": True},
         },
         {
             "$set": {
@@ -2018,6 +2158,11 @@ def _acquire_winner_promotion_lock(
         return_document=ReturnDocument.AFTER,
     )
     if locked is None:
+        current = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or {}
+        if bool(current.get("live_market_refresh_in_progress")):
+            raise StrategyLabConflict(
+                "Trader Winner promotion is temporarily unavailable while the temporal market-series synchronization is running."
+            )
         raise StrategyLabConflict(
             "Strategy selection changed or another Winner promotion is already in progress."
         )
@@ -2066,10 +2211,6 @@ def _assert_trader_safe_for_promotion(
 
 
     regular_market_open = _regular_market_is_open()
-    if regular_market_open:
-        raise StrategyLabConflict(
-            "Trader Winner promotion is allowed only while the XNYS regular market is closed."
-        )
 
     _assert_no_active_backtest(db)
 
@@ -2135,6 +2276,265 @@ def _assert_trader_safe_for_promotion(
         "holding_sessions": int(state.get("holding_sessions") or 0),
     }
 
+def _promote_stateful_strategy_direct(
+    db: Any,
+    source: dict[str, Any],
+    *,
+    control: dict[str, Any],
+    expected_control_revision: int,
+    expected_strategy_revision: int,
+    note: str,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    strategy_id = str(source.get("_id") or "")
+    if not strategy_id:
+        raise StrategyLabConflict("Stateful Strategy identity is unavailable.")
+    if bool(source.get("locked")):
+        raise StrategyLabConflict("This Strategy is already protected.")
+    if str(source.get("status") or "draft") != "draft":
+        raise StrategyLabConflict("Only the draft Stateful Strategy can be promoted directly to Winner.")
+    if int(source.get("revision") or 1) != int(expected_strategy_revision):
+        raise StrategyLabConflict(
+            f"Expected strategy revision {expected_strategy_revision}, current revision {int(source.get('revision') or 1)}."
+        )
+    runtime_compatibility = _assert_trader_runtime_compatible(source)
+    winner_model_snapshot = _resolved_strategy_model_snapshot(db, source)
+    if str(winner_model_snapshot.get("family") or "") != "lightgbm_utility":
+        raise StrategyLabConflict("Candidate A Stateful Winner requires its saved LightGBM Utility model.")
+
+    from .temporal_winner_transition_stateful import build_stateful_live_runtime_bundle
+    try:
+        live_bundle = build_stateful_live_runtime_bundle(db, source)
+    except Exception as exc:
+        raise StrategyLabConflict(f"Unable to prepare Candidate A Stateful live runtime: {exc}") from exc
+
+    policy_snapshot = deepcopy(source.get("temporal_policy_snapshot") or {})
+    stateful_policy = dict(policy_snapshot.get("stateful_policy") or {})
+    stateful_policy["live_runtime"] = bson_value(live_bundle)
+    policy_snapshot["stateful_policy"] = stateful_policy
+    validation = policy_snapshot.get("stateful_validation") if isinstance(policy_snapshot.get("stateful_validation"), dict) else {}
+    parity = validation.get("control_parity") if isinstance(validation.get("control_parity"), dict) else {}
+    if str(parity.get("status") or "").lower() != "passed":
+        raise StrategyLabConflict("Candidate A Stateful requires passed Control parity before Winner promotion.")
+
+    configuration = BacktestRequest.model_validate(source.get("configuration") or {})
+    payload = configuration.model_dump(mode="json")
+    configuration_hash = _configuration_hash(payload)
+    stored_hash = str(source.get("configuration_hash") or "")
+    if stored_hash and stored_hash != configuration_hash:
+        raise StrategyLabConflict("Stateful Strategy configuration hash does not match its stored revision.")
+
+    control_revision = int(control.get("revision") or 1)
+    if control_revision != int(expected_control_revision):
+        raise StrategyLabConflict(
+            f"Expected selection revision {expected_control_revision}, current revision {control_revision}."
+        )
+    next_winner_sequence = int(control.get("winner_sequence") or 0) + 1
+    actor = (actor_email or "").strip().lower() or None
+    _acquire_winner_promotion_lock(db, expected_control_revision=control_revision, actor_email=actor)
+    previous_winner_id = str(control.get("trader_winner_strategy_id") or "")
+    previous_promoted_candidate_id = str(control.get("promoted_candidate_strategy_id") or "") or None
+    previous_winner_changed = False
+    previous_promoted_changed = False
+    source_changed = False
+    completed = False
+    history_id = f"promotion-{uuid.uuid4().hex}"
+    original_name = str(source.get("name") or "Candidate A — Conservative Stateful")
+    try:
+        operational_snapshot = _assert_trader_safe_for_promotion(db, candidate_assets=list(configuration.assets))
+        now = utc_now()
+        if previous_winner_id and previous_winner_id != strategy_id:
+            previous = db[STRATEGY_PROFILES_COLLECTION].update_one(
+                {"_id": previous_winner_id, "status": "winner"},
+                {"$set": {
+                    "status": "former_winner",
+                    "locked": True,
+                    "updated_at": now,
+                    "superseded_by_winner_strategy_id": strategy_id,
+                }},
+            )
+            previous_winner_changed = previous.matched_count == 1
+            if not previous_winner_changed:
+                raise StrategyLabConflict("The active Winner changed before promotion could be committed.")
+
+        if previous_promoted_candidate_id and previous_promoted_candidate_id != strategy_id:
+            previous_promoted = db[STRATEGY_PROFILES_COLLECTION].update_one(
+                {"_id": previous_promoted_candidate_id, "status": "promoted_candidate"},
+                {"$set": {
+                    "status": "superseded_candidate",
+                    "locked": True,
+                    "superseded_at": now,
+                    "superseded_by_strategy_id": strategy_id,
+                    "superseded_reason": "winner_replaced",
+                    "historical_lifecycle_status": "promoted_candidate",
+                    "updated_at": now,
+                    "updated_by": actor,
+                }},
+            )
+            previous_promoted_changed = previous_promoted.matched_count == 1
+            if not previous_promoted_changed:
+                raise StrategyLabConflict("The active promoted Candidate changed before promotion could be committed.")
+
+        winner_name = f"Winner #{next_winner_sequence}"
+        updated_source = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
+            {"_id": strategy_id, "revision": int(expected_strategy_revision), "locked": {"$ne": True}},
+            {"$set": {
+                "name": winner_name,
+                "source_strategy_name_before_promotion": original_name,
+                "status": "winner",
+                "locked": True,
+                "winner_sequence": next_winner_sequence,
+                "winner_model_snapshot": bson_value(winner_model_snapshot),
+                "research_model_snapshot": bson_value(winner_model_snapshot),
+                "temporal_policy_snapshot": bson_value(policy_snapshot),
+                "winner_api_version": API_VERSION,
+                "source_api_version": API_VERSION,
+                "promoted_at": now,
+                "promoted_by": actor,
+                "promotion_note": note,
+                "promotion_mode": "stateful_direct_winner",
+                "trader_compatibility": bson_value(runtime_compatibility),
+                "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
+                "broker_interaction_performed": False,
+                "operational_state_preserved": True,
+                "updated_at": now,
+                "updated_by": actor,
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated_source is None:
+            raise StrategyLabConflict("Stateful Strategy changed before Winner promotion could be committed.")
+        source_changed = True
+
+        db[STRATEGY_PROMOTION_HISTORY_COLLECTION].insert_one(bson_value({
+            "_id": history_id,
+            "status": "pending_control_commit",
+            "action": "stateful_direct_winner_promoted",
+            "previous_winner_strategy_id": previous_winner_id,
+            "new_winner_strategy_id": strategy_id,
+            "new_winner_name": winner_name,
+            "winner_sequence": next_winner_sequence,
+            "source_strategy_id": strategy_id,
+            "source_strategy_revision": int(expected_strategy_revision),
+            "source_stateful_replay_id": source.get("source_stateful_replay_id"),
+            "configuration_hash": configuration_hash,
+            "model_family": winner_model_snapshot["family"],
+            "model_profile_id": winner_model_snapshot["profile_id"],
+            "model_settings_revision": winner_model_snapshot["settings_revision"],
+            "model_settings_hash": winner_model_snapshot["settings_hash"],
+            "trader_compatibility": bson_value(runtime_compatibility),
+            "assets_count": len(configuration.assets),
+            "note": note,
+            "promoted_at": now,
+            "promoted_by": actor,
+            "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
+            "broker_interaction_performed": False,
+            "operational_state_preserved": True,
+            "operational_snapshot": operational_snapshot,
+        }))
+
+        updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+            {"_id": CONTROL_ID, "revision": control_revision, "winner_promotion_in_progress": True},
+            {"$set": {
+                "candidate_strategy_id": None,
+                "promoted_candidate_strategy_id": None,
+                "trader_winner_strategy_id": strategy_id,
+                "winner_sequence": next_winner_sequence,
+                "research_reference_strategy_id": strategy_id,
+                "research_reference_configuration_hash": configuration_hash,
+                "research_reference_assets": list(configuration.assets),
+                "updated_at": now,
+                "updated_by": actor,
+                "last_promotion_note": note,
+                "last_promotion_mode": "stateful_direct_winner",
+                "last_promoted_api_version": API_VERSION,
+                "last_promoted_configuration_hash": configuration_hash,
+                "last_promoted_model_family": winner_model_snapshot["family"],
+                "last_promoted_model_profile_id": winner_model_snapshot["profile_id"],
+                "last_promoted_model_settings_hash": winner_model_snapshot["settings_hash"],
+                "last_promoted_assets_count": len(configuration.assets),
+                "paper_state_reinitialization_required": False,
+                "live_market_cutoff": None,
+                "live_market_cutoff_updated_at": None,
+                "live_market_cutoff_source": "winner_promoted_refresh_required",
+                "live_market_cutoff_winner_strategy_id": strategy_id,
+                "winner_promotion_in_progress": False,
+                "winner_promotion_started_at": None,
+                "winner_promotion_started_by": None,
+            }, "$inc": {"revision": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated_control is None:
+            raise StrategyLabConflict("Winner selection changed before Stateful promotion completed.")
+        db[STRATEGY_PROMOTION_HISTORY_COLLECTION].update_one(
+            {"_id": history_id},
+            {"$set": {"status": "completed", "control_revision_after": int(updated_control.get("revision") or 0), "completed_at": utc_now()}},
+        )
+        completed = True
+        return {
+            "status": "promoted",
+            "winner": _public_profile(updated_source),
+            "control": _control_response(db, updated_control),
+            "promotion": {
+                "mode": "stateful_direct_winner",
+                "regular_market_open_at_promotion": bool(operational_snapshot.get("regular_market_open_at_promotion")),
+                "broker_interaction_performed": False,
+                "operational_state_preserved": True,
+                "current_position_preserved": True,
+                "paper_pipeline_preserved": True,
+                "next_scheduled_evaluation_uses_new_winner": True,
+                "next_scheduled_evaluation_assets_count": len(configuration.assets),
+                "winner_model": public_model_snapshot(winner_model_snapshot),
+                "trader_compatibility": bson_value(runtime_compatibility),
+                "winner_sequence": next_winner_sequence,
+                **operational_snapshot,
+            },
+        }
+    except Exception:
+        if not completed:
+            if source_changed:
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": strategy_id},
+                    {"$set": {
+                        "name": original_name,
+                        "status": "draft",
+                        "locked": False,
+                        "updated_at": utc_now(),
+                    }, "$unset": {
+                        "winner_sequence": "",
+                        "winner_model_snapshot": "",
+                        "winner_api_version": "",
+                        "promoted_at": "",
+                        "promoted_by": "",
+                        "promotion_note": "",
+                        "promotion_mode": "",
+                    }},
+                )
+            if previous_winner_changed and previous_winner_id:
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": previous_winner_id},
+                    {"$set": {"status": "winner", "locked": True, "superseded_by_winner_strategy_id": None, "updated_at": utc_now()}},
+                )
+            if previous_promoted_changed and previous_promoted_candidate_id:
+                db[STRATEGY_PROFILES_COLLECTION].update_one(
+                    {"_id": previous_promoted_candidate_id},
+                    {"$set": {
+                        "status": "promoted_candidate",
+                        "locked": True,
+                        "superseded_at": None,
+                        "superseded_by_strategy_id": None,
+                        "superseded_reason": None,
+                        "historical_lifecycle_status": None,
+                        "updated_at": utc_now(),
+                    }},
+                )
+            db[STRATEGY_PROMOTION_HISTORY_COLLECTION].delete_one({"_id": history_id})
+        raise
+    finally:
+        if not completed:
+            _release_winner_promotion_lock(db, expected_control_revision=control_revision)
+
+
 def promote_strategy_to_trader(
     db: Any,
     strategy_id: str,
@@ -2160,6 +2560,16 @@ def promote_strategy_to_trader(
     if source_revision != expected_strategy_revision:
         raise StrategyLabConflict(
             f"Expected strategy revision {expected_strategy_revision}, current revision {source_revision}."
+        )
+    if _is_stateful_temporal_strategy(source):
+        return _promote_stateful_strategy_direct(
+            db,
+            source,
+            control=control,
+            expected_control_revision=expected_control_revision,
+            expected_strategy_revision=expected_strategy_revision,
+            note=note,
+            actor_email=actor_email,
         )
     if str(source.get("status") or "draft") != "candidate":
         raise StrategyLabConflict(

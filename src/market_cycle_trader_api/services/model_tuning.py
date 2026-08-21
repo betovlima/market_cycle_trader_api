@@ -169,24 +169,16 @@ class ModelTuningNotFound(RuntimeError):
 
 def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
     control = get_strategy_control(db)
-    selected_strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()
-    if selected_strategy_id:
-        strategy = get_strategy(db, selected_strategy_id)
-        model_snapshot = get_strategy_model_snapshot(db, selected_strategy_id)
-        return strategy, model_snapshot, "model_tuning_selection"
-    candidates = (
-        ("candidate", control.get("candidate_strategy_id")),
-        ("promoted_candidate", control.get("promoted_candidate_strategy_id")),
-        ("selected_strategy", control.get("research_strategy_id")),
-    )
-    for source, raw_id in candidates:
-        strategy_id = str(raw_id or "").strip()
-        if not strategy_id:
-            continue
-        strategy = get_strategy(db, strategy_id)
-        model_snapshot = get_strategy_model_snapshot(db, strategy_id)
-        return strategy, model_snapshot, source
-    raise ModelTuningConflict("No Strategy is available for model tuning.")
+    strategy_id = str(
+        control.get("strategy_research_strategy_id")
+        or control.get("research_strategy_id")
+        or ""
+    ).strip()
+    if not strategy_id:
+        raise ModelTuningConflict("No Strategy is selected for Strategy Research.")
+    strategy = get_strategy(db, strategy_id)
+    model_snapshot = get_strategy_model_snapshot(db, strategy_id)
+    return strategy, model_snapshot, "strategy_research_selection"
 
 
 def _tuning_target_allows_locked_strategy(strategy: dict[str, Any]) -> bool:
@@ -491,10 +483,26 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
                     })
         except Exception:
             temporal_modes = []
+    strategy_compatibility = {"eligible": True, "reason": None}
+    if db is not None:
+        try:
+            selected_strategy, _, _ = _tuning_target_strategy(db)
+            if (
+                str(selected_strategy.get("strategy_kind") or "") == "temporal_intelligence"
+                and str(selected_strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+            ):
+                strategy_compatibility = {
+                    "eligible": False,
+                    "reason": "Stateful-transition tuning is not implemented in the current Model Tuning engine. The Strategy remains the shared Strategy Research selection.",
+                }
+        except Exception as exc:
+            strategy_compatibility = {"eligible": False, "reason": str(exc)}
     default_startup_trials = max(4, min(24, len(search_space) + 2))
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
         "start_request_contract_version": 1,
+        "strategy_selection_source": "strategy_research_selection",
+        "strategy_compatibility": strategy_compatibility,
         "method": PROBABILITY_METHOD,
         "methods": [
             {
@@ -848,6 +856,11 @@ def _refresh_campaign_ranking(db: Any, run_id: str) -> None:
 
 def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     strategy, model_snapshot, target_source = _tuning_target_strategy(db)
+    if (
+        str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
+        and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+    ):
+        return []
     if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
         return [temporal_policy_baseline(strategy)]
     if str(model_snapshot.get("family") or "") != TUNING_MODEL_FAMILY:
@@ -2353,6 +2366,13 @@ def start_model_tuning(
         )
 
     strategy, model_snapshot, tuning_target_source = _tuning_target_strategy(db)
+    if (
+        str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
+        and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
+    ):
+        raise ModelTuningConflict(
+            "The selected Stateful Temporal Strategy is the Strategy Research baseline, but its stateful-transition parameters are not supported by the current Model Tuning engine."
+        )
     if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
         requested_temporal_target = str(tuning_target or TEMPORAL_MODEL_TUNING_SCOPE).strip().lower()
         if requested_temporal_target not in {TEMPORAL_MODEL_TUNING_SCOPE, TEMPORAL_POLICY_TUNING_SCOPE}:

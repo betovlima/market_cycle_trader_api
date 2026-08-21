@@ -17,6 +17,8 @@ from ..infrastructure.persistence.mongo_repository import (
     PAPER_TRADE_ORDERS_COLLECTION,
     PREDICTIONS_COLLECTION,
     RUNS_COLLECTION,
+    STRATEGY_PROFILES_COLLECTION,
+    TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION,
     TRADES_COLLECTION,
     bson_value,
     get_alpaca_integration_status,
@@ -24,6 +26,60 @@ from ..infrastructure.persistence.mongo_repository import (
 from .admin_rotations import admin_job_rotations
 from .dashboard import _public_metrics, _selected_internal_row
 from .serialization import iso_value
+
+
+_STATEFUL_STRATEGY_PROCESSING_PREFIX = "strategy-stateful:"
+
+
+def stateful_strategy_processing_id(strategy_id: str) -> str:
+    normalized = str(strategy_id or "").strip()
+    if not normalized:
+        raise ValueError("Stateful Strategy id is required.")
+    return f"{_STATEFUL_STRATEGY_PROCESSING_PREFIX}{normalized}"
+
+
+def _stateful_strategy_id_from_processing(processing_id: str) -> str | None:
+    value = str(processing_id or "").strip()
+    if not value.startswith(_STATEFUL_STRATEGY_PROCESSING_PREFIX):
+        return None
+    strategy_id = value[len(_STATEFUL_STRATEGY_PROCESSING_PREFIX):].strip()
+    return strategy_id or None
+
+
+def _stateful_strategy_processing_analytics(db: Any, processing_id: str) -> dict[str, Any] | None:
+    strategy_id = _stateful_strategy_id_from_processing(processing_id)
+    if not strategy_id:
+        return None
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id}, {"_id": 1, "name": 1, "revision": 1, "configuration_hash": 1, "strategy_kind": 1, "temporal_strategy_variant": 1, "source_stateful_replay_id": 1, "stateful_candidate_key": 1})
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Strategy Research Stateful processing source was not found.")
+    if str(profile.get("strategy_kind") or "") != "temporal_intelligence" or str(profile.get("temporal_strategy_variant") or "") != "winner_transition_stateful":
+        raise HTTPException(status_code=409, detail="The selected Strategy Research profile is not a Stateful Temporal Strategy.")
+    replay_id = str(profile.get("source_stateful_replay_id") or "").strip()
+    candidate_key = str(profile.get("stateful_candidate_key") or "a").strip().lower() or "a"
+    if not replay_id:
+        raise HTTPException(status_code=409, detail="The selected Stateful Strategy does not contain its source replay binding.")
+    replay = db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].find_one({"id": replay_id, "status": "completed"}, {"_id": 0})
+    if replay is None:
+        raise HTTPException(status_code=409, detail="The selected Stateful Strategy source replay is unavailable.")
+    candidate = replay.get(f"candidate_{candidate_key}") if isinstance(replay.get(f"candidate_{candidate_key}"), dict) else None
+    analytics = candidate.get("analytics") if isinstance(candidate, dict) and isinstance(candidate.get("analytics"), dict) else None
+    if analytics is None:
+        raise HTTPException(status_code=409, detail="The selected Stateful Strategy does not contain validated replay analytics.")
+    payload = dict(bson_value(analytics))
+    payload.update({
+        "job_id": str(processing_id),
+        "processing_id": str(processing_id),
+        "processing_kind": "strategy_research_stateful",
+        "processing_label": "Strategy Research · Stateful",
+        "reference_label": "Source Control",
+        "strategy_profile_id": strategy_id,
+        "strategy_profile_name": str(profile.get("name") or "Stateful Strategy"),
+        "strategy_profile_revision": int(profile.get("revision") or 1),
+        "strategy_configuration_hash": str(profile.get("configuration_hash") or ""),
+        "source_stateful_replay_id": replay_id,
+    })
+    return payload
 
 
 _FORBIDDEN_OUTPUT_KEYS = frozenset(
@@ -1006,6 +1062,9 @@ def completed_processings(db: Any, limit: int = 100) -> dict[str, Any]:
 
 
 def processing_analytics(db: Any, processing_id: str) -> dict[str, Any]:
+    stateful = _stateful_strategy_processing_analytics(db, processing_id)
+    if stateful is not None:
+        return stateful
     certification = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one(
         {"certification_processing_id": str(processing_id)}, {"_id": 0, "certification_analytics": 1}
     )
@@ -1035,6 +1094,16 @@ def processing_rotation_period_analysis(
     year: int,
     month: int,
 ) -> dict[str, Any]:
+    stateful = _stateful_strategy_processing_analytics(db, processing_id)
+    if stateful is not None:
+        return _rotation_period_from_data(
+            db,
+            processing_id,
+            equity=list(stateful.get("equity") or []),
+            rotations=list(stateful.get("rotations") or []),
+            year=year,
+            month=month,
+        )
     validation = db[MODEL_TUNING_VALIDATIONS_COLLECTION].find_one(
         {"$or": [{"id": str(processing_id)}, {"certification_processing_id": str(processing_id)}]},
         {"_id": 0, "id": 1, "analytics": 1, "certification_processing_id": 1, "certification_analytics": 1},

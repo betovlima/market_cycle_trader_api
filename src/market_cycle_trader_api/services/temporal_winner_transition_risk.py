@@ -136,7 +136,10 @@ def build_transition_risk_dataset(
         if key is None:
             continue
         rotation = rotation_map.get(key)
-        value_added = _finite(rotation.get("rotation_value_added")) if rotation else None
+        holding_interval = transition.get("holding_interval_outcome") if isinstance(transition.get("holding_interval_outcome"), dict) else {}
+        rotation_value_added = _finite(rotation.get("rotation_value_added")) if rotation else None
+        attributed_value_added = _finite(holding_interval.get("value_added"))
+        value_added = rotation_value_added if rotation_value_added is not None else attributed_value_added
         if value_added is None:
             continue
         stamp = _timestamp(transition.get("execution_at"))
@@ -152,6 +155,7 @@ def build_transition_risk_dataset(
             "from_asset": str(transition.get("from_asset") or "").upper(),
             "to_asset": str(transition.get("to_asset") or "").upper(),
             "rotation_value_added": value_added,
+            "rotation_value_added_source": "analytics_rotation" if rotation_value_added is not None else "temporal_holding_interval",
             "severe": int(value_added <= float(severe_threshold)),
             "one_interval_value_added": _finite(interval.get("value_added")),
             "one_interval_target_return": _finite(interval.get("target_return")),
@@ -496,9 +500,17 @@ def run_transition_risk_search_from_payloads(
         severe_threshold=severe_threshold,
     )
     if len(dataset) < min_outer_train_rows:
+        attribution_items = [item for item in transition_attribution.get("items") or [] if isinstance(item, dict)]
+        holding_outcomes = sum(
+            1
+            for item in attribution_items
+            if isinstance(item.get("holding_interval_outcome"), dict)
+            and _finite((item.get("holding_interval_outcome") or {}).get("value_added")) is not None
+        )
         raise WinnerTransitionRiskError(
-            f"Not enough attributed Winner transitions are available for chronological risk research: "
-            f"found {len(dataset)}, requires at least {min_outer_train_rows}."
+            f"Not enough attributed research transitions are available for chronological risk research: "
+            f"found {len(dataset)}, requires at least {min_outer_train_rows}. "
+            f"Attribution produced {len(attribution_items)} rotations and {holding_outcomes} complete holding outcomes."
         )
     frame = pd.DataFrame(dataset)
     outer_results: list[dict[str, Any]] = []
@@ -672,16 +684,33 @@ def run_winner_transition_risk_search(
     attribution = get_winner_transition_attribution(db, run_id, start_month=start_month, end_month=end_month)
     analytics = processing_analytics(db, processing_id)
     research_settings = temporal_research_settings_snapshot(db)
-    result = run_transition_risk_search_from_payloads(
-        run_id=run_id,
-        processing_id=processing_id,
-        start_month=start_month,
-        end_month=end_month,
-        transition_attribution=attribution,
-        analytics=analytics,
-        research_settings=research_settings,
-        seed=seed,
-    )
+    try:
+        result = run_transition_risk_search_from_payloads(
+            run_id=run_id,
+            processing_id=processing_id,
+            start_month=start_month,
+            end_month=end_month,
+            transition_attribution=attribution,
+            analytics=analytics,
+            research_settings=research_settings,
+            seed=seed,
+        )
+    except WinnerTransitionRiskError as exc:
+        failed = bson_value({
+            "schema_version": 2,
+            "id": f"winner-transition-risk-{utc_now().strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}",
+            "run_id": str(run_id),
+            "processing_id": str(processing_id),
+            "period_start": str(start_month),
+            "period_end": str(end_month),
+            "created_at": utc_now(),
+            "status": "failed",
+            "failure_message": str(exc),
+            "attribution_count": int(attribution.get("count") or 0),
+            "research_settings": research_settings,
+        })
+        db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].insert_one(dict(failed))
+        raise
     db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].insert_one(dict(result))
     return result
 
