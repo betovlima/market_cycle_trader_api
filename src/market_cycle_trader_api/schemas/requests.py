@@ -443,6 +443,28 @@ class WinnerTransitionConfidenceCalibrationRequest(BaseModel):
         return self
 
 
+
+
+class StrategyResearchPipelineControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["start", "resume", "stage_start", "stage_complete", "checkpoint", "stage_failed"]
+    stage: Literal["reference", "temporal", "risk", "confidence", "stateful", "validation"] | None = None
+    start_month: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    end_month: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    message: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_pipeline_control(self) -> "StrategyResearchPipelineControlRequest":
+        if self.action in {"stage_start", "stage_complete", "checkpoint", "stage_failed"} and not self.stage:
+            raise ValueError("stage is required for stage actions.")
+        if self.action == "start":
+            if not self.start_month or not self.end_month:
+                raise ValueError("start_month and end_month are required when starting Strategy Research.")
+            if self.end_month < self.start_month:
+                raise ValueError("end_month must be greater than or equal to start_month.")
+        return self
+
 class WinnerTransitionStatefulReplayRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

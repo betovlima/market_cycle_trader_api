@@ -24,7 +24,7 @@ from ...services.temporal_winner_transition_intervention import (
     get_latest_winner_transition_confidence_calibration,
     run_winner_transition_confidence_calibration,
 )
-from ...schemas.requests import TemporalPolicySearchRequest, WinnerTransitionConfidenceCalibrationRequest, WinnerTransitionInterventionSearchRequest, WinnerTransitionRiskSearchRequest, WinnerTransitionStatefulReplayRequest
+from ...schemas.requests import StrategyResearchPipelineControlRequest, TemporalPolicySearchRequest, WinnerTransitionConfidenceCalibrationRequest, WinnerTransitionInterventionSearchRequest, WinnerTransitionRiskSearchRequest, WinnerTransitionStatefulReplayRequest
 from ...services.temporal_winner_transition_stateful import (
     WinnerTransitionStatefulReplayError,
     get_latest_winner_transition_stateful_replay,
@@ -49,7 +49,11 @@ from ...services.temporal_intelligence import (
     get_latest_temporal_intelligence_run,
     get_temporal_intelligence_run,
     list_temporal_intelligence_history,
+    control_strategy_research_pipeline,
+    get_strategy_research_pipeline_state,
     materialize_temporal_intelligence_strategy,
+    request_strategy_research_pipeline_pause,
+    request_strategy_research_pipeline_stop,
     reset_strategy_research_pipeline,
     start_temporal_intelligence,
     stop_temporal_intelligence,
@@ -488,6 +492,59 @@ def create_temporal_intelligence(
     try:
         return start_temporal_intelligence(database(), actor_email=identity.email)
     except (TemporalIntelligenceConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.get("/{run_id}/strategy-research/pipeline")
+def strategy_research_pipeline_state(
+    run_id: str,
+    _identity: Annotated[SessionIdentity, Depends(require_temporal_view)],
+) -> dict[str, Any]:
+    try:
+        return get_strategy_research_pipeline_state(database(), run_id)
+    except TemporalIntelligenceNotFound as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{run_id}/strategy-research/pipeline/control")
+def control_strategy_research_run(
+    run_id: str,
+    payload: StrategyResearchPipelineControlRequest,
+    _identity: Annotated[SessionIdentity, Depends(require_temporal_start)],
+) -> dict[str, Any]:
+    try:
+        return control_strategy_research_pipeline(
+            database(),
+            run_id,
+            action=payload.action,
+            stage=payload.stage,
+            start_month=payload.start_month,
+            end_month=payload.end_month,
+            message=payload.message,
+        )
+    except (TemporalIntelligenceNotFound, TemporalIntelligenceConflict) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{run_id}/strategy-research/pipeline/pause")
+def pause_strategy_research_run(
+    run_id: str,
+    _identity: Annotated[SessionIdentity, Depends(require_temporal_stop)],
+) -> dict[str, Any]:
+    try:
+        return request_strategy_research_pipeline_pause(database(), run_id)
+    except (TemporalIntelligenceNotFound, TemporalIntelligenceConflict) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{run_id}/strategy-research/pipeline/stop")
+def stop_strategy_research_run(
+    run_id: str,
+    _identity: Annotated[SessionIdentity, Depends(require_temporal_stop)],
+) -> dict[str, Any]:
+    try:
+        return request_strategy_research_pipeline_stop(database(), run_id)
+    except (TemporalIntelligenceNotFound, TemporalIntelligenceConflict) as exc:
         raise _translate_error(exc) from exc
 
 
