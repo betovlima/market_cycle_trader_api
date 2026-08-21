@@ -50,6 +50,7 @@ from ...services.temporal_intelligence import (
     get_temporal_intelligence_run,
     list_temporal_intelligence_history,
     materialize_temporal_intelligence_strategy,
+    reset_strategy_research_pipeline,
     start_temporal_intelligence,
     stop_temporal_intelligence,
     validate_temporal_research_processing,
@@ -487,6 +488,17 @@ def create_temporal_intelligence(
     try:
         return start_temporal_intelligence(database(), actor_email=identity.email)
     except (TemporalIntelligenceConflict, ValueError, RuntimeError) as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/{run_id}/strategy-research/reset")
+def reset_strategy_research_run(
+    run_id: str,
+    _identity: Annotated[SessionIdentity, Depends(require_temporal_start)],
+) -> dict[str, Any]:
+    try:
+        return reset_strategy_research_pipeline(database(), run_id)
+    except (TemporalIntelligenceNotFound, TemporalIntelligenceConflict) as exc:
         raise _translate_error(exc) from exc
 
 

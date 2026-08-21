@@ -1,10 +1,9 @@
 [build]
 builder = "RAILPACK"
-buildCommand = "corepack enable && pnpm install --frozen-lockfile --prefer-offline && pnpm run build"
 
 [deploy]
-healthcheckPath = "/"
+startCommand = "python -m uvicorn market_cycle_trader_api.main:app --app-dir src --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/api/health/live"
 healthcheckTimeout = 300
-startCommand = "pnpm run start"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5

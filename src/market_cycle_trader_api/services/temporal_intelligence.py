@@ -1026,6 +1026,32 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_stateful.json", json.dumps(pipeline_stateful, indent=2, ensure_ascii=False, default=str))
     return archive_buffer.getvalue()
 
+def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0, "id": 1, "status": 1})
+    if document is None:
+        raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
+    status = str(document.get("status") or "").lower()
+    if status in {"queued", "running", "stop_requested"}:
+        raise TemporalIntelligenceConflict("Pause or stop the active Temporal Intelligence run before restarting Strategy Research.")
+
+    collections = {
+        "risk": TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION,
+        "intervention": TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION,
+        "confidence": TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION,
+        "stateful": TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION,
+    }
+    deleted = {}
+    for key, collection_name in collections.items():
+        result = db[collection_name].delete_many({"run_id": str(run_id)})
+        deleted[key] = int(getattr(result, "deleted_count", 0) or 0)
+    return {
+        "run_id": str(run_id),
+        "status": "reset",
+        "deleted": deleted,
+        "deleted_total": int(sum(deleted.values())),
+    }
+
+
 def stop_temporal_intelligence(db: Any, run_id: str) -> dict[str, Any]:
     document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)})
     if document is None:
