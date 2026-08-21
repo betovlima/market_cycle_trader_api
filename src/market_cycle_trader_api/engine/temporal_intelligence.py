@@ -2436,6 +2436,349 @@ _WINNER_TIMING_CHALLENGER_MINIMUM = 0.60
 _WINNER_TIMING_MINIMUM_ADVANTAGE = 0.25
 
 
+def _reference_asset(value: Any) -> str:
+    symbol = str(value or "CASH").strip().upper()
+    return symbol or "CASH"
+
+
+def _reference_timestamp(value: Any) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+
+
+def _reference_cost_sides(previous: str | None, target: str | None) -> int:
+    previous_asset = _reference_asset(previous)
+    target_asset = _reference_asset(target)
+    if previous_asset == target_asset:
+        return 0
+    if previous_asset == "CASH" or target_asset == "CASH":
+        return 1
+    return 2
+
+
+def _strategy_research_reference_study(
+    frame: pd.DataFrame,
+    winner_daily_rows: list[dict[str, Any]],
+    reference_analytics: dict[str, Any],
+    open_prices: pd.DataFrame,
+    config: Any,
+    *,
+    include_diagnostics: bool = False,
+    include_economic_curve: bool = False,
+    enable_timing_override: bool = True,
+) -> dict[str, Any]:
+    if frame.empty or not winner_daily_rows or not isinstance(reference_analytics, dict):
+        return {}
+    equity_rows = [
+        dict(row) for row in (reference_analytics.get("equity") or [])
+        if isinstance(row, dict) and _reference_timestamp(row.get("timestamp")) is not None
+        and _finite(row.get("simulation_equity")) is not None
+    ]
+    equity_rows.sort(key=lambda row: _reference_timestamp(row.get("timestamp")))
+    if len(equity_rows) < 2:
+        return {}
+
+    winner_by_execution: dict[pd.Timestamp, dict[str, Any]] = {}
+    for row in winner_daily_rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = _reference_timestamp(row.get("timestamp"))
+        if stamp is not None:
+            winner_by_execution[stamp] = row
+
+    frame_by_timestamp: dict[pd.Timestamp, pd.DataFrame] = {}
+    for raw_timestamp, rows in frame.groupby("timestamp", sort=False):
+        stamp = _reference_timestamp(raw_timestamp)
+        if stamp is not None:
+            frame_by_timestamp[stamp] = rows.copy()
+
+    aligned: list[tuple[dict[str, Any], dict[str, Any], pd.DataFrame]] = []
+    for session in equity_rows:
+        execution_stamp = _reference_timestamp(session.get("timestamp"))
+        winner_row = winner_by_execution.get(execution_stamp) if execution_stamp is not None else None
+        decision_stamp = _reference_timestamp((winner_row or {}).get("decision_date"))
+        rows = frame_by_timestamp.get(decision_stamp) if decision_stamp is not None else None
+        if winner_row is not None:
+            aligned.append((session, winner_row, rows.copy() if rows is not None else pd.DataFrame()))
+    if len(aligned) < 2:
+        return {}
+
+    first_equity = _finite(aligned[0][0].get("simulation_equity"))
+    source_metrics = reference_analytics.get("metrics") if isinstance(reference_analytics.get("metrics"), dict) else {}
+    initial_capital = _finite(source_metrics.get("initial_capital")) or float(config.initial_capital)
+    if first_equity is None or initial_capital <= 0:
+        return {}
+
+    rotations = [row for row in (reference_analytics.get("rotations") or []) if isinstance(row, dict)]
+    first_execution = _reference_timestamp(aligned[0][0].get("timestamp"))
+    first_rotation = next(
+        (row for row in rotations if _reference_timestamp(row.get("executed_at")) == first_execution),
+        None,
+    )
+    current_symbol = _reference_asset((first_rotation or {}).get("from_asset"))
+    candidate_capital = float(first_equity)
+    one_side_cost = max(0.0, float(config.slippage_bps) / 10_000.0) + max(0.0, float(config.commission_rate))
+
+    equity_curve: list[float] = []
+    gross_return_history: list[float] = []
+    cost_sides_history: list[int] = []
+    fold_id_history: list[int] = []
+    fold_close_cost_history: list[bool] = []
+    economic_rows: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    state_history: list[tuple[int, str]] = []
+    action_counts = {"buy": 0, "hold": 0, "sell": 0, "rotate": 0, "cash": 0}
+    exposure_days = 0
+    cash_days = 0
+    switch_count = 0
+    timing_override_count = 0
+    anchor_days = 0
+    anchor_top1_days = 0
+
+    for index, (session, winner_row, rows) in enumerate(aligned):
+        execution_stamp = _reference_timestamp(session.get("timestamp"))
+        decision_stamp = _reference_timestamp(winner_row.get("decision_date"))
+        fold_id = int(winner_row.get("walk_forward_fold") or winner_row.get("decision_fold_id") or winner_row.get("fold_id") or 0)
+        rows_by_symbol = rows.set_index("symbol", drop=False) if not rows.empty and "symbol" in rows.columns else pd.DataFrame()
+        control_previous = (
+            _reference_asset(aligned[index - 1][0].get("selected_asset"))
+            if index > 0 else _reference_asset((first_rotation or {}).get("from_asset"))
+        )
+        base_asset = _reference_asset(session.get("selected_asset"))
+        base_symbol = None if base_asset == "CASH" else base_asset
+        top1_value = winner_row.get("top_1_asset") or winner_row.get("raw_best_asset") or winner_row.get("best_asset")
+        top2_value = winner_row.get("top_2_asset") or winner_row.get("second_asset")
+        top1_asset = _reference_asset(top1_value)
+        challenger_asset = _reference_asset(top2_value)
+        top1_symbol = None if top1_asset == "CASH" else top1_asset
+        challenger_symbol = None if challenger_asset == "CASH" else challenger_asset
+        anchor_days += 1
+        if base_symbol is not None and base_symbol == top1_symbol:
+            anchor_top1_days += 1
+
+        base_short = None
+        challenger_short = None
+        temporal_advantage = None
+        timing_candidate = False
+        override = False
+        if base_symbol is not None and base_symbol in rows_by_symbol.index:
+            base_short = _finite(rows_by_symbol.loc[base_symbol].get("short_profit_consensus"))
+        if challenger_symbol is not None and challenger_symbol in rows_by_symbol.index:
+            challenger_short = _finite(rows_by_symbol.loc[challenger_symbol].get("short_profit_consensus"))
+        if base_short is not None and challenger_short is not None:
+            temporal_advantage = float(challenger_short) - float(base_short)
+            timing_candidate = bool(
+                base_symbol == top1_symbol
+                and challenger_symbol != base_symbol
+                and float(base_short) < _WINNER_TIMING_BASE_WEAK_THRESHOLD
+                and float(challenger_short) >= _WINNER_TIMING_CHALLENGER_MINIMUM
+                and temporal_advantage >= _WINNER_TIMING_MINIMUM_ADVANTAGE
+            )
+            override = bool(enable_timing_override and timing_candidate)
+
+        target_symbol = challenger_symbol if override else base_symbol
+        reason = "strategy_research_reference"
+        if override:
+            timing_override_count += 1
+            reason = "temporal_short_timing_overrides_strategy_research"
+
+        def interval_return_for(symbol: str | None) -> float | None:
+            if index >= len(aligned) - 1:
+                return None
+            if symbol is None:
+                return 0.0
+            if symbol not in open_prices.columns:
+                return None
+            current_execution = execution_stamp
+            next_execution = _reference_timestamp(aligned[index + 1][0].get("timestamp"))
+            if current_execution is None or next_execution is None:
+                return None
+            entry = _finite(open_prices.at[current_execution, symbol]) if current_execution in open_prices.index else None
+            nxt = _finite(open_prices.at[next_execution, symbol]) if next_execution in open_prices.index else None
+            if entry is None or nxt is None or entry <= 0:
+                return None
+            return float(nxt / entry - 1.0)
+
+        if target_symbol is not None and interval_return_for(target_symbol) is None and index < len(aligned) - 1:
+            if override and base_symbol is not None and interval_return_for(base_symbol) is not None:
+                target_symbol = base_symbol
+                override = False
+                timing_override_count = max(0, timing_override_count - 1)
+                reason = "strategy_research_reference_after_temporal_candidate_open_unavailable"
+            else:
+                target_symbol = base_symbol
+                reason = "strategy_research_reference_open_unavailable"
+
+        if current_symbol == "CASH" and target_symbol is not None:
+            action = "buy"
+        elif current_symbol != "CASH" and target_symbol is None:
+            action = "sell"
+        elif current_symbol != "CASH" and target_symbol is not None and current_symbol != target_symbol:
+            action = "rotate"
+        elif current_symbol == "CASH" and target_symbol is None:
+            action = "cash"
+        else:
+            action = "hold"
+        action_counts[action] += 1
+        sides = _reference_cost_sides(current_symbol, target_symbol)
+        if sides > 0:
+            switch_count += 1
+
+        target_asset = _reference_asset(target_symbol)
+        if target_asset == "CASH":
+            cash_days += 1
+        else:
+            exposure_days += 1
+        state_history.append((fold_id, target_asset))
+
+        equity_curve.append(float(candidate_capital))
+        if include_economic_curve:
+            economic_rows.append({
+                "fold_id": fold_id,
+                "decision_timestamp": decision_stamp,
+                "execution_date": execution_stamp,
+                "current_symbol": current_symbol,
+                "target_symbol": target_asset,
+                "action": action.upper(),
+                "reason": reason,
+                "winner_anchor_symbol": base_asset,
+                "winner_top2_symbol": challenger_asset,
+                "temporal_timing_candidate": bool(timing_candidate),
+                "temporal_timing_override": bool(override),
+                "strategy_equity": _finite(candidate_capital),
+            })
+
+        if include_diagnostics:
+            base_row = rows_by_symbol.loc[base_symbol] if base_symbol is not None and base_symbol in rows_by_symbol.index else None
+            challenger_row = rows_by_symbol.loc[challenger_symbol] if challenger_symbol is not None and challenger_symbol in rows_by_symbol.index else None
+            diagnostics.append({
+                "fold_id": fold_id,
+                "timestamp": decision_stamp,
+                "current_symbol": current_symbol,
+                "best_symbol": top1_asset,
+                "target_symbol": target_asset,
+                "action": action.upper(),
+                "reason": reason,
+                "winner_anchor_symbol": base_asset,
+                "winner_top1_symbol": top1_asset,
+                "winner_top2_symbol": challenger_asset,
+                "winner_anchor_score": _finite(winner_row.get("decision_score")),
+                "temporal_timing_candidate": bool(timing_candidate),
+                "temporal_timing_override": bool(override),
+                "winner_anchor_short_profit_consensus": base_short,
+                "winner_top2_short_profit_consensus": challenger_short,
+                "temporal_short_profit_advantage": _finite(temporal_advantage),
+                "winner_anchor_risk_safety": _finite(base_row.get("all_horizon_risk_safety")) if base_row is not None else None,
+                "winner_top2_risk_safety": _finite(challenger_row.get("all_horizon_risk_safety")) if challenger_row is not None else None,
+                "timing_base_weak_threshold": _WINNER_TIMING_BASE_WEAK_THRESHOLD,
+                "timing_challenger_minimum": _WINNER_TIMING_CHALLENGER_MINIMUM,
+                "timing_minimum_advantage": _WINNER_TIMING_MINIMUM_ADVANTAGE,
+            })
+
+        if index < len(aligned) - 1:
+            current_reference = _finite(session.get("simulation_equity"))
+            next_reference = _finite(aligned[index + 1][0].get("simulation_equity"))
+            if current_reference in {None, 0.0} or next_reference is None:
+                return {}
+            baseline_factor = float(next_reference / current_reference)
+            control_return = interval_return_for(base_symbol)
+            candidate_return = interval_return_for(target_symbol)
+            control_sides = _reference_cost_sides(control_previous, base_symbol)
+            if target_asset == base_asset and current_symbol == control_previous:
+                candidate_factor = baseline_factor
+                gross_return = baseline_factor / max(1e-9, 1.0 - sides * one_side_cost) - 1.0
+            else:
+                if candidate_return is None:
+                    target_symbol = base_symbol
+                    target_asset = base_asset
+                    candidate_return = control_return
+                    sides = _reference_cost_sides(current_symbol, target_symbol)
+                    override = False
+                if control_return is not None:
+                    expected_control = max(1e-9, 1.0 - control_sides * one_side_cost) * max(1e-9, 1.0 + float(control_return))
+                    residual = baseline_factor / expected_control if expected_control > 0 else 1.0
+                else:
+                    residual = baseline_factor / max(1e-9, 1.0 - control_sides * one_side_cost)
+                candidate_factor = residual * max(1e-9, 1.0 - sides * one_side_cost) * max(1e-9, 1.0 + float(candidate_return or 0.0))
+                gross_return = residual * max(1e-9, 1.0 + float(candidate_return or 0.0)) - 1.0
+            gross_return_history.append(float(gross_return))
+            cost_sides_history.append(int(sides))
+            fold_id_history.append(fold_id)
+            fold_close_cost_history.append(False)
+            candidate_capital *= max(1e-9, float(candidate_factor))
+            if include_economic_curve and economic_rows:
+                economic_rows[-1]["reference_interval_factor"] = _finite(baseline_factor)
+                economic_rows[-1]["net_interval_return"] = _finite(candidate_factor - 1.0)
+                economic_rows[-1]["gross_interval_return"] = _finite(gross_return)
+                economic_rows[-1]["cost_sides"] = int(sides)
+                economic_rows[-1]["one_side_cost_rate"] = float(one_side_cost)
+        current_symbol = target_asset
+
+    if not equity_curve:
+        return {}
+    values = np.asarray(equity_curve, dtype=float)
+    daily_returns = [float(values[0] / initial_capital - 1.0)]
+    daily_returns.extend(float(values[index] / values[index - 1] - 1.0) if values[index - 1] > 0 else 0.0 for index in range(1, len(values)))
+    returns = np.asarray(daily_returns, dtype=float)
+    ending_capital = float(values[-1])
+    years = max(len(values) / 252.0, 1.0 / 252.0)
+    cagr = (ending_capital / initial_capital) ** (1.0 / years) - 1.0 if ending_capital > 0 else -1.0
+    running_peak = np.maximum.accumulate(values)
+    drawdown_curve = values / running_peak - 1.0
+    volatility = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+    sharpe = float(np.mean(returns) / volatility * math.sqrt(252.0)) if volatility > 1e-12 else None
+    if include_economic_curve:
+        for index, row in enumerate(economic_rows):
+            if index >= len(values):
+                break
+            row["strategy_equity"] = _finite(values[index])
+            row["strategy_drawdown"] = _finite(drawdown_curve[index])
+            row["cumulative_return"] = _finite(values[index] / initial_capital - 1.0)
+
+    result = {
+        "initial_capital": float(initial_capital),
+        "ending_capital": ending_capital,
+        "total_return": ending_capital / float(initial_capital) - 1.0,
+        "cagr": _finite(cagr),
+        "sharpe": _finite(sharpe),
+        "max_drawdown": _finite(float(np.min(drawdown_curve))),
+        "exposure": _finite(exposure_days / max(1, len(values))),
+        "cash_days": int(cash_days),
+        "decision_days": int(len(values)),
+        "switch_count": int(switch_count),
+        "action_counts": action_counts,
+        "one_side_cost_rate": float(one_side_cost),
+        "decision_policy": "strategy_research_temporal_timing" if enable_timing_override else "strategy_research_reference_replay",
+        "winner_anchor_days": int(anchor_days),
+        "winner_anchor_top1_days": int(anchor_top1_days),
+        "timing_override_count": int(timing_override_count),
+        "timing_base_weak_threshold": _WINNER_TIMING_BASE_WEAK_THRESHOLD,
+        "timing_challenger_minimum": _WINNER_TIMING_CHALLENGER_MINIMUM,
+        "timing_minimum_advantage": _WINNER_TIMING_MINIMUM_ADVANTAGE,
+        "reference_coverage_start": bson_value(_reference_timestamp(aligned[0][0].get("timestamp"))),
+        "reference_coverage_end": bson_value(_reference_timestamp(aligned[-1][0].get("timestamp"))),
+        "reference_equity_sessions": int(len(aligned)),
+        "cost_stress": _cost_stress_metrics(
+            gross_return_history,
+            cost_sides_history,
+            fold_id_history,
+            fold_close_cost_history,
+            float(first_equity),
+        ) if gross_return_history else [],
+        **_state_duration_metrics(state_history),
+    }
+    if include_diagnostics:
+        result["decision_diagnostics"] = diagnostics
+    if include_economic_curve:
+        result["economic_curve"] = economic_rows
+    return result
+
+
 def _winner_anchored_temporal_study(
     frame: pd.DataFrame,
     winner_daily_rows: list[dict[str, Any]],
@@ -2939,6 +3282,190 @@ def _stateful_strategy_reference_rows(
     return output, transitions, interventions
 
 
+def _bind_strategy_research_reference_analytics(
+    *,
+    winner_reference: dict[str, Any],
+    winner_daily_rows: list[dict[str, Any]],
+    reference_analytics: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    metrics = reference_analytics.get("metrics") if isinstance(reference_analytics.get("metrics"), dict) else {}
+    equity_rows = [
+        dict(row) for row in (reference_analytics.get("equity") or [])
+        if isinstance(row, dict) and _reference_timestamp(row.get("timestamp")) is not None
+    ]
+    equity_rows.sort(key=lambda row: _reference_timestamp(row.get("timestamp")))
+    if len(equity_rows) < 2:
+        raise ValueError("Selected Strategy Research reference replay does not contain enough equity sessions.")
+    reference_by_execution = {
+        _reference_timestamp(row.get("timestamp")): row
+        for row in equity_rows
+        if _reference_timestamp(row.get("timestamp")) is not None
+    }
+    bound_rows: list[dict[str, Any]] = []
+    previous_asset = "CASH"
+    rotations = [dict(row) for row in (reference_analytics.get("rotations") or []) if isinstance(row, dict)]
+    first_stamp = _reference_timestamp(equity_rows[0].get("timestamp"))
+    first_rotation = next(
+        (row for row in rotations if _reference_timestamp(row.get("executed_at")) == first_stamp),
+        None,
+    )
+    if first_rotation is not None:
+        previous_asset = _reference_asset(first_rotation.get("from_asset"))
+    for source in sorted(
+        (dict(row) for row in winner_daily_rows if isinstance(row, dict)),
+        key=lambda row: _reference_timestamp(row.get("timestamp")) or pd.Timestamp.min.tz_localize("UTC"),
+    ):
+        execution_stamp = _reference_timestamp(source.get("timestamp"))
+        reference = reference_by_execution.get(execution_stamp)
+        if reference is None:
+            continue
+        selected_asset = _reference_asset(reference.get("selected_asset"))
+        source["strategy_research_control_asset"] = selected_asset
+        source["strategy_research_control_previous_asset"] = previous_asset
+        source["previous_asset"] = previous_asset
+        if "current_asset" in source:
+            source["current_asset"] = previous_asset
+        source["selected_asset"] = selected_asset
+        source["final_action_asset"] = selected_asset
+        source["strategy_equity"] = _finite(reference.get("simulation_equity"))
+        source["strategy_research_reference_source"] = "exact_stateful_processing_analytics"
+        bound_rows.append(source)
+        previous_asset = selected_asset
+
+    if len(bound_rows) != len(equity_rows):
+        raise ValueError(
+            "Selected Strategy Research reference replay is not aligned with the frozen Temporal market snapshot "
+            f"({len(bound_rows)}/{len(equity_rows)} sessions aligned)."
+        )
+
+    fold_equity: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    reference_by_execution = {
+        _reference_timestamp(row.get("timestamp")): row for row in equity_rows
+        if _reference_timestamp(row.get("timestamp")) is not None
+    }
+    for row in bound_rows:
+        stamp = _reference_timestamp(row.get("timestamp"))
+        reference = reference_by_execution.get(stamp)
+        if reference is None:
+            continue
+        fold_id = int(row.get("walk_forward_fold") or row.get("decision_fold_id") or row.get("fold_id") or 0)
+        fold_equity.setdefault(fold_id, []).append((row, reference))
+    exact_folds: list[dict[str, Any]] = []
+    for fold_id, items in sorted(fold_equity.items()):
+        values = np.asarray([float(item[1].get("simulation_equity") or 0.0) for item in items], dtype=float)
+        if len(values) < 2 or values[0] <= 0:
+            continue
+        returns = np.asarray([float(values[index] / values[index - 1] - 1.0) for index in range(1, len(values))], dtype=float)
+        peaks = np.maximum.accumulate(values)
+        drawdown = values / peaks - 1.0
+        volatility = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+        sharpe = float(np.mean(returns) / volatility * math.sqrt(252.0)) if volatility > 1e-12 else None
+        years = max((len(values) - 1) / 252.0, 1.0 / 252.0)
+        fold_return = float(values[-1] / values[0] - 1.0)
+        fold_cagr = float((values[-1] / values[0]) ** (1.0 / years) - 1.0) if values[-1] > 0 else -1.0
+        assets = [_reference_asset(item[1].get("selected_asset")) for item in items]
+        cash_days = sum(asset == "CASH" for asset in assets)
+        switches = sum(assets[index] != assets[index - 1] for index in range(1, len(assets)))
+        exact_folds.append({
+            "fold_id": int(fold_id),
+            "test_start": items[0][0].get("fold_test_start") or items[0][1].get("timestamp"),
+            "test_end": items[-1][0].get("fold_test_end") or items[-1][1].get("timestamp"),
+            "strategy_return": fold_return,
+            "strategy_ending_capital": _finite(values[-1]),
+            "strategy_cagr": _finite(fold_cagr),
+            "strategy_sharpe": _finite(sharpe),
+            "strategy_maximum_drawdown": _finite(float(np.min(drawdown))),
+            "market_exposure": _finite((len(assets) - cash_days) / max(1, len(assets))),
+            "capital_rotations": int(switches),
+        })
+
+    updated = deepcopy(winner_reference)
+    ending_capital = _finite(metrics.get("ending_capital"))
+    coverage_start = _reference_timestamp(equity_rows[0].get("timestamp"))
+    coverage_end = _reference_timestamp(equity_rows[-1].get("timestamp"))
+    updated.update({
+        "reference_type": "selected_strategy_research_stateful_exact_replay",
+        "same_frozen_market_snapshot": True,
+        "initial_capital": _finite(metrics.get("initial_capital")) or updated.get("initial_capital"),
+        "ending_capital": ending_capital,
+        "total_return": _finite(metrics.get("strategy_return")),
+        "cagr": _finite(metrics.get("cagr")),
+        "sharpe": _finite(metrics.get("sharpe")),
+        "max_drawdown": _finite(metrics.get("maximum_drawdown")),
+        "exposure": _finite(metrics.get("market_exposure")),
+        "cash_days": int(metrics.get("cash_days") or 0),
+        "switch_count": int(metrics.get("capital_rotations") or len(rotations)),
+        "folds": exact_folds,
+        "oos_start": bson_value(coverage_start),
+        "oos_end": bson_value(coverage_end),
+        "reference_equity_sessions": int(len(equity_rows)),
+        "reference_uncovered_market_sessions": int(max(0, len(winner_daily_rows) - len(bound_rows))),
+        "reference_coverage_start": bson_value(coverage_start),
+        "reference_coverage_end": bson_value(coverage_end),
+        "reference_processing_id": reference_analytics.get("processing_id") or reference_analytics.get("job_id"),
+        "source_stateful_replay_id": reference_analytics.get("source_stateful_replay_id"),
+        "strategy_profile_id": reference_analytics.get("strategy_profile_id"),
+        "strategy_profile_revision": reference_analytics.get("strategy_profile_revision"),
+        "strategy_configuration_hash": reference_analytics.get("strategy_configuration_hash"),
+    })
+    if ending_capital is None:
+        raise ValueError("Selected Strategy Research reference replay does not contain ending capital.")
+    return updated, bound_rows, rotations
+
+
+def _strategy_research_reference_parity(
+    reference: dict[str, Any],
+    replay: dict[str, Any],
+) -> dict[str, Any]:
+    reference_capital = _finite(reference.get("ending_capital"))
+    replay_capital = _finite(replay.get("ending_capital"))
+    reference_exposure = _finite(reference.get("exposure"))
+    replay_exposure = _finite(replay.get("exposure"))
+    reference_cash = int(reference.get("cash_days") or 0)
+    replay_cash = int(replay.get("cash_days") or 0)
+    reference_switches = int(reference.get("switch_count") or 0)
+    replay_switches = int(replay.get("switch_count") or 0)
+    reference_sessions = int(reference.get("reference_equity_sessions") or 0)
+    replay_sessions = int(replay.get("reference_equity_sessions") or replay.get("decision_days") or 0)
+    capital_delta = (
+        float(replay_capital / reference_capital - 1.0)
+        if replay_capital is not None and reference_capital not in {None, 0.0}
+        else None
+    )
+    exposure_delta = (
+        float(replay_exposure - reference_exposure)
+        if replay_exposure is not None and reference_exposure is not None
+        else None
+    )
+    checks = {
+        "ending_capital": capital_delta is not None and abs(capital_delta) <= 1e-10,
+        "cash_days": replay_cash == reference_cash,
+        "market_exposure": exposure_delta is not None and abs(exposure_delta) <= 1e-12,
+        "switches": replay_switches == reference_switches,
+        "equity_sessions": replay_sessions == reference_sessions,
+    }
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "checks": checks,
+        "ending_capital_delta_rate": _finite(capital_delta),
+        "market_exposure_delta": _finite(exposure_delta),
+        "reference": {
+            "ending_capital": reference_capital,
+            "cash_days": reference_cash,
+            "market_exposure": reference_exposure,
+            "switches": reference_switches,
+            "equity_sessions": reference_sessions,
+        },
+        "replay": {
+            "ending_capital": replay_capital,
+            "cash_days": replay_cash,
+            "market_exposure": replay_exposure,
+            "switches": replay_switches,
+            "equity_sessions": replay_sessions,
+        },
+    }
+
+
 def _replace_reference_with_stateful_strategy(
     *,
     winner_reference: dict[str, Any],
@@ -3037,6 +3564,7 @@ def run_temporal_intelligence(
     candidate_evaluation_only: bool = False,
     prepared_context: dict[str, Any] | None = None,
     stateful_reference_bundle: dict[str, Any] | None = None,
+    strategy_research_reference_analytics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if str(config.research_model_family) != "lightgbm_utility":
         raise ValueError("Temporal Decision Intelligence is restricted to a LightGBM Strategy snapshot.")
@@ -3296,7 +3824,13 @@ def run_temporal_intelligence(
     observation_rows = _multi_horizon_observation_rows(
         multi_horizon_frame, horizons, frames_by_symbol=frames, common_dates=common_dates
     )
-    if stateful_reference_bundle:
+    if strategy_research_reference_analytics:
+        winner_reference, winner_reference_daily_rows, winner_reference_trade_rows = _bind_strategy_research_reference_analytics(
+            winner_reference=winner_reference,
+            winner_daily_rows=winner_reference_daily_rows,
+            reference_analytics=strategy_research_reference_analytics,
+        )
+    elif stateful_reference_bundle:
         winner_reference, winner_reference_daily_rows, winner_reference_trade_rows = _replace_reference_with_stateful_strategy(
             winner_reference=winner_reference,
             winner_daily_rows=winner_reference_daily_rows,
@@ -3310,25 +3844,55 @@ def run_temporal_intelligence(
         )
     _attach_winner_reference(horizon_summaries, fold_summaries, winner_reference)
 
-    winner_anchor_replay = _winner_anchored_temporal_study(
-        multi_horizon_frame, winner_reference_daily_rows, open_prices, common_dates, config,
-        enable_timing_override=False,
-    ) if not multi_horizon_frame.empty else {}
-    multi_horizon_shadow = _winner_anchored_temporal_study(
-        multi_horizon_frame, winner_reference_daily_rows, open_prices, common_dates, config,
-        include_diagnostics=True, include_economic_curve=True, enable_timing_override=True,
-    ) if not multi_horizon_frame.empty else {}
+    if strategy_research_reference_analytics:
+        winner_anchor_replay = _strategy_research_reference_study(
+            multi_horizon_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
+            open_prices, config, enable_timing_override=False,
+        ) if not multi_horizon_frame.empty else {}
+        multi_horizon_shadow = _strategy_research_reference_study(
+            multi_horizon_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
+            open_prices, config, include_diagnostics=True, include_economic_curve=True,
+            enable_timing_override=True,
+        ) if not multi_horizon_frame.empty else {}
+    else:
+        winner_anchor_replay = _winner_anchored_temporal_study(
+            multi_horizon_frame, winner_reference_daily_rows, open_prices, common_dates, config,
+            enable_timing_override=False,
+        ) if not multi_horizon_frame.empty else {}
+        multi_horizon_shadow = _winner_anchored_temporal_study(
+            multi_horizon_frame, winner_reference_daily_rows, open_prices, common_dates, config,
+            include_diagnostics=True, include_economic_curve=True, enable_timing_override=True,
+        ) if not multi_horizon_frame.empty else {}
+
+    reference_parity = None
+    if strategy_research_reference_analytics:
+        reference_parity = _strategy_research_reference_parity(winner_reference, winner_anchor_replay)
+        if str(reference_parity.get("status") or "") != "passed":
+            raise ValueError(
+                "Selected Strategy Research reference replay failed exact parity before Temporal timing. "
+                + json.dumps(reference_parity.get("checks") or {}, sort_keys=True)
+            )
 
     multi_horizon_fold_metrics: list[dict[str, Any]] = []
     for fold in folds:
         fold_id = int(fold["fold_id"])
         fold_frame = multi_horizon_frame.loc[multi_horizon_frame["fold_id"] == fold_id].copy() if not multi_horizon_frame.empty else pd.DataFrame()
-        fold_capital = _winner_anchored_temporal_study(
-            fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=True
-        ) if not fold_frame.empty else {}
-        fold_anchor = _winner_anchored_temporal_study(
-            fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=False
-        ) if not fold_frame.empty else {}
+        if strategy_research_reference_analytics:
+            fold_capital = _strategy_research_reference_study(
+                fold_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
+                open_prices, config, enable_timing_override=True
+            ) if not fold_frame.empty else {}
+            fold_anchor = _strategy_research_reference_study(
+                fold_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
+                open_prices, config, enable_timing_override=False
+            ) if not fold_frame.empty else {}
+        else:
+            fold_capital = _winner_anchored_temporal_study(
+                fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=True
+            ) if not fold_frame.empty else {}
+            fold_anchor = _winner_anchored_temporal_study(
+                fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=False
+            ) if not fold_frame.empty else {}
         fold_anchor_capital = _finite(fold_anchor.get("ending_capital")) if fold_anchor else None
         fold_hybrid_capital = _finite(fold_capital.get("ending_capital")) if fold_capital else None
         multi_horizon_fold_metrics.append({
@@ -3337,7 +3901,13 @@ def run_temporal_intelligence(
             "test_end": fold["test_end"],
             "samples": int(len(fold_frame)),
             "winner_anchor_replay_ending_capital": fold_anchor_capital,
+            "strategy_research_reference_ending_capital": fold_anchor_capital,
             "capital_lift_vs_winner_anchor_replay": (
+                fold_hybrid_capital / fold_anchor_capital - 1.0
+                if fold_hybrid_capital is not None and fold_anchor_capital not in {None, 0.0}
+                else None
+            ),
+            "capital_lift_vs_strategy_research_reference": (
                 fold_hybrid_capital / fold_anchor_capital - 1.0
                 if fold_hybrid_capital is not None and fold_anchor_capital not in {None, 0.0}
                 else None
@@ -3354,7 +3924,9 @@ def run_temporal_intelligence(
         "risk_horizons": multi_horizon_roles["risk"],
         "shadow_capital": multi_horizon_shadow,
         "winner_anchor_replay": winner_anchor_replay,
+        "strategy_research_reference_replay": winner_anchor_replay,
         "winner_anchor_replay_ending_capital": anchor_capital,
+        "strategy_research_reference_ending_capital": anchor_capital,
         "winner_anchor_replay_sharpe": _finite(winner_anchor_replay.get("sharpe")) if winner_anchor_replay else None,
         "winner_anchor_replay_max_drawdown": _finite(winner_anchor_replay.get("max_drawdown")) if winner_anchor_replay else None,
         "winner_anchor_replay_switch_count": int(winner_anchor_replay.get("switch_count") or 0) if winner_anchor_replay else 0,
@@ -3363,16 +3935,24 @@ def run_temporal_intelligence(
             if multi_capital is not None and anchor_capital not in {None, 0.0}
             else None
         ),
+        "capital_lift_vs_strategy_research_reference": (
+            multi_capital / anchor_capital - 1.0
+            if multi_capital is not None and anchor_capital not in {None, 0.0}
+            else None
+        ),
         "standalone_temporal_reference": {
             key: value for key, value in standalone_temporal_shadow.items()
             if key not in {"decision_diagnostics", "economic_curve"}
         },
+        "strategy_research_reference_parity": reference_parity,
     }
 
     winner_capital = _finite(winner_reference.get("ending_capital"))
     benchmark_capital = _finite(winner_reference.get("benchmark_ending_capital"))
     if multi_capital is not None and winner_capital is not None and winner_capital > 0:
-        multi_horizon_metrics["capital_vs_winner"] = multi_capital / winner_capital - 1.0
+        capital_vs_reference = multi_capital / winner_capital - 1.0
+        multi_horizon_metrics["capital_vs_winner"] = capital_vs_reference
+        multi_horizon_metrics["capital_vs_strategy_research_reference"] = capital_vs_reference
     if multi_capital is not None and benchmark_capital is not None and benchmark_capital > 0:
         multi_horizon_metrics["capital_vs_benchmark"] = multi_capital / benchmark_capital - 1.0
     winner_folds = {int(item.get("fold_id")): item for item in (winner_reference.get("folds") or []) if isinstance(item, dict)}
@@ -3563,11 +4143,32 @@ def execute_temporal_run(run_id: str, db: Any) -> dict[str, Any]:
         raw = load_market_bars(symbol, asset_config)
         bars_by_symbol[symbol] = validate_and_clean_bars(raw, asset_config)
 
+    strategy_research_reference_analytics = None
+    if str(run.get("research_processing_kind") or "") == "strategy_research_stateful":
+        processing_id = str(run.get("research_processing_id") or "").strip()
+        if not processing_id:
+            raise ValueError("Selected Stateful Strategy Research is missing its reference processing binding.")
+        from ..services.analytics import processing_analytics
+        strategy_research_reference_analytics = processing_analytics(db, processing_id)
+        expected_strategy_id = str(run.get("strategy_profile_id") or "").strip()
+        actual_strategy_id = str(strategy_research_reference_analytics.get("strategy_profile_id") or "").strip()
+        expected_revision = int(run.get("strategy_profile_revision") or 1)
+        actual_revision = int(strategy_research_reference_analytics.get("strategy_profile_revision") or 1)
+        expected_hash = str(run.get("strategy_configuration_hash") or "").strip()
+        actual_hash = str(strategy_research_reference_analytics.get("strategy_configuration_hash") or "").strip()
+        if (
+            actual_strategy_id != expected_strategy_id
+            or actual_revision != expected_revision
+            or (expected_hash and actual_hash != expected_hash)
+        ):
+            raise ValueError("Selected Stateful Strategy Research reference does not match the frozen Strategy snapshot.")
+
     result = run_temporal_intelligence(
         bars_by_symbol,
         config,
         progress_callback=lambda percent, stage: _emit_progress(db, run_id, percent, stage),
         stateful_reference_bundle=(run.get("stateful_reference_bundle") if isinstance(run.get("stateful_reference_bundle"), dict) else None),
+        strategy_research_reference_analytics=strategy_research_reference_analytics,
     )
     observation_rows = result.pop("_multi_horizon_observations", [])
     winner_reference_daily_rows = result.pop("_winner_reference_daily_rows", [])
