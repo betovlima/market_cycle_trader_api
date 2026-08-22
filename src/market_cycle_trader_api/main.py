@@ -37,6 +37,7 @@ from .api.routers import (
     temporal_rotation_quality,
 )
 from .core.config import API_VERSION, cors_origins
+from .milp_decision.router import router as milp_decision_router
 from .auth.config import get_auth_settings
 from .auth.security import require_admin_session, require_backtest_access, require_portfolio_session, require_trader_access, require_trader_session
 from .auth.access_service import get_access_service
@@ -105,6 +106,7 @@ def create_app() -> FastAPI:
     application.include_router(model_research.router, dependencies=research_access)
     application.include_router(model_tuning.router, dependencies=research_access)
     application.include_router(temporal_intelligence.router)
+    application.include_router(milp_decision_router)
     application.include_router(temporal_rotation_quality.router)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)

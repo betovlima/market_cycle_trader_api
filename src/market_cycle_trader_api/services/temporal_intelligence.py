@@ -232,6 +232,13 @@ def _stable_temporal_market_snapshot(
 
 def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
     strategy_id = str(strategy.get("id") or "").strip()
+    from ..milp_decision.processing import resolve_research_processing_context
+    try:
+        milp_context = resolve_research_processing_context(strategy)
+    except ValueError as exc:
+        raise TemporalIntelligenceConflict(str(exc)) from exc
+    if milp_context is not None:
+        return milp_context
     is_stateful = (
         str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
         and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
@@ -302,6 +309,8 @@ def _delete_strategy_research_run_data(db: Any, run_id: str, *, delete_run: bool
         "confidence": int(db[TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
         "decision_policy": int(db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
     }
+    from ..milp_decision.persistence import delete_run_results
+    deleted["decision_optimization"] = delete_run_results(db, run_key)
     deleted["runs"] = int(db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].delete_many({"id": run_key}).deleted_count or 0) if delete_run else 0
     return deleted
 
@@ -1034,6 +1043,12 @@ def build_temporal_intelligence_export(
     pipeline_intervention = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION)
     pipeline_confidence = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION)
     pipeline_stateful = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION)
+    pipeline_milp = None
+    if processing_id and pipeline_period_start and pipeline_period_end:
+        from ..milp_decision.persistence import latest_raw as latest_milp_decision
+        pipeline_milp = latest_milp_decision(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
     pipeline_reference_analytics = None
     if processing_id:
         try:
@@ -1072,6 +1087,7 @@ def build_temporal_intelligence_export(
         "intervention_status": (pipeline_intervention or {}).get("status"),
         "confidence_status": (pipeline_confidence or {}).get("status"),
         "stateful_status": (pipeline_stateful or {}).get("status"),
+        "milp_decision_status": (pipeline_milp or {}).get("status"),
     })
 
     archive_buffer = io.BytesIO()
@@ -1113,6 +1129,8 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_confidence.json", json.dumps(pipeline_confidence, indent=2, ensure_ascii=False, default=str))
         if pipeline_stateful is not None:
             archive.writestr("strategy_research_stateful.json", json.dumps(pipeline_stateful, indent=2, ensure_ascii=False, default=str))
+        if pipeline_milp is not None:
+            archive.writestr("strategy_research_milp_decision.json", json.dumps(pipeline_milp, indent=2, ensure_ascii=False, default=str))
     return archive_buffer.getvalue()
 
 def _default_strategy_research_stage_states() -> dict[str, str]:

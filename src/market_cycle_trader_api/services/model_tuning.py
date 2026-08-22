@@ -468,7 +468,10 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     if db is not None:
         try:
             temporal_strategy, temporal_model_snapshot, _ = _tuning_target_strategy(db)
-            if str(temporal_strategy.get("strategy_kind") or "") == "temporal_intelligence":
+            if (
+                str(temporal_strategy.get("strategy_kind") or "") == "temporal_intelligence"
+                and str(temporal_strategy.get("tuning_target") or "") != "decision_optimization"
+            ):
                 for target in (TEMPORAL_MODEL_TUNING_SCOPE, TEMPORAL_POLICY_TUNING_SCOPE):
                     target_plan = _tuning_plan(temporal_strategy, temporal_model_snapshot, target)
                     temporal_modes.append({
@@ -487,7 +490,12 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     if db is not None:
         try:
             selected_strategy, _, _ = _tuning_target_strategy(db)
-            if (
+            if str(selected_strategy.get("tuning_target") or "") == "decision_optimization":
+                strategy_compatibility = {
+                    "eligible": False,
+                    "reason": "MILP Decision Optimization is research-only and is not supported by the current Model Tuning engine.",
+                }
+            elif (
                 str(selected_strategy.get("strategy_kind") or "") == "temporal_intelligence"
                 and str(selected_strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
             ):
@@ -856,6 +864,10 @@ def _refresh_campaign_ranking(db: Any, run_id: str) -> None:
 
 def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
     strategy, model_snapshot, target_source = _tuning_target_strategy(db)
+    if str(strategy.get("tuning_target") or "") == "decision_optimization":
+        raise ModelTuningConflict(
+            "The selected MILP Decision Strategy is research-only and is not a target for the current Model Tuning engine."
+        )
     if (
         str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
         and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
@@ -2366,6 +2378,10 @@ def start_model_tuning(
         )
 
     strategy, model_snapshot, tuning_target_source = _tuning_target_strategy(db)
+    if str(strategy.get("tuning_target") or "") == "decision_optimization":
+        raise ModelTuningConflict(
+            "The selected MILP Decision Strategy is research-only and is not a target for the current Model Tuning engine."
+        )
     if (
         str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
         and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"

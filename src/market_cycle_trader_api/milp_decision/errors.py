@@ -1,0 +1,2 @@
+class MilpDecisionError(RuntimeError):
+    pass

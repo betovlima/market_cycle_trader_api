@@ -1232,6 +1232,10 @@ def completed_processings(db: Any, limit: int = 100) -> dict[str, Any]:
 
 
 def processing_analytics(db: Any, processing_id: str) -> dict[str, Any]:
+    from ..milp_decision.processing import processing_analytics as milp_processing_analytics
+    milp = milp_processing_analytics(db, processing_id)
+    if milp is not None:
+        return milp
     temporal = _temporal_strategy_processing_analytics(db, processing_id)
     if temporal is not None:
         return temporal
@@ -1267,6 +1271,13 @@ def processing_rotation_period_analysis(
     year: int,
     month: int,
 ) -> dict[str, Any]:
+    from ..milp_decision.processing import processing_analytics as milp_processing_analytics
+    milp = milp_processing_analytics(db, processing_id)
+    if milp is not None:
+        return _rotation_period_from_data(
+            db, processing_id, equity=list(milp.get("equity") or []),
+            rotations=list(milp.get("rotations") or []), year=year, month=month,
+        )
     temporal = _temporal_strategy_processing_analytics(db, processing_id)
     if temporal is not None:
         return _rotation_period_from_data(
