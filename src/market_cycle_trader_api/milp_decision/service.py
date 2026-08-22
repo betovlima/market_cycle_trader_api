@@ -11,7 +11,7 @@ from .errors import MilpDecisionError
 from .inputs import artifact_rows, observation_rows
 from .metrics import fold_metrics, metrics, monthly_decision_map
 from .parity import compare as compare_control_parity
-from .parity import reference_analytics
+from .parity import reference_analytics, reference_path
 from .persistence import latest_raw, public_document, save
 from .replay import build_decisions
 from .utils import as_float
@@ -45,6 +45,8 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
 
     source_analytics = reference_analytics(db, processing_id)
     source_metrics = source_analytics.get("metrics") if isinstance(source_analytics.get("metrics"), dict) else {}
+    control_path = reference_path(source_analytics)
+    count_cash_transitions = bool(control_path.get("count_cash_transitions_as_rotations"))
     source_initial = as_float(source_metrics.get("initial_capital"))
     if source_initial is not None:
         initial_capital = source_initial
@@ -53,6 +55,7 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
         diagnostics=diagnostics,
         observations=observations,
         economics=economics,
+        reference_path=control_path,
         configuration=configuration,
         start_month=start_month,
         end_month=end_month,
@@ -60,7 +63,10 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
         should_stop=lambda: _stop_requested(db, run_id),
         force_control=True,
     )
-    control_metrics = metrics(control_decisions, initial_capital, base_cost_rate)
+    control_metrics = metrics(
+        control_decisions, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions,
+    )
     control_parity = compare_control_parity(source_analytics, control_metrics)
     if str(control_parity.get("status") or "") != "passed":
         raise MilpDecisionError(
@@ -76,6 +82,7 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
         diagnostics=diagnostics,
         observations=observations,
         economics=economics,
+        reference_path=control_path,
         configuration=configuration,
         start_month=start_month,
         end_month=end_month,
@@ -83,11 +90,20 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
         should_stop=lambda: _stop_requested(db, run_id),
     )
 
-    result_metrics = metrics(decisions, initial_capital, base_cost_rate)
-    folds = fold_metrics(decisions, initial_capital, base_cost_rate)
+    result_metrics = metrics(
+        decisions, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions,
+    )
+    folds = fold_metrics(
+        decisions, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions,
+    )
     cost_stress = []
     for bps in COST_STRESS_BPS:
-        stressed = metrics(decisions, initial_capital, bps / 10000.0)
+        stressed = metrics(
+            decisions, initial_capital, bps / 10000.0,
+            count_cash_transitions_as_rotations=count_cash_transitions,
+        )
         cost_stress.append({
             "one_side_cost_bps": bps,
             "ending_capital": stressed["ending_capital"],
@@ -102,7 +118,7 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
     document = bson_value({
         "id": optimization_id,
         "status": "completed",
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": str(run_id),
         "processing_id": str(processing_id),
         "period_start": str(start_month),
@@ -117,6 +133,11 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
             "realized_returns_usage": "post_hoc_replay_folds_cost_stress_and_attribution_only",
             "economic_replay": "exact_control_anchored_relative_overlay",
             "control_parity_required": True,
+            "control_path_source": "selected_strategy_processing_analytics",
+            "economic_overlay": "exact_reference_factor_with_residual_alternative_return",
+            "rotation_semantics": (
+                "all_position_changes" if count_cash_transitions else "invested_asset_to_invested_asset"
+            ),
             "stateful_candidate_consumed_as_input": False,
             "parallel_candidate_comparison": True,
             "configuration_origin": "fixed_non_tuned_research_baseline",
@@ -142,7 +163,12 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
         },
         "configuration": configuration,
         "metrics": {key: value for key, value in result_metrics.items() if key != "equity"},
-        "analytics": _analytics_snapshot(result_metrics, decisions),
+        "analytics": _analytics_snapshot(
+            result_metrics, decisions,
+            rotation_semantics=(
+                "all_position_changes" if count_cash_transitions else "invested_asset_to_invested_asset"
+            ),
+        ),
         "folds": folds,
         "cost_stress": cost_stress,
         "decision_map": monthly_decision_map(decisions),
@@ -159,8 +185,14 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
     return save(db, document)
 
 
-def _analytics_snapshot(result_metrics: dict[str, Any], decisions: list[dict[str, Any]]) -> dict[str, Any]:
+def _analytics_snapshot(
+    result_metrics: dict[str, Any],
+    decisions: list[dict[str, Any]],
+    *,
+    rotation_semantics: str,
+) -> dict[str, Any]:
     return {
+        "protocol": {"rotation_semantics": str(rotation_semantics)},
         "metrics": {key: value for key, value in result_metrics.items() if key != "equity"},
         "equity": result_metrics["equity"],
         "rotations": [

@@ -52,7 +52,13 @@ def _equity_values(
     return values
 
 
-def metrics(decisions: list[dict[str, Any]], initial_capital: float, one_side_cost_rate: float) -> dict[str, Any]:
+def metrics(
+    decisions: list[dict[str, Any]],
+    initial_capital: float,
+    one_side_cost_rate: float,
+    *,
+    count_cash_transitions_as_rotations: bool = True,
+) -> dict[str, Any]:
     if not decisions:
         return bson_value({
             "initial_capital": initial_capital,
@@ -88,7 +94,10 @@ def metrics(decisions: list[dict[str, Any]], initial_capital: float, one_side_co
         max_drawdown = min(max_drawdown, drawdown)
         item_action = str(item.get("action") or "HOLD")
         action_counts[item_action] += 1
-        switches += int(str(item.get("current_symbol") or "CASH") != str(item.get("target_symbol") or "CASH"))
+        current_asset = str(item.get("current_symbol") or "CASH")
+        target_asset = str(item.get("target_symbol") or "CASH")
+        changed = current_asset != target_asset
+        switches += int(changed and (count_cash_transitions_as_rotations or "CASH" not in {current_asset, target_asset}))
         cash_days += int(str(item.get("target_symbol") or "CASH") == "CASH")
         equity.append({
             "timestamp": item.get("execution_at") or item.get("decision_at"),
@@ -148,14 +157,23 @@ def _rebased_fold_decisions(items: list[dict[str, Any]], initial_capital: float)
     return rebased
 
 
-def fold_metrics(decisions: list[dict[str, Any]], initial_capital: float, one_side_cost_rate: float) -> list[dict[str, Any]]:
+def fold_metrics(
+    decisions: list[dict[str, Any]],
+    initial_capital: float,
+    one_side_cost_rate: float,
+    *,
+    count_cash_transitions_as_rotations: bool = True,
+) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in decisions:
         grouped[str(item.get("fold_id") or "0")].append(item)
     rows: list[dict[str, Any]] = []
     for fold_id, items in sorted(grouped.items(), key=lambda pair: pair[0]):
         rebased = _rebased_fold_decisions(items, initial_capital)
-        result = metrics(rebased, initial_capital, one_side_cost_rate)
+        result = metrics(
+            rebased, initial_capital, one_side_cost_rate,
+            count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+        )
         rows.append({
             "fold_id": int(fold_id) if fold_id.isdigit() else fold_id,
             "test_start": items[0].get("execution_at") if items else None,

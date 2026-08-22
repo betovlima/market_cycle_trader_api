@@ -31,7 +31,7 @@ def latest_raw(db: Any, run_id: str, *, processing_id: str, start_month: str, en
             "period_start": str(start_month),
             "period_end": str(end_month),
             "status": "completed",
-            "schema_version": {"$gte": 2},
+            "schema_version": {"$gte": 3},
         },
         {"_id": 0},
         sort=[("created_at", -1)],
@@ -44,7 +44,7 @@ def get_completed(db: Any, run_id: str, optimization_id: str) -> dict[str, Any] 
         "id": str(optimization_id),
         "run_id": str(run_id),
         "status": "completed",
-        "schema_version": {"$gte": 2},
+        "schema_version": {"$gte": 3},
     })
     return bson_value(row) if row is not None else None
 

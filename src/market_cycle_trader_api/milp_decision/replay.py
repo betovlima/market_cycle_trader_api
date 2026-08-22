@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from ..infrastructure.persistence.mongo_repository import bson_value
 from .errors import MilpDecisionError
-from .metrics import action, cost_sides, net_interval_return
+from .metrics import action, cost_sides
 from .objective import objective_breakdown, rank_value
 from .solver import solve_binary_one_hot
 from .utils import as_datetime, as_float, within_month_range
@@ -73,28 +73,44 @@ def _alternatives(
     return rows
 
 
-def _selected_interval_return(
+def _open_return(symbol: str, rows_by_symbol: dict[str, dict[str, Any]]) -> float | None:
+    if symbol == "CASH":
+        return 0.0
+    row = rows_by_symbol.get(symbol)
+    return as_float((row or {}).get("open_to_open_return")) if row else None
+
+
+def _selected_interval_factor(
     target_symbol: str,
     rows_by_symbol: dict[str, dict[str, Any]],
-    economic: dict[str, Any],
     *,
     current_symbol: str,
     control_current: str,
     control_target: str,
+    reference_factor: float,
     base_cost_rate: float,
 ) -> tuple[float | None, float | None, int]:
     sides = cost_sides(current_symbol, target_symbol)
-    control_net = as_float(economic.get("net_interval_return"))
-    if target_symbol == control_target and current_symbol == control_current and control_net is not None:
-        return control_net, as_float(economic.get("gross_interval_return"), control_net), sides
-    if target_symbol == "CASH":
-        gross = 0.0
-    else:
-        row = rows_by_symbol.get(target_symbol)
-        gross = as_float((row or {}).get("open_to_open_return")) if row else None
-    if gross is None:
+    if target_symbol == control_target and current_symbol == control_current:
+        gross = _open_return(control_target, rows_by_symbol)
+        return float(reference_factor), gross, sides
+
+    candidate_return = _open_return(target_symbol, rows_by_symbol)
+    if candidate_return is None:
         return None, None, sides
-    return net_interval_return(gross, sides, base_cost_rate), gross, sides
+
+    control_return = _open_return(control_target, rows_by_symbol)
+    control_sides = cost_sides(control_current, control_target)
+    base_cost = max(0.0, float(base_cost_rate))
+    if control_return is not None:
+        expected_control = ((1.0 - base_cost) ** control_sides) * max(1e-9, 1.0 + float(control_return))
+        residual = float(reference_factor) / expected_control if expected_control > 0 else 1.0
+    else:
+        residual = float(reference_factor) / max(1e-9, (1.0 - base_cost) ** control_sides)
+
+    factor = residual * ((1.0 - base_cost) ** sides) * max(1e-9, 1.0 + float(candidate_return))
+    gross = residual * max(1e-9, 1.0 + float(candidate_return)) - 1.0
+    return float(factor), float(gross), sides
 
 
 def build_decisions(
@@ -102,6 +118,7 @@ def build_decisions(
     diagnostics: list[dict[str, Any]],
     observations: dict[str, list[dict[str, Any]]],
     economics: dict[str, dict[str, Any]],
+    reference_path: dict[str, Any],
     configuration: dict[str, Any],
     start_month: str,
     end_month: str,
@@ -109,6 +126,15 @@ def build_decisions(
     should_stop: Callable[[], bool],
     force_control: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    reference_values = [float(value) for value in (reference_path.get("equity") or [])]
+    reference_assets = [str(value or "CASH").upper() for value in (reference_path.get("assets") or [])]
+    if len(reference_values) != len(reference_assets) or len(reference_values) != len(diagnostics):
+        raise MilpDecisionError(
+            "MILP Control replay cannot align the selected Strategy reference path with Temporal decision rows "
+            f"({len(reference_values)} reference sessions vs {len(diagnostics)} decision rows)."
+        )
+
+    initial_previous = str(reference_path.get("initial_previous_asset") or reference_assets[0] or "CASH").upper()
     current_symbol: str | None = None
     holding_days = 0
     decisions: list[dict[str, Any]] = []
@@ -126,14 +152,13 @@ def build_decisions(
             continue
 
         economic = economics.get(decision_at.isoformat()) or {}
-        reference_equity = as_float(economic.get("strategy_equity"))
-        if path_matches_control and reference_equity is not None:
+        reference_equity = reference_values[index]
+        control_target = reference_assets[index]
+        control_current = initial_previous if index == 0 else reference_assets[index - 1]
+        if path_matches_control:
             candidate_equity = reference_equity
         if candidate_equity is None:
             raise MilpDecisionError("MILP replay is missing the reference equity anchor for the selected period.")
-
-        control_target = str(diagnostic.get("target_symbol") or economic.get("target_symbol") or "CASH").upper() or "CASH"
-        control_current = str(diagnostic.get("current_symbol") or economic.get("current_symbol") or "CASH").upper() or "CASH"
         if current_symbol is None:
             current_symbol = control_current
 
@@ -143,7 +168,8 @@ def build_decisions(
             for row in observation_rows
             if str(row.get("symbol") or "").strip()
         }
-        must_follow_control = force_control or not observation_rows or not rows_by_symbol
+        no_forward_interval = index >= len(reference_values) - 1
+        must_follow_control = force_control or no_forward_interval or not observation_rows or not rows_by_symbol
         alternatives: list[dict[str, Any]] = []
         solver: dict[str, Any] | None = None
         selected: dict[str, Any]
@@ -177,23 +203,50 @@ def build_decisions(
             solver_pruned += int(solver["nodes_pruned"])
             solver_decisions += 1
 
-        target_symbol = str(selected["symbol"])
-        decision_action = action(current_symbol, target_symbol)
-        selected_net, gross_return, sides = _selected_interval_return(
-            target_symbol,
-            rows_by_symbol,
-            economic,
-            current_symbol=current_symbol,
-            control_current=control_current,
-            control_target=control_target,
-            base_cost_rate=base_cost_rate,
+        target_symbol = str(selected["symbol"] or "CASH").upper()
+        reference_factor = (
+            reference_values[index + 1] / reference_equity
+            if not no_forward_interval and reference_equity > 0
+            else None
         )
-        control_net = as_float(economic.get("net_interval_return"))
-        if control_net is None and control_target == "CASH":
-            control_net = 0.0
-        execution_at = economic.get("execution_date") or diagnostic.get("timestamp")
+        selected_factor: float | None = None
+        gross_return: float | None = None
+        sides = cost_sides(current_symbol, target_symbol)
+        if reference_factor is not None:
+            selected_factor, gross_return, sides = _selected_interval_factor(
+                target_symbol,
+                rows_by_symbol,
+                current_symbol=current_symbol,
+                control_current=control_current,
+                control_target=control_target,
+                reference_factor=reference_factor,
+                base_cost_rate=base_cost_rate,
+            )
+            if selected_factor is None:
+                target_symbol = control_target
+                selected = {
+                    "symbol": control_target,
+                    "objective": selected.get("objective"),
+                    "breakdown": {"forced_control_missing_economic_return": 1.0},
+                }
+                must_follow_control = True
+                forced_control_decisions += 1
+                selected_factor, gross_return, sides = _selected_interval_factor(
+                    target_symbol,
+                    rows_by_symbol,
+                    current_symbol=current_symbol,
+                    control_current=control_current,
+                    control_target=control_target,
+                    reference_factor=reference_factor,
+                    base_cost_rate=base_cost_rate,
+                )
+
+        decision_action = action(current_symbol, target_symbol)
+        selected_net = selected_factor - 1.0 if selected_factor is not None else None
+        control_net = reference_factor - 1.0 if reference_factor is not None else None
+        execution_at = economic.get("execution_date") or reference_path.get("timestamps", [None] * len(reference_values))[index] or diagnostic.get("timestamp")
         next_execution_at = economic.get("next_execution_date")
-        delta = selected_net - control_net if selected_net is not None and control_net is not None else None
+        delta = selected_factor - reference_factor if selected_factor is not None and reference_factor is not None else None
 
         if target_symbol != control_target:
             changed += 1
@@ -242,8 +295,8 @@ def build_decisions(
             "solver": solver,
         }))
 
-        if selected_net is not None:
-            candidate_equity *= 1.0 + selected_net
+        if selected_factor is not None:
+            candidate_equity *= max(1e-9, float(selected_factor))
         if target_symbol == current_symbol:
             holding_days += 1
         else:
