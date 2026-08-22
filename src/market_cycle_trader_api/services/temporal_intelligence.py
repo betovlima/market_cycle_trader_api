@@ -313,7 +313,9 @@ def _delete_strategy_research_run_data(db: Any, run_id: str, *, delete_run: bool
         "decision_policy": int(db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
     }
     from ..milp_decision.persistence import delete_run_results
+    from ..leadership_regime.service import delete_run_results as delete_leadership_results
     deleted["decision_optimization"] = delete_run_results(db, run_key)
+    deleted["leadership_regime"] = delete_leadership_results(db, run_key)
     deleted["runs"] = int(db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].delete_many({"id": run_key}).deleted_count or 0) if delete_run else 0
     return deleted
 
@@ -1057,6 +1059,30 @@ def build_temporal_intelligence_export(
         if isinstance(document.get("strategy_research_final_validation"), dict)
         else None
     )
+    pipeline_leadership = None
+    if processing_id and pipeline_period_start and pipeline_period_end:
+        from ..leadership_regime.service import get_persisted as get_leadership_regime
+        pipeline_leadership = get_leadership_regime(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+    leadership_session_rows: list[dict[str, Any]] = []
+    leadership_monthly_rows: list[dict[str, Any]] = []
+    if pipeline_leadership is not None:
+        for item in pipeline_leadership.get("sessions") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "signals", "thresholds"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            row.update({f"signal_{key}": value for key, value in (item.get("signals") or {}).items()})
+            row.update({f"threshold_{key}": value for key, value in (item.get("thresholds") or {}).items()})
+            leadership_session_rows.append(bson_value(row))
+        for item in pipeline_leadership.get("monthly") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"state_counts", "state_shares"}}
+            row.update({f"state_count_{key}": value for key, value in (item.get("state_counts") or {}).items()})
+            row.update({f"state_share_{key}": value for key, value in (item.get("state_shares") or {}).items()})
+            leadership_monthly_rows.append(bson_value(row))
     pipeline_state_export = _strategy_research_pipeline_state(document)
     pipeline_reference_analytics = None
     if processing_id:
@@ -1080,7 +1106,7 @@ def build_temporal_intelligence_export(
             pipeline_attribution = {"status": "unavailable", "failure_message": str(exc)}
 
     pipeline_manifest = bson_value({
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": str(run_id),
         "pipeline_status": pipeline_state_export.get("status"),
         "stage_states": pipeline_state_export.get("stage_states"),
@@ -1098,6 +1124,7 @@ def build_temporal_intelligence_export(
         "intervention_status": (pipeline_intervention or {}).get("status"),
         "confidence_status": (pipeline_confidence or {}).get("status"),
         "stateful_status": (pipeline_stateful or {}).get("status"),
+        "leadership_regime_status": (pipeline_leadership or {}).get("status"),
         "milp_decision_status": (pipeline_milp or {}).get("status"),
         "validation_status": (pipeline_validation or {}).get("status") or pipeline_state_export.get("stage_states", {}).get("validation"),
     })
@@ -1141,6 +1168,10 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_confidence.json", json.dumps(pipeline_confidence, indent=2, ensure_ascii=False, default=str))
         if pipeline_stateful is not None:
             archive.writestr("strategy_research_stateful.json", json.dumps(pipeline_stateful, indent=2, ensure_ascii=False, default=str))
+        if pipeline_leadership is not None:
+            archive.writestr("strategy_research_leadership_regime.json", json.dumps(pipeline_leadership, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_leadership_regime_sessions.csv", _csv_text(leadership_session_rows))
+            archive.writestr("strategy_research_leadership_regime_monthly.csv", _csv_text(leadership_monthly_rows))
         if pipeline_milp is not None:
             archive.writestr("strategy_research_milp_decision.json", json.dumps(pipeline_milp, indent=2, ensure_ascii=False, default=str))
         if pipeline_validation is not None:
@@ -1241,6 +1272,12 @@ def _persist_strategy_research_final_validation(
     candidate_a = stateful.get("candidate_a") if isinstance(stateful.get("candidate_a"), dict) else {}
     candidate_a_analytics = candidate_a.get("analytics") if isinstance(candidate_a.get("analytics"), dict) else {}
     milp_analytics = milp.get("analytics") if isinstance(milp.get("analytics"), dict) else {}
+    from ..leadership_regime.service import get_persisted as get_leadership_regime, public_summary as leadership_public_summary
+    leadership = leadership_public_summary(
+        get_leadership_regime(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+    )
     now = utc_now()
     validation = bson_value({
         "schema_version": 1,
@@ -1264,6 +1301,10 @@ def _persist_strategy_research_final_validation(
             "control_parity_status": parity.get("status"),
             "metrics": _compact_validation_metrics(milp_analytics),
             "attribution": bson_value(milp.get("attribution") or {}),
+        },
+        "leadership_regime": {
+            "status": (leadership or {}).get("status"),
+            "summary": bson_value((leadership or {}).get("summary") or {}),
         },
         "created_at": now,
         "updated_at": now,
@@ -1378,6 +1419,18 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
             )
         if _pipeline_stop_requested(db, run_id):
             return
+        try:
+            from ..leadership_regime.service import build_and_persist as build_leadership_regime, unavailable as leadership_regime_unavailable
+            build_leadership_regime(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+        except Exception as leadership_exc:
+            try:
+                leadership_regime_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(leadership_exc)
+                )
+            except Exception:
+                pass
         _pipeline_stage_complete(db, run_id, current_stage)
 
         current_stage = "milp"
@@ -1551,9 +1604,17 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
             db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
         )
     validation = document.get("strategy_research_final_validation") if isinstance(document.get("strategy_research_final_validation"), dict) else None
+    leadership = None
+    if processing_id and period_start and period_end:
+        from ..leadership_regime.service import get_persisted as get_leadership_regime, public_summary as leadership_public_summary
+        leadership = leadership_public_summary(
+            get_leadership_regime(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
 
     return bson_value({
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": str(run_id),
         "processing_id": processing_id or None,
         "period_start": period_start or None,
@@ -1564,6 +1625,7 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         "confidence": latest(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION),
         "stateful": latest(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION, ("completed", "blocked")),
         "milp": pipeline_milp,
+        "leadership_regime": leadership,
         "validation": bson_value(validation) if validation is not None else None,
     })
 
@@ -1756,7 +1818,12 @@ def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
             {"id": str(run_id)},
             {"$unset": {"strategy_research_pipeline": "", "strategy_research_final_validation": ""}, "$set": {"updated_at": utc_now()}},
         )
-        deleted = {"observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0, "decision_policy": 0, "runs": 0}
+        from ..leadership_regime.service import delete_run_results as delete_leadership_results
+        deleted = {
+            "observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0,
+            "decision_policy": 0, "decision_optimization": 0,
+            "leadership_regime": delete_leadership_results(db, run_id), "runs": 0,
+        }
     else:
         deleted = _delete_strategy_research_run_data(db, run_id, delete_run=True)
 

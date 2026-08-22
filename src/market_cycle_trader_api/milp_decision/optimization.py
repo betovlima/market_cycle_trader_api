@@ -37,9 +37,16 @@ def _summary(
     control_folds: dict[str, dict[str, Any]],
     control_cost_folds: dict[str, dict[str, Any]],
     calibration_fold_ids: list[str],
+    count_cash_transitions_as_rotations: bool,
 ) -> dict[str, Any]:
-    candidate_folds = _fold_map(fold_metrics(decisions, initial_capital, base_cost_rate))
-    candidate_cost_folds = _fold_map(fold_metrics(decisions, initial_capital, SELECTION_COST_BPS / 10000.0))
+    candidate_folds = _fold_map(fold_metrics(
+        decisions, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    ))
+    candidate_cost_folds = _fold_map(fold_metrics(
+        decisions, initial_capital, SELECTION_COST_BPS / 10000.0,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    ))
     capital_deltas: list[float] = []
     cost_deltas: list[float] = []
     sharpe_deltas: list[float] = []
@@ -125,14 +132,19 @@ def optimize(
     diagnostics: list[dict[str, Any]],
     observations: dict[str, list[dict[str, Any]]],
     economics: dict[str, dict[str, Any]],
+    reference_path: dict[str, Any],
     control_decisions: list[dict[str, Any]],
     initial_capital: float,
     base_cost_rate: float,
     start_month: str,
     end_month: str,
     should_stop: Callable[[], bool],
+    count_cash_transitions_as_rotations: bool,
 ) -> dict[str, Any]:
-    control_folds_rows = fold_metrics(control_decisions, initial_capital, base_cost_rate)
+    control_folds_rows = fold_metrics(
+        control_decisions, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    )
     fold_ids = [str(row.get("fold_id")) for row in control_folds_rows]
     if len(fold_ids) < 2:
         return {
@@ -146,7 +158,10 @@ def optimize(
     calibration_fold_ids = fold_ids[:-1]
     validation_fold_id = fold_ids[-1]
     control_folds = _fold_map(control_folds_rows)
-    control_cost_folds = _fold_map(fold_metrics(control_decisions, initial_capital, SELECTION_COST_BPS / 10000.0))
+    control_cost_folds = _fold_map(fold_metrics(
+        control_decisions, initial_capital, SELECTION_COST_BPS / 10000.0,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    ))
     summaries: list[dict[str, Any]] = []
     best_summary: dict[str, Any] | None = None
     best_decisions: list[dict[str, Any]] | None = None
@@ -159,6 +174,7 @@ def optimize(
             diagnostics=diagnostics,
             observations=observations,
             economics=economics,
+            reference_path=reference_path,
             configuration=dict(candidate["configuration"]),
             start_month=start_month,
             end_month=end_month,
@@ -175,6 +191,7 @@ def optimize(
             control_folds=control_folds,
             control_cost_folds=control_cost_folds,
             calibration_fold_ids=calibration_fold_ids,
+            count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
         )
         summaries.append(summary)
         if not summary["passed"]:
@@ -219,6 +236,7 @@ def optimize(
         diagnostics=diagnostics,
         observations=observations,
         economics=economics,
+        reference_path=reference_path,
         configuration=dict(best_summary["configuration"]),
         start_month=start_month,
         end_month=end_month,
@@ -231,6 +249,7 @@ def optimize(
         diagnostics=diagnostics,
         observations=observations,
         economics=economics,
+        reference_path=reference_path,
         configuration=dict(best_summary["configuration"]),
         start_month=start_month,
         end_month=end_month,
@@ -238,10 +257,22 @@ def optimize(
         should_stop=should_stop,
         allowed_fold_ids={validation_fold_id},
     )
-    validation_control_metrics = (fold_metrics(validation_control, initial_capital, base_cost_rate)[0].get("metrics") or {})
-    validation_candidate_metrics = (fold_metrics(validation_candidate, initial_capital, base_cost_rate)[0].get("metrics") or {})
-    validation_control_cost = (fold_metrics(validation_control, initial_capital, SELECTION_COST_BPS / 10000.0)[0].get("metrics") or {})
-    validation_candidate_cost = (fold_metrics(validation_candidate, initial_capital, SELECTION_COST_BPS / 10000.0)[0].get("metrics") or {})
+    validation_control_metrics = (fold_metrics(
+        validation_control, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    )[0].get("metrics") or {})
+    validation_candidate_metrics = (fold_metrics(
+        validation_candidate, initial_capital, base_cost_rate,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    )[0].get("metrics") or {})
+    validation_control_cost = (fold_metrics(
+        validation_control, initial_capital, SELECTION_COST_BPS / 10000.0,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    )[0].get("metrics") or {})
+    validation_candidate_cost = (fold_metrics(
+        validation_candidate, initial_capital, SELECTION_COST_BPS / 10000.0,
+        count_cash_transitions_as_rotations=count_cash_transitions_as_rotations,
+    )[0].get("metrics") or {})
     validation = {
         "fold_id": validation_fold_id,
         "used_for_selection": False,
