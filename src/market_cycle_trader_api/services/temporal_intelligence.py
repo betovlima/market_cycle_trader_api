@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import zipfile
 import zlib
@@ -59,8 +60,10 @@ _NUMERIC_THREAD_ENVIRONMENT_KEYS = (
 )
 _ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 _ACTIVE_LOCK = threading.Lock()
+_ACTIVE_PIPELINE_WORKERS: set[str] = set()
+_ACTIVE_PIPELINE_LOCK = threading.Lock()
 
-STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "risk", "confidence", "stateful", "validation")
+STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "risk", "confidence", "stateful", "milp", "validation")
 STRATEGY_RESEARCH_PIPELINE_STAGE_STATES = frozenset({"waiting", "running", "completed", "paused", "stopped", "failed", "skipped"})
 STRATEGY_RESEARCH_PIPELINE_STATUSES = frozenset({"idle", "running", "pause_requested", "paused", "stop_requested", "stopped", "completed", "failed"})
 STRATEGY_RESEARCH_HISTORY_KEEP = 5
@@ -1049,6 +1052,12 @@ def build_temporal_intelligence_export(
         pipeline_milp = latest_milp_decision(
             db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
         )
+    pipeline_validation = (
+        bson_value(document.get("strategy_research_final_validation"))
+        if isinstance(document.get("strategy_research_final_validation"), dict)
+        else None
+    )
+    pipeline_state_export = _strategy_research_pipeline_state(document)
     pipeline_reference_analytics = None
     if processing_id:
         try:
@@ -1071,8 +1080,10 @@ def build_temporal_intelligence_export(
             pipeline_attribution = {"status": "unavailable", "failure_message": str(exc)}
 
     pipeline_manifest = bson_value({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": str(run_id),
+        "pipeline_status": pipeline_state_export.get("status"),
+        "stage_states": pipeline_state_export.get("stage_states"),
         "processing_id": processing_id,
         "period_start": pipeline_period_start,
         "period_end": pipeline_period_end,
@@ -1088,6 +1099,7 @@ def build_temporal_intelligence_export(
         "confidence_status": (pipeline_confidence or {}).get("status"),
         "stateful_status": (pipeline_stateful or {}).get("status"),
         "milp_decision_status": (pipeline_milp or {}).get("status"),
+        "validation_status": (pipeline_validation or {}).get("status") or pipeline_state_export.get("stage_states", {}).get("validation"),
     })
 
     archive_buffer = io.BytesIO()
@@ -1131,6 +1143,8 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_stateful.json", json.dumps(pipeline_stateful, indent=2, ensure_ascii=False, default=str))
         if pipeline_milp is not None:
             archive.writestr("strategy_research_milp_decision.json", json.dumps(pipeline_milp, indent=2, ensure_ascii=False, default=str))
+        if pipeline_validation is not None:
+            archive.writestr("strategy_research_final_validation.json", json.dumps(pipeline_validation, indent=2, ensure_ascii=False, default=str))
     return archive_buffer.getvalue()
 
 def _default_strategy_research_stage_states() -> dict[str, str]:
@@ -1179,6 +1193,242 @@ def _persist_strategy_research_pipeline_state(
     return {"run_id": str(run_id), **_strategy_research_pipeline_state({"strategy_research_pipeline": update})}
 
 
+def _pipeline_stop_requested(db: Any, run_id: str) -> bool:
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
+        {"id": str(run_id)}, {"_id": 0, "strategy_research_pipeline.status": 1}
+    ) or {}
+    pipeline = document.get("strategy_research_pipeline") if isinstance(document.get("strategy_research_pipeline"), dict) else {}
+    return str(pipeline.get("status") or "").lower() in {"stop_requested", "stopped"}
+
+
+def _compact_validation_metrics(analytics: dict[str, Any] | None) -> dict[str, Any]:
+    metrics = analytics.get("metrics") if isinstance(analytics, dict) and isinstance(analytics.get("metrics"), dict) else {}
+    keys = (
+        "initial_capital", "ending_capital", "total_return", "cagr", "sharpe",
+        "maximum_drawdown", "max_drawdown", "market_exposure", "exposure",
+        "capital_rotations", "switch_count", "cash_days", "equity_sessions",
+    )
+    return bson_value({key: metrics.get(key) for key in keys if key in metrics})
+
+
+def _persist_strategy_research_final_validation(
+    db: Any,
+    run_id: str,
+    *,
+    processing_id: str,
+    start_month: str,
+    end_month: str,
+) -> dict[str, Any]:
+    from .analytics import processing_analytics
+    from .temporal_winner_transition_stateful import get_latest_winner_transition_stateful_replay
+    from ..milp_decision.persistence import latest_raw as latest_milp_decision
+
+    control_analytics = processing_analytics(db, processing_id)
+    stateful = get_latest_winner_transition_stateful_replay(
+        db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+    )
+    milp = latest_milp_decision(
+        db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+    )
+    if stateful is None:
+        raise TemporalIntelligenceConflict("Final Validation requires a completed Decision Policy Replay.")
+    if milp is None or str(milp.get("status") or "").lower() != "completed":
+        raise TemporalIntelligenceConflict("Final Validation requires a completed MILP Decision Optimization.")
+    parity = milp.get("control_parity") if isinstance(milp.get("control_parity"), dict) else {}
+    if str(parity.get("status") or "").lower() != "passed":
+        raise TemporalIntelligenceConflict("Final Validation requires MILP exact Control replay parity.")
+
+    candidate_a = stateful.get("candidate_a") if isinstance(stateful.get("candidate_a"), dict) else {}
+    candidate_a_analytics = candidate_a.get("analytics") if isinstance(candidate_a.get("analytics"), dict) else {}
+    milp_analytics = milp.get("analytics") if isinstance(milp.get("analytics"), dict) else {}
+    now = utc_now()
+    validation = bson_value({
+        "schema_version": 1,
+        "status": "completed",
+        "run_id": str(run_id),
+        "processing_id": str(processing_id),
+        "period_start": str(start_month),
+        "period_end": str(end_month),
+        "control": {
+            "metrics": _compact_validation_metrics(control_analytics),
+        },
+        "stateful": {
+            "id": stateful.get("id"),
+            "status": stateful.get("status"),
+            "candidate_a_label": candidate_a.get("label"),
+            "metrics": _compact_validation_metrics(candidate_a_analytics),
+        },
+        "milp": {
+            "id": milp.get("id"),
+            "status": milp.get("status"),
+            "control_parity_status": parity.get("status"),
+            "metrics": _compact_validation_metrics(milp_analytics),
+            "attribution": bson_value(milp.get("attribution") or {}),
+        },
+        "created_at": now,
+        "updated_at": now,
+    })
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
+        {"id": str(run_id)},
+        {"$set": {"strategy_research_final_validation": validation, "updated_at": now}},
+    )
+    return validation
+
+
+def _pipeline_stage_start(db: Any, run_id: str, stage: str) -> dict[str, Any]:
+    return control_strategy_research_pipeline(db, run_id, action="stage_start", stage=stage)
+
+
+def _pipeline_stage_complete(db: Any, run_id: str, stage: str) -> dict[str, Any]:
+    return control_strategy_research_pipeline(db, run_id, action="stage_complete", stage=stage)
+
+
+def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
+    current_stage = "temporal"
+    try:
+        while True:
+            if _pipeline_stop_requested(db, run_id):
+                return
+            run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0}) or {}
+            temporal_status = str(run.get("status") or "").lower()
+            if temporal_status == "completed":
+                break
+            if temporal_status in {"failed", "interrupted"}:
+                raise TemporalIntelligenceConflict(str(run.get("failure_message") or "Temporal Intelligence failed."))
+            if temporal_status in {"cancelled", "stopped"}:
+                return
+            time.sleep(1.0)
+
+        state = get_strategy_research_pipeline_state(db, run_id)
+        if state["stage_states"].get("reference") != "completed":
+            _pipeline_stage_complete(db, run_id, "reference")
+        if state["stage_states"].get("temporal") != "completed":
+            _pipeline_stage_complete(db, run_id, "temporal")
+
+        run = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0}) or {}
+        pipeline = _strategy_research_pipeline_state(run)
+        processing_id = str(run.get("research_processing_id") or "").strip()
+        start_month = str(pipeline.get("start_month") or "").strip()
+        end_month = str(pipeline.get("end_month") or "").strip()
+        if not processing_id or not start_month or not end_month:
+            raise TemporalIntelligenceConflict("Strategy Research pipeline is missing its processing or period binding.")
+
+        from .temporal_winner_transition_risk import (
+            get_latest_winner_transition_risk_search,
+            run_winner_transition_risk_search,
+        )
+        from .temporal_winner_transition_intervention import (
+            get_latest_winner_transition_confidence_calibration,
+            get_latest_winner_transition_intervention_search,
+            run_winner_transition_confidence_calibration,
+            run_winner_transition_intervention_search,
+        )
+        from .temporal_winner_transition_stateful import (
+            get_latest_winner_transition_stateful_replay,
+            run_winner_transition_stateful_replay,
+        )
+        from ..milp_decision.persistence import latest_raw as latest_milp_decision
+        from ..milp_decision.service import run as run_milp_decision
+
+        current_stage = "risk"
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_start(db, run_id, current_stage)
+        risk = get_latest_winner_transition_risk_search(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if risk is None:
+            run_winner_transition_risk_search(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, seed=42
+            )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        intervention = get_latest_winner_transition_intervention_search(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if intervention is None:
+            run_winner_transition_intervention_search(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, seed=42
+            )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "confidence"
+        _pipeline_stage_start(db, run_id, current_stage)
+        confidence = get_latest_winner_transition_confidence_calibration(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if confidence is None:
+            run_winner_transition_confidence_calibration(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "stateful"
+        _pipeline_stage_start(db, run_id, current_stage)
+        stateful = get_latest_winner_transition_stateful_replay(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if stateful is None:
+            run_winner_transition_stateful_replay(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "milp"
+        _pipeline_stage_start(db, run_id, current_stage)
+        milp = latest_milp_decision(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        valid_milp = bool(
+            milp
+            and str(milp.get("status") or "").lower() == "completed"
+            and int(milp.get("schema_version") or 0) >= 2
+            and str(((milp.get("control_parity") or {}).get("status") or "")).lower() == "passed"
+        )
+        if not valid_milp:
+            run_milp_decision(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "validation"
+        _pipeline_stage_start(db, run_id, current_stage)
+        _persist_strategy_research_final_validation(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+    except Exception as exc:
+        if not _pipeline_stop_requested(db, run_id):
+            try:
+                control_strategy_research_pipeline(
+                    db, run_id, action="stage_failed", stage=current_stage, message=str(exc)
+                )
+            except Exception:
+                pass
+    finally:
+        with _ACTIVE_PIPELINE_LOCK:
+            _ACTIVE_PIPELINE_WORKERS.discard(str(run_id))
+
+
+def _start_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
+    run_key = str(run_id)
+    with _ACTIVE_PIPELINE_LOCK:
+        if run_key in _ACTIVE_PIPELINE_WORKERS:
+            return
+        _ACTIVE_PIPELINE_WORKERS.add(run_key)
+    threading.Thread(target=_run_strategy_research_pipeline_worker, args=(db, run_key), daemon=True).start()
+
+
 def _reconcile_detached_strategy_research_pipeline(
     db: Any,
     document: dict[str, Any],
@@ -1187,38 +1437,53 @@ def _reconcile_detached_strategy_research_pipeline(
     state = _strategy_research_pipeline_state(document)
     pipeline_status = str(state.get("status") or "idle").lower()
     current_stage = state.get("current_stage")
-    if current_stage != "temporal" or pipeline_status not in {"running", "pause_requested", "stop_requested"}:
-        return {"run_id": run_id, **state}
-
     temporal_status = str(document.get("status") or "").lower()
+
+    if pipeline_status == "paused" and temporal_status == "completed":
+        stage_states = dict(state.get("stage_states") or _default_strategy_research_stage_states())
+        if stage_states.get("reference") == "waiting":
+            stage_states["reference"] = "completed"
+        stage_states["temporal"] = "completed"
+        repaired = _persist_strategy_research_pipeline_state(
+            db,
+            run_id,
+            {
+                **state,
+                "status": "running",
+                "current_stage": None,
+                "stage_states": stage_states,
+                "failure_message": None,
+            },
+        )
+        _start_strategy_research_pipeline_worker(db, run_id)
+        return repaired
+
+    if pipeline_status == "running":
+        _start_strategy_research_pipeline_worker(db, run_id)
+
+    if current_stage != "temporal" or pipeline_status not in {"running", "stop_requested"}:
+        return {"run_id": run_id, **state}
     if temporal_status in {"queued", "running", "stop_requested"}:
         return {"run_id": run_id, **state}
 
     stage_states = dict(state.get("stage_states") or _default_strategy_research_stage_states())
-    failure_message = state.get("failure_message")
-    next_status = pipeline_status
-    next_stage = current_stage
-
     if temporal_status == "completed":
         stage_states["temporal"] = "completed"
+        next_status = "stopped" if pipeline_status == "stop_requested" else "running"
         next_stage = None
-        next_status = "stopped" if pipeline_status == "stop_requested" else "paused"
-    elif pipeline_status == "stop_requested" or temporal_status == "cancelled":
+        failure_message = None
+    elif pipeline_status == "stop_requested" or temporal_status in {"cancelled", "stopped"}:
         stage_states["temporal"] = "stopped"
         next_status = "stopped"
-    elif pipeline_status == "pause_requested":
-        stage_states["temporal"] = "paused"
-        next_status = "paused"
+        next_stage = "temporal"
+        failure_message = None
     else:
         stage_states["temporal"] = "failed"
         next_status = "failed"
-        failure_message = str(
-            document.get("failure_message")
-            or document.get("stage")
-            or "Temporal Intelligence was interrupted before the pipeline could continue."
-        )
+        next_stage = "temporal"
+        failure_message = str(document.get("failure_message") or "Temporal Intelligence failed.")
 
-    return _persist_strategy_research_pipeline_state(
+    reconciled = _persist_strategy_research_pipeline_state(
         db,
         run_id,
         {
@@ -1229,7 +1494,9 @@ def _reconcile_detached_strategy_research_pipeline(
             "failure_message": failure_message,
         },
     )
-
+    if next_status == "running":
+        _start_strategy_research_pipeline_worker(db, run_id)
+    return reconciled
 
 def get_strategy_research_pipeline_state(db: Any, run_id: str) -> dict[str, Any]:
     document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one(
@@ -1246,7 +1513,7 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         {"id": str(run_id)},
         {
             "_id": 0, "id": 1, "status": 1, "research_processing_id": 1,
-            "strategy_research_pipeline": 1, "result": 1, "analysis_end_date": 1,
+            "strategy_research_pipeline": 1, "strategy_research_final_validation": 1, "result": 1, "analysis_end_date": 1,
         },
     )
     if document is None:
@@ -1277,8 +1544,16 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         )
         return bson_value(row) if row is not None else None
 
+    pipeline_milp = None
+    if processing_id and period_start and period_end:
+        from ..milp_decision.persistence import latest_raw as latest_milp_decision
+        pipeline_milp = latest_milp_decision(
+            db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+        )
+    validation = document.get("strategy_research_final_validation") if isinstance(document.get("strategy_research_final_validation"), dict) else None
+
     return bson_value({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": str(run_id),
         "processing_id": processing_id or None,
         "period_start": period_start or None,
@@ -1288,6 +1563,8 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         "intervention": latest(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION),
         "confidence": latest(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION),
         "stateful": latest(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION, ("completed", "blocked")),
+        "milp": pipeline_milp,
+        "validation": bson_value(validation) if validation is not None else None,
     })
 
 
@@ -1310,24 +1587,40 @@ def control_strategy_research_pipeline(
     next_status = current["status"]
     current_stage = current.get("current_stage")
     failure_message = current.get("failure_message")
+    start_worker = False
 
     if action == "start":
+        if not start_month or not end_month:
+            raise TemporalIntelligenceConflict("Strategy Research start requires start_month and end_month.")
+        if str(end_month) < str(start_month):
+            raise TemporalIntelligenceConflict("Strategy Research end_month must be greater than or equal to start_month.")
         stage_states = _default_strategy_research_stage_states()
+        stage_states["reference"] = "completed"
+        temporal_status = str(document.get("status") or "").lower()
+        if temporal_status == "completed":
+            stage_states["temporal"] = "completed"
+            current_stage = None
+        elif temporal_status in {"failed", "interrupted", "cancelled", "stopped"}:
+            raise TemporalIntelligenceConflict("A failed or stopped Temporal Intelligence run cannot start Strategy Research. Restart the pipeline.")
+        else:
+            stage_states["temporal"] = "running"
+            current_stage = "temporal"
         next_status = "running"
-        current_stage = None
         failure_message = None
+        start_worker = True
     elif action == "resume":
-        if next_status not in {"paused", "pause_requested", "failed", "running"}:
-            raise TemporalIntelligenceConflict("Only a paused or failed Strategy Research pipeline can be resumed.")
+        if next_status not in {"paused", "failed", "running"}:
+            raise TemporalIntelligenceConflict("Only a legacy paused or failed Strategy Research pipeline can be recovered.")
         next_status = "running"
         failure_message = None
         if current_stage and stage_states.get(current_stage) in {"paused", "stopped", "failed"}:
             stage_states[current_stage] = "waiting"
         current_stage = None
+        start_worker = True
     elif action == "stage_start":
         if stage not in STRATEGY_RESEARCH_PIPELINE_STAGES:
             raise TemporalIntelligenceConflict("Unknown Strategy Research stage.")
-        if next_status in {"pause_requested", "stop_requested", "paused", "stopped"}:
+        if next_status in {"stop_requested", "stopped"}:
             return {"run_id": str(run_id), **current}
         next_status = "running"
         current_stage = stage
@@ -1338,9 +1631,7 @@ def control_strategy_research_pipeline(
             raise TemporalIntelligenceConflict("Unknown Strategy Research stage.")
         stage_states[stage] = "completed"
         current_stage = None
-        if next_status == "pause_requested":
-            next_status = "paused"
-        elif next_status == "stop_requested":
+        if next_status in {"stop_requested", "stopped"}:
             next_status = "stopped"
         elif stage == "validation":
             next_status = "completed"
@@ -1349,10 +1640,11 @@ def control_strategy_research_pipeline(
     elif action == "checkpoint":
         if stage not in STRATEGY_RESEARCH_PIPELINE_STAGES:
             raise TemporalIntelligenceConflict("Unknown Strategy Research stage.")
-        if next_status == "stop_requested":
+        if next_status in {"stop_requested", "stopped"}:
             next_status = "stopped"
             current_stage = stage
-            stage_states[stage] = "stopped"
+            if stage_states.get(stage) != "completed":
+                stage_states[stage] = "stopped"
     elif action == "stage_failed":
         if stage not in STRATEGY_RESEARCH_PIPELINE_STAGES:
             raise TemporalIntelligenceConflict("Unknown Strategy Research stage.")
@@ -1376,47 +1668,16 @@ def control_strategy_research_pipeline(
         {"id": str(run_id)},
         {"$set": {"strategy_research_pipeline": update, "updated_at": now}},
     )
-    return {"run_id": str(run_id), **_strategy_research_pipeline_state({"strategy_research_pipeline": update})}
-
+    result = {"run_id": str(run_id), **_strategy_research_pipeline_state({"strategy_research_pipeline": update})}
+    if start_worker:
+        _start_strategy_research_pipeline_worker(db, run_id)
+    return result
 
 def request_strategy_research_pipeline_pause(db: Any, run_id: str) -> dict[str, Any]:
-    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)})
+    document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0, "id": 1})
     if document is None:
         raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
-    current = _strategy_research_pipeline_state(document)
-    if current["status"] in {"paused", "pause_requested"}:
-        return {"run_id": str(run_id), **current}
-
-    temporal_status = str(document.get("status") or "").lower()
-    temporal_active = temporal_status in {"queued", "running", "stop_requested"}
-    if temporal_active and current["status"] not in {"running", "stop_requested"}:
-        stage_states = dict(current.get("stage_states") or _default_strategy_research_stage_states())
-        stage_states["reference"] = "completed" if stage_states.get("reference") != "waiting" else stage_states["reference"]
-        stage_states["temporal"] = "running"
-        for stage in ("risk", "confidence", "stateful", "validation"):
-            stage_states[stage] = "waiting"
-        repaired = _persist_strategy_research_pipeline_state(
-            db,
-            run_id,
-            {
-                **current,
-                "status": "running",
-                "current_stage": "temporal",
-                "stage_states": stage_states,
-                "failure_message": None,
-            },
-        )
-        current = {key: value for key, value in repaired.items() if key != "run_id"}
-
-    if current["status"] not in {"running", "stop_requested"}:
-        raise TemporalIntelligenceConflict("Only a running Strategy Research pipeline can be paused.")
-    now = utc_now()
-    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
-        {"id": str(run_id)},
-        {"$set": {"strategy_research_pipeline.status": "pause_requested", "strategy_research_pipeline.updated_at": now, "updated_at": now}},
-    )
-    return get_strategy_research_pipeline_state(db, run_id)
-
+    raise TemporalIntelligenceConflict("Strategy Research does not pause between stages. Use Stop Pipeline to interrupt the full pipeline.")
 
 def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, Any]:
     document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)})
@@ -1435,7 +1696,7 @@ def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, A
         if stage_states.get("reference") == "waiting":
             stage_states["reference"] = "completed"
         stage_states["temporal"] = "running"
-        for stage in ("risk", "confidence", "stateful", "validation"):
+        for stage in ("risk", "confidence", "stateful", "milp", "validation"):
             stage_states[stage] = "waiting"
         repaired = _persist_strategy_research_pipeline_state(
             db,
@@ -1493,7 +1754,7 @@ def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
     if protected:
         db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
             {"id": str(run_id)},
-            {"$unset": {"strategy_research_pipeline": ""}, "$set": {"updated_at": utc_now()}},
+            {"$unset": {"strategy_research_pipeline": "", "strategy_research_final_validation": ""}, "$set": {"updated_at": utc_now()}},
         )
         deleted = {"observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0, "decision_policy": 0, "runs": 0}
     else:
@@ -1556,21 +1817,7 @@ def recover_temporal_intelligence_runs(db: Any) -> int:
         {
             "status": "interrupted",
             "strategy_research_pipeline.current_stage": "temporal",
-            "strategy_research_pipeline.status": "pause_requested",
-        },
-        {
-            "$set": {
-                "strategy_research_pipeline.status": "paused",
-                "strategy_research_pipeline.stage_states.temporal": "paused",
-                "strategy_research_pipeline.updated_at": now,
-            }
-        },
-    )
-    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_many(
-        {
-            "status": "interrupted",
-            "strategy_research_pipeline.current_stage": "temporal",
-            "strategy_research_pipeline.status": "running",
+            "strategy_research_pipeline.status": {"$in": ["running", "pause_requested", "paused"]},
         },
         {
             "$set": {
@@ -1581,4 +1828,15 @@ def recover_temporal_intelligence_runs(db: Any) -> int:
             }
         },
     )
+    resumable = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find(
+        {
+            "status": "completed",
+            "strategy_research_pipeline.status": "running",
+        },
+        {"_id": 0, "id": 1},
+    )
+    for item in resumable:
+        run_id = str(item.get("id") or "").strip()
+        if run_id:
+            _start_strategy_research_pipeline_worker(db, run_id)
     return int(getattr(result, "modified_count", 0) or 0)
