@@ -2522,7 +2522,11 @@ def _strategy_research_reference_study(
         (row for row in rotations if _reference_timestamp(row.get("executed_at")) == first_execution),
         None,
     )
-    current_symbol = _reference_asset((first_rotation or {}).get("from_asset"))
+    current_symbol = _reference_asset(
+        aligned[0][1].get("strategy_research_control_previous_asset")
+        or aligned[0][1].get("previous_asset")
+        or (first_rotation or {}).get("from_asset")
+    )
     candidate_capital = float(first_equity)
     one_side_cost = max(0.0, float(config.slippage_bps) / 10_000.0) + max(0.0, float(config.commission_rate))
 
@@ -2547,11 +2551,19 @@ def _strategy_research_reference_study(
         decision_stamp = _reference_timestamp(winner_row.get("decision_date"))
         fold_id = int(winner_row.get("walk_forward_fold") or winner_row.get("decision_fold_id") or winner_row.get("fold_id") or 0)
         rows_by_symbol = rows.set_index("symbol", drop=False) if not rows.empty and "symbol" in rows.columns else pd.DataFrame()
-        control_previous = (
-            _reference_asset(aligned[index - 1][0].get("selected_asset"))
-            if index > 0 else _reference_asset((first_rotation or {}).get("from_asset"))
+        control_previous = _reference_asset(
+            winner_row.get("strategy_research_control_previous_asset")
+            or winner_row.get("previous_asset")
+            or (
+                aligned[index - 1][1].get("strategy_research_control_asset")
+                if index > 0 else (first_rotation or {}).get("from_asset")
+            )
         )
-        base_asset = _reference_asset(session.get("selected_asset"))
+        base_asset = _reference_asset(
+            winner_row.get("strategy_research_control_asset")
+            or winner_row.get("selected_asset")
+            or session.get("selected_asset")
+        )
         base_symbol = None if base_asset == "CASH" else base_asset
         top1_value = winner_row.get("top_1_asset") or winner_row.get("raw_best_asset") or winner_row.get("best_asset")
         top2_value = winner_row.get("top_2_asset") or winner_row.get("second_asset")
@@ -3918,7 +3930,11 @@ def run_temporal_intelligence(
         if str(reference_parity.get("status") or "") != "passed":
             raise ValueError(
                 "Selected Strategy Research reference replay failed exact parity before Temporal timing. "
-                + json.dumps(reference_parity.get("checks") or {}, sort_keys=True)
+                + json.dumps({
+                    "checks": reference_parity.get("checks") or {},
+                    "reference": reference_parity.get("reference") or {},
+                    "replay": reference_parity.get("replay") or {},
+                }, sort_keys=True)
             )
 
     multi_horizon_fold_metrics: list[dict[str, Any]] = []
