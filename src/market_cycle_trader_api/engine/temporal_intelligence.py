@@ -2463,6 +2463,26 @@ def _reference_cost_sides(previous: str | None, target: str | None) -> int:
     return 2
 
 
+def _reference_counts_cash_transitions_as_rotations(reference_analytics: dict[str, Any]) -> bool:
+    processing_kind = str(reference_analytics.get("processing_kind") or "").strip().lower()
+    return processing_kind in {"strategy_research_temporal", "strategy_research_stateful", "strategy_research_decision_optimization"}
+
+
+def _reference_rotation_increment(
+    previous: str | None,
+    target: str | None,
+    *,
+    count_cash_transitions: bool,
+) -> int:
+    previous_asset = _reference_asset(previous)
+    target_asset = _reference_asset(target)
+    if previous_asset == target_asset:
+        return 0
+    if not count_cash_transitions and (previous_asset == "CASH" or target_asset == "CASH"):
+        return 0
+    return 1
+
+
 def _strategy_research_reference_study(
     frame: pd.DataFrame,
     winner_daily_rows: list[dict[str, Any]],
@@ -2517,12 +2537,17 @@ def _strategy_research_reference_study(
         return {}
 
     rotations = [row for row in (reference_analytics.get("rotations") or []) if isinstance(row, dict)]
+    count_cash_transitions_as_rotations = _reference_counts_cash_transitions_as_rotations(reference_analytics)
     first_execution = _reference_timestamp(aligned[0][0].get("timestamp"))
     first_rotation = next(
         (row for row in rotations if _reference_timestamp(row.get("executed_at")) == first_execution),
         None,
     )
-    current_symbol = _reference_asset((first_rotation or {}).get("from_asset"))
+    current_symbol = _reference_asset(
+        aligned[0][1].get("strategy_research_control_previous_asset")
+        or aligned[0][1].get("previous_asset")
+        or (first_rotation or {}).get("from_asset")
+    )
     candidate_capital = float(first_equity)
     one_side_cost = max(0.0, float(config.slippage_bps) / 10_000.0) + max(0.0, float(config.commission_rate))
 
@@ -2547,11 +2572,19 @@ def _strategy_research_reference_study(
         decision_stamp = _reference_timestamp(winner_row.get("decision_date"))
         fold_id = int(winner_row.get("walk_forward_fold") or winner_row.get("decision_fold_id") or winner_row.get("fold_id") or 0)
         rows_by_symbol = rows.set_index("symbol", drop=False) if not rows.empty and "symbol" in rows.columns else pd.DataFrame()
-        control_previous = (
-            _reference_asset(aligned[index - 1][0].get("selected_asset"))
-            if index > 0 else _reference_asset((first_rotation or {}).get("from_asset"))
+        control_previous = _reference_asset(
+            winner_row.get("strategy_research_control_previous_asset")
+            or winner_row.get("previous_asset")
+            or (
+                aligned[index - 1][1].get("strategy_research_control_asset")
+                if index > 0 else (first_rotation or {}).get("from_asset")
+            )
         )
-        base_asset = _reference_asset(session.get("selected_asset"))
+        base_asset = _reference_asset(
+            winner_row.get("strategy_research_control_asset")
+            or winner_row.get("selected_asset")
+            or session.get("selected_asset")
+        )
         base_symbol = None if base_asset == "CASH" else base_asset
         top1_value = winner_row.get("top_1_asset") or winner_row.get("raw_best_asset") or winner_row.get("best_asset")
         top2_value = winner_row.get("top_2_asset") or winner_row.get("second_asset")
@@ -2629,8 +2662,11 @@ def _strategy_research_reference_study(
             action = "hold"
         action_counts[action] += 1
         sides = _reference_cost_sides(current_symbol, target_symbol)
-        if sides > 0:
-            switch_count += 1
+        switch_count += _reference_rotation_increment(
+            current_symbol,
+            target_symbol,
+            count_cash_transitions=count_cash_transitions_as_rotations,
+        )
 
         target_asset = _reference_asset(target_symbol)
         if target_asset == "CASH":
@@ -3388,6 +3424,7 @@ def _bind_strategy_research_reference_analytics(
         fold_id = int(row.get("walk_forward_fold") or row.get("decision_fold_id") or row.get("fold_id") or 0)
         fold_equity.setdefault(fold_id, []).append((row, reference))
     exact_folds: list[dict[str, Any]] = []
+    count_cash_transitions_as_rotations = _reference_counts_cash_transitions_as_rotations(reference_analytics)
     for fold_id, items in sorted(fold_equity.items()):
         values = np.asarray([float(item[1].get("simulation_equity") or 0.0) for item in items], dtype=float)
         if len(values) < 2 or values[0] <= 0:
@@ -3402,7 +3439,14 @@ def _bind_strategy_research_reference_analytics(
         fold_cagr = float((values[-1] / values[0]) ** (1.0 / years) - 1.0) if values[-1] > 0 else -1.0
         assets = [_reference_asset(item[0].get("selected_asset")) for item in items]
         cash_days = sum(asset == "CASH" for asset in assets)
-        switches = sum(assets[index] != assets[index - 1] for index in range(1, len(assets)))
+        switches = sum(
+            _reference_rotation_increment(
+                assets[index - 1],
+                assets[index],
+                count_cash_transitions=count_cash_transitions_as_rotations,
+            )
+            for index in range(1, len(assets))
+        )
         exact_folds.append({
             "fold_id": int(fold_id),
             "test_start": items[0][0].get("fold_test_start") or items[0][1].get("timestamp"),
@@ -3918,7 +3962,11 @@ def run_temporal_intelligence(
         if str(reference_parity.get("status") or "") != "passed":
             raise ValueError(
                 "Selected Strategy Research reference replay failed exact parity before Temporal timing. "
-                + json.dumps(reference_parity.get("checks") or {}, sort_keys=True)
+                + json.dumps({
+                    "checks": reference_parity.get("checks") or {},
+                    "reference": reference_parity.get("reference") or {},
+                    "replay": reference_parity.get("replay") or {},
+                }, sort_keys=True)
             )
 
     multi_horizon_fold_metrics: list[dict[str, Any]] = []

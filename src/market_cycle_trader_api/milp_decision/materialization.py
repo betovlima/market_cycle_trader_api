@@ -20,6 +20,9 @@ def materialize(db: Any, run_id: str, optimization_id: str, *, actor_email: str 
     optimization = get_completed(db, run_id, optimization_id)
     if optimization is None:
         raise MilpDecisionError("Completed MILP Decision Optimization result not found.")
+    control_parity = optimization.get("control_parity") if isinstance(optimization.get("control_parity"), dict) else {}
+    if str(control_parity.get("status") or "") != "passed":
+        raise MilpDecisionError("MILP Strategy materialization requires passed exact Control replay parity.")
     existing_id = str(optimization.get("materialized_strategy_id") or "").strip()
     if existing_id:
         try:

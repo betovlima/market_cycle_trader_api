@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from ..infrastructure.persistence.mongo_repository import bson_value
-from .utils import as_datetime, month_key
+from .utils import as_datetime, as_float, month_key
 
 
 def cost_sides(current_symbol: str, target_symbol: str) -> int:
@@ -30,60 +30,95 @@ def net_interval_return(gross_return: float, sides: int, one_side_cost_rate: flo
     return (1.0 + float(gross_return)) * ((1.0 - rate) ** max(0, int(sides))) - 1.0
 
 
+def _equity_values(
+    decisions: list[dict[str, Any]],
+    *,
+    one_side_cost_rate: float,
+) -> list[float]:
+    values: list[float] = []
+    stress_factor = 1.0
+    requested_rate = max(0.0, float(one_side_cost_rate))
+    for item in decisions:
+        base_equity = as_float(item.get("candidate_equity"))
+        if base_equity is None:
+            raise ValueError("MILP decision replay is missing candidate_equity.")
+        base_rate = max(0.0, float(as_float(item.get("one_side_cost_rate"), 0.0) or 0.0))
+        sides = max(0, int(item.get("cost_sides") or 0))
+        if sides:
+            base_factor = max(1e-15, 1.0 - base_rate)
+            requested_factor = max(0.0, 1.0 - requested_rate)
+            stress_factor *= (requested_factor / base_factor) ** sides
+        values.append(float(base_equity) * stress_factor)
+    return values
+
+
 def metrics(decisions: list[dict[str, Any]], initial_capital: float, one_side_cost_rate: float) -> dict[str, Any]:
-    capital = float(initial_capital)
-    peak = capital
-    max_drawdown = 0.0
+    if not decisions:
+        return bson_value({
+            "initial_capital": initial_capital,
+            "ending_capital": initial_capital,
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "sharpe": 0.0,
+            "maximum_drawdown": 0.0,
+            "market_exposure": 0.0,
+            "cash_days": 0,
+            "decision_days": 0,
+            "capital_rotations": 0,
+            "realized_cvar_10": 0.0,
+            "action_counts": {},
+            "equity": [],
+        })
+
+    values = _equity_values(decisions, one_side_cost_rate=one_side_cost_rate)
     interval_returns: list[float] = []
+    previous = float(initial_capital)
+    peak = float(initial_capital)
+    max_drawdown = 0.0
     equity: list[dict[str, Any]] = []
     action_counts: Counter[str] = Counter()
     switches = cash_days = 0
-    first_date = last_date = None
-    for item in decisions:
-        net = net_interval_return(float(item.get("gross_interval_return") or 0.0), int(item.get("cost_sides") or 0), one_side_cost_rate)
-        capital *= 1.0 + net
+
+    for item, capital in zip(decisions, values):
+        interval_return = capital / previous - 1.0 if previous > 0 else 0.0
+        interval_returns.append(interval_return)
+        previous = capital
         peak = max(peak, capital)
         drawdown = capital / peak - 1.0 if peak > 0 else 0.0
         max_drawdown = min(max_drawdown, drawdown)
-        interval_returns.append(net)
         item_action = str(item.get("action") or "HOLD")
         action_counts[item_action] += 1
-        switches += int(int(item.get("cost_sides") or 0) > 0)
+        switches += int(str(item.get("current_symbol") or "CASH") != str(item.get("target_symbol") or "CASH"))
         cash_days += int(str(item.get("target_symbol") or "CASH") == "CASH")
-        stamp = as_datetime(item.get("execution_at") or item.get("decision_at"))
-        if stamp is not None:
-            first_date = first_date or stamp
-            last_date = stamp
         equity.append({
             "timestamp": item.get("execution_at") or item.get("decision_at"),
             "simulation_equity": capital,
-            "reference_equity": capital,
+            "reference_equity": item.get("reference_equity"),
             "drawdown": drawdown,
             "selected_asset": item.get("target_symbol"),
             "trade_action": item_action,
             "objective": item.get("objective"),
         })
-    total_return = capital / initial_capital - 1.0 if initial_capital > 0 else 0.0
-    if first_date and last_date and last_date > first_date:
-        years = max((last_date - first_date).total_seconds() / (365.25 * 86400.0), 1.0 / 252.0)
-        cagr = (capital / initial_capital) ** (1.0 / years) - 1.0 if capital > 0 and initial_capital > 0 else -1.0
-    else:
-        cagr = (1.0 + total_return) ** (252.0 / max(1, len(decisions))) - 1.0 if total_return > -1 else -1.0
+
+    ending_capital = values[-1]
+    total_return = ending_capital / initial_capital - 1.0 if initial_capital > 0 else 0.0
+    years = max(len(decisions) / 252.0, 1.0 / 252.0)
+    cagr = (ending_capital / initial_capital) ** (1.0 / years) - 1.0 if ending_capital > 0 and initial_capital > 0 else -1.0
     sharpe = 0.0
     if len(interval_returns) > 1:
         std = statistics.stdev(interval_returns)
         if std > 0:
             sharpe = statistics.mean(interval_returns) / std * math.sqrt(252.0)
-    tail_count = max(1, math.ceil(len(interval_returns) * 0.10)) if interval_returns else 0
-    cvar = statistics.mean(sorted(interval_returns)[:tail_count]) if tail_count else 0.0
+    tail_count = max(1, math.ceil(len(interval_returns) * 0.10))
+    cvar = statistics.mean(sorted(interval_returns)[:tail_count])
     return bson_value({
         "initial_capital": initial_capital,
-        "ending_capital": capital,
+        "ending_capital": ending_capital,
         "total_return": total_return,
         "cagr": cagr,
         "sharpe": sharpe,
         "maximum_drawdown": max_drawdown,
-        "market_exposure": (len(decisions) - cash_days) / len(decisions) if decisions else 0.0,
+        "market_exposure": (len(decisions) - cash_days) / len(decisions),
         "cash_days": cash_days,
         "decision_days": len(decisions),
         "capital_rotations": switches,
@@ -93,13 +128,34 @@ def metrics(decisions: list[dict[str, Any]], initial_capital: float, one_side_co
     })
 
 
+def _rebased_fold_decisions(items: list[dict[str, Any]], initial_capital: float) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    first_equity = as_float(items[0].get("candidate_equity"))
+    if first_equity in {None, 0.0}:
+        return [dict(item) for item in items]
+    scale = float(initial_capital) / float(first_equity)
+    rebased: list[dict[str, Any]] = []
+    for item in items:
+        row = dict(item)
+        value = as_float(row.get("candidate_equity"))
+        reference = as_float(row.get("reference_equity"))
+        if value is not None:
+            row["candidate_equity"] = value * scale
+        if reference is not None:
+            row["reference_equity"] = reference * scale
+        rebased.append(row)
+    return rebased
+
+
 def fold_metrics(decisions: list[dict[str, Any]], initial_capital: float, one_side_cost_rate: float) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in decisions:
         grouped[str(item.get("fold_id") or "0")].append(item)
     rows: list[dict[str, Any]] = []
     for fold_id, items in sorted(grouped.items(), key=lambda pair: pair[0]):
-        result = metrics(items, initial_capital, one_side_cost_rate)
+        rebased = _rebased_fold_decisions(items, initial_capital)
+        result = metrics(rebased, initial_capital, one_side_cost_rate)
         rows.append({
             "fold_id": int(fold_id) if fold_id.isdigit() else fold_id,
             "test_start": items[0].get("execution_at") if items else None,

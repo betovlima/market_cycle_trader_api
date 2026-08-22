@@ -11,13 +11,6 @@ from .solver import solve_binary_one_hot
 from .utils import as_datetime, as_float, within_month_range
 
 
-def _control_target_return(target_symbol: str, rows_by_symbol: dict[str, dict[str, Any]]) -> float | None:
-    if target_symbol == "CASH":
-        return 0.0
-    row = rows_by_symbol.get(target_symbol)
-    return as_float((row or {}).get("open_to_open_return")) if row else None
-
-
 def _candidate_symbols(
     diagnostic: dict[str, Any],
     observation_rows: list[dict[str, Any]],
@@ -80,6 +73,30 @@ def _alternatives(
     return rows
 
 
+def _selected_interval_return(
+    target_symbol: str,
+    rows_by_symbol: dict[str, dict[str, Any]],
+    economic: dict[str, Any],
+    *,
+    current_symbol: str,
+    control_current: str,
+    control_target: str,
+    base_cost_rate: float,
+) -> tuple[float | None, float | None, int]:
+    sides = cost_sides(current_symbol, target_symbol)
+    control_net = as_float(economic.get("net_interval_return"))
+    if target_symbol == control_target and current_symbol == control_current and control_net is not None:
+        return control_net, as_float(economic.get("gross_interval_return"), control_net), sides
+    if target_symbol == "CASH":
+        gross = 0.0
+    else:
+        row = rows_by_symbol.get(target_symbol)
+        gross = as_float((row or {}).get("open_to_open_return")) if row else None
+    if gross is None:
+        return None, None, sides
+    return net_interval_return(gross, sides, base_cost_rate), gross, sides
+
+
 def build_decisions(
     *,
     diagnostics: list[dict[str, Any]],
@@ -90,13 +107,16 @@ def build_decisions(
     end_month: str,
     base_cost_rate: float,
     should_stop: Callable[[], bool],
+    force_control: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     current_symbol: str | None = None
     holding_days = 0
     decisions: list[dict[str, Any]] = []
-    solver_nodes = solver_pruned = 0
+    solver_nodes = solver_pruned = solver_decisions = forced_control_decisions = 0
     solve_ms_total = 0.0
     changed = better = worse = neutral = 0
+    candidate_equity: float | None = None
+    path_matches_control = True
 
     for index, diagnostic in enumerate(diagnostics):
         if index % 50 == 0 and should_stop():
@@ -104,51 +124,77 @@ def build_decisions(
         decision_at = as_datetime(diagnostic.get("timestamp"))
         if decision_at is None or not within_month_range(decision_at, start_month, end_month):
             continue
+
+        economic = economics.get(decision_at.isoformat()) or {}
+        reference_equity = as_float(economic.get("strategy_equity"))
+        if path_matches_control and reference_equity is not None:
+            candidate_equity = reference_equity
+        if candidate_equity is None:
+            raise MilpDecisionError("MILP replay is missing the reference equity anchor for the selected period.")
+
+        control_target = str(diagnostic.get("target_symbol") or economic.get("target_symbol") or "CASH").upper() or "CASH"
+        control_current = str(diagnostic.get("current_symbol") or economic.get("current_symbol") or "CASH").upper() or "CASH"
+        if current_symbol is None:
+            current_symbol = control_current
+
         observation_rows = observations.get(decision_at.isoformat()) or []
-        if not observation_rows:
-            continue
         rows_by_symbol = {
             str(row.get("symbol") or "").upper(): row
             for row in observation_rows
             if str(row.get("symbol") or "").strip()
         }
-        if current_symbol is None:
-            current_symbol = str(diagnostic.get("current_symbol") or "CASH").upper() or "CASH"
-        anchor, candidates = _candidate_symbols(
-            diagnostic,
-            observation_rows,
-            rows_by_symbol,
-            current_symbol,
-            int(configuration["candidate_rank_limit"]),
-        )
-        alternatives = _alternatives(
-            candidates,
-            rows_by_symbol,
-            current_symbol=current_symbol,
-            anchor_symbol=anchor,
-            configuration=configuration,
-        )
-        started = time.perf_counter()
-        selected, solver = solve_binary_one_hot(alternatives)
-        solve_ms_total += (time.perf_counter() - started) * 1000.0
-        solver_nodes += int(solver["nodes_explored"])
-        solver_pruned += int(solver["nodes_pruned"])
+        must_follow_control = force_control or not observation_rows or not rows_by_symbol
+        alternatives: list[dict[str, Any]] = []
+        solver: dict[str, Any] | None = None
+        selected: dict[str, Any]
+
+        if must_follow_control:
+            forced_control_decisions += 1
+            selected = {
+                "symbol": control_target,
+                "objective": None,
+                "breakdown": {"forced_control": 1.0},
+            }
+        else:
+            anchor, candidates = _candidate_symbols(
+                diagnostic,
+                observation_rows,
+                rows_by_symbol,
+                current_symbol,
+                int(configuration["candidate_rank_limit"]),
+            )
+            alternatives = _alternatives(
+                candidates,
+                rows_by_symbol,
+                current_symbol=current_symbol,
+                anchor_symbol=anchor,
+                configuration=configuration,
+            )
+            started = time.perf_counter()
+            selected, solver = solve_binary_one_hot(alternatives)
+            solve_ms_total += (time.perf_counter() - started) * 1000.0
+            solver_nodes += int(solver["nodes_explored"])
+            solver_pruned += int(solver["nodes_pruned"])
+            solver_decisions += 1
 
         target_symbol = str(selected["symbol"])
         decision_action = action(current_symbol, target_symbol)
-        sides = cost_sides(current_symbol, target_symbol)
-        selected_row = rows_by_symbol.get(target_symbol)
-        gross_return = 0.0 if target_symbol == "CASH" else (as_float((selected_row or {}).get("open_to_open_return"), 0.0) or 0.0)
-        economic = economics.get(decision_at.isoformat()) or {}
-        execution_at = economic.get("execution_date") or (selected_row or {}).get("execution_date") or diagnostic.get("timestamp")
-        next_execution_at = economic.get("next_execution_date") or (selected_row or {}).get("next_execution_date")
-        control_target = str(diagnostic.get("target_symbol") or "CASH").upper() or "CASH"
-        control_current = str(diagnostic.get("current_symbol") or "CASH").upper() or "CASH"
-        control_return = _control_target_return(control_target, rows_by_symbol)
-        control_sides = cost_sides(control_current, control_target)
-        selected_net = net_interval_return(gross_return, sides, base_cost_rate)
-        control_net = net_interval_return(control_return, control_sides, base_cost_rate) if control_return is not None else None
-        delta = selected_net - control_net if control_net is not None else None
+        selected_net, gross_return, sides = _selected_interval_return(
+            target_symbol,
+            rows_by_symbol,
+            economic,
+            current_symbol=current_symbol,
+            control_current=control_current,
+            control_target=control_target,
+            base_cost_rate=base_cost_rate,
+        )
+        control_net = as_float(economic.get("net_interval_return"))
+        if control_net is None and control_target == "CASH":
+            control_net = 0.0
+        execution_at = economic.get("execution_date") or diagnostic.get("timestamp")
+        next_execution_at = economic.get("next_execution_date")
+        delta = selected_net - control_net if selected_net is not None and control_net is not None else None
+
         if target_symbol != control_target:
             changed += 1
             if delta is None or abs(delta) <= 1e-12:
@@ -158,6 +204,10 @@ def build_decisions(
             else:
                 worse += 1
 
+        control_path_match = current_symbol == control_current and target_symbol == control_target
+        if not control_path_match:
+            path_matches_control = False
+
         decisions.append(bson_value({
             "fold_id": diagnostic.get("fold_id"),
             "decision_at": diagnostic.get("timestamp"),
@@ -166,15 +216,20 @@ def build_decisions(
             "current_symbol": current_symbol,
             "target_symbol": target_symbol,
             "action": decision_action,
-            "objective": selected["objective"],
+            "objective": selected.get("objective"),
             "objective_breakdown": selected.get("breakdown"),
             "gross_interval_return": gross_return,
+            "effective_net_interval_return": selected_net,
             "cost_sides": sides,
             "one_side_cost_rate": base_cost_rate,
+            "control_current_symbol": control_current,
             "control_target_symbol": control_target,
             "control_interval_return": control_net,
             "decision_value_added_vs_control": delta,
             "holding_days_before": holding_days,
+            "candidate_equity": candidate_equity,
+            "reference_equity": reference_equity,
+            "forced_control": must_follow_control,
             "alternatives": [
                 {
                     "symbol": item["symbol"],
@@ -186,6 +241,9 @@ def build_decisions(
             ],
             "solver": solver,
         }))
+
+        if selected_net is not None:
+            candidate_equity *= 1.0 + selected_net
         if target_symbol == current_symbol:
             holding_days += 1
         else:
@@ -197,7 +255,9 @@ def build_decisions(
     return decisions, {
         "nodes_explored": solver_nodes,
         "nodes_pruned": solver_pruned,
-        "average_solve_ms": solve_ms_total / max(1, len(decisions)),
+        "decisions_solved": solver_decisions,
+        "forced_control_decisions": forced_control_decisions,
+        "average_solve_ms": solve_ms_total / max(1, solver_decisions),
         "same_decision": len(decisions) - changed,
         "different_decision": changed,
         "milp_better": better,

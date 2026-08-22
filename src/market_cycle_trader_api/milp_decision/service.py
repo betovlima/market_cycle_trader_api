@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -9,6 +10,8 @@ from .config import COST_STRESS_BPS, DEFAULT_CONFIGURATION
 from .errors import MilpDecisionError
 from .inputs import artifact_rows, observation_rows
 from .metrics import fold_metrics, metrics, monthly_decision_map
+from .parity import compare as compare_control_parity
+from .parity import reference_analytics
 from .persistence import latest_raw, public_document, save
 from .replay import build_decisions
 from .utils import as_float
@@ -39,6 +42,36 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
     capital = multi.get("shadow_capital") if isinstance(multi.get("shadow_capital"), dict) else {}
     initial_capital = as_float(capital.get("initial_capital"), 10000.0) or 10000.0
     base_cost_rate = as_float(capital.get("one_side_cost_rate"), 0.0) or 0.0
+
+    source_analytics = reference_analytics(db, processing_id)
+    source_metrics = source_analytics.get("metrics") if isinstance(source_analytics.get("metrics"), dict) else {}
+    source_initial = as_float(source_metrics.get("initial_capital"))
+    if source_initial is not None:
+        initial_capital = source_initial
+
+    control_decisions, control_stats = build_decisions(
+        diagnostics=diagnostics,
+        observations=observations,
+        economics=economics,
+        configuration=configuration,
+        start_month=start_month,
+        end_month=end_month,
+        base_cost_rate=base_cost_rate,
+        should_stop=lambda: _stop_requested(db, run_id),
+        force_control=True,
+    )
+    control_metrics = metrics(control_decisions, initial_capital, base_cost_rate)
+    control_parity = compare_control_parity(source_analytics, control_metrics)
+    if str(control_parity.get("status") or "") != "passed":
+        raise MilpDecisionError(
+            "MILP Control replay failed exact parity before Decision Optimization. "
+            + json.dumps({
+                "checks": control_parity.get("checks") or {},
+                "reference": control_parity.get("reference") or {},
+                "replay": control_parity.get("replay") or {},
+            }, sort_keys=True)
+        )
+
     decisions, replay_stats = build_decisions(
         diagnostics=diagnostics,
         observations=observations,
@@ -69,7 +102,7 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
     document = bson_value({
         "id": optimization_id,
         "status": "completed",
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": str(run_id),
         "processing_id": str(processing_id),
         "period_start": str(start_month),
@@ -82,15 +115,27 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
             "decision_space": "one_binary_position_across_ranked_assets_and_cash",
             "objective_information": "decision_time_causal_features_only",
             "realized_returns_usage": "post_hoc_replay_folds_cost_stress_and_attribution_only",
+            "economic_replay": "exact_control_anchored_relative_overlay",
+            "control_parity_required": True,
             "stateful_candidate_consumed_as_input": False,
             "parallel_candidate_comparison": True,
             "configuration_origin": "fixed_non_tuned_research_baseline",
             "promotion_policy": "research_only_until_live_runtime_parity",
         },
+        "control_parity": control_parity,
+        "control_replay": {
+            "metrics": {key: value for key, value in control_metrics.items() if key != "equity"},
+            "solver": {
+                "decisions": len(control_decisions),
+                "forced_control_decisions": control_stats.get("forced_control_decisions"),
+            },
+        },
         "solver": {
             "model": "binary_one_hot_milp",
             "algorithm": "deterministic_branch_and_bound",
-            "decisions_solved": len(decisions),
+            "decisions_evaluated": len(decisions),
+            "decisions_solved": replay_stats["decisions_solved"],
+            "forced_control_decisions": replay_stats["forced_control_decisions"],
             "nodes_explored": replay_stats["nodes_explored"],
             "nodes_pruned": replay_stats["nodes_pruned"],
             "average_solve_ms": replay_stats["average_solve_ms"],
