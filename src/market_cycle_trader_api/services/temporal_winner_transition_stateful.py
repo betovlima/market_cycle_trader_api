@@ -603,6 +603,13 @@ def _path_metrics(
     volatility = float(np.std(daily, ddof=1)) if len(daily) > 1 else 0.0
     sharpe = float(np.mean(daily) / volatility * math.sqrt(252.0)) if volatility > 1e-12 else 0.0
     cash_days = sum(_asset_name(asset) == "CASH" for asset in selected_assets)
+    capital_rotations = sum(
+        1
+        for rotation in rotations
+        if _asset_name(rotation.get("from_asset")) != "CASH"
+        and _asset_name(rotation.get("to_asset")) != "CASH"
+        and _asset_name(rotation.get("from_asset")) != _asset_name(rotation.get("to_asset"))
+    )
     metrics = {
         "initial_capital": float(initial_capital),
         "ending_capital": ending_capital,
@@ -610,8 +617,8 @@ def _path_metrics(
         "cagr": float(cagr),
         "sharpe": float(sharpe),
         "maximum_drawdown": float(np.min(drawdowns)),
-        "capital_rotations": int(len(rotations)),
-        "average_holding_days": float(len(selected_assets) / max(1, len(rotations))),
+        "capital_rotations": int(capital_rotations),
+        "average_holding_days": float(len(selected_assets) / max(1, capital_rotations)),
         "market_exposure": float((len(selected_assets) - cash_days) / max(1, len(selected_assets))),
         "cash_days": int(cash_days),
         "interventions": int(interventions),
