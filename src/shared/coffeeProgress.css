@@ -1,0 +1,83 @@
+.coffee-progress {
+  --coffee-unit: 1.35px;
+  --coffee-color: color-mix(in srgb, var(--accent) 76%, #d9f2ff 24%);
+  position: relative;
+  display: inline-block;
+  width: calc(48 * var(--coffee-unit));
+  height: calc(40 * var(--coffee-unit));
+  flex: 0 0 auto;
+  border-radius: 15% 15% 35% 35%;
+  background: var(--coffee-color);
+  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--accent) 24%, transparent));
+}
+
+.coffee-progress::after {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+  left: calc(45 * var(--coffee-unit));
+  top: calc(8 * var(--coffee-unit));
+  width: calc(16 * var(--coffee-unit));
+  height: calc(20 * var(--coffee-unit));
+  border: calc(4 * var(--coffee-unit)) solid var(--coffee-color);
+  border-radius: 0 calc(4 * var(--coffee-unit)) calc(4 * var(--coffee-unit)) 0;
+}
+
+.coffee-progress::before {
+  content: "";
+  position: absolute;
+  top: calc(-16 * var(--coffee-unit));
+  left: calc(10 * var(--coffee-unit));
+  width: 1px;
+  height: calc(12 * var(--coffee-unit));
+  color: var(--coffee-color);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--accent) 30%, transparent));
+  animation: coffee-progress-steam 1s ease-in-out infinite;
+}
+
+.coffee-progress-counter {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: calc(2 * var(--coffee-unit));
+  color: rgba(4, 22, 34, .92);
+  font-size: calc(10 * var(--coffee-unit));
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.2px;
+  line-height: 1;
+  pointer-events: none;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, .2);
+}
+
+.coffee-progress-sm { --coffee-unit: .78px; }
+.coffee-progress-sm .coffee-progress-counter { font-size: calc(9.5 * var(--coffee-unit)); }
+.coffee-progress-lg { --coffee-unit: 1.55px; }
+
+@keyframes coffee-progress-steam {
+  0% {
+    box-shadow:
+      calc(2 * var(--coffee-unit)) 0 transparent,
+      calc(12 * var(--coffee-unit)) 0 color-mix(in srgb, var(--coffee-color) 48%, transparent),
+      calc(20 * var(--coffee-unit)) 0 transparent;
+  }
+  50% {
+    box-shadow:
+      calc(2 * var(--coffee-unit)) calc(-5 * var(--coffee-unit)) color-mix(in srgb, var(--coffee-color) 72%, transparent),
+      calc(12 * var(--coffee-unit)) calc(-3 * var(--coffee-unit)) color-mix(in srgb, var(--coffee-color) 72%, transparent),
+      calc(20 * var(--coffee-unit)) calc(-2 * var(--coffee-unit)) color-mix(in srgb, var(--coffee-color) 88%, transparent);
+  }
+  100% {
+    box-shadow:
+      calc(2 * var(--coffee-unit)) calc(-8 * var(--coffee-unit)) transparent,
+      calc(12 * var(--coffee-unit)) calc(-5 * var(--coffee-unit)) transparent,
+      calc(20 * var(--coffee-unit)) calc(-5 * var(--coffee-unit)) transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .coffee-progress::before { animation: none; }
+}

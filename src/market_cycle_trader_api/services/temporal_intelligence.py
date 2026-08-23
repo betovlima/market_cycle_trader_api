@@ -31,6 +31,8 @@ from ..infrastructure.persistence.mongo_repository import (
     TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION,
     TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION,
     TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION,
+    TEMPORAL_RISK_AWARE_ALTERNATIVE_ACTION_COLLECTION,
+    TEMPORAL_OPERATIONAL_POLICY_QUALIFICATION_COLLECTION,
     TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION,
     bson_value,
     utc_now,
@@ -63,7 +65,7 @@ _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_PIPELINE_WORKERS: set[str] = set()
 _ACTIVE_PIPELINE_LOCK = threading.Lock()
 
-STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "risk", "confidence", "stateful", "milp", "validation")
+STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation")
 STRATEGY_RESEARCH_PIPELINE_STAGE_STATES = frozenset({"waiting", "running", "completed", "paused", "stopped", "failed", "skipped"})
 STRATEGY_RESEARCH_PIPELINE_STATUSES = frozenset({"idle", "running", "pause_requested", "paused", "stop_requested", "stopped", "completed", "failed"})
 STRATEGY_RESEARCH_HISTORY_KEEP = 5
@@ -308,12 +310,24 @@ def _delete_strategy_research_run_data(db: Any, run_id: str, *, delete_run: bool
         "observations": int(db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
         "artifacts": int(db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
         "risk": int(db[TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "alternative_action": int(db[TEMPORAL_RISK_AWARE_ALTERNATIVE_ACTION_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
+        "operational_policy_qualification": int(db[TEMPORAL_OPERATIONAL_POLICY_QUALIFICATION_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
         "intervention": int(db[TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
         "confidence": int(db[TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
         "decision_policy": int(db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
     }
     from ..milp_decision.persistence import delete_run_results
+    from ..leadership_regime.service import delete_run_results as delete_leadership_results
     deleted["decision_optimization"] = delete_run_results(db, run_key)
+    deleted["leadership_regime"] = delete_leadership_results(db, run_key)
+    from ..opportunity_drought.service import delete_run_results as delete_opportunity_drought_results
+    deleted["opportunity_drought"] = delete_opportunity_drought_results(db, run_key)
+    from ..fragile_incumbent.service import delete_run_results as delete_fragile_incumbent_results
+    deleted["fragile_incumbent"] = delete_fragile_incumbent_results(db, run_key)
+    from ..regime_clustering.service import delete_run_results as delete_regime_clustering_results
+    deleted["clustering"] = delete_regime_clustering_results(db, run_key)
+    from ..emerging_trend.service import delete_run_results as delete_emerging_trend_results
+    deleted["emerging_trend"] = delete_emerging_trend_results(db, run_key)
     deleted["runs"] = int(db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].delete_many({"id": run_key}).deleted_count or 0) if delete_run else 0
     return deleted
 
@@ -1043,6 +1057,8 @@ def build_temporal_intelligence_export(
         return bson_value(row) if row is not None else None
 
     pipeline_risk = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION)
+    pipeline_alternative_action = latest_pipeline_document(TEMPORAL_RISK_AWARE_ALTERNATIVE_ACTION_COLLECTION)
+    pipeline_operational_qualification = latest_pipeline_document(TEMPORAL_OPERATIONAL_POLICY_QUALIFICATION_COLLECTION)
     pipeline_intervention = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION)
     pipeline_confidence = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION)
     pipeline_stateful = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION)
@@ -1057,6 +1073,185 @@ def build_temporal_intelligence_export(
         if isinstance(document.get("strategy_research_final_validation"), dict)
         else None
     )
+    pipeline_leadership = None
+    pipeline_opportunity_drought = None
+    pipeline_clustering = None
+    pipeline_fragile_incumbent = None
+    pipeline_emerging_trend = None
+    if processing_id and pipeline_period_start and pipeline_period_end:
+        from ..leadership_regime.service import get_persisted as get_leadership_regime
+        pipeline_leadership = get_leadership_regime(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+        from ..opportunity_drought.service import get_persisted as get_opportunity_drought
+        pipeline_opportunity_drought = get_opportunity_drought(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+        from ..regime_clustering.service import get_persisted as get_regime_clustering
+        pipeline_clustering = get_regime_clustering(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+        from ..fragile_incumbent.service import get_persisted as get_fragile_incumbent
+        pipeline_fragile_incumbent = get_fragile_incumbent(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+        from ..emerging_trend.service import get_persisted as get_emerging_trend
+        pipeline_emerging_trend = get_emerging_trend(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+    leadership_session_rows: list[dict[str, Any]] = []
+    leadership_monthly_rows: list[dict[str, Any]] = []
+    if pipeline_leadership is not None:
+        for item in pipeline_leadership.get("sessions") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "signals", "thresholds"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            row.update({f"signal_{key}": value for key, value in (item.get("signals") or {}).items()})
+            row.update({f"threshold_{key}": value for key, value in (item.get("thresholds") or {}).items()})
+            leadership_session_rows.append(bson_value(row))
+        for item in pipeline_leadership.get("monthly") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"state_counts", "state_shares"}}
+            row.update({f"state_count_{key}": value for key, value in (item.get("state_counts") or {}).items()})
+            row.update({f"state_share_{key}": value for key, value in (item.get("state_shares") or {}).items()})
+            leadership_monthly_rows.append(bson_value(row))
+    opportunity_drought_monthly_rows: list[dict[str, Any]] = []
+    opportunity_drought_fold_rows: list[dict[str, Any]] = []
+    opportunity_drought_feature_rows: list[dict[str, Any]] = []
+    opportunity_drought_oos_rows: list[dict[str, Any]] = []
+    if pipeline_opportunity_drought is not None:
+        for item in pipeline_opportunity_drought.get("monthly") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "top_drivers"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            for index, driver in enumerate((item.get("top_drivers") or [])[:5], start=1):
+                if isinstance(driver, dict):
+                    row[f"driver_{index}_feature"] = driver.get("feature")
+                    row[f"driver_{index}_contribution"] = driver.get("contribution")
+            opportunity_drought_monthly_rows.append(bson_value(row))
+        for item in pipeline_opportunity_drought.get("folds") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics"}}
+            row.update({f"session_{key}": value for key, value in (item.get("session_metrics") or {}).items()})
+            row.update({f"monthly_{key}": value for key, value in (item.get("monthly_metrics") or {}).items()})
+            opportunity_drought_fold_rows.append(bson_value(row))
+        opportunity_drought_feature_rows = [
+            bson_value(dict(item)) for item in (pipeline_opportunity_drought.get("feature_importance") or []) if isinstance(item, dict)
+        ]
+        for item in pipeline_opportunity_drought.get("oos_sessions") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "contributions"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            row.update({f"contribution_{key}": value for key, value in (item.get("contributions") or {}).items()})
+            opportunity_drought_oos_rows.append(bson_value(row))
+
+    clustering_monthly_rows: list[dict[str, Any]] = []
+    clustering_cluster_rows: list[dict[str, Any]] = []
+    clustering_feature_rows: list[dict[str, Any]] = []
+    if pipeline_clustering is not None:
+        for item in pipeline_clustering.get("monthly") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "feature_zscores", "similar_months"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            row.update({f"zscore_{key}": value for key, value in (item.get("feature_zscores") or {}).items()})
+            for index, similar in enumerate((item.get("similar_months") or [])[:5], start=1):
+                if isinstance(similar, dict):
+                    row[f"similar_{index}_month"] = similar.get("month")
+                    row[f"similar_{index}_distance"] = similar.get("distance")
+                    row[f"similar_{index}_return"] = similar.get("official_return")
+            clustering_monthly_rows.append(bson_value(row))
+        for item in pipeline_clustering.get("clusters") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "feature_zscores", "months_list"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            row.update({f"zscore_{key}": value for key, value in (item.get("feature_zscores") or {}).items()})
+            row["months_list"] = ", ".join(str(v) for v in (item.get("months_list") or []))
+            clustering_cluster_rows.append(bson_value(row))
+        clustering_feature_rows = [bson_value(dict(item)) for item in (pipeline_clustering.get("feature_importance") or []) if isinstance(item, dict)]
+
+    emerging_trend_monthly_rows: list[dict[str, Any]] = []
+    emerging_trend_fold_rows: list[dict[str, Any]] = []
+    emerging_trend_feature_rows: list[dict[str, Any]] = []
+    emerging_trend_session_rows: list[dict[str, Any]] = []
+    if pipeline_emerging_trend is not None:
+        for item in pipeline_emerging_trend.get("monthly") or []:
+            if isinstance(item, dict):
+                emerging_trend_monthly_rows.append(bson_value(dict(item)))
+        for item in pipeline_emerging_trend.get("folds") or []:
+            if isinstance(item, dict):
+                emerging_trend_fold_rows.append(bson_value(dict(item)))
+        emerging_trend_feature_rows = [bson_value(dict(item)) for item in (pipeline_emerging_trend.get("feature_importance") or []) if isinstance(item, dict)]
+        for item in pipeline_emerging_trend.get("sessions") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "top_drivers"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            for index, driver in enumerate((item.get("top_drivers") or [])[:6], start=1):
+                if isinstance(driver, dict):
+                    row[f"driver_{index}_feature"] = driver.get("feature")
+                    row[f"driver_{index}_contribution"] = driver.get("contribution")
+            emerging_trend_session_rows.append(bson_value(row))
+
+    fragile_incumbent_monthly_rows: list[dict[str, Any]] = []
+    fragile_incumbent_fold_rows: list[dict[str, Any]] = []
+    fragile_incumbent_feature_rows: list[dict[str, Any]] = []
+    fragile_incumbent_oos_rows: list[dict[str, Any]] = []
+    if pipeline_fragile_incumbent is not None:
+        for item in pipeline_fragile_incumbent.get("monthly") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "top_drivers"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            for index, driver in enumerate((item.get("top_drivers") or [])[:6], start=1):
+                if isinstance(driver, dict):
+                    row[f"driver_{index}_feature"] = driver.get("feature")
+                    row[f"driver_{index}_contribution"] = driver.get("contribution")
+            fragile_incumbent_monthly_rows.append(bson_value(row))
+        for item in pipeline_fragile_incumbent.get("folds") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics"}}
+            row.update({f"session_{key}": value for key, value in (item.get("session_metrics") or {}).items()})
+            row.update({f"monthly_{key}": value for key, value in (item.get("monthly_metrics") or {}).items()})
+            fragile_incumbent_fold_rows.append(bson_value(row))
+        fragile_incumbent_feature_rows = [
+            bson_value(dict(item)) for item in (pipeline_fragile_incumbent.get("feature_importance") or []) if isinstance(item, dict)
+        ]
+        for item in pipeline_fragile_incumbent.get("oos_sessions") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"features", "contributions"}}
+            row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
+            row.update({f"contribution_{key}": value for key, value in (item.get("contributions") or {}).items()})
+            fragile_incumbent_oos_rows.append(bson_value(row))
+
+    alternative_action_rows: list[dict[str, Any]] = []
+    alternative_action_yearly_rows: list[dict[str, Any]] = []
+    if pipeline_alternative_action is not None:
+        alternative_action_rows = [bson_value(dict(item)) for item in (pipeline_alternative_action.get("alerts") or []) if isinstance(item, dict)]
+        for item in pipeline_alternative_action.get("yearly_oos") or []:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if key not in {"best_action_counts", "average_returns"}}
+            row.update({f"best_{key.lower()}": value for key, value in (item.get("best_action_counts") or {}).items()})
+            row.update({f"avg_{key.lower()}_return": value for key, value in (item.get("average_returns") or {}).items()})
+            alternative_action_yearly_rows.append(bson_value(row))
+
+    operational_qualification_prediction_rows: list[dict[str, Any]] = []
+    operational_qualification_yearly_rows: list[dict[str, Any]] = []
+    operational_qualification_gate_rows: list[dict[str, Any]] = []
+    if pipeline_operational_qualification is not None:
+        operational_qualification_prediction_rows = [bson_value(dict(item)) for item in (pipeline_operational_qualification.get("predictions") or []) if isinstance(item, dict)]
+        operational_qualification_yearly_rows = [bson_value(dict(item)) for item in (pipeline_operational_qualification.get("yearly_oos") or []) if isinstance(item, dict)]
+        operational_qualification_gate_rows = [bson_value(dict(item)) for item in (pipeline_operational_qualification.get("gates") or []) if isinstance(item, dict)]
+
     pipeline_state_export = _strategy_research_pipeline_state(document)
     pipeline_reference_analytics = None
     if processing_id:
@@ -1080,7 +1275,7 @@ def build_temporal_intelligence_export(
             pipeline_attribution = {"status": "unavailable", "failure_message": str(exc)}
 
     pipeline_manifest = bson_value({
-        "schema_version": 2,
+        "schema_version": 6,
         "run_id": str(run_id),
         "pipeline_status": pipeline_state_export.get("status"),
         "stage_states": pipeline_state_export.get("stage_states"),
@@ -1094,10 +1289,23 @@ def build_temporal_intelligence_export(
         "strategy_kind": document.get("strategy_kind"),
         "temporal_strategy_variant": document.get("temporal_strategy_variant"),
         "risk_status": (pipeline_risk or {}).get("status"),
+        "alternative_action_status": (pipeline_alternative_action or {}).get("status"),
+        "alternative_action_readiness": ((pipeline_alternative_action or {}).get("readiness") or {}).get("status"),
+        "operational_policy_qualification_status": (pipeline_operational_qualification or {}).get("status"),
+        "operational_policy_decision": ((pipeline_operational_qualification or {}).get("decision") or {}).get("status"),
         "risk_failure_message": (pipeline_risk or {}).get("failure_message"),
         "intervention_status": (pipeline_intervention or {}).get("status"),
         "confidence_status": (pipeline_confidence or {}).get("status"),
         "stateful_status": (pipeline_stateful or {}).get("status"),
+        "leadership_regime_status": (pipeline_leadership or {}).get("status"),
+        "clustering_status": (pipeline_clustering or {}).get("status"),
+        "clustering_readiness": ((pipeline_clustering or {}).get("readiness") or {}).get("status"),
+        "opportunity_drought_status": (pipeline_opportunity_drought or {}).get("status"),
+        "opportunity_drought_readiness": ((pipeline_opportunity_drought or {}).get("readiness") or {}).get("status"),
+        "fragile_incumbent_status": (pipeline_fragile_incumbent or {}).get("status"),
+        "fragile_incumbent_readiness": ((pipeline_fragile_incumbent or {}).get("readiness") or {}).get("status"),
+        "emerging_trend_status": (pipeline_emerging_trend or {}).get("status"),
+        "emerging_trend_readiness": ((pipeline_emerging_trend or {}).get("readiness") or {}).get("status"),
         "milp_decision_status": (pipeline_milp or {}).get("status"),
         "validation_status": (pipeline_validation or {}).get("status") or pipeline_state_export.get("stage_states", {}).get("validation"),
     })
@@ -1135,12 +1343,48 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_transition_attribution.json", json.dumps(bson_value(pipeline_attribution), indent=2, ensure_ascii=False, default=str))
         if pipeline_risk is not None:
             archive.writestr("strategy_research_risk.json", json.dumps(pipeline_risk, indent=2, ensure_ascii=False, default=str))
+        if pipeline_alternative_action is not None:
+            archive.writestr("strategy_research_alternative_action.json", json.dumps(pipeline_alternative_action, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_alternative_action_alerts.csv", _csv_text(alternative_action_rows))
+            archive.writestr("strategy_research_alternative_action_yearly.csv", _csv_text(alternative_action_yearly_rows))
+        if pipeline_operational_qualification is not None:
+            archive.writestr("strategy_research_operational_policy_qualification.json", json.dumps(pipeline_operational_qualification, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_operational_policy_predictions.csv", _csv_text(operational_qualification_prediction_rows))
+            archive.writestr("strategy_research_operational_policy_yearly.csv", _csv_text(operational_qualification_yearly_rows))
+            archive.writestr("strategy_research_operational_policy_gates.csv", _csv_text(operational_qualification_gate_rows))
         if pipeline_intervention is not None:
             archive.writestr("strategy_research_intervention.json", json.dumps(pipeline_intervention, indent=2, ensure_ascii=False, default=str))
         if pipeline_confidence is not None:
             archive.writestr("strategy_research_confidence.json", json.dumps(pipeline_confidence, indent=2, ensure_ascii=False, default=str))
         if pipeline_stateful is not None:
             archive.writestr("strategy_research_stateful.json", json.dumps(pipeline_stateful, indent=2, ensure_ascii=False, default=str))
+        if pipeline_leadership is not None:
+            archive.writestr("strategy_research_leadership_regime.json", json.dumps(pipeline_leadership, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_leadership_regime_sessions.csv", _csv_text(leadership_session_rows))
+            archive.writestr("strategy_research_leadership_regime_monthly.csv", _csv_text(leadership_monthly_rows))
+        if pipeline_clustering is not None:
+            archive.writestr("strategy_research_regime_clustering.json", json.dumps(pipeline_clustering, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_regime_clustering_monthly.csv", _csv_text(clustering_monthly_rows))
+            archive.writestr("strategy_research_regime_clustering_clusters.csv", _csv_text(clustering_cluster_rows))
+            archive.writestr("strategy_research_regime_clustering_feature_importance.csv", _csv_text(clustering_feature_rows))
+        if pipeline_opportunity_drought is not None:
+            archive.writestr("strategy_research_opportunity_drought.json", json.dumps(pipeline_opportunity_drought, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_opportunity_drought_monthly.csv", _csv_text(opportunity_drought_monthly_rows))
+            archive.writestr("strategy_research_opportunity_drought_folds.csv", _csv_text(opportunity_drought_fold_rows))
+            archive.writestr("strategy_research_opportunity_drought_feature_importance.csv", _csv_text(opportunity_drought_feature_rows))
+            archive.writestr("strategy_research_opportunity_drought_oos_sessions.csv", _csv_text(opportunity_drought_oos_rows))
+        if pipeline_fragile_incumbent is not None:
+            archive.writestr("strategy_research_fragile_incumbent.json", json.dumps(pipeline_fragile_incumbent, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_fragile_incumbent_monthly.csv", _csv_text(fragile_incumbent_monthly_rows))
+            archive.writestr("strategy_research_fragile_incumbent_folds.csv", _csv_text(fragile_incumbent_fold_rows))
+            archive.writestr("strategy_research_fragile_incumbent_feature_importance.csv", _csv_text(fragile_incumbent_feature_rows))
+            archive.writestr("strategy_research_fragile_incumbent_oos_sessions.csv", _csv_text(fragile_incumbent_oos_rows))
+        if pipeline_emerging_trend is not None:
+            archive.writestr("strategy_research_emerging_trend.json", json.dumps(pipeline_emerging_trend, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_emerging_trend_monthly.csv", _csv_text(emerging_trend_monthly_rows))
+            archive.writestr("strategy_research_emerging_trend_folds.csv", _csv_text(emerging_trend_fold_rows))
+            archive.writestr("strategy_research_emerging_trend_feature_importance.csv", _csv_text(emerging_trend_feature_rows))
+            archive.writestr("strategy_research_emerging_trend_sessions.csv", _csv_text(emerging_trend_session_rows))
         if pipeline_milp is not None:
             archive.writestr("strategy_research_milp_decision.json", json.dumps(pipeline_milp, indent=2, ensure_ascii=False, default=str))
         if pipeline_validation is not None:
@@ -1160,6 +1404,13 @@ def _strategy_research_pipeline_state(document: dict[str, Any] | None) -> dict[s
     status_value = str(stored.get("status") or "idle")
     if status_value not in STRATEGY_RESEARCH_PIPELINE_STATUSES:
         status_value = "idle"
+    stored_stage_states = dict(stored.get("stage_states") or {})
+    if status_value == "completed" and "clustering" not in stored_stage_states:
+        stage_states["clustering"] = "skipped"
+    if status_value == "completed" and "fragile_incumbent" not in stored_stage_states:
+        stage_states["fragile_incumbent"] = "skipped"
+    if status_value == "completed" and "emerging_trend" not in stored_stage_states:
+        stage_states["emerging_trend"] = "skipped"
     return {
         "status": status_value,
         "current_stage": stored.get("current_stage") if stored.get("current_stage") in STRATEGY_RESEARCH_PIPELINE_STAGES else None,
@@ -1222,6 +1473,7 @@ def _persist_strategy_research_final_validation(
     from .analytics import processing_analytics
     from .temporal_winner_transition_stateful import get_latest_winner_transition_stateful_replay
     from ..milp_decision.persistence import latest_raw as latest_milp_decision
+    from ..operational_policy_qualification.service import get_persisted as get_operational_policy_qualification, public_summary as operational_policy_public_summary
 
     control_analytics = processing_analytics(db, processing_id)
     stateful = get_latest_winner_transition_stateful_replay(
@@ -1241,6 +1493,19 @@ def _persist_strategy_research_final_validation(
     candidate_a = stateful.get("candidate_a") if isinstance(stateful.get("candidate_a"), dict) else {}
     candidate_a_analytics = candidate_a.get("analytics") if isinstance(candidate_a.get("analytics"), dict) else {}
     milp_analytics = milp.get("analytics") if isinstance(milp.get("analytics"), dict) else {}
+    from ..leadership_regime.service import get_persisted as get_leadership_regime, public_summary as leadership_public_summary
+    leadership = leadership_public_summary(
+        get_leadership_regime(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+    )
+    operational_qualification = operational_policy_public_summary(
+        get_operational_policy_qualification(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+    )
+    if operational_qualification is None:
+        raise TemporalIntelligenceConflict("Final Validation requires Operational Policy Qualification.")
     now = utc_now()
     validation = bson_value({
         "schema_version": 1,
@@ -1264,6 +1529,17 @@ def _persist_strategy_research_final_validation(
             "control_parity_status": parity.get("status"),
             "metrics": _compact_validation_metrics(milp_analytics),
             "attribution": bson_value(milp.get("attribution") or {}),
+        },
+        "leadership_regime": {
+            "status": (leadership or {}).get("status"),
+            "summary": bson_value((leadership or {}).get("summary") or {}),
+        },
+        "operational_policy_qualification": {
+            "id": (operational_qualification or {}).get("id"),
+            "status": (operational_qualification or {}).get("status"),
+            "decision": bson_value((operational_qualification or {}).get("decision") or {}),
+            "summary": bson_value((operational_qualification or {}).get("summary") or {}),
+            "gates": bson_value((operational_qualification or {}).get("gates") or []),
         },
         "created_at": now,
         "updated_at": now,
@@ -1330,6 +1606,96 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
         from ..milp_decision.persistence import latest_raw as latest_milp_decision
         from ..milp_decision.service import run as run_milp_decision
 
+        current_stage = "clustering"
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_start(db, run_id, current_stage)
+        try:
+            from ..leadership_regime.service import build_and_persist as build_leadership_regime, unavailable as leadership_regime_unavailable
+            leadership = build_leadership_regime(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+        except Exception as leadership_exc:
+            leadership = None
+            try:
+                leadership_regime_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(leadership_exc)
+                )
+            except Exception:
+                pass
+        try:
+            from ..regime_clustering.service import build_and_persist as build_regime_clustering, unavailable as regime_clustering_unavailable
+            if leadership and str(leadership.get("status") or "").lower() == "completed":
+                build_regime_clustering(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+                )
+            else:
+                regime_clustering_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month,
+                    message="Leadership Regime diagnostics are unavailable for Regime Clustering.",
+                )
+        except Exception as clustering_exc:
+            try:
+                regime_clustering_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(clustering_exc)
+                )
+            except Exception:
+                pass
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "fragile_incumbent"
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_start(db, run_id, current_stage)
+        try:
+            from ..fragile_incumbent.service import build_and_persist as build_fragile_incumbent, unavailable as fragile_incumbent_unavailable
+            if leadership and str(leadership.get("status") or "").lower() == "completed":
+                build_fragile_incumbent(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+                )
+            else:
+                fragile_incumbent_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month,
+                    message="Leadership Regime diagnostics are unavailable for Fragile Incumbent Research.",
+                )
+        except Exception as fragile_exc:
+            try:
+                fragile_incumbent_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(fragile_exc)
+                )
+            except Exception:
+                pass
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "emerging_trend"
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_start(db, run_id, current_stage)
+        try:
+            from ..emerging_trend.service import build_and_persist as build_emerging_trend, unavailable as emerging_trend_unavailable
+            emerging_result = build_emerging_trend(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+            if str((emerging_result or {}).get("status") or "").lower() != "completed":
+                raise TemporalIntelligenceConflict(
+                    str((emerging_result or {}).get("failure_message") or "Emerging Trend Research did not produce a completed result.")
+                )
+        except Exception as emerging_exc:
+            try:
+                emerging_trend_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(emerging_exc)
+                )
+            except Exception:
+                pass
+            raise TemporalIntelligenceConflict(f"Emerging Trend Research failed: {emerging_exc}") from emerging_exc
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
         current_stage = "risk"
         if _pipeline_stop_requested(db, run_id):
             return
@@ -1349,6 +1715,16 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
         if intervention is None:
             run_winner_transition_intervention_search(
                 db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, seed=42
+            )
+        if _pipeline_stop_requested(db, run_id):
+            return
+        from ..alternative_action.service import build_and_persist as build_alternative_action
+        alternative_action = build_alternative_action(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if str((alternative_action or {}).get("status") or "").lower() != "completed":
+            raise TemporalIntelligenceConflict(
+                str((alternative_action or {}).get("failure_message") or "Risk-Aware Alternative Action did not produce a completed result.")
             )
         if _pipeline_stop_requested(db, run_id):
             return
@@ -1378,6 +1754,18 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
             )
         if _pipeline_stop_requested(db, run_id):
             return
+        try:
+            from ..leadership_regime.service import build_and_persist as build_leadership_regime, unavailable as leadership_regime_unavailable
+            build_leadership_regime(
+                db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+            )
+        except Exception as leadership_exc:
+            try:
+                leadership_regime_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(leadership_exc)
+                )
+            except Exception:
+                pass
         _pipeline_stage_complete(db, run_id, current_stage)
 
         current_stage = "milp"
@@ -1401,6 +1789,12 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
 
         current_stage = "validation"
         _pipeline_stage_start(db, run_id, current_stage)
+        from ..operational_policy_qualification.service import build_and_persist as build_operational_policy_qualification
+        operational_qualification = build_operational_policy_qualification(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if str((operational_qualification or {}).get("status") or "").lower() != "completed":
+            raise TemporalIntelligenceConflict("Operational Policy Qualification did not produce a completed result.")
         _persist_strategy_research_final_validation(
             db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
         )
@@ -1551,19 +1945,76 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
             db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
         )
     validation = document.get("strategy_research_final_validation") if isinstance(document.get("strategy_research_final_validation"), dict) else None
+    leadership = None
+    clustering = None
+    opportunity_drought = None
+    fragile_incumbent = None
+    emerging_trend = None
+    alternative_action = None
+    operational_policy_qualification = None
+    if processing_id and period_start and period_end:
+        from ..leadership_regime.service import get_persisted as get_leadership_regime, public_summary as leadership_public_summary
+        leadership = leadership_public_summary(
+            get_leadership_regime(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
+        from ..regime_clustering.service import get_persisted as get_regime_clustering, public_summary as clustering_public_summary
+        clustering = clustering_public_summary(
+            get_regime_clustering(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
+        from ..opportunity_drought.service import get_persisted as get_opportunity_drought, public_summary as opportunity_drought_public_summary
+        opportunity_drought = opportunity_drought_public_summary(
+            get_opportunity_drought(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
+        from ..fragile_incumbent.service import get_persisted as get_fragile_incumbent, public_summary as fragile_incumbent_public_summary
+        fragile_incumbent = fragile_incumbent_public_summary(
+            get_fragile_incumbent(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
+        from ..emerging_trend.service import get_persisted as get_emerging_trend, public_summary as emerging_trend_public_summary
+        emerging_trend = emerging_trend_public_summary(
+            get_emerging_trend(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
+        from ..alternative_action.service import get_persisted as get_alternative_action, public_summary as alternative_action_public_summary
+        alternative_action = alternative_action_public_summary(
+            get_alternative_action(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
+        from ..operational_policy_qualification.service import get_persisted as get_operational_policy_qualification, public_summary as operational_policy_public_summary
+        operational_policy_qualification = operational_policy_public_summary(
+            get_operational_policy_qualification(
+                db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end
+            )
+        )
 
     return bson_value({
-        "schema_version": 2,
+        "schema_version": 6,
         "run_id": str(run_id),
         "processing_id": processing_id or None,
         "period_start": period_start or None,
         "period_end": period_end or None,
         "pipeline": pipeline,
         "risk": latest(TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION),
+        "alternative_action": alternative_action,
+        "operational_policy_qualification": operational_policy_qualification,
         "intervention": latest(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION),
         "confidence": latest(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION),
         "stateful": latest(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION, ("completed", "blocked")),
         "milp": pipeline_milp,
+        "leadership_regime": leadership,
+        "clustering": clustering,
+        "opportunity_drought": opportunity_drought,
+        "fragile_incumbent": fragile_incumbent,
+        "emerging_trend": emerging_trend,
         "validation": bson_value(validation) if validation is not None else None,
     })
 
@@ -1696,7 +2147,7 @@ def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, A
         if stage_states.get("reference") == "waiting":
             stage_states["reference"] = "completed"
         stage_states["temporal"] = "running"
-        for stage in ("risk", "confidence", "stateful", "milp", "validation"):
+        for stage in ("clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation"):
             stage_states[stage] = "waiting"
         repaired = _persist_strategy_research_pipeline_state(
             db,
@@ -1756,7 +2207,24 @@ def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
             {"id": str(run_id)},
             {"$unset": {"strategy_research_pipeline": "", "strategy_research_final_validation": ""}, "$set": {"updated_at": utc_now()}},
         )
-        deleted = {"observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0, "decision_policy": 0, "runs": 0}
+        from ..leadership_regime.service import delete_run_results as delete_leadership_results
+        from ..opportunity_drought.service import delete_run_results as delete_opportunity_drought_results
+        from ..fragile_incumbent.service import delete_run_results as delete_fragile_incumbent_results
+        from ..regime_clustering.service import delete_run_results as delete_regime_clustering_results
+        from ..emerging_trend.service import delete_run_results as delete_emerging_trend_results
+        from ..alternative_action.service import delete_run_results as delete_alternative_action_results
+        from ..operational_policy_qualification.service import delete_run_results as delete_operational_policy_qualification_results
+        deleted = {
+            "observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0,
+            "decision_policy": 0, "decision_optimization": 0,
+            "leadership_regime": delete_leadership_results(db, run_id),
+            "opportunity_drought": delete_opportunity_drought_results(db, run_id),
+            "clustering": delete_regime_clustering_results(db, run_id),
+            "emerging_trend": delete_emerging_trend_results(db, run_id),
+            "alternative_action": delete_alternative_action_results(db, run_id),
+            "operational_policy_qualification": delete_operational_policy_qualification_results(db, run_id),
+            "fragile_incumbent": delete_fragile_incumbent_results(db, run_id), "runs": 0,
+        }
     else:
         deleted = _delete_strategy_research_run_data(db, run_id, delete_run=True)
 

@@ -1,0 +1,26 @@
+{
+  "name": "market_cycle_trader",
+  "private": true,
+  "version": "6.4.3",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "serve -s dist -l $PORT"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "recharts": "3.10.1",
+    "serve": "14.2.6"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.0.4",
+    "vite": "^8.1.0"
+  },
+  "engines": {
+    "node": ">=22.12.0 <25"
+  },
+  "packageManager": "pnpm@10.15.1"
+}

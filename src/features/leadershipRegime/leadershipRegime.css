@@ -1,0 +1,57 @@
+.leadership-regime-panel { margin-top: 18px; border-top: 1px solid #22384e; padding-top: 18px; }
+.leadership-regime-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:16px; }
+.leadership-regime-heading h4 { margin:4px 0 5px; font-size:18px; }
+.leadership-regime-heading p { margin:0; color:#9bb7d2; max-width:920px; line-height:1.45; }
+.leadership-regime-causal-badge { border:1px solid #2d5978; border-radius:999px; padding:7px 11px; color:#a9d8f6; font-weight:800; white-space:nowrap; }
+.leadership-regime-state-cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:20px; }
+.leadership-regime-state-card { background:#111f32; border:1px solid #263b52; border-radius:13px; padding:13px; min-width:0; }
+.leadership-regime-state-card > div:first-child { display:flex; align-items:center; gap:9px; margin-bottom:10px; }
+.leadership-regime-state-code { display:grid; place-items:center; width:30px; height:30px; border-radius:8px; font-weight:900; background:#193149; }
+.leadership-regime-state-card dl, .leadership-regime-cohort dl { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; margin:0; }
+.leadership-regime-state-card dl div, .leadership-regime-cohort dl div { min-width:0; }
+.leadership-regime-state-card dt, .leadership-regime-cohort dt { color:#83a2bf; font-size:12px; }
+.leadership-regime-state-card dd, .leadership-regime-cohort dd { margin:2px 0 0; font-weight:850; }
+.leadership-regime-state-card small { display:block; margin-top:10px; color:#738da7; line-height:1.35; }
+.leadership-regime-state-card.healthy_leader { border-color:#245e54; }
+.leadership-regime-state-card.weak_relative_leader { border-color:#6e5b2d; }
+.leadership-regime-state-card.whipsaw_leadership { border-color:#7a3d49; }
+.leadership-regime-state-card.no_good_opportunity { border-color:#3b526b; }
+.leadership-regime-map-heading { display:flex; justify-content:space-between; align-items:end; gap:12px; margin:10px 0; }
+.leadership-regime-map-heading span { color:#8ca9c4; font-size:13px; }
+.leadership-regime-calendar { width:100%; padding-bottom:4px; }
+.leadership-regime-month-head, .leadership-regime-row { display:grid; grid-template-columns:52px repeat(12,minmax(0,1fr)); gap:6px; align-items:center; margin-bottom:7px; }
+.leadership-regime-month-head strong { text-align:center; color:#b9d0e6; font-size:12px; }
+.leadership-regime-row > strong { color:#b9d0e6; }
+.leadership-regime-cell { min-height:48px; border:1px solid #263b52; border-radius:11px; background:#111f32; display:flex; align-items:center; justify-content:center; gap:6px; cursor:pointer; color:#f1f6fb; }
+.leadership-regime-cell span { font-size:17px; font-weight:950; }
+.leadership-regime-cell small { font-size:11px; font-weight:800; opacity:.82; }
+.leadership-regime-cell.healthy_leader { background:rgba(37,118,94,.20); border-color:#286957; }
+.leadership-regime-cell.weak_relative_leader { background:rgba(153,119,36,.18); border-color:#705d2f; }
+.leadership-regime-cell.whipsaw_leadership { background:rgba(166,65,80,.18); border-color:#79404a; }
+.leadership-regime-cell.no_good_opportunity { background:rgba(52,83,112,.24); border-color:#405d76; }
+.leadership-regime-cell.missing { opacity:.45; cursor:default; }
+.leadership-regime-legend { display:flex; flex-wrap:wrap; gap:14px; margin:10px 0 18px; color:#9db7d0; font-size:12px; }
+.leadership-regime-legend span { display:flex; align-items:center; gap:6px; }
+.leadership-regime-legend i { width:10px; height:10px; border-radius:3px; background:#345; }
+.leadership-regime-legend i.healthy_leader { background:#2c8a70; }
+.leadership-regime-legend i.weak_relative_leader { background:#ad8935; }
+.leadership-regime-legend i.whipsaw_leadership { background:#b84e61; }
+.leadership-regime-legend i.no_good_opportunity { background:#4e7190; }
+.leadership-regime-cohorts { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.leadership-regime-cohort { background:#111f32; border:1px solid #263b52; border-radius:13px; padding:14px; }
+.leadership-regime-cohort > div:first-child { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:11px; }
+.leadership-regime-cohort > div:first-child span { font-weight:800; }
+.leadership-regime-cohort > div:first-child strong { font-size:22px; }
+.leadership-regime-cohort.positive { border-color:#245e54; }
+.leadership-regime-cohort.negative { border-color:#7a3d49; }
+.leadership-regime-dialog-state-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:14px 0; }
+.leadership-regime-state-share { border:1px solid #2b4055; border-radius:10px; padding:10px; display:flex; flex-direction:column; gap:4px; }
+.leadership-regime-state-share span { color:#8faac4; font-size:12px; }
+.leadership-regime-state-share strong { font-size:17px; }
+.leadership-regime-metric { min-width:0; }
+.leadership-regime-metric span { color:#8faac4; }
+.leadership-regime-metric strong { display:block; margin-top:2px; }
+.leadership-regime-empty { min-height:90px; display:grid; place-items:center; color:#88a5bf; border:1px dashed #2d455d; border-radius:12px; }
+@media (max-width: 1100px) { .leadership-regime-state-cards { grid-template-columns:1fr 1fr; } }
+@media (max-width: 900px) { .leadership-regime-cell small { display:none; } .leadership-regime-cell span { font-size:13px; } .leadership-regime-month-head, .leadership-regime-row { grid-template-columns:38px repeat(12,minmax(0,1fr)); gap:3px; } .leadership-regime-cell { min-height:38px; padding:2px; } }
+@media (max-width: 720px) { .leadership-regime-state-cards, .leadership-regime-cohorts, .leadership-regime-dialog-state-grid { grid-template-columns:1fr; } .leadership-regime-heading, .leadership-regime-map-heading { align-items:flex-start; flex-direction:column; } }
