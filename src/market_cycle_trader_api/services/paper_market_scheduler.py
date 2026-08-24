@@ -338,7 +338,7 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
     market_open = bool(clock.get("is_open"))
     plan_status = str(plan.get("status") or "")
     run_present = bool(run)
-    blocked_plan = plan_status in {"executing", "executed"}
+    blocked_plan = plan_status == "executing"
     can_prepare = market_open and run_present and not blocked_plan
     can_execute = market_open and plan_status == "prepared"
 
@@ -394,7 +394,7 @@ def prepare_manual_current_session_plan(
     if run is None:
         raise RuntimeError("No scheduled Paper run exists for the current regular session.")
     existing_status = str((existing or {}).get("status") or "")
-    if existing_status in {"executing", "executed"}:
+    if existing_status == "executing":
         raise RuntimeError(
             f"The current-session Paper plan cannot be replaced while status={existing_status}."
         )
