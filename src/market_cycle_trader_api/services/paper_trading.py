@@ -481,7 +481,15 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
     }
 
 
-def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]:
+def prepare_next_paper_plan(
+    db: Any,
+    *,
+    replace: bool = False,
+    allow_open_market: bool = False,
+    execution_session_override: str | None = None,
+    expected_market_open_override: Any | None = None,
+    refresh_source: str = "premarket_plan_refresh",
+) -> dict[str, Any]:
     runtime_training = get_system_settings(db)["training"]
     if not bool(runtime_training["enabled"]):
         raise RuntimeError("Model training is disabled in System Settings.")
@@ -490,13 +498,16 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
     account = account_snapshot(client)
     assert_account_can_trade(account)
     clock = clock_snapshot(client)
-    if bool(clock["is_open"]):
+    market_is_open = bool(clock["is_open"])
+    if market_is_open and not allow_open_market:
         raise RuntimeError(
             "Prepare the next-open decision only while the regular market is closed, "
             "so the latest daily candle is complete."
         )
+    if allow_open_market and not market_is_open:
+        raise RuntimeError("Manual current-session recovery requires the regular market to be open.")
 
-    live_market = refresh_trader_live_market_data(db, source="premarket_plan_refresh", force=True)
+    live_market = refresh_trader_live_market_data(db, source=refresh_source, force=True)
 
     _assert_no_conflicting_orders(client, assets=strategy.assets)
     _reconcile_state_with_account(
@@ -539,9 +550,31 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         if _et_date(stateful_decision["decision_date"]) != _et_date(decision.decision_date):
             raise RuntimeError("Stateful and base live decisions resolved different completed sessions.")
     decision_date = _et_date(decision.decision_date)
-    expected_open = pd.Timestamp(clock["next_open"])
-    expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
-    execution_session = expected_open.tz_convert(EASTERN).date().isoformat()
+    if expected_market_open_override is not None:
+        expected_open = pd.Timestamp(expected_market_open_override)
+        expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
+    else:
+        expected_open = pd.Timestamp(clock["next_open"])
+        expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
+    execution_session = (
+        str(execution_session_override)
+        if execution_session_override is not None
+        else expected_open.tz_convert(EASTERN).date().isoformat()
+    )
+    if execution_session != expected_open.tz_convert(EASTERN).date().isoformat():
+        raise RuntimeError(
+            "Execution-session override does not match the supplied market-open timestamp: "
+            f"session={execution_session}, open={expected_open.isoformat()}."
+        )
+    if allow_open_market:
+        current_session = pd.Timestamp(clock["timestamp"])
+        current_session = current_session.tz_localize("UTC") if current_session.tzinfo is None else current_session.tz_convert("UTC")
+        current_session = current_session.tz_convert(EASTERN).date().isoformat()
+        if execution_session != current_session:
+            raise RuntimeError(
+                "Manual recovery may prepare only the currently open regular session: "
+                f"requested={execution_session}, current={current_session}."
+            )
 
     calendar_start = (expected_open.tz_convert(EASTERN).date() - timedelta(days=14))
     calendar_end = expected_open.tz_convert(EASTERN).date()
@@ -617,6 +650,8 @@ def prepare_next_paper_plan(db: Any, *, replace: bool = False) -> dict[str, Any]
         "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
         "live_market_cutoff": live_market.get("live_market_cutoff"),
+        "manual_current_session_recovery": bool(allow_open_market),
+        "plan_source": refresh_source,
         "stateful_intervention": bool((stateful_decision or {}).get("stateful_intervention")),
         "stateful_control_target_asset": (stateful_decision or {}).get("control_target_asset"),
         "stateful_defer_cooldown_before": bool((stateful_decision or {}).get("stateful_cooldown_before")),

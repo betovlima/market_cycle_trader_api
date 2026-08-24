@@ -225,6 +225,7 @@ def _record_admin_operation(
     new_mode: str,
     reason: str | None,
     actor_email: str | None,
+    success: bool = True,
 ) -> None:
     db[ADMIN_OPERATION_LOGS_COLLECTION].insert_one(
         bson_value({
@@ -234,7 +235,7 @@ def _record_admin_operation(
             "reason": (reason or "").strip() or None,
             "actor_email": (actor_email or "").strip().lower() or None,
             "created_at": utc_now(),
-            "success": True,
+            "success": bool(success),
         })
     )
 
@@ -294,6 +295,217 @@ def list_admin_operation_logs(db: Any, *, limit: int = 50) -> list[dict[str, Any
         {key: bson_value(value) for key, value in item.items() if key != "_id"}
         for item in cursor
     ]
+
+
+
+def _manual_recovery_context(db: Any) -> dict[str, Any]:
+    readiness = paper_market_readiness(db)
+    clock = readiness["clock"]
+    timestamp = _utc_stamp(clock["timestamp"])
+    current_session = timestamp.tz_convert(EASTERN).date().isoformat()
+    run = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
+        {"execution_session": current_session},
+        sort=[("created_at", -1)],
+    )
+    plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+        {"execution_session": current_session},
+        sort=[("created_at", -1)],
+    )
+    return {
+        "readiness": readiness,
+        "clock": clock,
+        "timestamp": timestamp,
+        "current_session": current_session,
+        "run": run,
+        "plan": plan,
+    }
+
+
+def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
+    try:
+        context = _manual_recovery_context(db)
+    except Exception as exc:
+        return {
+            "available": False,
+            "can_prepare": False,
+            "can_execute": False,
+            "reason": str(exc),
+        }
+
+    clock = context["clock"]
+    run = context["run"] or {}
+    plan = context["plan"] or {}
+    market_open = bool(clock.get("is_open"))
+    plan_status = str(plan.get("status") or "")
+    run_present = bool(run)
+    blocked_plan = plan_status in {"executing", "executed"}
+    can_prepare = market_open and run_present and not blocked_plan
+    can_execute = market_open and plan_status == "prepared"
+
+    if not market_open:
+        prepare_reason = "Manual same-session recovery is available only while the regular market is open."
+    elif not run_present:
+        prepare_reason = "No scheduled Paper run exists for the current regular session."
+    elif blocked_plan:
+        prepare_reason = f"The current-session Paper plan cannot be replaced while status={plan_status}."
+    else:
+        prepare_reason = None
+
+    if not market_open:
+        execute_reason = "Manual execution is available only while the regular market is open."
+    elif plan_status != "prepared":
+        execute_reason = "Run manual analysis first to create a fresh prepared plan for the current session."
+    else:
+        execute_reason = None
+
+    return {
+        "available": bool(market_open and run_present),
+        "market_open": market_open,
+        "current_session": context["current_session"],
+        "can_prepare": can_prepare,
+        "prepare_reason": prepare_reason,
+        "can_execute": can_execute,
+        "execute_reason": execute_reason,
+        "run_id": run.get("run_id"),
+        "run_status": run.get("status"),
+        "run_phase": run.get("phase"),
+        "expected_market_open": bson_value(run.get("expected_market_open")),
+        "plan_id": plan.get("plan_id"),
+        "plan_status": plan_status or None,
+        "decision_date": plan.get("decision_date"),
+        "current_asset": plan.get("current_asset"),
+        "target_asset": plan.get("target_asset"),
+        "action": plan.get("action"),
+        "manual_current_session_recovery": bool(plan.get("manual_current_session_recovery")),
+    }
+
+
+def prepare_manual_current_session_plan(
+    db: Any,
+    *,
+    actor_email: str | None = None,
+) -> dict[str, Any]:
+    context = _manual_recovery_context(db)
+    clock = context["clock"]
+    run = context["run"]
+    existing = context["plan"]
+    if not bool(clock.get("is_open")):
+        raise RuntimeError("Manual same-session analysis requires the regular market to be open.")
+    if run is None:
+        raise RuntimeError("No scheduled Paper run exists for the current regular session.")
+    existing_status = str((existing or {}).get("status") or "")
+    if existing_status in {"executing", "executed"}:
+        raise RuntimeError(
+            f"The current-session Paper plan cannot be replaced while status={existing_status}."
+        )
+    expected_open = run.get("expected_market_open")
+    if expected_open is None:
+        raise RuntimeError("The scheduled Paper run does not contain expected_market_open.")
+
+    plan = prepare_next_paper_plan(
+        db,
+        replace=existing is not None,
+        allow_open_market=True,
+        execution_session_override=context["current_session"],
+        expected_market_open_override=expected_open,
+        refresh_source="manual_current_session_recovery",
+    )
+    now = utc_now()
+    db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+        {"run_id": str(run["run_id"])},
+        {"$set": {
+            "manual_recovery_prepared_at": now,
+            "manual_recovery_plan_id": str(plan["plan_id"]),
+            "manual_recovery_actor_email": (actor_email or "").strip().lower() or None,
+            "updated_at": now,
+        }},
+    )
+    mode = _control_mode(_automation_document(db))
+    _record_admin_operation(
+        db,
+        action="manual_current_session_analysis",
+        previous_mode=mode,
+        new_mode=mode,
+        reason=f"Prepared manual recovery plan {plan['plan_id']} for {context['current_session']}.",
+        actor_email=actor_email,
+    )
+    return {
+        "status": "prepared",
+        "plan": {key: bson_value(value) for key, value in plan.items() if key != "_id"},
+        "manual_recovery": paper_market_manual_recovery_status(db),
+    }
+
+
+def execute_manual_current_session_plan(
+    db: Any,
+    *,
+    plan_id: str | None = None,
+    actor_email: str | None = None,
+) -> dict[str, Any]:
+    context = _manual_recovery_context(db)
+    clock = context["clock"]
+    if not bool(clock.get("is_open")):
+        raise RuntimeError("Manual same-session execution requires the regular market to be open.")
+    mode = _control_mode(_automation_document(db))
+    if mode in {"paused", "stopped"}:
+        raise RuntimeError(
+            f"Manual execution is blocked while Trader control mode is {mode}. Start the Trader first."
+        )
+
+    query: dict[str, Any] = {
+        "execution_session": context["current_session"],
+        "status": "prepared",
+    }
+    if plan_id:
+        query["plan_id"] = str(plan_id)
+    plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(query, sort=[("created_at", -1)])
+    if plan is None:
+        raise RuntimeError("No prepared manual-recovery Paper plan was found for the current session.")
+    action = str(plan.get("action") or "").strip().lower()
+    if mode == "exit_only" and action not in EXIT_ONLY_ALLOWED_ACTIONS:
+        raise RuntimeError(
+            f"Manual action {action!r} is blocked by exit-only Trader mode."
+        )
+
+    try:
+        result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
+    except Exception as exc:
+        _record_admin_operation(
+            db,
+            action="manual_current_session_execution",
+            previous_mode=mode,
+            new_mode=mode,
+            reason=str(exc),
+            actor_email=actor_email,
+            success=False,
+        )
+        raise
+
+    run = context["run"] or {}
+    if run.get("run_id"):
+        now = utc_now()
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": str(run["run_id"])},
+            {"$set": {
+                "manual_recovery_executed_at": now,
+                "manual_recovery_execution_result": bson_value(result),
+                "manual_recovery_actor_email": (actor_email or "").strip().lower() or None,
+                "updated_at": now,
+            }},
+        )
+    _record_admin_operation(
+        db,
+        action="manual_current_session_execution",
+        previous_mode=mode,
+        new_mode=mode,
+        reason=f"Executed manual recovery plan {plan['plan_id']} for {context['current_session']}.",
+        actor_email=actor_email,
+    )
+    return {
+        "status": "executed",
+        "result": bson_value(result),
+        "manual_recovery": paper_market_manual_recovery_status(db),
+    }
 
 
 def _public_robot_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
