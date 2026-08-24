@@ -184,7 +184,7 @@ def export_strategy_transfer_package(
         "observation_count": len(observations),
         "artifact_count": len(artifacts),
         "market_snapshot_document_count": len(snapshot_documents),
-        "next_step": "Commit scripts/strategy_import.json with API v6.6.2, deploy it to production, then call POST /api/admin/strategy-transfer/import with confirm=IMPORT.",
+        "next_step": f"Commit scripts/strategy_import.json with API v{API_VERSION}, deploy it to production, then call POST /api/admin/strategy-transfer/import with confirm=IMPORT.",
     }
 
 
@@ -299,10 +299,21 @@ def import_strategy_transfer_package(db: Any, *, actor_email: str | None) -> dic
             if manifest_document is None:
                 raise StrategyTransferConflict("Production snapshot documents exist but the ready manifest is missing.")
 
+    orphan_observation_count = int(
+        db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].count_documents({"run_id": run_id}) or 0
+    )
+    orphan_artifact_count = int(
+        db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].count_documents({"run_id": run_id}) or 0
+    )
+    if orphan_observation_count:
+        db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].delete_many({"run_id": run_id})
+    if orphan_artifact_count:
+        db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].delete_many({"run_id": run_id})
+
     inserted_snapshot = False
     inserted_run = False
-    inserted_observations = False
-    inserted_artifacts = False
+    observations_write_started = False
+    artifacts_write_started = False
     created_strategy_id: str | None = None
     now = utc_now()
     actor = (actor_email or "").strip().lower() or None
@@ -335,17 +346,17 @@ def import_strategy_transfer_package(db: Any, *, actor_email: str | None) -> dic
         inserted_run = True
 
         if observations:
+            observations_write_started = True
             db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].insert_many(
-                [_without_id(item, run_id=run_id) for item in observations if isinstance(item, dict)],
+                [_without_id(item, run_id=run_id) for item in observations],
                 ordered=True,
             )
-            inserted_observations = True
         if artifacts:
+            artifacts_write_started = True
             db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].insert_many(
-                [_without_id(item, run_id=run_id) for item in artifacts if isinstance(item, dict)],
+                [_without_id(item, run_id=run_id) for item in artifacts],
                 ordered=True,
             )
-            inserted_artifacts = True
 
         created = create_strategy(
             db,
@@ -430,10 +441,18 @@ def import_strategy_transfer_package(db: Any, *, actor_email: str | None) -> dic
             },
         )
 
-        verified_observations = int(db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].count_documents({"run_id": run_id}) or 0)
-        verified_artifacts = int(db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].count_documents({"run_id": run_id}) or 0)
+        verified_observations = int(
+            db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].count_documents({"run_id": run_id}) or 0
+        )
+        verified_artifacts = int(
+            db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].count_documents({"run_id": run_id}) or 0
+        )
         if verified_observations != len(observations) or verified_artifacts != len(artifacts):
-            raise StrategyTransferConflict("Imported Temporal run dependency counts do not match the transfer package.")
+            raise StrategyTransferConflict(
+                "Imported Temporal run dependency counts do not match the transfer package: "
+                f"observations expected={len(observations)} actual={verified_observations}; "
+                f"artifacts expected={len(artifacts)} actual={verified_artifacts}."
+            )
 
         return {
             "status": "imported",
@@ -444,6 +463,8 @@ def import_strategy_transfer_package(db: Any, *, actor_email: str | None) -> dic
             "ending_capital": _ending_capital(source_run),
             "observation_count": verified_observations,
             "artifact_count": verified_artifacts,
+            "recovered_orphan_observation_count": orphan_observation_count,
+            "recovered_orphan_artifact_count": orphan_artifact_count,
             "market_snapshot_document_count": int(
                 db[MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION].count_documents({"snapshot_id": snapshot_id}) or 0
             ) if snapshot_id else 0,
@@ -452,9 +473,9 @@ def import_strategy_transfer_package(db: Any, *, actor_email: str | None) -> dic
     except Exception as exc:
         if created_strategy_id:
             db[STRATEGY_PROFILES_COLLECTION].delete_one({"_id": created_strategy_id})
-        if inserted_artifacts:
+        if artifacts_write_started:
             db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].delete_many({"run_id": run_id})
-        if inserted_observations:
+        if observations_write_started:
             db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].delete_many({"run_id": run_id})
         if inserted_run:
             db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].delete_many({"id": run_id})
