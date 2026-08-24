@@ -2105,9 +2105,6 @@ def select_research_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    winner_id = str(control.get("trader_winner_strategy_id") or "")
-    if strategy_id == winner_id:
-        raise StrategyLabConflict("The active WINNER cannot simultaneously hold the RESEARCH role. Mark another Strategy as RESEARCH.")
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},
@@ -2520,7 +2517,6 @@ def promote_strategy_to_trader(
             f"Expected selection revision {expected_control_revision}, current revision {control_revision}."
         )
     current_winner_id = str(control.get("trader_winner_strategy_id") or "")
-    research_id = str(control.get("research_strategy_id") or "")
     if strategy_id == current_winner_id:
         raise StrategyLabConflict("This Strategy is already the active Winner.")
     source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
@@ -2663,14 +2659,6 @@ def promote_strategy_to_trader(
             "winner_promotion_started_at": None,
             "winner_promotion_started_by": None,
         }
-        if strategy_id == research_id and current_winner_id:
-            control_set.update({
-                "research_strategy_id": current_winner_id,
-                "model_tuning_strategy_id": current_winner_id,
-                "last_selection_note": "Previous WINNER became RESEARCH because the promoted Strategy held the RESEARCH role.",
-                "last_strategy_research_selection_note": "Automatic WINNER/RESEARCH role swap during promotion.",
-                "last_model_tuning_selection_note": "Automatic WINNER/RESEARCH role swap during promotion.",
-            })
         updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
             {"_id": CONTROL_ID, "revision": control_revision, "winner_promotion_in_progress": True},
             {"$set": control_set, "$inc": {"revision": 1}},
