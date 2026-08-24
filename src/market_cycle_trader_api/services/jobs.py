@@ -118,7 +118,10 @@ PUBLIC_JOB_FIELDS = frozenset({
     "completed_runs",
     "total_runs",
     "return_code",
+    "strategy_profile_id",
     "strategy_profile_name",
+    "strategy_profile_revision",
+    "strategy_configuration_hash",
     "progress_detail",
 })
 

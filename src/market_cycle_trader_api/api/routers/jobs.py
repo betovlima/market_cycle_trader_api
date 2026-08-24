@@ -254,8 +254,24 @@ def create_job() -> dict[str, Any]:
 
 
 @router.get("/api/jobs/latest")
-def get_latest_job() -> dict[str, Any] | None:
-    return public_job(database()[JOBS_COLLECTION].find_one({"internal_job": {"$ne": True}}, sort=[("created_at", -1)]))
+def get_latest_job(
+    strategy_profile_id: str | None = None,
+    strategy_profile_revision: int | None = None,
+    strategy_configuration_hash: str | None = None,
+    reusable: bool = False,
+) -> dict[str, Any] | None:
+    query: dict[str, Any] = {"internal_job": {"$ne": True}}
+    strategy_id = str(strategy_profile_id or "").strip()
+    configuration_hash = str(strategy_configuration_hash or "").strip()
+    if strategy_id:
+        query["strategy_profile_id"] = strategy_id
+    if strategy_profile_revision is not None:
+        query["strategy_profile_revision"] = int(strategy_profile_revision)
+    if configuration_hash:
+        query["strategy_configuration_hash"] = configuration_hash
+    if reusable:
+        query["status"] = {"$in": ["queued", "running", "completed"]}
+    return public_job(database()[JOBS_COLLECTION].find_one(query, sort=[("created_at", -1)]))
 
 
 @router.get("/api/jobs/{job_id}")
