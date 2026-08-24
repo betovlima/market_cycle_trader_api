@@ -31,7 +31,6 @@ from .api.routers import (
     parameter_bootstrap,
     strategy_configuration,
     strategy_lab,
-    strategy_transfer,
     system_settings,
     temporal_intelligence,
     temporal_research_settings,
@@ -120,7 +119,6 @@ def create_app() -> FastAPI:
     application.include_router(parameter_bootstrap.router, dependencies=admin_required)
     application.include_router(strategy_configuration.router, dependencies=admin_required)
     application.include_router(strategy_lab.router, dependencies=research_access)
-    application.include_router(strategy_transfer.router)
     application.include_router(asset_discovery.router, dependencies=admin_required)
     application.include_router(system_settings.router, dependencies=admin_required)
     application.include_router(temporal_research_settings.router, dependencies=admin_required)
