@@ -14,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api.routers import (
     access_admin,
-    asset_discovery,
     admin_rotations,
     analytics,
     admin_setup,
@@ -47,10 +46,6 @@ from .services.paper_market_scheduler import (
     start_paper_market_scheduler,
     stop_paper_market_scheduler,
 )
-from .services.asset_discovery_scheduler import (
-    start_asset_discovery_scheduler,
-    stop_asset_discovery_scheduler,
-)
 from .services.model_tuning import recover_integrated_model_tuning_runs
 from .services.temporal_intelligence import recover_temporal_intelligence_runs
 from .services.temporal_research_settings import ensure_temporal_research_settings
@@ -66,11 +61,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     get_auth_settings().validate_runtime()
     get_access_service().ensure_storage()
     start_paper_market_scheduler()
-    start_asset_discovery_scheduler()
     try:
         yield
     finally:
-        stop_asset_discovery_scheduler()
         stop_paper_market_scheduler()
         close_mongo()
 
@@ -119,7 +112,6 @@ def create_app() -> FastAPI:
     application.include_router(parameter_bootstrap.router, dependencies=admin_required)
     application.include_router(strategy_configuration.router, dependencies=admin_required)
     application.include_router(strategy_lab.router, dependencies=research_access)
-    application.include_router(asset_discovery.router, dependencies=admin_required)
     application.include_router(system_settings.router, dependencies=admin_required)
     application.include_router(temporal_research_settings.router, dependencies=admin_required)
     application.include_router(admin_setup.router, dependencies=admin_required)

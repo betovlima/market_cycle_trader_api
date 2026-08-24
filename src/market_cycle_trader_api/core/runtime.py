@@ -9,7 +9,6 @@ from pymongo.database import Database
 from pymongo.errors import PyMongoError
 
 from ..infrastructure.persistence.mongo_repository import (
-    ASSET_DISCOVERY_RUNS_COLLECTION,
     JOBS_COLLECTION,
     MONGO_DATABASE,
     MONGO_URI,
@@ -82,19 +81,6 @@ def initialize_mongo(*, role: str = "api") -> None:
                         "updated_at": utc_now(),
                     },
                     "$unset": {"process_id": ""},
-                },
-            )
-            db[ASSET_DISCOVERY_RUNS_COLLECTION].update_many(
-                {"status": {"$in": ["queued", "running", "stopping"]}},
-                {
-                    "$set": {
-                        "status": "interrupted",
-                        "phase": "interrupted",
-                        "last_message": "The API was restarted before Asset Discovery finished.",
-                        "finished_at": utc_now(),
-                        "updated_at": utc_now(),
-                    },
-                    "$unset": {"active_key": ""},
                 },
             )
 

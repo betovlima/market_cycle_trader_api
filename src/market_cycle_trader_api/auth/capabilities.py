@@ -21,7 +21,6 @@ CAPABILITY_NAMES = (
     "temporal_intelligence.materialize_strategy",
     "analytics.view",
     "portfolio.view",
-    "asset_discovery.view",
     "administration.view",
     "settings.view",
     "research.manage",
