@@ -68,6 +68,8 @@ TEMPORAL_ROTATION_QUALITY_RESEARCH_COLLECTION = "temporal_rotation_quality_resea
 TEMPORAL_ROTATION_QUALITY_VALIDATION_COLLECTION = "temporal_rotation_quality_validations"
 TEMPORAL_ROTATION_QUALITY_DIAGNOSTIC_COLLECTION = "temporal_rotation_quality_diagnostics"
 TEMPORAL_ROTATION_QUALITY_ANALYTICS_COLLECTION = "temporal_rotation_quality_analytics"
+ASSET_DISCOVERY_RESEARCH_COLLECTION = "asset_discovery_research"
+ASSET_DISCOVERY_CATALOG_COLLECTION = "asset_discovery_catalog"
 SETTINGS_SCHEMA_VERSION = 16
 SETTINGS_METADATA_FIELDS = frozenset({
     "_id",
@@ -175,6 +177,14 @@ def ensure_database(db: Database) -> None:
     db[STRATEGY_PROFILES_COLLECTION].create_index(
         [("configuration_hash", ASCENDING)],
         name="ix_strategy_profiles_configuration_hash",
+    )
+    db[ASSET_DISCOVERY_CATALOG_COLLECTION].create_index(
+        [("last_seen_at", DESCENDING)],
+        name="ix_asset_discovery_catalog_last_seen",
+    )
+    db[ASSET_DISCOVERY_CATALOG_COLLECTION].create_index(
+        [("times_discovered", DESCENDING), ("best_rank", ASCENDING)],
+        name="ix_asset_discovery_catalog_recurrence_rank",
     )
     db[STRATEGY_PROMOTION_HISTORY_COLLECTION].create_index(
         [("promoted_at", DESCENDING), ("created_at", DESCENDING)],

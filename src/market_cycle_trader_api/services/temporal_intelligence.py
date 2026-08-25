@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import csv
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -64,6 +65,7 @@ _ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_PIPELINE_WORKERS: set[str] = set()
 _ACTIVE_PIPELINE_LOCK = threading.Lock()
+_logger = logging.getLogger(__name__)
 
 STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation")
 STRATEGY_RESEARCH_PIPELINE_STAGE_STATES = frozenset({"waiting", "running", "completed", "paused", "stopped", "failed", "skipped"})
@@ -1278,6 +1280,8 @@ def build_temporal_intelligence_export(
         "schema_version": 6,
         "run_id": str(run_id),
         "pipeline_status": pipeline_state_export.get("status"),
+        "current_stage": pipeline_state_export.get("current_stage"),
+        "pipeline_failure_message": pipeline_state_export.get("failure_message"),
         "stage_states": pipeline_state_export.get("stage_states"),
         "processing_id": processing_id,
         "period_start": pipeline_period_start,
@@ -1803,12 +1807,22 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
         _pipeline_stage_complete(db, run_id, current_stage)
     except Exception as exc:
         if not _pipeline_stop_requested(db, run_id):
+            _logger.exception(
+                "Strategy Research pipeline failed at stage %s for run %s: %s",
+                current_stage,
+                run_id,
+                exc,
+            )
             try:
                 control_strategy_research_pipeline(
                     db, run_id, action="stage_failed", stage=current_stage, message=str(exc)
                 )
             except Exception:
-                pass
+                _logger.exception(
+                    "Failed to persist Strategy Research pipeline failure at stage %s for run %s.",
+                    current_stage,
+                    run_id,
+                )
     finally:
         with _ACTIVE_PIPELINE_LOCK:
             _ACTIVE_PIPELINE_WORKERS.discard(str(run_id))

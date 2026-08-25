@@ -16,6 +16,7 @@ from .api.routers import (
     access_admin,
     admin_rotations,
     analytics,
+    asset_discovery,
     admin_setup,
     admin_trader,
     auth,
@@ -105,6 +106,7 @@ def create_app() -> FastAPI:
     application.include_router(temporal_rotation_quality.router)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)
+    application.include_router(asset_discovery.router)
     application.include_router(paper_market.router, dependencies=admin_required)
     application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
     application.include_router(admin_rotations.router, dependencies=admin_required)

@@ -3410,6 +3410,12 @@ def _bind_strategy_research_reference_analytics(
             "Selected Strategy Research reference replay could not bind every reference equity session "
             f"({len(bound_rows)}/{len(equity_rows)} sessions bound)."
         )
+    if synthetic_context_sessions:
+        raise ValueError(
+            "Strategy Research market context is incomplete: "
+            f"{synthetic_context_sessions} of {len(equity_rows)} reference sessions have no complete market context. "
+            "This usually indicates discontinuous history in one or more Strategy assets; the research run was stopped before downstream analysis."
+        )
 
     fold_equity: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
     reference_by_execution = {

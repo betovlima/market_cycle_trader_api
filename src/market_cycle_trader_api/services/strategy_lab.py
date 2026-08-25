@@ -700,6 +700,11 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "last_promoted_winner_strategy_id": document.get("last_promoted_winner_strategy_id"),
         "last_promoted_at": bson_value(document.get("last_promoted_at")),
         "source_candidate_backtest_id": document.get("source_candidate_backtest_id"),
+        "discovery_origin": (
+            bson_value(document.get("discovery_origin"))
+            if isinstance(document.get("discovery_origin"), dict)
+            else None
+        ),
         "last_backtest_model": (
             public_model_snapshot(document.get("last_backtest_model_snapshot"))
             if isinstance(document.get("last_backtest_model_snapshot"), dict)
