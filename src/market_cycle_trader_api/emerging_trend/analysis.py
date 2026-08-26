@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score, roc_auc_score
 
+from ..classification_evaluation import roc_curve_payload
+
 from .config import (
     ANALYSIS_VERSION,
     FEATURES,
@@ -235,6 +237,7 @@ def build_analysis(
             "balanced_accuracy": float(balanced_accuracy_score(truth, prediction)),
             "precision": float(precision_score(truth, prediction, zero_division=0)),
             "recall": float(recall_score(truth, prediction, zero_division=0)),
+            "roc": roc_curve_payload(truth, probability, operating_threshold=float(threshold)),
             "best_iteration": int(getattr(model, "best_iteration_", 0) or getattr(model, "n_estimators_", 0) or 0),
         })
 

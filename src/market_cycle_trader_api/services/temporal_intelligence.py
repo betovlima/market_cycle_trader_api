@@ -790,6 +790,29 @@ def build_temporal_intelligence_export(
     if result is None:
         raise TemporalIntelligenceConflict("Temporal Intelligence results are not available until the execution finishes successfully.")
 
+    def append_roc_rows(target: list[dict[str, Any]], roc: Any, **context: Any) -> None:
+        if not isinstance(roc, dict):
+            return
+        operating = roc.get("operating_point") if isinstance(roc.get("operating_point"), dict) else {}
+        for index, point in enumerate(roc.get("points") or []):
+            if not isinstance(point, dict):
+                continue
+            target.append(bson_value({
+                **context,
+                "auc": roc.get("auc"),
+                "positive_count": roc.get("positive_count"),
+                "negative_count": roc.get("negative_count"),
+                "point_index": index,
+                "fpr": point.get("fpr"),
+                "tpr": point.get("tpr"),
+                "threshold": point.get("threshold"),
+                "operating_threshold": operating.get("threshold"),
+                "operating_threshold_mode": operating.get("threshold_mode"),
+                "operating_fpr": operating.get("fpr"),
+                "operating_tpr": operating.get("tpr"),
+                "operating_specificity": operating.get("specificity"),
+            }))
+
     horizon_rows = [
         bson_value({key: value for key, value in item.items() if key not in {"confidence_bins", "risk_buckets", "signal_metrics", "shadow_capital"}})
         for item in (result.get("horizon_metrics") or [])
@@ -913,6 +936,7 @@ def build_temporal_intelligence_export(
     confidence_rows: list[dict[str, Any]] = []
     risk_rows: list[dict[str, Any]] = []
     signal_rows: list[dict[str, Any]] = []
+    temporal_roc_rows: list[dict[str, Any]] = []
     capital_rows: list[dict[str, Any]] = []
     diagnostic_rows: list[dict[str, Any]] = []
     for horizon in result.get("horizon_metrics") or []:
@@ -927,7 +951,8 @@ def build_temporal_intelligence_export(
                 risk_rows.append(bson_value({"horizon": horizon_value, **dict(item)}))
         for item in horizon.get("signal_metrics") or []:
             if isinstance(item, dict):
-                signal_rows.append(bson_value({"horizon": horizon_value, **dict(item)}))
+                signal_rows.append(bson_value({"horizon": horizon_value, **{key: value for key, value in item.items() if key != "roc"}}))
+                append_roc_rows(temporal_roc_rows, item.get("roc"), horizon=horizon_value, signal=item.get("signal"), evaluation_scope="horizon_oos")
         capital = horizon.get("shadow_capital")
         if isinstance(capital, dict):
             capital_rows.append(bson_value({
@@ -1121,6 +1146,7 @@ def build_temporal_intelligence_export(
             leadership_monthly_rows.append(bson_value(row))
     opportunity_drought_monthly_rows: list[dict[str, Any]] = []
     opportunity_drought_fold_rows: list[dict[str, Any]] = []
+    opportunity_drought_roc_rows: list[dict[str, Any]] = []
     opportunity_drought_feature_rows: list[dict[str, Any]] = []
     opportunity_drought_oos_rows: list[dict[str, Any]] = []
     if pipeline_opportunity_drought is not None:
@@ -1137,10 +1163,14 @@ def build_temporal_intelligence_export(
         for item in pipeline_opportunity_drought.get("folds") or []:
             if not isinstance(item, dict):
                 continue
+            session_metrics = item.get("session_metrics") if isinstance(item.get("session_metrics"), dict) else {}
+            monthly_metrics = item.get("monthly_metrics") if isinstance(item.get("monthly_metrics"), dict) else {}
             row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics"}}
-            row.update({f"session_{key}": value for key, value in (item.get("session_metrics") or {}).items()})
-            row.update({f"monthly_{key}": value for key, value in (item.get("monthly_metrics") or {}).items()})
+            row.update({f"session_{key}": value for key, value in session_metrics.items() if key != "roc"})
+            row.update({f"monthly_{key}": value for key, value in monthly_metrics.items() if key != "roc"})
             opportunity_drought_fold_rows.append(bson_value(row))
+            append_roc_rows(opportunity_drought_roc_rows, session_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="session_oos")
+            append_roc_rows(opportunity_drought_roc_rows, monthly_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
         opportunity_drought_feature_rows = [
             bson_value(dict(item)) for item in (pipeline_opportunity_drought.get("feature_importance") or []) if isinstance(item, dict)
         ]
@@ -1180,6 +1210,7 @@ def build_temporal_intelligence_export(
 
     emerging_trend_monthly_rows: list[dict[str, Any]] = []
     emerging_trend_fold_rows: list[dict[str, Any]] = []
+    emerging_trend_roc_rows: list[dict[str, Any]] = []
     emerging_trend_feature_rows: list[dict[str, Any]] = []
     emerging_trend_session_rows: list[dict[str, Any]] = []
     if pipeline_emerging_trend is not None:
@@ -1188,7 +1219,8 @@ def build_temporal_intelligence_export(
                 emerging_trend_monthly_rows.append(bson_value(dict(item)))
         for item in pipeline_emerging_trend.get("folds") or []:
             if isinstance(item, dict):
-                emerging_trend_fold_rows.append(bson_value(dict(item)))
+                emerging_trend_fold_rows.append(bson_value({key: value for key, value in item.items() if key != "roc"}))
+                append_roc_rows(emerging_trend_roc_rows, item.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="session_oos")
         emerging_trend_feature_rows = [bson_value(dict(item)) for item in (pipeline_emerging_trend.get("feature_importance") or []) if isinstance(item, dict)]
         for item in pipeline_emerging_trend.get("sessions") or []:
             if not isinstance(item, dict):
@@ -1203,6 +1235,7 @@ def build_temporal_intelligence_export(
 
     fragile_incumbent_monthly_rows: list[dict[str, Any]] = []
     fragile_incumbent_fold_rows: list[dict[str, Any]] = []
+    fragile_incumbent_roc_rows: list[dict[str, Any]] = []
     fragile_incumbent_feature_rows: list[dict[str, Any]] = []
     fragile_incumbent_oos_rows: list[dict[str, Any]] = []
     if pipeline_fragile_incumbent is not None:
@@ -1219,10 +1252,14 @@ def build_temporal_intelligence_export(
         for item in pipeline_fragile_incumbent.get("folds") or []:
             if not isinstance(item, dict):
                 continue
+            session_metrics = item.get("session_metrics") if isinstance(item.get("session_metrics"), dict) else {}
+            monthly_metrics = item.get("monthly_metrics") if isinstance(item.get("monthly_metrics"), dict) else {}
             row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics"}}
-            row.update({f"session_{key}": value for key, value in (item.get("session_metrics") or {}).items()})
-            row.update({f"monthly_{key}": value for key, value in (item.get("monthly_metrics") or {}).items()})
+            row.update({f"session_{key}": value for key, value in session_metrics.items() if key != "roc"})
+            row.update({f"monthly_{key}": value for key, value in monthly_metrics.items() if key != "roc"})
             fragile_incumbent_fold_rows.append(bson_value(row))
+            append_roc_rows(fragile_incumbent_roc_rows, session_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="session_oos")
+            append_roc_rows(fragile_incumbent_roc_rows, monthly_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
         fragile_incumbent_feature_rows = [
             bson_value(dict(item)) for item in (pipeline_fragile_incumbent.get("feature_importance") or []) if isinstance(item, dict)
         ]
@@ -1233,6 +1270,21 @@ def build_temporal_intelligence_export(
             row.update({f"feature_{key}": value for key, value in (item.get("features") or {}).items()})
             row.update({f"contribution_{key}": value for key, value in (item.get("contributions") or {}).items()})
             fragile_incumbent_oos_rows.append(bson_value(row))
+
+    risk_roc_rows: list[dict[str, Any]] = []
+    if pipeline_risk is not None:
+        oos_metrics = ((pipeline_risk.get("oos") or {}).get("metrics") or {}) if isinstance(pipeline_risk.get("oos"), dict) else {}
+        append_roc_rows(risk_roc_rows, oos_metrics.get("roc"), evaluation_scope="overall_oos")
+        for item in pipeline_risk.get("family_comparison") or []:
+            if not isinstance(item, dict):
+                continue
+            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+            append_roc_rows(risk_roc_rows, metrics.get("roc"), evaluation_scope="family_oos", family=item.get("family"), risk_quantile=item.get("risk_quantile"))
+        for item in pipeline_risk.get("outer_results") or []:
+            if not isinstance(item, dict):
+                continue
+            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+            append_roc_rows(risk_roc_rows, metrics.get("roc"), evaluation_scope="outer_year", test_year=item.get("test_year"), family=item.get("selected_family"), risk_quantile=item.get("risk_quantile"), risk_threshold=item.get("risk_threshold"))
 
     alternative_action_rows: list[dict[str, Any]] = []
     alternative_action_yearly_rows: list[dict[str, Any]] = []
@@ -1322,6 +1374,7 @@ def build_temporal_intelligence_export(
         archive.writestr("temporal_intelligence_confidence_bins.csv", _csv_text(confidence_rows))
         archive.writestr("temporal_intelligence_risk_buckets.csv", _csv_text(risk_rows))
         archive.writestr("temporal_intelligence_signal_metrics.csv", _csv_text(signal_rows))
+        archive.writestr("temporal_intelligence_roc.csv", _csv_text(temporal_roc_rows))
         archive.writestr("temporal_intelligence_shadow_capital.csv", _csv_text(capital_rows))
         archive.writestr("temporal_intelligence_shadow_capital_folds.csv", _csv_text(fold_capital_rows))
         archive.writestr("temporal_intelligence_decision_diagnostics.csv", _csv_text(diagnostic_rows))
@@ -1347,6 +1400,7 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_transition_attribution.json", json.dumps(bson_value(pipeline_attribution), indent=2, ensure_ascii=False, default=str))
         if pipeline_risk is not None:
             archive.writestr("strategy_research_risk.json", json.dumps(pipeline_risk, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_risk_roc.csv", _csv_text(risk_roc_rows))
         if pipeline_alternative_action is not None:
             archive.writestr("strategy_research_alternative_action.json", json.dumps(pipeline_alternative_action, indent=2, ensure_ascii=False, default=str))
             archive.writestr("strategy_research_alternative_action_alerts.csv", _csv_text(alternative_action_rows))
@@ -1375,18 +1429,21 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_opportunity_drought.json", json.dumps(pipeline_opportunity_drought, indent=2, ensure_ascii=False, default=str))
             archive.writestr("strategy_research_opportunity_drought_monthly.csv", _csv_text(opportunity_drought_monthly_rows))
             archive.writestr("strategy_research_opportunity_drought_folds.csv", _csv_text(opportunity_drought_fold_rows))
+            archive.writestr("strategy_research_opportunity_drought_roc.csv", _csv_text(opportunity_drought_roc_rows))
             archive.writestr("strategy_research_opportunity_drought_feature_importance.csv", _csv_text(opportunity_drought_feature_rows))
             archive.writestr("strategy_research_opportunity_drought_oos_sessions.csv", _csv_text(opportunity_drought_oos_rows))
         if pipeline_fragile_incumbent is not None:
             archive.writestr("strategy_research_fragile_incumbent.json", json.dumps(pipeline_fragile_incumbent, indent=2, ensure_ascii=False, default=str))
             archive.writestr("strategy_research_fragile_incumbent_monthly.csv", _csv_text(fragile_incumbent_monthly_rows))
             archive.writestr("strategy_research_fragile_incumbent_folds.csv", _csv_text(fragile_incumbent_fold_rows))
+            archive.writestr("strategy_research_fragile_incumbent_roc.csv", _csv_text(fragile_incumbent_roc_rows))
             archive.writestr("strategy_research_fragile_incumbent_feature_importance.csv", _csv_text(fragile_incumbent_feature_rows))
             archive.writestr("strategy_research_fragile_incumbent_oos_sessions.csv", _csv_text(fragile_incumbent_oos_rows))
         if pipeline_emerging_trend is not None:
             archive.writestr("strategy_research_emerging_trend.json", json.dumps(pipeline_emerging_trend, indent=2, ensure_ascii=False, default=str))
             archive.writestr("strategy_research_emerging_trend_monthly.csv", _csv_text(emerging_trend_monthly_rows))
             archive.writestr("strategy_research_emerging_trend_folds.csv", _csv_text(emerging_trend_fold_rows))
+            archive.writestr("strategy_research_emerging_trend_roc.csv", _csv_text(emerging_trend_roc_rows))
             archive.writestr("strategy_research_emerging_trend_feature_importance.csv", _csv_text(emerging_trend_feature_rows))
             archive.writestr("strategy_research_emerging_trend_sessions.csv", _csv_text(emerging_trend_session_rows))
         if pipeline_milp is not None:

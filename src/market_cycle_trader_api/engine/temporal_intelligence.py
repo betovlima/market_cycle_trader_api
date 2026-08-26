@@ -14,6 +14,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
+from ..classification_evaluation import roc_curve_payload
 from ..core.environment import load_project_environment
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
@@ -899,6 +900,7 @@ def _binary_signal_metrics(
     labels = realized_values > 0.0
     high_rate = _finite(labels[high].mean()) if bool(high.any()) else None
     positive_rate = _finite(labels[valid].mean()) if bool(valid.any()) else None
+    roc = roc_curve_payload(labels[valid].astype(int), probability_values[valid], operating_threshold=0.70) if bool(valid.any()) else roc_curve_payload([], [])
     return {
         "brier": calibrated["brier"],
         "raw_brier": raw["brier"],
@@ -918,6 +920,7 @@ def _binary_signal_metrics(
             _finite(float(high_rate) - float(positive_rate))
             if high_rate is not None and positive_rate is not None else None
         ),
+        "roc": roc,
     }
 
 

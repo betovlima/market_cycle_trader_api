@@ -13,6 +13,7 @@ from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from ..classification_evaluation import roc_curve_payload
 from ..infrastructure.persistence.mongo_repository import (
     TEMPORAL_WINNER_TRANSITION_RISK_RESEARCH_COLLECTION,
     bson_value,
@@ -202,6 +203,20 @@ def _classification_metrics(frame: pd.DataFrame, scores: np.ndarray, flags: np.n
     value_added = frame["rotation_value_added"].to_numpy(dtype=float)
     flagged_values = value_added[flags]
     unflagged_values = value_added[~flags]
+    roc = roc_curve_payload(labels, scores)
+    negative_count = int((labels == 0).sum())
+    false_positive = int(((labels == 0) & flags).sum())
+    roc["operating_point"] = {
+        "threshold": None,
+        "threshold_mode": "chronological_fold_thresholds",
+        "tpr": recall,
+        "fpr": float(false_positive / negative_count) if negative_count else None,
+        "specificity": float(1.0 - (false_positive / negative_count)) if negative_count else None,
+        "true_positive": captured,
+        "false_positive": false_positive,
+        "true_negative": int(negative_count - false_positive),
+        "false_negative": int(severe_count - captured),
+    }
     return {
         "count": int(len(frame)),
         "severe_count": severe_count,
@@ -213,6 +228,7 @@ def _classification_metrics(frame: pd.DataFrame, scores: np.ndarray, flags: np.n
         "f2": f2,
         "auc": _auc(labels, scores),
         "brier": float(brier_score_loss(labels, scores)) if len(np.unique(labels)) >= 2 else None,
+        "roc": roc,
         "mean_rotation_value_added_flagged": float(flagged_values.mean()) if len(flagged_values) else None,
         "mean_rotation_value_added_unflagged": float(unflagged_values.mean()) if len(unflagged_values) else None,
         "rotation_value_added_separation": (
