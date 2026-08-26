@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import balanced_accuracy_score, brier_score_loss, log_loss, precision_score, recall_score, roc_auc_score
 
+from ..classification_evaluation import roc_curve_payload
+
 from .config import (
     ANALYSIS_VERSION,
     FEATURES,
@@ -54,6 +56,7 @@ def _metrics(y_true: np.ndarray, probabilities: np.ndarray, threshold: float) ->
         "precision": float(precision_score(truth, prediction, zero_division=0)) if len(truth) else None,
         "recall": float(recall_score(truth, prediction, zero_division=0)) if len(truth) else None,
         "average_probability": float(np.mean(clipped)) if len(clipped) else None,
+        "roc": roc_curve_payload(truth, clipped, operating_threshold=float(threshold)),
     }
 
 
