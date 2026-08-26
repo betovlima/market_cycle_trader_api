@@ -331,8 +331,12 @@ def _candidate_history_coverage(
         candidate_config.start_date,
         candidate_config.end_date,
     )
-    coverage = _history_coverage_against_baseline(symbol, frame, candidate_config, required_sessions)
-    return frame, coverage
+    try:
+        cleaned = validate_and_clean_bars(frame, candidate_config)
+    except ValueError as exc:
+        raise RuntimeError("insufficient_history") from exc
+    coverage = _history_coverage_against_baseline(symbol, cleaned, candidate_config, required_sessions)
+    return cleaned, coverage
 
 
 def _persist_selected_asset_history(
@@ -361,9 +365,10 @@ def _persist_selected_asset_history(
             f"{symbol} does not provide the complete historical window required by the Strategy."
         )
     try:
-        _history_coverage_against_baseline(symbol, downloaded, selected_config, required_sessions)
-        complete_market_history(symbol, downloaded, selected_config, provider="alpaca")
-    except RuntimeError as exc:
+        cleaned_downloaded = validate_and_clean_bars(downloaded, selected_config)
+        _history_coverage_against_baseline(symbol, cleaned_downloaded, selected_config, required_sessions)
+        complete_market_history(symbol, cleaned_downloaded, selected_config, provider="alpaca")
+    except Exception as exc:
         reason = str(exc).strip().lower()
         if reason == "ticker_identity_discontinuity":
             raise AssetDiscoveryConflict(
@@ -373,11 +378,13 @@ def _persist_selected_asset_history(
             raise AssetDiscoveryConflict(
                 f"{symbol} does not cover every historical session required by the source Strategy and cannot be used for a comparable replay."
             ) from exc
-        raise AssetDiscoveryConflict(str(exc)) from exc
+        raise AssetDiscoveryConflict(
+            f"{symbol} does not provide a complete clean historical window for the source Strategy: {str(exc)}"
+        ) from exc
     collection = db[ALPACA_MARKET_BARS_COLLECTION]
     identity = _market_data_identity(symbol, selected_config)
     collection.delete_many(identity)
-    _upsert_frame(collection, downloaded, identity, selected_config.mongo_write_batch_size)
+    _upsert_frame(collection, cleaned_downloaded, identity, selected_config.mongo_write_batch_size)
 
     try:
         persisted = load_market_bars(symbol, selected_config)
@@ -393,7 +400,7 @@ def _persist_selected_asset_history(
         raise AssetDiscoveryConflict(
             f"{symbol} failed the persisted market-history integrity readback and cannot be used in a comparable Strategy: {str(exc)}"
         ) from exc
-    return int(len(downloaded))
+    return int(len(cleaned_downloaded))
 
 def _candidate_frame(db: Database, symbol: str, config: Any, end_session: pd.Timestamp) -> pd.DataFrame:
     credentials = get_alpaca_credentials(db)
@@ -483,6 +490,44 @@ def _median_metric(results: list[Any], key: str) -> float | None:
     return float((clean[middle - 1] + clean[middle]) / 2.0)
 
 
+def _prediction_sessions(results: list[Any]) -> pd.DatetimeIndex:
+    session_sets: list[set[pd.Timestamp]] = []
+    for result in results:
+        predictions = getattr(result, "predictions", None)
+        if not isinstance(predictions, pd.DataFrame) or predictions.empty:
+            continue
+        if isinstance(predictions.index, pd.DatetimeIndex):
+            values = pd.DatetimeIndex(pd.to_datetime(predictions.index, utc=True))
+        elif "timestamp" in predictions.columns:
+            values = pd.DatetimeIndex(pd.to_datetime(predictions["timestamp"], utc=True))
+        else:
+            continue
+        normalized = values.tz_convert("UTC").tz_localize(None).normalize().unique()
+        session_sets.append(set(pd.DatetimeIndex(normalized)))
+    if not session_sets:
+        return pd.DatetimeIndex([])
+    common = set.intersection(*session_sets)
+    return pd.DatetimeIndex(sorted(common))
+
+
+def _research_context_compatibility(
+    baseline_sessions: pd.DatetimeIndex,
+    candidate_sessions: pd.DatetimeIndex,
+) -> dict[str, Any]:
+    baseline = pd.DatetimeIndex(baseline_sessions).tz_localize(None).normalize().unique().sort_values()
+    candidate = pd.DatetimeIndex(candidate_sessions).tz_localize(None).normalize().unique().sort_values()
+    candidate_set = set(candidate)
+    missing = pd.DatetimeIndex([session for session in baseline if session not in candidate_set])
+    return {
+        "research_context_compatible": not bool(len(missing)),
+        "research_context_baseline_sessions": int(len(baseline)),
+        "research_context_candidate_sessions": int(len(candidate)),
+        "research_context_missing_sessions": int(len(missing)),
+        "research_context_first_missing_session": pd.Timestamp(missing[0]).date().isoformat() if len(missing) else None,
+        "research_context_last_missing_session": pd.Timestamp(missing[-1]).date().isoformat() if len(missing) else None,
+    }
+
+
 def _aggregate_rotation_replay(results: list[Any]) -> dict[str, Any]:
     if not results:
         raise RuntimeError("Marginal Capital Replay produced no rotation result.")
@@ -495,6 +540,7 @@ def _aggregate_rotation_replay(results: list[Any]) -> dict[str, Any]:
             value = _finite_number(fold.get("strategy_return"))
             if value is not None:
                 fold_returns.append(value)
+    sessions = _prediction_sessions(results)
     return {
         "ending_capital": _median_metric(results, "strategy_ending_capital"),
         "cagr": _median_metric(results, "strategy_cagr"),
@@ -505,6 +551,9 @@ def _aggregate_rotation_replay(results: list[Any]) -> dict[str, Any]:
         "switches": _median_metric(results, "capital_rotations"),
         "worst_fold_return": min(fold_returns) if fold_returns else None,
         "repetition_count": len(results),
+        "decision_session_count": int(len(sessions)),
+        "decision_session_start": pd.Timestamp(sessions[0]).date().isoformat() if len(sessions) else None,
+        "decision_session_end": pd.Timestamp(sessions[-1]).date().isoformat() if len(sessions) else None,
     }
 
 
@@ -525,10 +574,7 @@ def _marginal_execution_request(
     locked = base_config.model_copy(update={"assets": assets, "end_date": end_session})
     locked = apply_training_runtime_settings(db, locked)
     locked = apply_execution_profile(locked, family, settings)
-    selected_set = set(assets)
-    anchors = [symbol for symbol in winner_config.assets if symbol in selected_set]
-    if len(anchors) < 2:
-        anchors = list(assets)
+    anchors = list(assets)
     return BacktestExecutionRequest.model_validate({
         **locked.model_dump(mode="python"),
         "analysis_start_date": locked.start_date,
@@ -547,7 +593,7 @@ def _run_rotation_replay(
     request: BacktestExecutionRequest,
     *,
     progress_callback: Any | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], pd.DatetimeIndex]:
     cleaned: dict[str, pd.DataFrame] = {}
     for symbol in request.assets:
         frame = frames.get(symbol)
@@ -564,7 +610,7 @@ def _run_rotation_replay(
         progress_detail_callback=None,
         technical_log_callback=None,
     )
-    return _aggregate_rotation_replay(results)
+    return _aggregate_rotation_replay(results), _prediction_sessions(results)
 
 
 def _marginal_progress_callback(
@@ -657,7 +703,7 @@ def _run_marginal_capital_replay(
         },
     )
     total_runs = len(shortlist) + 1
-    baseline_metrics = _run_rotation_replay(
+    baseline_metrics, baseline_decision_sessions = _run_rotation_replay(
         baseline_frames,
         baseline_request,
         progress_callback=_marginal_progress_callback(
@@ -670,6 +716,8 @@ def _run_marginal_capital_replay(
             completed_count=0,
         ),
     )
+    if baseline_decision_sessions.empty:
+        raise RuntimeError("Asset Discovery baseline replay produced no decision-session context.")
     db[COLLECTION].update_one(
         {"_id": CURRENT_ID, "run_id": run_id},
         {"$set": {
@@ -713,7 +761,7 @@ def _run_marginal_capital_replay(
             )
             candidate_frames = dict(baseline_frames)
             candidate_frames[symbol] = candidate_frame
-            candidate_metrics = _run_rotation_replay(
+            candidate_metrics, candidate_decision_sessions = _run_rotation_replay(
                 candidate_frames,
                 candidate_request,
                 progress_callback=_marginal_progress_callback(
@@ -726,20 +774,33 @@ def _run_marginal_capital_replay(
                     completed_count=index - 1,
                 ),
             )
-            row.update({
-                "history_window_complete": bool(coverage.get("history_window_complete")),
-                "baseline": baseline_metrics,
-                "candidate": candidate_metrics,
-                "ending_capital_delta": _delta(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
-                "ending_capital_delta_rate": _capital_delta_rate(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
-                "cagr_delta": _delta(candidate_metrics.get("cagr"), baseline_metrics.get("cagr")),
-                "sharpe_delta": _delta(candidate_metrics.get("sharpe"), baseline_metrics.get("sharpe")),
-                "maximum_drawdown_delta": _delta(candidate_metrics.get("maximum_drawdown"), baseline_metrics.get("maximum_drawdown")),
-                "worst_fold_return_delta": _delta(candidate_metrics.get("worst_fold_return"), baseline_metrics.get("worst_fold_return")),
-                "switches_delta": _delta(candidate_metrics.get("switches"), baseline_metrics.get("switches")),
-                "cash_days_delta": _delta(candidate_metrics.get("cash_days"), baseline_metrics.get("cash_days")),
-                "market_exposure_delta": _delta(candidate_metrics.get("market_exposure"), baseline_metrics.get("market_exposure")),
-            })
+            context_compatibility = _research_context_compatibility(
+                baseline_decision_sessions, candidate_decision_sessions
+            )
+            if not bool(context_compatibility.get("research_context_compatible")):
+                row.update({
+                    "status": "rejected",
+                    "rejection_reason": "research_context_incomplete",
+                    "history_window_complete": bool(coverage.get("history_window_complete")),
+                    **context_compatibility,
+                })
+                _reject(db, run_id, "research_context_incomplete")
+            else:
+                row.update({
+                    "history_window_complete": bool(coverage.get("history_window_complete")),
+                    **context_compatibility,
+                    "baseline": baseline_metrics,
+                    "candidate": candidate_metrics,
+                    "ending_capital_delta": _delta(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
+                    "ending_capital_delta_rate": _capital_delta_rate(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
+                    "cagr_delta": _delta(candidate_metrics.get("cagr"), baseline_metrics.get("cagr")),
+                    "sharpe_delta": _delta(candidate_metrics.get("sharpe"), baseline_metrics.get("sharpe")),
+                    "maximum_drawdown_delta": _delta(candidate_metrics.get("maximum_drawdown"), baseline_metrics.get("maximum_drawdown")),
+                    "worst_fold_return_delta": _delta(candidate_metrics.get("worst_fold_return"), baseline_metrics.get("worst_fold_return")),
+                    "switches_delta": _delta(candidate_metrics.get("switches"), baseline_metrics.get("switches")),
+                    "cash_days_delta": _delta(candidate_metrics.get("cash_days"), baseline_metrics.get("cash_days")),
+                    "market_exposure_delta": _delta(candidate_metrics.get("market_exposure"), baseline_metrics.get("market_exposure")),
+                })
         except Exception as exc:
             row.update({"status": "failed", "error": str(exc)[:700]})
         replay_rows.append(row)
@@ -783,6 +844,13 @@ def _run_marginal_capital_replay(
         if symbol in marginal_rank:
             row["marginal_rank"] = marginal_rank[symbol]
 
+    eligible_results = [
+        item for item in updated_results
+        if isinstance(item.get("marginal_replay"), dict)
+        and item["marginal_replay"].get("status") == "completed"
+        and bool(item["marginal_replay"].get("research_context_compatible", True))
+    ]
+
     replay_summary = {
         "status": "completed" if len(replay_rows) == len(shortlist) else "stopped",
         "total_count": len(shortlist),
@@ -793,8 +861,10 @@ def _run_marginal_capital_replay(
         "progress_percent": 100.0 if len(replay_rows) == len(shortlist) else round(100.0 * (len(replay_rows) + 1) / total_runs, 1),
         "baseline": baseline_metrics,
         "results": replay_rows,
+        "eligible_count": len(eligible_results),
+        "research_context_rejected_count": sum(1 for row in replay_rows if row.get("rejection_reason") == "research_context_incomplete"),
     }
-    return updated_results, replay_summary
+    return eligible_results, replay_summary
 
 def _catalog_metrics(item: dict[str, Any]) -> dict[str, Any]:
     keys = (
@@ -822,6 +892,8 @@ def _catalog_metrics(item: dict[str, Any]) -> dict[str, Any]:
             "maximum_drawdown_delta": marginal.get("maximum_drawdown_delta"),
             "worst_fold_return_delta": marginal.get("worst_fold_return_delta"),
             "candidate_ending_capital": candidate.get("ending_capital"),
+            "research_context_compatible": marginal.get("research_context_compatible"),
+            "research_context_missing_sessions": marginal.get("research_context_missing_sessions"),
         }
     return metrics
 
@@ -1065,7 +1137,7 @@ def _run_worker(db: Database, run_id: str) -> None:
             db,
             run_id,
             "completed",
-            f"Asset Discovery ranked {len(evaluated)} evaluable external assets and completed Marginal Capital Replay for {len(shortlist)} shortlisted assets.",
+            f"Asset Discovery ranked {len(evaluated)} evaluable external assets and retained {len(shortlist)} research-context-compatible assets after Marginal Capital Replay.",
             results=shortlist,
         )
     except Exception as exc:
@@ -1480,6 +1552,63 @@ def create_research_strategy_from_discovery(
         )
 
     combined_assets = list(dict.fromkeys([*source_assets, *valid_symbols]))
+
+    research_config = source_config.model_copy(
+        update={
+            "end_date": snapshot_end,
+            "mongo_cache_enabled": True,
+            "market_data_history_backfill_enabled": False,
+        }
+    )
+    combined_frames = dict(source_baseline_frames)
+    for symbol in combined_assets:
+        if symbol in combined_frames:
+            continue
+        frame = load_market_bars(symbol, research_config)
+        combined_frames[symbol] = validate_and_clean_bars(frame, research_config)
+
+    replay_strategy = {"id": source_id}
+    baseline_request = _marginal_execution_request(
+        db,
+        source_config,
+        replay_strategy,
+        source_config,
+        snapshot_end,
+        assets=source_assets,
+        reference_assets=source_assets,
+        candidate_assets=[],
+    )
+    _baseline_metrics, baseline_decision_sessions = _run_rotation_replay(
+        source_baseline_frames,
+        baseline_request,
+    )
+    combined_request = _marginal_execution_request(
+        db,
+        source_config,
+        replay_strategy,
+        source_config,
+        snapshot_end,
+        assets=combined_assets,
+        reference_assets=source_assets,
+        candidate_assets=[symbol for symbol in valid_symbols if symbol not in source_asset_set],
+    )
+    _combined_metrics, combined_decision_sessions = _run_rotation_replay(
+        combined_frames,
+        combined_request,
+    )
+    context_compatibility = _research_context_compatibility(
+        baseline_decision_sessions,
+        combined_decision_sessions,
+    )
+    if not bool(context_compatibility.get("research_context_compatible")):
+        raise AssetDiscoveryConflict(
+            "The selected Discovery assets reduce the Strategy research decision context by "
+            f"{int(context_compatibility.get('research_context_missing_sessions') or 0)} sessions "
+            f"({context_compatibility.get('research_context_first_missing_session') or 'unknown'} → "
+            f"{context_compatibility.get('research_context_last_missing_session') or 'unknown'}). "
+            "The Strategy was not created."
+        )
+
     updated_configuration = source_config.model_copy(update={"assets": combined_assets})
     configuration_payload = updated_configuration.model_dump(mode="json")
 

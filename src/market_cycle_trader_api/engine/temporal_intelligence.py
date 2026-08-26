@@ -3370,6 +3370,7 @@ def _bind_strategy_research_reference_analytics(
     current_asset = _reference_asset((first_rotation or {}).get("from_asset"))
     rotation_index = 0
     synthetic_context_sessions = 0
+    missing_context_stamps: list[pd.Timestamp] = []
     bound_rows: list[dict[str, Any]] = []
     last_fold_id = 0
 
@@ -3388,6 +3389,7 @@ def _bind_strategy_research_reference_analytics(
         source = deepcopy(winner_by_execution.get(execution_stamp) or {})
         if not source:
             synthetic_context_sessions += 1
+            missing_context_stamps.append(execution_stamp)
             source = {
                 "timestamp": execution_stamp,
                 "decision_date": None,
@@ -3420,10 +3422,21 @@ def _bind_strategy_research_reference_analytics(
             f"({len(bound_rows)}/{len(equity_rows)} sessions bound)."
         )
     if synthetic_context_sessions:
+        context_stamps = sorted(stamp for stamp in winner_by_execution if stamp is not None)
+        missing_context_stamps = sorted(stamp for stamp in missing_context_stamps if stamp is not None)
+        missing_start = missing_context_stamps[0].date().isoformat() if missing_context_stamps else "unknown"
+        missing_end = missing_context_stamps[-1].date().isoformat() if missing_context_stamps else "unknown"
+        context_start = context_stamps[0].date().isoformat() if context_stamps else "unavailable"
+        context_end = context_stamps[-1].date().isoformat() if context_stamps else "unavailable"
+        first_missing = ", ".join(stamp.date().isoformat() for stamp in missing_context_stamps[:5]) or "unavailable"
         raise ValueError(
             "Strategy Research market context is incomplete: "
             f"{synthetic_context_sessions} of {len(equity_rows)} reference sessions have no complete market context. "
-            "This usually indicates discontinuous history in one or more Strategy assets; the research run was stopped before downstream analysis."
+            f"Missing reference range={missing_start} → {missing_end}; "
+            f"available decision context={context_start} → {context_end}; "
+            f"first missing sessions={first_missing}. "
+            "This usually indicates discontinuous or insufficient research context in one or more Strategy assets; "
+            "the research run was stopped before downstream analysis."
         )
 
     fold_equity: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
