@@ -21,6 +21,7 @@ from ..engine.market_data import (
     _upsert_frame,
     complete_market_history,
     latest_safe_completed_xnys_session,
+    refresh_market_data_to_live_cutoff,
     load_market_bars,
     validate_and_clean_bars,
 )
@@ -1104,8 +1105,17 @@ def _run_worker(db: Database, run_id: str) -> None:
         _event(db, run_id, "Loading the Strategy Research baseline.", phase="baseline", changes={"status": "running", "started_at": utc_now()})
         config, strategy = get_research_strategy_context(db)
         winner_config, winner_strategy = get_trader_winner_context(db)
-        safe_session = latest_safe_completed_xnys_session()
-        end_session = pd.Timestamp(safe_session).date().isoformat()
+        _event(
+            db,
+            run_id,
+            "Synchronizing the Strategy Research market-data cache before freezing the Discovery snapshot.",
+            phase="baseline_sync",
+        )
+        baseline_sync = refresh_market_data_to_live_cutoff(config)
+        end_session = str(baseline_sync.get("live_market_cutoff") or "").strip()
+        if not end_session:
+            raise RuntimeError("Asset Discovery could not resolve the synchronized Strategy Research market cutoff.")
+        safe_session = pd.Timestamp(end_session)
         baseline_frames = _baseline_frames(config, end_session)
         baseline_returns = _baseline_recent_returns(baseline_frames)
         _event(
@@ -1122,6 +1132,11 @@ def _run_worker(db: Database, run_id: str) -> None:
                     "asset_count": len(config.assets),
                     "assets": list(config.assets),
                     "market_snapshot_end": end_session,
+                    "market_data_sync": {
+                        "target_session": baseline_sync.get("target_session"),
+                        "rows_refreshed": dict(baseline_sync.get("rows_refreshed") or {}),
+                        "data_delay_minutes": baseline_sync.get("data_delay_minutes"),
+                    },
                 },
                 "winner_source": {
                     "strategy_id": winner_strategy.get("id"),
