@@ -67,7 +67,7 @@ _ACTIVE_PIPELINE_WORKERS: set[str] = set()
 _ACTIVE_PIPELINE_LOCK = threading.Lock()
 _logger = logging.getLogger(__name__)
 
-STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation")
+STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "roc_policy", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation")
 STRATEGY_RESEARCH_PIPELINE_STAGE_STATES = frozenset({"waiting", "running", "completed", "paused", "stopped", "failed", "skipped"})
 STRATEGY_RESEARCH_PIPELINE_STATUSES = frozenset({"idle", "running", "pause_requested", "paused", "stop_requested", "stopped", "completed", "failed"})
 STRATEGY_RESEARCH_HISTORY_KEEP = 5
@@ -319,8 +319,10 @@ def _delete_strategy_research_run_data(db: Any, run_id: str, *, delete_run: bool
         "decision_policy": int(db[TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION].delete_many({"run_id": run_key}).deleted_count or 0),
     }
     from ..milp_decision.persistence import delete_run_results
+    from ..roc_decision_policy.persistence import delete_run_results as delete_roc_decision_policy_results
     from ..leadership_regime.service import delete_run_results as delete_leadership_results
     deleted["decision_optimization"] = delete_run_results(db, run_key)
+    deleted["roc_decision_policy"] = delete_roc_decision_policy_results(db, run_key)
     deleted["leadership_regime"] = delete_leadership_results(db, run_key)
     from ..opportunity_drought.service import delete_run_results as delete_opportunity_drought_results
     deleted["opportunity_drought"] = delete_opportunity_drought_results(db, run_key)
@@ -1141,6 +1143,14 @@ def build_temporal_intelligence_export(
     pipeline_intervention = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION)
     pipeline_confidence = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION)
     pipeline_stateful = latest_pipeline_document(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION)
+    pipeline_roc_policy = None
+    pipeline_roc_policy_raw = None
+    if processing_id and pipeline_period_start and pipeline_period_end:
+        from ..roc_decision_policy.persistence import latest_raw as latest_roc_decision_policy, public_summary as roc_decision_policy_public_summary
+        pipeline_roc_policy_raw = latest_roc_decision_policy(
+            db, run_id, processing_id=processing_id, start_month=pipeline_period_start, end_month=pipeline_period_end
+        )
+        pipeline_roc_policy = roc_decision_policy_public_summary(pipeline_roc_policy_raw)
     pipeline_milp = None
     if processing_id and pipeline_period_start and pipeline_period_end:
         from ..milp_decision.persistence import latest_raw as latest_milp_decision
@@ -1406,6 +1416,8 @@ def build_temporal_intelligence_export(
         "intervention_status": (pipeline_intervention or {}).get("status"),
         "confidence_status": (pipeline_confidence or {}).get("status"),
         "stateful_status": (pipeline_stateful or {}).get("status"),
+        "roc_decision_policy_status": (pipeline_roc_policy or {}).get("status"),
+        "roc_decision_policy_capital_delta_rate": (((pipeline_roc_policy or {}).get("comparison") or {}).get("delta") or {}).get("ending_capital_rate"),
         "leadership_regime_status": (pipeline_leadership or {}).get("status"),
         "clustering_status": (pipeline_clustering or {}).get("status"),
         "clustering_readiness": ((pipeline_clustering or {}).get("readiness") or {}).get("status"),
@@ -1500,6 +1512,26 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_emerging_trend_roc.csv", _csv_text(emerging_trend_roc_rows))
             archive.writestr("strategy_research_emerging_trend_feature_importance.csv", _csv_text(emerging_trend_feature_rows))
             archive.writestr("strategy_research_emerging_trend_sessions.csv", _csv_text(emerging_trend_session_rows))
+        if pipeline_roc_policy is not None:
+            roc_export = pipeline_roc_policy_raw or pipeline_roc_policy
+            archive.writestr("strategy_research_roc_decision_policy.json", json.dumps(roc_export, indent=2, ensure_ascii=False, default=str))
+            archive.writestr("strategy_research_roc_decision_policy_thresholds.csv", _csv_text([
+                {key: value for key, value in item.items() if key not in {"roc", "calibration_roc"}}
+                for item in (roc_export.get("fold_horizons") or []) if isinstance(item, dict)
+            ]))
+            archive.writestr("strategy_research_roc_decision_policy_stability.csv", _csv_text(roc_export.get("threshold_stability") or []))
+            archive.writestr("strategy_research_roc_decision_policy_equity.csv", _csv_text(roc_export.get("equity") or []))
+            archive.writestr("strategy_research_roc_decision_policy_decisions.csv", _csv_text([
+                {key: value for key, value in item.items() if key not in {"base_horizons", "challenger_horizons"}}
+                for item in (roc_export.get("decision_diagnostics") or []) if isinstance(item, dict)
+            ]))
+            roc_policy_curves = []
+            for item in (roc_export.get("fold_horizons") or []):
+                if not isinstance(item, dict):
+                    continue
+                append_roc_rows(roc_policy_curves, item.get("calibration_roc"), analysis="roc_decision_policy", evaluation_scope="fold_calibration", fold_id=item.get("fold_id"), horizon=item.get("horizon"))
+                append_roc_rows(roc_policy_curves, item.get("roc"), analysis="roc_decision_policy", evaluation_scope="fold_oos", fold_id=item.get("fold_id"), horizon=item.get("horizon"))
+            archive.writestr("strategy_research_roc_decision_policy_roc.csv", _csv_text(roc_policy_curves))
         if pipeline_milp is not None:
             archive.writestr("strategy_research_milp_decision.json", json.dumps(pipeline_milp, indent=2, ensure_ascii=False, default=str))
         if pipeline_validation is not None:
@@ -1520,6 +1552,8 @@ def _strategy_research_pipeline_state(document: dict[str, Any] | None) -> dict[s
     if status_value not in STRATEGY_RESEARCH_PIPELINE_STATUSES:
         status_value = "idle"
     stored_stage_states = dict(stored.get("stage_states") or {})
+    if status_value == "completed" and "roc_policy" not in stored_stage_states:
+        stage_states["roc_policy"] = "skipped"
     if status_value == "completed" and "clustering" not in stored_stage_states:
         stage_states["clustering"] = "skipped"
     if status_value == "completed" and "fragile_incumbent" not in stored_stage_states:
@@ -1720,6 +1754,20 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
         )
         from ..milp_decision.persistence import latest_raw as latest_milp_decision
         from ..milp_decision.service import run as run_milp_decision
+
+        current_stage = "roc_policy"
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_start(db, run_id, current_stage)
+        from ..roc_decision_policy.service import run as run_roc_decision_policy
+        roc_policy = run_roc_decision_policy(
+            db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+        )
+        if str((roc_policy or {}).get("status") or "").lower() != "completed":
+            raise TemporalIntelligenceConflict("ROC Decision Policy did not produce a completed result.")
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
 
         current_stage = "clustering"
         if _pipeline_stop_requested(db, run_id):
@@ -2063,6 +2111,12 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         )
         return bson_value(row) if row is not None else None
 
+    pipeline_roc_policy = None
+    if processing_id and period_start and period_end:
+        from ..roc_decision_policy.persistence import latest_raw as latest_roc_decision_policy, public_summary as roc_decision_policy_public_summary
+        pipeline_roc_policy = roc_decision_policy_public_summary(
+            latest_roc_decision_policy(db, run_id, processing_id=processing_id, start_month=period_start, end_month=period_end)
+        )
     pipeline_milp = None
     if processing_id and period_start and period_end:
         from ..milp_decision.persistence import latest_raw as latest_milp_decision
@@ -2122,7 +2176,7 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         )
 
     return bson_value({
-        "schema_version": 6,
+        "schema_version": 7,
         "run_id": str(run_id),
         "processing_id": processing_id or None,
         "period_start": period_start or None,
@@ -2134,6 +2188,7 @@ def get_strategy_research_pipeline_snapshot(db: Any, run_id: str) -> dict[str, A
         "intervention": latest(TEMPORAL_WINNER_TRANSITION_INTERVENTION_RESEARCH_COLLECTION),
         "confidence": latest(TEMPORAL_WINNER_TRANSITION_CONFIDENCE_RESEARCH_COLLECTION),
         "stateful": latest(TEMPORAL_WINNER_TRANSITION_STATEFUL_RESEARCH_COLLECTION, ("completed", "blocked")),
+        "roc_decision_policy": pipeline_roc_policy,
         "milp": pipeline_milp,
         "leadership_regime": leadership,
         "clustering": clustering,
@@ -2272,7 +2327,7 @@ def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, A
         if stage_states.get("reference") == "waiting":
             stage_states["reference"] = "completed"
         stage_states["temporal"] = "running"
-        for stage in ("clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation"):
+        for stage in ("roc_policy", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation"):
             stage_states[stage] = "waiting"
         repaired = _persist_strategy_research_pipeline_state(
             db,
@@ -2339,6 +2394,7 @@ def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
         from ..emerging_trend.service import delete_run_results as delete_emerging_trend_results
         from ..alternative_action.service import delete_run_results as delete_alternative_action_results
         from ..operational_policy_qualification.service import delete_run_results as delete_operational_policy_qualification_results
+        from ..roc_decision_policy.persistence import delete_run_results as delete_roc_decision_policy_results
         deleted = {
             "observations": 0, "artifacts": 0, "risk": 0, "intervention": 0, "confidence": 0,
             "decision_policy": 0, "decision_optimization": 0,
@@ -2348,6 +2404,7 @@ def reset_strategy_research_pipeline(db: Any, run_id: str) -> dict[str, Any]:
             "emerging_trend": delete_emerging_trend_results(db, run_id),
             "alternative_action": delete_alternative_action_results(db, run_id),
             "operational_policy_qualification": delete_operational_policy_qualification_results(db, run_id),
+            "roc_decision_policy": delete_roc_decision_policy_results(db, run_id),
             "fragile_incumbent": delete_fragile_incumbent_results(db, run_id), "runs": 0,
         }
     else:

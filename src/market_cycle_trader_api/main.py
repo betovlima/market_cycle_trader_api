@@ -39,6 +39,7 @@ from .api.routers import (
 from .core.config import API_VERSION, cors_origins
 from .milp_decision.router import router as milp_decision_router
 from .decision_science.router import router as decision_science_router
+from .roc_decision_policy.router import router as roc_decision_policy_router
 from .auth.config import get_auth_settings
 from .auth.security import require_admin_session, require_backtest_access, require_portfolio_session, require_trader_access, require_trader_session
 from .auth.access_service import get_access_service
@@ -50,6 +51,7 @@ from .services.paper_market_scheduler import (
 from .services.model_tuning import recover_integrated_model_tuning_runs
 from .services.temporal_intelligence import recover_temporal_intelligence_runs
 from .services.temporal_research_settings import ensure_temporal_research_settings
+from .roc_decision_policy.config import ensure_settings as ensure_roc_decision_policy_settings
 
 
 @asynccontextmanager
@@ -57,6 +59,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     initialize_mongo()
     if bool(MONGO_STATUS.get("available")):
         ensure_temporal_research_settings(database())
+        ensure_roc_decision_policy_settings(database())
         recover_integrated_model_tuning_runs(database())
         recover_temporal_intelligence_runs(database())
     get_auth_settings().validate_runtime()
@@ -103,6 +106,7 @@ def create_app() -> FastAPI:
     application.include_router(temporal_intelligence.router)
     application.include_router(milp_decision_router)
     application.include_router(decision_science_router)
+    application.include_router(roc_decision_policy_router)
     application.include_router(temporal_rotation_quality.router)
     application.include_router(exports.router, dependencies=admin_required)
     application.include_router(analytics.router)

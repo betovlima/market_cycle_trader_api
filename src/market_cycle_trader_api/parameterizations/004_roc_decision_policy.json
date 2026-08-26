@@ -1,0 +1,6 @@
+{
+  "selection_metric": "youden_j",
+  "minimum_calibration_samples": 100,
+  "minimum_class_samples": 20,
+  "max_curve_points": 121
+}
