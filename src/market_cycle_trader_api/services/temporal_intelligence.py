@@ -790,10 +790,52 @@ def build_temporal_intelligence_export(
     if result is None:
         raise TemporalIntelligenceConflict("Temporal Intelligence results are not available until the execution finishes successfully.")
 
+    roc_diagnostic_rows: list[dict[str, Any]] = []
+
+    def append_roc_diagnostic(roc: Any, **context: Any) -> None:
+        if not isinstance(roc, dict):
+            return
+        operating = roc.get("operating_point") if isinstance(roc.get("operating_point"), dict) else {}
+        diagnostic = roc.get("diagnostic_best_point") if isinstance(roc.get("diagnostic_best_point"), dict) else {}
+        operating_threshold = operating.get("threshold")
+        diagnostic_threshold = diagnostic.get("threshold")
+        threshold_delta = None
+        try:
+            if operating_threshold is not None and diagnostic_threshold is not None:
+                threshold_delta = float(operating_threshold) - float(diagnostic_threshold)
+        except (TypeError, ValueError):
+            threshold_delta = None
+        roc_diagnostic_rows.append(bson_value({
+            **context,
+            "auc": roc.get("auc"),
+            "positive_count": roc.get("positive_count"),
+            "negative_count": roc.get("negative_count"),
+            "point_role": operating.get("point_role"),
+            "threshold_origin": operating.get("threshold_origin"),
+            "validation_metric_name": operating.get("validation_metric_name"),
+            "validation_metric_value": operating.get("validation_metric_value"),
+            "operating_threshold": operating_threshold,
+            "operating_threshold_mode": operating.get("threshold_mode"),
+            "operating_tpr": operating.get("tpr"),
+            "operating_fpr": operating.get("fpr"),
+            "operating_specificity": operating.get("specificity"),
+            "operating_balanced_accuracy": operating.get("balanced_accuracy"),
+            "diagnostic_best_threshold": diagnostic_threshold,
+            "diagnostic_best_tpr": diagnostic.get("tpr"),
+            "diagnostic_best_fpr": diagnostic.get("fpr"),
+            "diagnostic_best_specificity": diagnostic.get("specificity"),
+            "diagnostic_best_balanced_accuracy": diagnostic.get("balanced_accuracy"),
+            "threshold_delta_to_oos_diagnostic_best": threshold_delta,
+            "diagnostic_only": diagnostic.get("diagnostic_only"),
+            "diagnostic_selection_rule": diagnostic.get("selection_rule"),
+        }))
+
     def append_roc_rows(target: list[dict[str, Any]], roc: Any, **context: Any) -> None:
         if not isinstance(roc, dict):
             return
         operating = roc.get("operating_point") if isinstance(roc.get("operating_point"), dict) else {}
+        diagnostic = roc.get("diagnostic_best_point") if isinstance(roc.get("diagnostic_best_point"), dict) else {}
+        append_roc_diagnostic(roc, **context)
         for index, point in enumerate(roc.get("points") or []):
             if not isinstance(point, dict):
                 continue
@@ -806,11 +848,21 @@ def build_temporal_intelligence_export(
                 "fpr": point.get("fpr"),
                 "tpr": point.get("tpr"),
                 "threshold": point.get("threshold"),
+                "point_role": operating.get("point_role"),
+                "threshold_origin": operating.get("threshold_origin"),
+                "validation_metric_name": operating.get("validation_metric_name"),
+                "validation_metric_value": operating.get("validation_metric_value"),
                 "operating_threshold": operating.get("threshold"),
                 "operating_threshold_mode": operating.get("threshold_mode"),
                 "operating_fpr": operating.get("fpr"),
                 "operating_tpr": operating.get("tpr"),
                 "operating_specificity": operating.get("specificity"),
+                "operating_balanced_accuracy": operating.get("balanced_accuracy"),
+                "diagnostic_best_threshold": diagnostic.get("threshold"),
+                "diagnostic_best_fpr": diagnostic.get("fpr"),
+                "diagnostic_best_tpr": diagnostic.get("tpr"),
+                "diagnostic_best_specificity": diagnostic.get("specificity"),
+                "diagnostic_best_balanced_accuracy": diagnostic.get("balanced_accuracy"),
             }))
 
     horizon_rows = [
@@ -952,7 +1004,7 @@ def build_temporal_intelligence_export(
         for item in horizon.get("signal_metrics") or []:
             if isinstance(item, dict):
                 signal_rows.append(bson_value({"horizon": horizon_value, **{key: value for key, value in item.items() if key != "roc"}}))
-                append_roc_rows(temporal_roc_rows, item.get("roc"), horizon=horizon_value, signal=item.get("signal"), evaluation_scope="horizon_oos")
+                append_roc_rows(temporal_roc_rows, item.get("roc"), analysis="temporal_intelligence", horizon=horizon_value, signal=item.get("signal"), evaluation_scope="horizon_oos")
         capital = horizon.get("shadow_capital")
         if isinstance(capital, dict):
             capital_rows.append(bson_value({
@@ -1169,8 +1221,8 @@ def build_temporal_intelligence_export(
             row.update({f"session_{key}": value for key, value in session_metrics.items() if key != "roc"})
             row.update({f"monthly_{key}": value for key, value in monthly_metrics.items() if key != "roc"})
             opportunity_drought_fold_rows.append(bson_value(row))
-            append_roc_rows(opportunity_drought_roc_rows, session_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="session_oos")
-            append_roc_rows(opportunity_drought_roc_rows, monthly_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
+            append_roc_rows(opportunity_drought_roc_rows, session_metrics.get("roc"), analysis="opportunity_drought", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
+            append_roc_rows(opportunity_drought_roc_rows, monthly_metrics.get("roc"), analysis="opportunity_drought", fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
         opportunity_drought_feature_rows = [
             bson_value(dict(item)) for item in (pipeline_opportunity_drought.get("feature_importance") or []) if isinstance(item, dict)
         ]
@@ -1220,7 +1272,7 @@ def build_temporal_intelligence_export(
         for item in pipeline_emerging_trend.get("folds") or []:
             if isinstance(item, dict):
                 emerging_trend_fold_rows.append(bson_value({key: value for key, value in item.items() if key != "roc"}))
-                append_roc_rows(emerging_trend_roc_rows, item.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="session_oos")
+                append_roc_rows(emerging_trend_roc_rows, item.get("roc"), analysis="emerging_trend", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
         emerging_trend_feature_rows = [bson_value(dict(item)) for item in (pipeline_emerging_trend.get("feature_importance") or []) if isinstance(item, dict)]
         for item in pipeline_emerging_trend.get("sessions") or []:
             if not isinstance(item, dict):
@@ -1258,8 +1310,8 @@ def build_temporal_intelligence_export(
             row.update({f"session_{key}": value for key, value in session_metrics.items() if key != "roc"})
             row.update({f"monthly_{key}": value for key, value in monthly_metrics.items() if key != "roc"})
             fragile_incumbent_fold_rows.append(bson_value(row))
-            append_roc_rows(fragile_incumbent_roc_rows, session_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="session_oos")
-            append_roc_rows(fragile_incumbent_roc_rows, monthly_metrics.get("roc"), fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
+            append_roc_rows(fragile_incumbent_roc_rows, session_metrics.get("roc"), analysis="fragile_incumbent", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
+            append_roc_rows(fragile_incumbent_roc_rows, monthly_metrics.get("roc"), analysis="fragile_incumbent", fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
         fragile_incumbent_feature_rows = [
             bson_value(dict(item)) for item in (pipeline_fragile_incumbent.get("feature_importance") or []) if isinstance(item, dict)
         ]
@@ -1274,17 +1326,17 @@ def build_temporal_intelligence_export(
     risk_roc_rows: list[dict[str, Any]] = []
     if pipeline_risk is not None:
         oos_metrics = ((pipeline_risk.get("oos") or {}).get("metrics") or {}) if isinstance(pipeline_risk.get("oos"), dict) else {}
-        append_roc_rows(risk_roc_rows, oos_metrics.get("roc"), evaluation_scope="overall_oos")
+        append_roc_rows(risk_roc_rows, oos_metrics.get("roc"), analysis="winner_transition_risk", evaluation_scope="overall_oos")
         for item in pipeline_risk.get("family_comparison") or []:
             if not isinstance(item, dict):
                 continue
             metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
-            append_roc_rows(risk_roc_rows, metrics.get("roc"), evaluation_scope="family_oos", family=item.get("family"), risk_quantile=item.get("risk_quantile"))
+            append_roc_rows(risk_roc_rows, metrics.get("roc"), analysis="winner_transition_risk", evaluation_scope="family_oos", family=item.get("family"), risk_quantile=item.get("risk_quantile"))
         for item in pipeline_risk.get("outer_results") or []:
             if not isinstance(item, dict):
                 continue
             metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
-            append_roc_rows(risk_roc_rows, metrics.get("roc"), evaluation_scope="outer_year", test_year=item.get("test_year"), family=item.get("selected_family"), risk_quantile=item.get("risk_quantile"), risk_threshold=item.get("risk_threshold"))
+            append_roc_rows(risk_roc_rows, metrics.get("roc"), analysis="winner_transition_risk", evaluation_scope="outer_year", test_year=item.get("test_year"), family=item.get("selected_family"), risk_quantile=item.get("risk_quantile"), risk_threshold=item.get("risk_threshold"))
 
     alternative_action_rows: list[dict[str, Any]] = []
     alternative_action_yearly_rows: list[dict[str, Any]] = []
@@ -1329,7 +1381,8 @@ def build_temporal_intelligence_export(
             pipeline_attribution = {"status": "unavailable", "failure_message": str(exc)}
 
     pipeline_manifest = bson_value({
-        "schema_version": 6,
+        "schema_version": 7,
+        "roc_diagnostics_schema_version": 1,
         "run_id": str(run_id),
         "pipeline_status": pipeline_state_export.get("status"),
         "current_stage": pipeline_state_export.get("current_stage"),
@@ -1375,6 +1428,7 @@ def build_temporal_intelligence_export(
         archive.writestr("temporal_intelligence_risk_buckets.csv", _csv_text(risk_rows))
         archive.writestr("temporal_intelligence_signal_metrics.csv", _csv_text(signal_rows))
         archive.writestr("temporal_intelligence_roc.csv", _csv_text(temporal_roc_rows))
+        archive.writestr("strategy_research_roc_diagnostics.csv", _csv_text(roc_diagnostic_rows))
         archive.writestr("temporal_intelligence_shadow_capital.csv", _csv_text(capital_rows))
         archive.writestr("temporal_intelligence_shadow_capital_folds.csv", _csv_text(fold_capital_rows))
         archive.writestr("temporal_intelligence_decision_diagnostics.csv", _csv_text(diagnostic_rows))

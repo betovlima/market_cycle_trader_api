@@ -900,7 +900,13 @@ def _binary_signal_metrics(
     labels = realized_values > 0.0
     high_rate = _finite(labels[high].mean()) if bool(high.any()) else None
     positive_rate = _finite(labels[valid].mean()) if bool(valid.any()) else None
-    roc = roc_curve_payload(labels[valid].astype(int), probability_values[valid], operating_threshold=0.70) if bool(valid.any()) else roc_curve_payload([], [])
+    roc = roc_curve_payload(
+        labels[valid].astype(int),
+        probability_values[valid],
+        operating_threshold=0.70,
+        operating_point_role="high_confidence_cutoff",
+        threshold_origin="fixed_high_confidence_definition",
+    ) if bool(valid.any()) else roc_curve_payload([], [])
     return {
         "brier": calibrated["brier"],
         "raw_brier": raw["brier"],

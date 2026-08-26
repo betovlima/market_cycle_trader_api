@@ -42,7 +42,14 @@ def _safe_auc(y_true: np.ndarray, probabilities: np.ndarray) -> float | None:
     return float(roc_auc_score(y_true, probabilities))
 
 
-def _metrics(y_true: np.ndarray, probabilities: np.ndarray, threshold: float) -> dict[str, Any]:
+def _metrics(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    threshold: float,
+    *,
+    threshold_origin: str | None = None,
+    validation_metric_value: float | None = None,
+) -> dict[str, Any]:
     clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1.0 - 1e-6)
     truth = np.asarray(y_true, dtype=int)
     prediction = clipped >= float(threshold)
@@ -56,7 +63,14 @@ def _metrics(y_true: np.ndarray, probabilities: np.ndarray, threshold: float) ->
         "precision": float(precision_score(truth, prediction, zero_division=0)) if len(truth) else None,
         "recall": float(recall_score(truth, prediction, zero_division=0)) if len(truth) else None,
         "average_probability": float(np.mean(clipped)) if len(clipped) else None,
-        "roc": roc_curve_payload(truth, clipped, operating_threshold=float(threshold)),
+        "roc": roc_curve_payload(
+            truth,
+            clipped,
+            operating_threshold=float(threshold),
+            threshold_origin=threshold_origin,
+            validation_metric_name="balanced_accuracy" if validation_metric_value is not None else None,
+            validation_metric_value=validation_metric_value,
+        ),
     }
 
 
@@ -286,11 +300,17 @@ def build_analysis(
             "threshold": float(threshold),
             "threshold_validation_balanced_accuracy": float(threshold_score),
             "best_iteration": int(getattr(model, "best_iteration_", 0) or getattr(model, "n_estimators_", 0) or 0),
-            "session_metrics": _metrics(test["target_negative_month"].to_numpy(dtype=int), probability, threshold),
+            "session_metrics": _metrics(
+                test["target_negative_month"].to_numpy(dtype=int), probability, threshold,
+                threshold_origin="validation_balanced_accuracy",
+                validation_metric_value=threshold_score,
+            ),
             "monthly_metrics": _metrics(
                 monthly_test["target_negative_month"].to_numpy(dtype=int),
                 monthly_test["oos_fragility_probability"].to_numpy(dtype=float),
                 threshold,
+                threshold_origin="validation_balanced_accuracy",
+                validation_metric_value=threshold_score,
             ),
         })
 
