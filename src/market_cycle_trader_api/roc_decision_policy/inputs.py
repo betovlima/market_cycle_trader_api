@@ -11,7 +11,6 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
 )
 from ..schemas.requests import BacktestExecutionRequest
-from ..services.analytics import processing_analytics
 from ..services.temporal_model.inputs import load_frozen_bars
 from ..services.temporal_model.preprocessing import prepare_training_context
 from .errors import RocDecisionPolicyConflict, RocDecisionPolicyNotFound
@@ -31,6 +30,13 @@ def load_source_run(db: Any, run_id: str, processing_id: str) -> dict[str, Any]:
     return run
 
 
+def _decoded_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = document.get("rows") or []
+    if document.get("encoding") == "zlib-json-v1" and document.get("payload"):
+        rows = json.loads(zlib.decompress(bytes(document["payload"])).decode("utf-8"))
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
 def load_observations(db: Any, run_id: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     cursor = db[TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION].find(
@@ -38,12 +44,8 @@ def load_observations(db: Any, run_id: str) -> list[dict[str, Any]]:
         {"_id": 0, "timestamp": 1, "rows": 1, "encoding": 1, "payload": 1},
     ).sort("timestamp", 1)
     for item in cursor:
-        current = item.get("rows") or []
-        if item.get("encoding") == "zlib-json-v1" and item.get("payload"):
-            current = json.loads(zlib.decompress(bytes(item["payload"])).decode("utf-8"))
-        for row in current:
-            if isinstance(row, dict):
-                rows.append(bson_value({"timestamp": item.get("timestamp"), **dict(row)}))
+        for row in _decoded_rows(item):
+            rows.append(bson_value({"timestamp": item.get("timestamp"), **row}))
     if not rows:
         raise RocDecisionPolicyConflict("Temporal Intelligence observations are unavailable for ROC Decision Policy.")
     return rows
@@ -56,10 +58,20 @@ def load_artifact_rows(db: Any, run_id: str, kind: str) -> list[dict[str, Any]]:
         {"_id": 0, "sequence": 1, "encoding": 1, "payload": 1, "rows": 1},
     ).sort("sequence", 1)
     for item in cursor:
-        current = item.get("rows") or []
-        if item.get("encoding") == "zlib-json-v1" and item.get("payload"):
-            current = json.loads(zlib.decompress(bytes(item["payload"])).decode("utf-8"))
-        rows.extend(bson_value(dict(row)) for row in current if isinstance(row, dict))
+        rows.extend(bson_value(row) for row in _decoded_rows(item))
+    return rows
+
+
+def load_embedded_artifact_rows(db: Any, run_id: str, artifact_kind: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    cursor = db[TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION].find(
+        {"run_id": str(run_id), "kind": "decision_diagnostics"},
+        {"_id": 0, "sequence": 1, "encoding": 1, "payload": 1, "rows": 1},
+    ).sort("sequence", 1)
+    for item in cursor:
+        for row in _decoded_rows(item):
+            if str(row.get("artifact_kind") or "") == str(artifact_kind):
+                rows.append(bson_value(row))
     return rows
 
 
@@ -67,14 +79,17 @@ def prepare_inputs(db: Any, run: dict[str, Any], processing_id: str) -> dict[str
     request = BacktestExecutionRequest.model_validate(run["request"])
     bars = load_frozen_bars(request)
     training = prepare_training_context(bars, request)
-    winner_daily = load_artifact_rows(db, str(run.get("id") or ""), "winner_reference_daily")
+    run_id = str(run.get("id") or "")
+    winner_daily = load_artifact_rows(db, run_id, "winner_reference_daily")
     if not winner_daily:
         raise RocDecisionPolicyConflict("Immutable Winner/reference daily rows are unavailable for ROC Decision Policy.")
-    reference = processing_analytics(db, processing_id)
+    temporal_curve = load_embedded_artifact_rows(db, run_id, "multi_horizon_equity_curve")
+    if not temporal_curve:
+        raise RocDecisionPolicyConflict("Frozen Temporal economic replay rows are unavailable for ROC Decision Policy.")
     return {
         "request": request,
         "training": training,
-        "observations": load_observations(db, str(run.get("id") or "")),
+        "observations": load_observations(db, run_id),
         "winner_daily": winner_daily,
-        "reference_analytics": reference,
+        "temporal_curve": temporal_curve,
     }

@@ -1417,6 +1417,7 @@ def build_temporal_intelligence_export(
         "confidence_status": (pipeline_confidence or {}).get("status"),
         "stateful_status": (pipeline_stateful or {}).get("status"),
         "roc_decision_policy_status": (pipeline_roc_policy or {}).get("status"),
+        "roc_decision_policy_control_parity": ((pipeline_roc_policy or {}).get("control_parity") or {}).get("status"),
         "roc_decision_policy_capital_delta_rate": (((pipeline_roc_policy or {}).get("comparison") or {}).get("delta") or {}).get("ending_capital_rate"),
         "leadership_regime_status": (pipeline_leadership or {}).get("status"),
         "clustering_status": (pipeline_clustering or {}).get("status"),
@@ -1520,6 +1521,11 @@ def build_temporal_intelligence_export(
                 for item in (roc_export.get("fold_horizons") or []) if isinstance(item, dict)
             ]))
             archive.writestr("strategy_research_roc_decision_policy_stability.csv", _csv_text(roc_export.get("threshold_stability") or []))
+            parity = roc_export.get("control_parity") if isinstance(roc_export.get("control_parity"), dict) else {}
+            parity_checks = parity.get("checks") if isinstance(parity.get("checks"), dict) else {}
+            archive.writestr("strategy_research_roc_decision_policy_control_parity.csv", _csv_text([
+                {"check": key, "passed": bool(value)} for key, value in parity_checks.items()
+            ]))
             archive.writestr("strategy_research_roc_decision_policy_equity.csv", _csv_text(roc_export.get("equity") or []))
             archive.writestr("strategy_research_roc_decision_policy_decisions.csv", _csv_text([
                 {key: value for key, value in item.items() if key not in {"base_horizons", "challenger_horizons"}}
