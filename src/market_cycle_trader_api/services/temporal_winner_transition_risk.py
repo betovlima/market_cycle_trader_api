@@ -209,6 +209,8 @@ def _classification_metrics(frame: pd.DataFrame, scores: np.ndarray, flags: np.n
     roc["operating_point"] = {
         "threshold": None,
         "threshold_mode": "chronological_fold_thresholds",
+        "point_role": "operating_threshold",
+        "threshold_origin": "chronological_validation_per_fold",
         "tpr": recall,
         "fpr": float(false_positive / negative_count) if negative_count else None,
         "specificity": float(1.0 - (false_positive / negative_count)) if negative_count else None,
@@ -550,6 +552,12 @@ def run_transition_risk_search_from_payloads(
         quantile = float(candidate["risk_quantile"])
         scores, flags, threshold = _fit_score(train, test, family, quantile, seed + year)
         metrics = _classification_metrics(test, scores, flags)
+        if isinstance((metrics.get("roc") or {}).get("operating_point"), dict):
+            metrics["roc"]["operating_point"].update({
+                "threshold": float(threshold),
+                "threshold_mode": "single_chronological_fold",
+                "threshold_origin": "chronological_validation_for_test_year",
+            })
         holding_gains = []
         for (_, row), score, flagged in zip(test.iterrows(), scores, flags):
             item = row.to_dict()

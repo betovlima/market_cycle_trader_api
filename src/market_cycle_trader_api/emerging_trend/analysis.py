@@ -237,7 +237,14 @@ def build_analysis(
             "balanced_accuracy": float(balanced_accuracy_score(truth, prediction)),
             "precision": float(precision_score(truth, prediction, zero_division=0)),
             "recall": float(recall_score(truth, prediction, zero_division=0)),
-            "roc": roc_curve_payload(truth, probability, operating_threshold=float(threshold)),
+            "roc": roc_curve_payload(
+                truth,
+                probability,
+                operating_threshold=float(threshold),
+                threshold_origin="validation_balanced_accuracy",
+                validation_metric_name="balanced_accuracy",
+                validation_metric_value=validation_balanced_accuracy,
+            ),
             "best_iteration": int(getattr(model, "best_iteration_", 0) or getattr(model, "n_estimators_", 0) or 0),
         })
 
