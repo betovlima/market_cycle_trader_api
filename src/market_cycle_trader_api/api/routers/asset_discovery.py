@@ -8,7 +8,7 @@ from fastapi.encoders import jsonable_encoder
 
 from ...auth.security import SessionIdentity, require_capability
 from ...core.runtime import database
-from ...schemas.asset_discovery import AssetDiscoveryCreateStrategyRequest, AssetDiscoveryStartRequest
+from ...schemas.asset_discovery import AssetDiscoveryCreateStrategyRequest, AssetDiscoveryStartRequest, AssetDiscoveryValidateSelectionRequest
 from ...services.asset_discovery import (
     AssetDiscoveryConflict,
     create_research_strategy_from_discovery,
@@ -16,6 +16,7 @@ from ...services.asset_discovery import (
     get_asset_discovery_status,
     get_discovery_catalog,
     start_asset_discovery,
+    start_full_strategy_validation,
     start_marginal_capital_replay,
     stop_asset_discovery,
 )
@@ -59,6 +60,21 @@ def stop_campaign(
     _: Annotated[SessionIdentity, Depends(require_capability("asset_discovery.stop"))],
 ) -> dict[str, Any]:
     return stop_asset_discovery(database())
+
+
+@router.post("/full-strategy-validation", status_code=status.HTTP_202_ACCEPTED)
+def validate_selection(
+    payload: AssetDiscoveryValidateSelectionRequest,
+    _: Annotated[SessionIdentity, Depends(require_capability("asset_discovery.create_strategy"))],
+) -> dict[str, Any]:
+    try:
+        return start_full_strategy_validation(
+            database(),
+            run_id=payload.run_id,
+            symbols=payload.symbols,
+        )
+    except AssetDiscoveryConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post("/create-strategy", status_code=status.HTTP_201_CREATED)

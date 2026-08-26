@@ -38,6 +38,7 @@ from ..engine.capital_rotation import run_rotation_models
 from ..engine.compound_rotation_backtest import apply_slippage, calculate_reference_fees
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings
+from .temporal_research_settings import temporal_research_settings_snapshot
 from .strategy_lab import (
     _configuration_hash,
     create_strategy,
@@ -56,6 +57,8 @@ SUPPORTED_EXCHANGES = frozenset({"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE"})
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.\-]+$")
 ACTIVE_STATUSES = frozenset({"queued", "running", "stopping"})
 TICKER_IDENTITY_GAP_SESSIONS = 20
+MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE = 0.0
+DEFAULT_SEVERE_MONTH_THRESHOLD = -0.05
 
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
@@ -528,10 +531,44 @@ def _research_context_compatibility(
     }
 
 
-def _aggregate_rotation_replay(results: list[Any]) -> dict[str, Any]:
+def _monthly_replay_counts(result: Any, severe_threshold: float) -> tuple[int | None, int | None]:
+    predictions = getattr(result, "predictions", None)
+    if not isinstance(predictions, pd.DataFrame) or predictions.empty or "strategy_equity" not in predictions.columns:
+        return None, None
+    values = pd.to_numeric(predictions["strategy_equity"], errors="coerce").dropna()
+    if values.empty:
+        return None, None
+    if not isinstance(values.index, pd.DatetimeIndex):
+        if "timestamp" not in predictions.columns:
+            return None, None
+        timestamps = pd.to_datetime(predictions.loc[values.index, "timestamp"], utc=True, errors="coerce")
+        values.index = pd.DatetimeIndex(timestamps)
+    else:
+        values.index = pd.DatetimeIndex(pd.to_datetime(values.index, utc=True))
+    if values.index.tz is not None:
+        values.index = values.index.tz_convert("UTC").tz_localize(None)
+    monthly = values.groupby(values.index.to_period("M")).last().pct_change().dropna()
+    if monthly.empty:
+        return 0, 0
+    return int((monthly < 0.0).sum()), int((monthly <= float(severe_threshold)).sum())
+
+
+def _median_numbers(values: list[float | int | None]) -> float | None:
+    clean = sorted(float(value) for value in values if value is not None and pd.notna(value))
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return float(clean[middle])
+    return float((clean[middle - 1] + clean[middle]) / 2.0)
+
+
+def _aggregate_rotation_replay(results: list[Any], *, severe_threshold: float = DEFAULT_SEVERE_MONTH_THRESHOLD) -> dict[str, Any]:
     if not results:
         raise RuntimeError("Marginal Capital Replay produced no rotation result.")
     fold_returns: list[float] = []
+    negative_month_counts: list[int | None] = []
+    severe_month_counts: list[int | None] = []
     for result in results:
         folds = (result.metrics or {}).get("walk_forward_folds") or []
         for fold in folds:
@@ -540,6 +577,9 @@ def _aggregate_rotation_replay(results: list[Any]) -> dict[str, Any]:
             value = _finite_number(fold.get("strategy_return"))
             if value is not None:
                 fold_returns.append(value)
+        negative_count, severe_count = _monthly_replay_counts(result, severe_threshold)
+        negative_month_counts.append(negative_count)
+        severe_month_counts.append(severe_count)
     sessions = _prediction_sessions(results)
     return {
         "ending_capital": _median_metric(results, "strategy_ending_capital"),
@@ -550,6 +590,9 @@ def _aggregate_rotation_replay(results: list[Any]) -> dict[str, Any]:
         "cash_days": _median_metric(results, "cash_days"),
         "switches": _median_metric(results, "capital_rotations"),
         "worst_fold_return": min(fold_returns) if fold_returns else None,
+        "negative_months": _median_numbers(negative_month_counts),
+        "severe_negative_months": _median_numbers(severe_month_counts),
+        "severe_month_threshold": float(severe_threshold),
         "repetition_count": len(results),
         "decision_session_count": int(len(sessions)),
         "decision_session_start": pd.Timestamp(sessions[0]).date().isoformat() if len(sessions) else None,
@@ -593,6 +636,7 @@ def _run_rotation_replay(
     request: BacktestExecutionRequest,
     *,
     progress_callback: Any | None = None,
+    severe_threshold: float = DEFAULT_SEVERE_MONTH_THRESHOLD,
 ) -> tuple[dict[str, Any], pd.DatetimeIndex]:
     cleaned: dict[str, pd.DataFrame] = {}
     for symbol in request.assets:
@@ -610,7 +654,7 @@ def _run_rotation_replay(
         progress_detail_callback=None,
         technical_log_callback=None,
     )
-    return _aggregate_rotation_replay(results), _prediction_sessions(results)
+    return _aggregate_rotation_replay(results, severe_threshold=severe_threshold), _prediction_sessions(results)
 
 
 def _marginal_progress_callback(
@@ -661,6 +705,31 @@ def _capital_delta_rate(candidate: float | None, baseline: float | None) -> floa
     if candidate is None or baseline in (None, 0.0):
         return None
     return float(candidate / baseline - 1.0)
+
+
+def _marginal_replay_is_persistent_candidate(replay: Any) -> bool:
+    if not isinstance(replay, dict):
+        return False
+    if str(replay.get("status") or "").lower() != "completed":
+        return False
+    if not bool(replay.get("research_context_compatible", True)):
+        return False
+    delta = _finite_number(replay.get("ending_capital_delta_rate"))
+    return delta is not None and delta > MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE
+
+
+def _item_is_persistent_candidate(item: Any) -> bool:
+    if not isinstance(item, dict) or not bool(item.get("history_window_complete")):
+        return False
+    return _marginal_replay_is_persistent_candidate(item.get("marginal_replay"))
+
+
+def _selection_symbols(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(str(value or "").strip().upper() for value in values if str(value or "").strip()))
+
+
+def _selection_matches(left: Any, right: Any) -> bool:
+    return sorted(_selection_symbols(list(left or []))) == sorted(_selection_symbols(list(right or [])))
 
 
 def _run_marginal_capital_replay(
@@ -803,10 +872,14 @@ def _run_marginal_capital_replay(
                 })
         except Exception as exc:
             row.update({"status": "failed", "error": str(exc)[:700]})
+        row["persistence_eligible"] = _marginal_replay_is_persistent_candidate(row)
+        row["persistence_reason"] = "positive_marginal_capital" if row["persistence_eligible"] else "low_strategy_adherence"
         replay_rows.append(row)
         target = result_map.get(symbol)
         if target is not None:
             target["marginal_replay"] = row
+            target["persistence_eligible"] = bool(row["persistence_eligible"])
+            target["persistence_reason"] = row["persistence_reason"]
         _event(
             db, run_id,
             f"Marginal Capital Replay finished for {symbol}.",
@@ -862,6 +935,8 @@ def _run_marginal_capital_replay(
         "baseline": baseline_metrics,
         "results": replay_rows,
         "eligible_count": len(eligible_results),
+        "persistent_candidate_count": sum(1 for row in replay_rows if bool(row.get("persistence_eligible"))),
+        "low_adherence_count": sum(1 for row in replay_rows if row.get("status") == "completed" and not bool(row.get("persistence_eligible"))),
         "research_context_rejected_count": sum(1 for row in replay_rows if row.get("rejection_reason") == "research_context_incomplete"),
     }
     return eligible_results, replay_summary
@@ -906,10 +981,13 @@ def _persist_shortlist_to_catalog(db: Database, document: dict[str, Any], result
     winner = document.get("winner_source") if isinstance(document.get("winner_source"), dict) else {}
     now = utc_now()
     for item in results:
-        if not isinstance(item, dict) or not bool(item.get("history_window_complete")):
+        if not isinstance(item, dict):
             continue
         symbol = str(item.get("symbol") or "").strip().upper()
         if not symbol:
+            continue
+        if not _item_is_persistent_candidate(item):
+            db[CATALOG_COLLECTION].delete_one({"_id": symbol})
             continue
         existing = db[CATALOG_COLLECTION].find_one({"_id": symbol}) or {}
         recent_run_ids = [str(value) for value in existing.get("recent_run_ids") or []]
@@ -967,6 +1045,16 @@ def get_discovery_catalog(db: Database) -> dict[str, Any]:
     document = _campaign(db) or {}
     if str(document.get("status") or "") in {"completed", "stopped"} and document.get("results"):
         _persist_shortlist_to_catalog(db, document, list(document.get("results") or []))
+    for stored in list(db[CATALOG_COLLECTION].find({})):
+        if not isinstance(stored, dict):
+            continue
+        metrics = stored.get("latest_metrics") if isinstance(stored.get("latest_metrics"), dict) else {}
+        persisted_view = {
+            "history_window_complete": bool(stored.get("history_window_complete")),
+            **metrics,
+        }
+        if not _item_is_persistent_candidate(persisted_view):
+            db[CATALOG_COLLECTION].delete_one({"_id": stored.get("_id")})
     assets = [_public(item) for item in db[CATALOG_COLLECTION].find({}).sort([("last_seen_at", -1), ("times_discovered", -1), ("best_rank", 1)])]
     clean_assets = [item for item in assets if item is not None]
     return {
@@ -976,6 +1064,8 @@ def get_discovery_catalog(db: Database) -> dict[str, Any]:
         "persistence_policy": {
             "market_bars": "not_stored_by_catalog",
             "rejected_assets": "not_stored",
+            "low_adherence_assets": "not_stored",
+            "minimum_marginal_capital_delta_rate": MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE,
             "recent_discoveries_per_asset": 12,
         },
     }
@@ -1153,13 +1243,18 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
     if document and str(document.get("status") or "") in ACTIVE_STATUSES and not _worker_alive():
         phase = str(document.get("phase") or "").strip().lower()
         interrupted_marginal = phase == "marginal_replay"
+        interrupted_full_validation = phase == "full_strategy_validation"
         changes: dict[str, Any] = {
             "status": "interrupted",
-            "phase": "marginal_replay" if interrupted_marginal else "interrupted",
+            "phase": phase if (interrupted_marginal or interrupted_full_validation) else "interrupted",
             "message": (
                 "Marginal Capital Replay worker was interrupted. Run Marginal Capital Replay again to restart the replay."
                 if interrupted_marginal
-                else "The previous Asset Discovery worker is no longer active. Start a new manual campaign to continue research."
+                else (
+                    "Full Strategy validation was interrupted. Validate the exact selection again."
+                    if interrupted_full_validation
+                    else "The previous Asset Discovery worker is no longer active. Start a new manual campaign to continue research."
+                )
             ),
             "completed_at": utc_now(),
             "updated_at": utc_now(),
@@ -1169,6 +1264,11 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
                 "marginal_replay.status": "interrupted",
                 "marginal_replay.current_symbol": None,
                 "marginal_replay.current_stage": "Replay interrupted",
+            })
+        if interrupted_full_validation:
+            changes.update({
+                "full_strategy_validation.status": "interrupted",
+                "full_strategy_validation.current_stage": "Validation interrupted",
             })
         db[COLLECTION].update_one(
             {"_id": CURRENT_ID, "run_id": document.get("run_id")},
@@ -1200,7 +1300,8 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
             "stored_shortlist_limit": 8,
             "marginal_replay": "shortlist_only_in_memory_market_data",
             "history": "latest_campaign_only",
-            "discovery_catalog": "shortlist_assets_only",
+            "discovery_catalog": "positive_marginal_candidates_only",
+            "low_adherence_assets": "visible_in_campaign_not_persisted",
         },
         "campaign": _public(document),
     }
@@ -1244,6 +1345,7 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
             "rejection_summary": {},
             "results": [],
             "marginal_replay": {"status": "pending", "total_count": 0, "completed_count": 0, "current_symbol": None, "baseline": None, "results": []},
+            "full_strategy_validation": {"status": "idle", "selected_assets": [], "decision": None},
             "events": [{"at": utc_now(), "message": "Manual Asset Discovery campaign queued."}],
             "cancel_requested": False,
             "created_at": utc_now(),
@@ -1407,6 +1509,12 @@ def start_marginal_capital_replay(db: Database) -> dict[str, Any]:
                     "baseline": None,
                     "results": [],
                 },
+                "full_strategy_validation": {
+                    "status": "idle",
+                    "selected_assets": [],
+                    "decision": None,
+                    "invalidated_reason": "marginal_replay_restarted",
+                },
             }},
         )
         _worker_thread = threading.Thread(
@@ -1462,6 +1570,461 @@ def _creation_source_profiles(db: Database, document: dict[str, Any]) -> tuple[d
     return source, template, source_kind
 
 
+
+def _current_research_source(db: Database) -> tuple[dict[str, Any], BacktestRequest]:
+    config, public = get_research_strategy_context(db)
+    source_id = str(public.get("id") or public.get("strategy_id") or "").strip()
+    source = _raw_strategy(db, source_id)
+    if source is None:
+        raise AssetDiscoveryConflict("The current Strategy Research source is no longer available.")
+    return source, BacktestRequest.model_validate(source.get("configuration") or config.model_dump(mode="python"))
+
+
+def _discovery_metadata_for_symbols(
+    db: Database,
+    campaign_document: dict[str, Any],
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    shortlist = {
+        str(item.get("symbol") or "").strip().upper(): item
+        for item in campaign_document.get("results") or []
+        if isinstance(item, dict)
+    }
+    catalog_documents = {
+        str(item.get("symbol") or item.get("_id") or "").strip().upper(): item
+        for item in db[CATALOG_COLLECTION].find({"_id": {"$in": symbols}})
+        if isinstance(item, dict)
+    }
+    metadata: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        if symbol in shortlist:
+            metadata[symbol] = shortlist[symbol]
+            continue
+        item = catalog_documents.get(symbol)
+        if item is None:
+            raise AssetDiscoveryConflict(
+                f"{symbol} is not available in the current Discovery shortlist or Discovery Catalog."
+            )
+        metrics = item.get("latest_metrics") if isinstance(item.get("latest_metrics"), dict) else {}
+        metadata[symbol] = {
+            "symbol": symbol,
+            "rank": item.get("latest_rank"),
+            "raw_score": item.get("latest_model_score"),
+            "history_window_complete": item.get("history_window_complete"),
+            "history_required_start": item.get("history_required_start"),
+            "history_actual_start": item.get("history_actual_start"),
+            "history_actual_end": item.get("history_actual_end"),
+            "history_expected_sessions": item.get("history_expected_sessions"),
+            "history_missing_required_sessions": item.get("history_missing_required_sessions"),
+            **metrics,
+        }
+    return metadata
+
+
+def _require_persistent_candidate_selection(metadata: dict[str, dict[str, Any]], symbols: list[str]) -> None:
+    low_adherence = [symbol for symbol in symbols if not _item_is_persistent_candidate(metadata.get(symbol))]
+    if low_adherence:
+        raise AssetDiscoveryConflict(
+            "Low-adherence assets cannot be validated or persisted as Strategy candidates: "
+            + ", ".join(low_adherence)
+            + ". They remain visible only in the current Discovery result."
+        )
+
+
+def _severe_month_threshold(db: Database) -> float:
+    try:
+        snapshot = temporal_research_settings_snapshot(db)
+        settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
+        risk = settings.get("risk") if isinstance(settings.get("risk"), dict) else {}
+        value = _finite_number(risk.get("severe_threshold"))
+        if value is not None and -1.0 < value < 0.0:
+            return float(value)
+    except Exception:
+        pass
+    return DEFAULT_SEVERE_MONTH_THRESHOLD
+
+
+def _full_strategy_validation_progress_callback(
+    db: Database,
+    run_id: str,
+    validation_id: str,
+    *,
+    run_position: int,
+    total_runs: int,
+    label: str,
+) -> Any:
+    last_percent = -1.0
+    last_stage = ""
+
+    def emit(local_percent: float, stage: str, _completed: int) -> None:
+        nonlocal last_percent, last_stage
+        local = max(0.0, min(100.0, float(local_percent or 0.0)))
+        global_percent = 100.0 * (float(run_position) + local / 100.0) / max(1, int(total_runs))
+        rounded = round(global_percent, 1)
+        safe_stage = str(stage or label or "").strip()[:240]
+        if rounded < 100.0 and rounded - last_percent < 0.5 and safe_stage == last_stage:
+            return
+        last_percent = rounded
+        last_stage = safe_stage
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "full_strategy_validation.validation_id": validation_id},
+            {"$set": {
+                "updated_at": utc_now(),
+                "full_strategy_validation.progress_percent": rounded,
+                "full_strategy_validation.current_stage": safe_stage,
+            }},
+        )
+
+    return emit
+
+
+def _full_strategy_validation_gates(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    deltas = {
+        "ending_capital_delta": _delta(candidate.get("ending_capital"), baseline.get("ending_capital")),
+        "ending_capital_delta_rate": _capital_delta_rate(candidate.get("ending_capital"), baseline.get("ending_capital")),
+        "cagr_delta": _delta(candidate.get("cagr"), baseline.get("cagr")),
+        "sharpe_delta": _delta(candidate.get("sharpe"), baseline.get("sharpe")),
+        "maximum_drawdown_delta": _delta(candidate.get("maximum_drawdown"), baseline.get("maximum_drawdown")),
+        "worst_fold_return_delta": _delta(candidate.get("worst_fold_return"), baseline.get("worst_fold_return")),
+        "negative_months_delta": _delta(candidate.get("negative_months"), baseline.get("negative_months")),
+        "severe_negative_months_delta": _delta(candidate.get("severe_negative_months"), baseline.get("severe_negative_months")),
+        "switches_delta": _delta(candidate.get("switches"), baseline.get("switches")),
+    }
+    capital_delta_rate = _finite_number(deltas.get("ending_capital_delta_rate"))
+    cagr_delta = _finite_number(deltas.get("cagr_delta"))
+    sharpe_delta = _finite_number(deltas.get("sharpe_delta"))
+    maxdd_delta = _finite_number(deltas.get("maximum_drawdown_delta"))
+    worst_fold_delta = _finite_number(deltas.get("worst_fold_return_delta"))
+    baseline_severe = _finite_number(baseline.get("severe_negative_months"))
+    candidate_severe = _finite_number(candidate.get("severe_negative_months"))
+    gates = {
+        "research_context": bool(context.get("research_context_compatible")),
+        "capital_improves": capital_delta_rate is not None and capital_delta_rate > 0.0,
+        "cagr_not_worse": cagr_delta is not None and cagr_delta >= -1e-12,
+        "sharpe_not_worse": sharpe_delta is not None and sharpe_delta >= -1e-12,
+        "max_drawdown_not_worse": maxdd_delta is not None and maxdd_delta >= -1e-12,
+        "worst_fold_not_worse": worst_fold_delta is not None and worst_fold_delta >= -1e-12,
+        "severe_months_not_worse": (
+            baseline_severe is not None
+            and candidate_severe is not None
+            and candidate_severe <= baseline_severe
+        ),
+    }
+    decision = "PASS" if all(gates.values()) else "FAIL"
+    return deltas, gates, decision
+
+
+def _update_catalog_full_validation(
+    db: Database,
+    symbols: list[str],
+    validation: dict[str, Any],
+) -> None:
+    now = utc_now()
+    summary = {
+        "validation_id": validation.get("validation_id"),
+        "decision": validation.get("decision"),
+        "source_strategy_id": validation.get("source_strategy_id"),
+        "source_strategy_revision": validation.get("source_strategy_revision"),
+        "source_strategy_hash": validation.get("source_strategy_hash"),
+        "source_model_family": validation.get("source_model_family"),
+        "source_model_settings_hash": validation.get("source_model_settings_hash"),
+        "source_model_settings_revision": validation.get("source_model_settings_revision"),
+        "snapshot_end": validation.get("snapshot_end"),
+        "deltas": validation.get("deltas"),
+        "gates": validation.get("gates"),
+        "completed_at": validation.get("completed_at"),
+    }
+    for symbol in symbols:
+        db[CATALOG_COLLECTION].update_one(
+            {"_id": symbol},
+            {"$set": {"latest_full_strategy_validation": bson_value(summary), "updated_at": now}},
+        )
+
+
+def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_id: str) -> None:
+    try:
+        document = _campaign(db) or {}
+        validation = document.get("full_strategy_validation") if isinstance(document.get("full_strategy_validation"), dict) else {}
+        if str(document.get("run_id") or "") != run_id or str(validation.get("validation_id") or "") != validation_id:
+            return
+
+        selected_symbols = _selection_symbols(list(validation.get("selected_assets") or []))
+        source_id = str(validation.get("source_strategy_id") or "").strip()
+        source_raw = _raw_strategy(db, source_id)
+        if source_raw is None:
+            raise AssetDiscoveryConflict("The Strategy Research source selected for validation is no longer available.")
+        if int(source_raw.get("revision") or 1) != int(validation.get("source_strategy_revision") or 1):
+            raise AssetDiscoveryConflict("The Strategy Research source changed after validation was queued. Run validation again.")
+        if str(source_raw.get("configuration_hash") or "") != str(validation.get("source_strategy_hash") or ""):
+            raise AssetDiscoveryConflict("The Strategy Research source configuration changed. Run validation again.")
+        current_model_snapshot = get_strategy_model_snapshot(db, source_id)
+        if str(current_model_snapshot.get("family") or "") != str(validation.get("source_model_family") or ""):
+            raise AssetDiscoveryConflict("The Strategy Research model changed after validation was queued. Run validation again.")
+        if str(current_model_snapshot.get("settings_hash") or "") != str(validation.get("source_model_settings_hash") or ""):
+            raise AssetDiscoveryConflict("The Strategy Research model settings changed after validation was queued. Run validation again.")
+
+        source_config = BacktestRequest.model_validate(source_raw.get("configuration") or {})
+        source_assets = [str(item).strip().upper() for item in source_config.assets]
+        source_asset_set = set(source_assets)
+        added_symbols = [symbol for symbol in selected_symbols if symbol not in source_asset_set]
+        if not added_symbols:
+            raise AssetDiscoveryConflict("The selected assets are already present in the current Strategy Research source.")
+
+        snapshot_end = str(validation.get("snapshot_end") or "").strip()
+        if not snapshot_end:
+            snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+        baseline_frames = _baseline_frames(source_config, snapshot_end)
+        required_sessions = _baseline_required_sessions(baseline_frames, source_config, snapshot_end)
+        combined_frames = dict(baseline_frames)
+        coverage_by_symbol: dict[str, Any] = {}
+        for symbol in added_symbols:
+            frame, coverage = _candidate_history_coverage(
+                db, symbol, source_config, pd.Timestamp(snapshot_end), required_sessions
+            )
+            combined_frames[symbol] = frame
+            coverage_by_symbol[symbol] = coverage
+
+        severe_threshold = _severe_month_threshold(db)
+        baseline_request = _marginal_execution_request(
+            db,
+            source_config,
+            {"id": source_id},
+            source_config,
+            snapshot_end,
+            assets=source_assets,
+            reference_assets=source_assets,
+            candidate_assets=[],
+        )
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "full_strategy_validation.validation_id": validation_id},
+            {"$set": {
+                "status": "running",
+                "phase": "full_strategy_validation",
+                "updated_at": utc_now(),
+                "full_strategy_validation.status": "running",
+                "full_strategy_validation.current_stage": "Replaying current Strategy Research baseline",
+                "full_strategy_validation.progress_percent": 0.0,
+            }},
+        )
+        baseline_metrics, baseline_sessions = _run_rotation_replay(
+            baseline_frames,
+            baseline_request,
+            progress_callback=_full_strategy_validation_progress_callback(
+                db, run_id, validation_id, run_position=0, total_runs=2, label="Baseline replay"
+            ),
+            severe_threshold=severe_threshold,
+        )
+        if _should_stop_after_batch(db, run_id):
+            stopped = {
+                **validation,
+                "status": "stopped",
+                "current_stage": "Stopped after baseline replay",
+                "progress_percent": 50.0,
+                "baseline": baseline_metrics,
+                "completed_at": utc_now(),
+            }
+            db[COLLECTION].update_one(
+                {"_id": CURRENT_ID, "run_id": run_id},
+                {"$set": {
+                    "status": "stopped",
+                    "phase": "full_strategy_validation",
+                    "message": "Full Strategy validation stopped after the baseline replay.",
+                    "full_strategy_validation": bson_value(stopped),
+                    "updated_at": utc_now(),
+                }},
+            )
+            return
+
+        combined_assets = list(dict.fromkeys([*source_assets, *added_symbols]))
+        combined_request = _marginal_execution_request(
+            db,
+            source_config,
+            {"id": source_id},
+            source_config,
+            snapshot_end,
+            assets=combined_assets,
+            reference_assets=source_assets,
+            candidate_assets=added_symbols,
+        )
+        candidate_metrics, candidate_sessions = _run_rotation_replay(
+            combined_frames,
+            combined_request,
+            progress_callback=_full_strategy_validation_progress_callback(
+                db, run_id, validation_id, run_position=1, total_runs=2, label="Selected-universe replay"
+            ),
+            severe_threshold=severe_threshold,
+        )
+        context = _research_context_compatibility(baseline_sessions, candidate_sessions)
+        deltas, gates, decision = _full_strategy_validation_gates(baseline_metrics, candidate_metrics, context)
+        completed_at = utc_now()
+        completed = {
+            **validation,
+            "status": "completed",
+            "current_stage": "Full Strategy validation completed",
+            "progress_percent": 100.0,
+            "source_asset_count": len(source_assets),
+            "candidate_asset_count": len(combined_assets),
+            "added_assets": added_symbols,
+            "coverage": coverage_by_symbol,
+            "severe_month_threshold": severe_threshold,
+            "baseline": baseline_metrics,
+            "candidate": candidate_metrics,
+            "context": context,
+            "deltas": deltas,
+            "gates": gates,
+            "decision": decision,
+            "completed_at": completed_at,
+        }
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "full_strategy_validation.validation_id": validation_id},
+            {"$set": {
+                "status": "completed",
+                "phase": "completed",
+                "cancel_requested": False,
+                "completed_at": completed_at,
+                "updated_at": completed_at,
+                "message": f"Full Strategy validation {decision} for {', '.join(added_symbols)}.",
+                "full_strategy_validation": bson_value(completed),
+            }},
+        )
+        _update_catalog_full_validation(db, selected_symbols, completed)
+    except Exception as exc:
+        now = utc_now()
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "full_strategy_validation.validation_id": validation_id},
+            {"$set": {
+                "status": "failed",
+                "phase": "full_strategy_validation",
+                "updated_at": now,
+                "message": f"Full Strategy validation failed: {str(exc)[:700]}",
+                "full_strategy_validation.status": "failed",
+                "full_strategy_validation.current_stage": "Validation failed",
+                "full_strategy_validation.error": str(exc)[:700],
+                "full_strategy_validation.completed_at": now,
+            }},
+        )
+    finally:
+        global _worker_thread
+        with _worker_lock:
+            _worker_thread = None
+
+
+def start_full_strategy_validation(
+    db: Database,
+    *,
+    run_id: str | None,
+    symbols: list[str],
+) -> dict[str, Any]:
+    global _worker_thread
+    requested_symbols = _selection_symbols(symbols)
+    if not requested_symbols:
+        raise AssetDiscoveryConflict("Select at least one discovered asset.")
+
+    with _worker_lock:
+        document = _campaign(db) or {}
+        if _worker_thread and _worker_thread.is_alive():
+            raise AssetDiscoveryConflict("An Asset Discovery operation is already running.")
+        current_run_id = str(document.get("run_id") or "").strip()
+        if not current_run_id:
+            raise AssetDiscoveryConflict("Complete an Asset Discovery search before validating a selection.")
+        normalized_run_id = str(run_id or "").strip()
+        if normalized_run_id and normalized_run_id != current_run_id:
+            raise AssetDiscoveryConflict("The selected Asset Discovery run is no longer the current campaign.")
+
+        metadata = _discovery_metadata_for_symbols(db, document, requested_symbols)
+        _require_persistent_candidate_selection(metadata, requested_symbols)
+        source_raw, source_config = _current_research_source(db)
+        source_id = str(source_raw.get("_id") or "")
+        source_assets = [str(item).strip().upper() for item in source_config.assets]
+        added_symbols = [symbol for symbol in requested_symbols if symbol not in set(source_assets)]
+        if not added_symbols:
+            raise AssetDiscoveryConflict("The selected assets are already present in the current Strategy Research source.")
+
+        source_model_snapshot = get_strategy_model_snapshot(db, source_id)
+        baseline = document.get("baseline") if isinstance(document.get("baseline"), dict) else {}
+        snapshot_end = str(baseline.get("market_snapshot_end") or "").strip()
+        if not snapshot_end:
+            snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+        validation_id = f"asset-full-{uuid4().hex[:12]}"
+        validation = {
+            "validation_id": validation_id,
+            "status": "queued",
+            "selected_assets": requested_symbols,
+            "added_assets": added_symbols,
+            "source_strategy_id": source_id,
+            "source_strategy_sequence": source_raw.get("strategy_sequence"),
+            "source_strategy_revision": int(source_raw.get("revision") or 1),
+            "source_strategy_hash": str(source_raw.get("configuration_hash") or ""),
+            "source_model_family": str(source_model_snapshot.get("family") or ""),
+            "source_model_settings_hash": str(source_model_snapshot.get("settings_hash") or ""),
+            "source_model_settings_revision": int(source_model_snapshot.get("settings_revision") or 0),
+            "source_asset_count": len(source_assets),
+            "snapshot_end": snapshot_end,
+            "current_stage": "Queued",
+            "progress_percent": 0.0,
+            "decision": None,
+            "created_at": utc_now(),
+        }
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": current_run_id},
+            {"$set": {
+                "status": "queued",
+                "phase": "full_strategy_validation",
+                "cancel_requested": False,
+                "completed_at": None,
+                "updated_at": utc_now(),
+                "message": "Full Strategy validation queued for the selected assets.",
+                "full_strategy_validation": bson_value(validation),
+            }},
+        )
+        _worker_thread = threading.Thread(
+            target=_run_full_strategy_validation_worker,
+            args=(db, current_run_id, validation_id),
+            name="asset-discovery-full-strategy-validation",
+            daemon=True,
+        )
+        _worker_thread.start()
+    return get_asset_discovery_status(db)
+
+
+def _validated_creation_source(
+    db: Database,
+    document: dict[str, Any],
+    requested_symbols: list[str],
+) -> tuple[dict[str, Any], BacktestRequest, dict[str, Any]]:
+    validation = document.get("full_strategy_validation") if isinstance(document.get("full_strategy_validation"), dict) else {}
+    if str(validation.get("status") or "").lower() != "completed" or str(validation.get("decision") or "").upper() != "PASS":
+        raise AssetDiscoveryConflict("Run Full Strategy validation and obtain PASS before creating a Research Strategy.")
+    if not _selection_matches(validation.get("selected_assets"), requested_symbols):
+        raise AssetDiscoveryConflict("The selected assets changed after Full Strategy validation. Validate the exact selection again.")
+    source_id = str(validation.get("source_strategy_id") or "").strip()
+    source = _raw_strategy(db, source_id)
+    if source is None:
+        raise AssetDiscoveryConflict("The Strategy source used by Full Strategy validation is no longer available.")
+    if int(source.get("revision") or 1) != int(validation.get("source_strategy_revision") or 1):
+        raise AssetDiscoveryConflict("The Strategy source revision changed after Full Strategy validation. Validate again.")
+    if str(source.get("configuration_hash") or "") != str(validation.get("source_strategy_hash") or ""):
+        raise AssetDiscoveryConflict("The Strategy source configuration changed after Full Strategy validation. Validate again.")
+    current_source, _current_config = _current_research_source(db)
+    if str(current_source.get("_id") or "") != source_id:
+        raise AssetDiscoveryConflict("The selected Strategy Research source changed after Full Strategy validation. Validate again.")
+    if int(current_source.get("revision") or 1) != int(validation.get("source_strategy_revision") or 1):
+        raise AssetDiscoveryConflict("The selected Strategy Research source revision changed after Full Strategy validation. Validate again.")
+    if str(current_source.get("configuration_hash") or "") != str(validation.get("source_strategy_hash") or ""):
+        raise AssetDiscoveryConflict("The selected Strategy Research source configuration changed after Full Strategy validation. Validate again.")
+    current_model_snapshot = get_strategy_model_snapshot(db, source_id)
+    if str(current_model_snapshot.get("family") or "") != str(validation.get("source_model_family") or ""):
+        raise AssetDiscoveryConflict("The selected Strategy Research model changed after Full Strategy validation. Validate again.")
+    if str(current_model_snapshot.get("settings_hash") or "") != str(validation.get("source_model_settings_hash") or ""):
+        raise AssetDiscoveryConflict("The selected Strategy Research model settings changed after Full Strategy validation. Validate again.")
+    config = BacktestRequest.model_validate(source.get("configuration") or {})
+    return source, config, validation
+
+
 def create_research_strategy_from_discovery(
     db: Database,
     *,
@@ -1470,59 +2033,28 @@ def create_research_strategy_from_discovery(
     actor_email: str | None,
 ) -> dict[str, Any]:
     current_document = _campaign(db) or {}
+    current_run_id = str(current_document.get("run_id") or "").strip()
     normalized_run_id = str(run_id or "").strip()
-    campaign_document = (
-        current_document
-        if normalized_run_id and str(current_document.get("run_id") or "") == normalized_run_id
-        else {}
-    )
+    if normalized_run_id and normalized_run_id != current_run_id:
+        raise AssetDiscoveryConflict("The selected Asset Discovery run is no longer the current campaign.")
 
-    requested_symbols = list(dict.fromkeys(str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()))
+    requested_symbols = _selection_symbols(symbols)
     if not requested_symbols:
         raise AssetDiscoveryConflict("Select at least one discovered asset.")
 
-    shortlist = {
-        str(item.get("symbol") or "").strip().upper(): item
-        for item in campaign_document.get("results") or []
-        if isinstance(item, dict)
-    }
-    catalog_documents = {
-        str(item.get("symbol") or item.get("_id") or "").strip().upper(): item
-        for item in db[CATALOG_COLLECTION].find({"_id": {"$in": requested_symbols}})
-        if isinstance(item, dict)
-    }
-    discovery_metadata: dict[str, dict[str, Any]] = {}
-    for symbol in requested_symbols:
-        if symbol in shortlist:
-            discovery_metadata[symbol] = shortlist[symbol]
-        elif symbol in catalog_documents:
-            item = catalog_documents[symbol]
-            metrics = item.get("latest_metrics") if isinstance(item.get("latest_metrics"), dict) else {}
-            discovery_metadata[symbol] = {
-                "symbol": symbol,
-                "rank": item.get("latest_rank"),
-                "raw_score": item.get("latest_model_score"),
-                "history_window_complete": item.get("history_window_complete"),
-                "history_required_start": item.get("history_required_start"),
-                "history_actual_start": item.get("history_actual_start"),
-            "history_actual_end": item.get("history_actual_end"),
-            "history_expected_sessions": item.get("history_expected_sessions"),
-            "history_missing_required_sessions": item.get("history_missing_required_sessions"),
-                **metrics,
-            }
-        else:
-            raise AssetDiscoveryConflict(f"{symbol} is not available in the current Discovery shortlist or Discovery Catalog.")
-
-    source_document = campaign_document if campaign_document else {}
-    source_raw, template_raw, source_resolution = _creation_source_profiles(db, source_document)
+    discovery_metadata = _discovery_metadata_for_symbols(db, current_document, requested_symbols)
+    _require_persistent_candidate_selection(discovery_metadata, requested_symbols)
+    source_raw, source_config, validation = _validated_creation_source(db, current_document, requested_symbols)
     source_id = str(source_raw.get("_id") or "")
-    template_id = str(template_raw.get("_id") or "")
-    source_config = BacktestRequest.model_validate(source_raw.get("configuration") or {})
+    template_id = source_id
+    source_resolution = "full_strategy_validated_current_research_strategy"
     source_assets = [str(item).strip().upper() for item in source_config.assets]
+    source_asset_set = set(source_assets)
+    added_symbols = [symbol for symbol in requested_symbols if symbol not in source_asset_set]
+    if not added_symbols:
+        raise AssetDiscoveryConflict("The selected assets are already present in the validated Strategy Research source.")
 
-    snapshot_end = None
-    if campaign_document and isinstance(campaign_document.get("baseline"), dict):
-        snapshot_end = (campaign_document.get("baseline") or {}).get("market_snapshot_end")
+    snapshot_end = str(validation.get("snapshot_end") or "").strip()
     if not snapshot_end:
         snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
 
@@ -1531,7 +2063,6 @@ def create_research_strategy_from_discovery(
     persisted_history_rows: dict[str, int] = {}
     valid_symbols: list[str] = []
     discarded_assets: list[dict[str, str]] = []
-    source_asset_set = set(source_assets)
     for symbol in requested_symbols:
         if symbol in source_asset_set:
             valid_symbols.append(symbol)
@@ -1545,77 +2076,21 @@ def create_research_strategy_from_discovery(
             discarded_assets.append({"symbol": symbol, "reason": str(exc)})
             db[CATALOG_COLLECTION].delete_one({"_id": symbol})
 
-    if not valid_symbols:
-        discarded = ", ".join(item["symbol"] for item in discarded_assets) or "the selected assets"
+    if discarded_assets:
+        discarded = ", ".join(item["symbol"] for item in discarded_assets)
         raise AssetDiscoveryConflict(
-            f"No selected Discovery asset has complete continuous history for the source Strategy. Discarded: {discarded}."
+            "The validated selection changed during market-history persistence. "
+            f"Discarded: {discarded}. Run Full Strategy validation again."
         )
 
     combined_assets = list(dict.fromkeys([*source_assets, *valid_symbols]))
-
-    research_config = source_config.model_copy(
-        update={
-            "end_date": snapshot_end,
-            "mongo_cache_enabled": True,
-            "market_data_history_backfill_enabled": False,
-        }
-    )
-    combined_frames = dict(source_baseline_frames)
-    for symbol in combined_assets:
-        if symbol in combined_frames:
-            continue
-        frame = load_market_bars(symbol, research_config)
-        combined_frames[symbol] = validate_and_clean_bars(frame, research_config)
-
-    replay_strategy = {"id": source_id}
-    baseline_request = _marginal_execution_request(
-        db,
-        source_config,
-        replay_strategy,
-        source_config,
-        snapshot_end,
-        assets=source_assets,
-        reference_assets=source_assets,
-        candidate_assets=[],
-    )
-    _baseline_metrics, baseline_decision_sessions = _run_rotation_replay(
-        source_baseline_frames,
-        baseline_request,
-    )
-    combined_request = _marginal_execution_request(
-        db,
-        source_config,
-        replay_strategy,
-        source_config,
-        snapshot_end,
-        assets=combined_assets,
-        reference_assets=source_assets,
-        candidate_assets=[symbol for symbol in valid_symbols if symbol not in source_asset_set],
-    )
-    _combined_metrics, combined_decision_sessions = _run_rotation_replay(
-        combined_frames,
-        combined_request,
-    )
-    context_compatibility = _research_context_compatibility(
-        baseline_decision_sessions,
-        combined_decision_sessions,
-    )
-    if not bool(context_compatibility.get("research_context_compatible")):
-        raise AssetDiscoveryConflict(
-            "The selected Discovery assets reduce the Strategy research decision context by "
-            f"{int(context_compatibility.get('research_context_missing_sessions') or 0)} sessions "
-            f"({context_compatibility.get('research_context_first_missing_session') or 'unknown'} → "
-            f"{context_compatibility.get('research_context_last_missing_session') or 'unknown'}). "
-            "The Strategy was not created."
-        )
-
     updated_configuration = source_config.model_copy(update={"assets": combined_assets})
     configuration_payload = updated_configuration.model_dump(mode="json")
 
     created = create_strategy(
         db,
         name="Asset Discovery Research Strategy",
-        description="Research Strategy created from Asset Discovery selected assets.",
+        description="Research Strategy created from Asset Discovery selected assets after Full Strategy validation.",
         clone_from_strategy_id=template_id,
         actor_email=actor_email,
     )
@@ -1624,24 +2099,41 @@ def create_research_strategy_from_discovery(
     try:
         source_model_snapshot = get_strategy_model_snapshot(db, source_id)
     except Exception:
-        source_model_snapshot = template_raw.get("research_model_snapshot") if isinstance(template_raw.get("research_model_snapshot"), dict) else None
+        source_model_snapshot = source_raw.get("research_model_snapshot") if isinstance(source_raw.get("research_model_snapshot"), dict) else None
 
-    baseline = campaign_document.get("baseline") if isinstance(campaign_document.get("baseline"), dict) else {}
-    winner = campaign_document.get("winner_source") if isinstance(campaign_document.get("winner_source"), dict) else {}
+    campaign_baseline = current_document.get("baseline") if isinstance(current_document.get("baseline"), dict) else {}
+    winner = current_document.get("winner_source") if isinstance(current_document.get("winner_source"), dict) else {}
     origin = {
-        "run_id": normalized_run_id or None,
+        "run_id": current_run_id or None,
         "source_resolution": source_resolution,
         "source_strategy_id": source_id,
         "source_strategy_revision": source_raw.get("revision"),
         "source_strategy_hash": source_raw.get("configuration_hash"),
         "source_strategy_kind": source_raw.get("strategy_kind"),
         "campaign_winner_strategy_id": winner.get("strategy_id"),
-        "discovery_baseline_strategy_id": baseline.get("strategy_id"),
-        "discovery_baseline_hash": baseline.get("configuration_hash"),
-        "discovery_snapshot_end": baseline.get("market_snapshot_end") or snapshot_end,
+        "discovery_baseline_strategy_id": campaign_baseline.get("strategy_id"),
+        "discovery_baseline_hash": campaign_baseline.get("configuration_hash"),
+        "discovery_snapshot_end": snapshot_end,
         "selected_assets": valid_symbols,
+        "added_assets": [symbol for symbol in valid_symbols if symbol not in source_asset_set],
         "discarded_assets": discarded_assets,
         "persisted_history_rows": persisted_history_rows,
+        "full_strategy_validation": {
+            "validation_id": validation.get("validation_id"),
+            "decision": validation.get("decision"),
+            "source_strategy_id": validation.get("source_strategy_id"),
+            "source_strategy_revision": validation.get("source_strategy_revision"),
+            "source_strategy_hash": validation.get("source_strategy_hash"),
+            "source_model_family": validation.get("source_model_family"),
+            "source_model_settings_hash": validation.get("source_model_settings_hash"),
+            "source_model_settings_revision": validation.get("source_model_settings_revision"),
+            "snapshot_end": validation.get("snapshot_end"),
+            "baseline": validation.get("baseline"),
+            "candidate": validation.get("candidate"),
+            "deltas": validation.get("deltas"),
+            "gates": validation.get("gates"),
+            "completed_at": validation.get("completed_at"),
+        },
         "ranked_assets": [
             {
                 "symbol": symbol,
@@ -1664,7 +2156,7 @@ def create_research_strategy_from_discovery(
         "locked": False,
         "research_reference_assets": list(source_assets),
         "discovery_origin": bson_value(origin),
-        "last_change_note": "Created from Asset Discovery selected assets.",
+        "last_change_note": "Created from Asset Discovery after Full Strategy validation PASS.",
         "updated_at": utc_now(),
         "updated_by": (actor_email or "").strip().lower() or None,
     }
@@ -1721,12 +2213,19 @@ def create_research_strategy_from_discovery(
             "configuration_hash": source_raw.get("configuration_hash"),
             "resolution": source_resolution,
         },
+        "full_strategy_validation": {
+            "validation_id": validation.get("validation_id"),
+            "decision": validation.get("decision"),
+            "deltas": validation.get("deltas"),
+            "gates": validation.get("gates"),
+        },
         "selected_assets": valid_symbols,
         "discarded_assets": discarded_assets,
         "persisted_history_rows": persisted_history_rows,
         "asset_count": len(combined_assets),
         "added_asset_count": len([symbol for symbol in valid_symbols if symbol not in source_asset_set]),
     }
+
 
 def export_asset_discovery(db: Database, *, front_version: str | None = None) -> dict[str, Any]:
     document = _campaign(db)
@@ -1743,6 +2242,7 @@ def export_asset_discovery(db: Database, *, front_version: str | None = None) ->
             "raw_external_market_data_persisted": False,
             "rejected_symbols_persisted": False,
             "technical_failure_symbols_persisted": False,
+            "low_adherence_symbols_persisted": False,
             "campaign_history_persisted": False,
             "discovery_catalog_persisted": True,
         },
