@@ -4,6 +4,7 @@ import os
 import random
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -528,8 +529,15 @@ def _persist_selected_asset_history(
         ) from exc
     return int(len(cleaned_downloaded))
 
-def _candidate_frame(db: Database, symbol: str, config: Any, end_session: pd.Timestamp) -> pd.DataFrame:
-    credentials = get_alpaca_credentials(db)
+def _candidate_frame(
+    db: Database,
+    symbol: str,
+    config: Any,
+    end_session: pd.Timestamp,
+    *,
+    credentials: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    credentials = credentials or get_alpaca_credentials(db)
     session = pd.Timestamp(end_session)
     end = session.tz_localize("UTC") if session.tzinfo is None else session.tz_convert("UTC")
     end = end + pd.Timedelta(days=1)
@@ -587,13 +595,19 @@ def _score_candidate(bundle: Any, symbol: str, frame: pd.DataFrame, baseline_ret
     }
 
 
-def _rank_results(rows: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
-    ordered = sorted(rows, key=lambda item: float(item["raw_score"]), reverse=True)
+def _rank_all_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted((dict(item) for item in rows), key=lambda item: float(item["raw_score"]), reverse=True)
     count = len(ordered)
     for index, row in enumerate(ordered, start=1):
         row["rank"] = index
         row["rank_score"] = 1.0 if count <= 1 else float(1.0 - ((index - 1) / (count - 1)))
-    return ordered[: max(1, min(limit, count))]
+    return ordered
+
+
+def _rank_results(rows: list[dict[str, Any]], limit: int = 8) -> list[dict[str, Any]]:
+    ordered = _rank_all_results(rows)
+    count = len(ordered)
+    return ordered[: max(1, min(limit, count))] if count else []
 
 
 
@@ -866,6 +880,7 @@ def _run_marginal_capital_replay(
     baseline_frames: dict[str, pd.DataFrame],
     required_sessions: pd.DatetimeIndex,
     shortlist: list[dict[str, Any]],
+    candidate_frame_cache: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     baseline_assets = [str(symbol).strip().upper() for symbol in config.assets]
     baseline_request = _marginal_execution_request(
@@ -941,9 +956,16 @@ def _run_marginal_capital_replay(
         )
         row: dict[str, Any] = {"symbol": symbol, "status": "completed"}
         try:
-            candidate_frame, coverage = _candidate_history_coverage(
-                db, symbol, config, pd.Timestamp(end_session), required_sessions
-            )
+            cached_frame = (candidate_frame_cache or {}).get(symbol)
+            if cached_frame is not None and not cached_frame.empty:
+                candidate_frame = cached_frame
+                coverage = _history_coverage_against_baseline(
+                    symbol, candidate_frame, config, required_sessions
+                )
+            else:
+                candidate_frame, coverage = _candidate_history_coverage(
+                    db, symbol, config, pd.Timestamp(end_session), required_sessions
+                )
             candidate_assets = list(dict.fromkeys([*baseline_assets, symbol]))
             candidate_request = _marginal_execution_request(
                 db, config, strategy, winner_config, end_session,
@@ -1334,47 +1356,106 @@ def _run_worker(db: Database, run_id: str) -> None:
         evaluated: list[dict[str, Any]] = []
         for batch_index, batch_start in enumerate(range(0, len(selected), BATCH_SIZE), start=1):
             batch = selected[batch_start: batch_start + BATCH_SIZE]
-            _event(db, run_id, f"Processing batch {batch_index}.", changes={"current_batch": batch_index})
-            for symbol in batch:
-                _event(db, run_id, "Evaluating the current external asset.", changes={"current_symbol": symbol})
-                try:
-                    frame, coverage = _candidate_history_coverage(
-                        db, symbol, config, safe_session, required_sessions
-                    )
-                    result = _score_candidate(bundle, symbol, frame, baseline_returns)
-                    asset_metadata = universe_metadata.get(symbol) or {}
-                    result["company_name"] = asset_metadata.get("company_name")
-                    result["exchange"] = asset_metadata.get("exchange")
-                    result.update(coverage)
-                    evaluated.append(result)
-                    _increment(db, run_id, {"attempted_count": 1, "evaluated_count": 1})
-                except RuntimeError as exc:
-                    reason = str(exc).strip().lower()
-                    if reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity", "price_filter", "liquidity_filter", "volume_quality_filter"}:
-                        _increment(db, run_id, {"attempted_count": 1})
-                        _reject(db, run_id, reason)
-                    else:
+            _event(
+                db,
+                run_id,
+                f"Fast-scanning batch {batch_index} with up to {len(batch)} concurrent market-data requests.",
+                changes={"current_batch": batch_index, "current_symbol": None},
+            )
+
+            scan_credentials = get_alpaca_credentials(db)
+            with ThreadPoolExecutor(
+                max_workers=max(1, min(BATCH_SIZE, len(batch))),
+                thread_name_prefix="mct-asset-discovery-scan",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _candidate_frame,
+                        db,
+                        symbol,
+                        config,
+                        safe_session,
+                        credentials=scan_credentials,
+                    ): symbol
+                    for symbol in batch
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        frame = future.result()
+                        result = _score_candidate(bundle, symbol, frame, baseline_returns)
+                        asset_metadata = universe_metadata.get(symbol) or {}
+                        result["company_name"] = asset_metadata.get("company_name")
+                        result["exchange"] = asset_metadata.get("exchange")
+                        evaluated.append(result)
+                        _increment(db, run_id, {"attempted_count": 1, "evaluated_count": 1})
+                    except RuntimeError as exc:
+                        reason = str(exc).strip().lower()
+                        if reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity", "price_filter", "liquidity_filter", "volume_quality_filter"}:
+                            _increment(db, run_id, {"attempted_count": 1})
+                            _reject(db, run_id, reason)
+                        else:
+                            _increment(db, run_id, {"attempted_count": 1, "technical_failure_count": 1})
+                    except Exception:
                         _increment(db, run_id, {"attempted_count": 1, "technical_failure_count": 1})
-                except Exception:
-                    _increment(db, run_id, {"attempted_count": 1, "technical_failure_count": 1})
 
             if _should_stop_after_batch(db, run_id):
-                shortlist = _rank_results(evaluated)
                 _finish(
                     db,
                     run_id,
                     "stopped",
-                    f"Asset Discovery stopped after batch {batch_index}; unvalidated shortlist data was discarded.",
+                    f"Asset Discovery stopped after fast-scan batch {batch_index}; unvalidated shortlist data was discarded.",
                     results=[],
                 )
                 return
 
-        shortlist = _rank_results(evaluated)
+        ranked_fast = _rank_all_results(evaluated)
+        shortlist: list[dict[str, Any]] = []
+        validated_candidate_frames: dict[str, pd.DataFrame] = {}
+        _event(
+            db,
+            run_id,
+            f"Fast scan ranked {len(ranked_fast)} assets. Validating complete walk-forward history only in ranking order until {min(8, len(ranked_fast))} adherent assets are found.",
+            phase="scanning",
+            changes={"fast_evaluated_count": len(ranked_fast), "adherence_validated_count": 0},
+        )
+        for ranked_item in ranked_fast:
+            if len(shortlist) >= 8:
+                break
+            symbol = str(ranked_item.get("symbol") or "").strip().upper()
+            try:
+                frame, coverage = _candidate_history_coverage(
+                    db, symbol, config, safe_session, required_sessions
+                )
+                validated = dict(ranked_item)
+                validated.update(coverage)
+                shortlist.append(validated)
+                validated_candidate_frames[symbol] = frame
+                _increment(db, run_id, {"adherence_validated_count": 1})
+            except RuntimeError as exc:
+                reason = str(exc).strip().lower()
+                if reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity", "price_filter", "liquidity_filter", "volume_quality_filter"}:
+                    _reject(db, run_id, reason)
+                else:
+                    _increment(db, run_id, {"technical_failure_count": 1})
+            except Exception:
+                _increment(db, run_id, {"technical_failure_count": 1})
+
+            if _should_stop_after_batch(db, run_id):
+                _finish(
+                    db,
+                    run_id,
+                    "stopped",
+                    "Asset Discovery stopped during shortlist adherence validation; transient candidate data was discarded.",
+                    results=[],
+                )
+                return
+
         if shortlist:
             _event(
                 db,
                 run_id,
-                f"Asset Discovery ranked {len(evaluated)} evaluable external assets; starting Marginal Capital Replay for all {len(shortlist)} shortlisted assets.",
+                f"Asset Discovery fast-ranked {len(evaluated)} evaluable external assets; {len(shortlist)} passed full-history adherence and will enter Marginal Capital Replay.",
                 phase="marginal_replay",
                 changes={"results": [], "shortlisted_count": len(shortlist)},
             )
@@ -1388,6 +1469,7 @@ def _run_worker(db: Database, run_id: str) -> None:
                 baseline_frames=baseline_frames,
                 required_sessions=required_sessions,
                 shortlist=shortlist,
+                candidate_frame_cache=validated_candidate_frames,
             )
             if _should_stop_after_batch(db, run_id):
                 _event(db, run_id, "Asset Discovery stopped after the current Marginal Capital Replay asset.", changes={"marginal_replay": marginal_replay})
@@ -1404,7 +1486,7 @@ def _run_worker(db: Database, run_id: str) -> None:
             db,
             run_id,
             "completed",
-            f"Asset Discovery ranked {len(evaluated)} evaluable external assets and retained {len(shortlist)} research-context-compatible assets after Marginal Capital Replay.",
+            f"Asset Discovery fast-ranked {len(evaluated)} evaluable external assets and retained {len(shortlist)} research-context-compatible assets after full-history validation and Marginal Capital Replay.",
             results=shortlist,
         )
     except Exception as exc:
