@@ -18,7 +18,7 @@ from ..infrastructure.persistence.mongo_repository import (
 from .schemas import RocDecisionPolicySettings, RocDecisionPolicySettingsUpdateRequest
 
 SETTINGS_ID = "roc-decision-policy"
-SETTINGS_SCHEMA_VERSION = 3
+SETTINGS_SCHEMA_VERSION = 4
 PARAMETERIZATION_FILE = "004_roc_decision_policy.json"
 
 

@@ -13,6 +13,7 @@ from ..classification_evaluation import roc_curve_payload
 from ..engine.capital_rotation import ROTATION_FEATURES
 from ..engine.temporal_intelligence import _fit_binary_classifier_relaxed
 from .metrics import finite
+from .qualification import qualify_signal
 from .threshold_selection import select_threshold
 
 
@@ -227,6 +228,13 @@ def fit_fold_horizon(
     probabilities = np.clip(calibrator.transform(raw_calibration), 0.0, 1.0)
     selected = select_threshold(labels, probabilities, metric=str(settings["selection_metric"]))
     auc = float(roc_auc_score(labels, probabilities))
+    qualification = qualify_signal(
+        labels,
+        probabilities,
+        calibration_edge,
+        selected_threshold=float(selected["threshold"]),
+        settings=settings,
+    )
     roc = roc_curve_payload(
         labels,
         probabilities,
@@ -245,6 +253,7 @@ def fit_fold_horizon(
         "selection_score": float(selected["selection_score"]),
         "calibration_auc": auc,
         "calibration_roc": roc,
+        **qualification,
         "_model": model,
         "_calibrator": calibrator,
     }
@@ -291,6 +300,12 @@ def score_pair(
         "probability": probability,
         "threshold": threshold,
         "margin": probability - threshold,
+        "signal_qualified": bool(calibration.get("signal_qualified")),
+        "qualification_status": calibration.get("qualification_status"),
+        "qualification_reasons": list(calibration.get("qualification_reasons") or []),
+        "calibration_auc": calibration.get("calibration_auc"),
+        "calibration_auc_ci_lower": calibration.get("calibration_auc_ci_lower"),
+        "qualification_net_edge_ci_lower": calibration.get("qualification_net_edge_ci_lower"),
         "realized_relative_edge": edge,
         "realized_outperformance": None if edge is None else bool(edge > 0.0),
     }

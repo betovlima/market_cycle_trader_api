@@ -117,6 +117,9 @@ def run_replay(
     equity_rows: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     roc_override_count = 0
+    roc_candidate_count = 0
+    roc_signal_qualified_count = 0
+    roc_abstention_count = 0
     switch_count = 0
     exposure_days = 0
     cash_days = 0
@@ -139,9 +142,17 @@ def run_replay(
         challenger = _asset(temporal.get("winner_top2_symbol") or winner.get("top_2_asset") or winner.get("second_asset"))
         score = relative_scores.get(decision) if decision is not None else None
         relative_margin = finite((score or {}).get("aggregate_margin"))
+        signal_qualified = bool((score or {}).get("signal_qualified"))
+        if enable_roc and score is not None:
+            roc_candidate_count += 1
+            if signal_qualified:
+                roc_signal_qualified_count += 1
+            else:
+                roc_abstention_count += 1
 
         override = bool(
             enable_roc
+            and signal_qualified
             and not temporal_override
             and temporal_target != "CASH"
             and temporal_target == winner_anchor
@@ -196,6 +207,10 @@ def run_replay(
             "target_asset": target,
             "temporal_timing_override": temporal_override,
             "roc_override": override,
+            "roc_signal_qualified": signal_qualified,
+            "roc_abstention": bool(enable_roc and score is not None and not signal_qualified),
+            "qualified_horizons": (score or {}).get("qualified_horizons") or [],
+            "abstained_horizons": (score or {}).get("abstained_horizons") or [],
             "relative_probability": (score or {}).get("aggregate_probability"),
             "relative_threshold": (score or {}).get("aggregate_threshold"),
             "relative_margin": relative_margin,
@@ -242,10 +257,13 @@ def run_replay(
     metrics.update({
         "switch_count": int(switch_count),
         "roc_override_count": int(roc_override_count),
+        "roc_candidate_count": int(roc_candidate_count),
+        "roc_signal_qualified_count": int(roc_signal_qualified_count),
+        "roc_abstention_count": int(roc_abstention_count),
         "temporal_timing_override_count": int(temporal_override_count),
         "exposure": exposure_days / max(1, len(equity_values)),
         "cash_days": int(cash_days),
-        "decision_policy": "temporal_control_plus_relative_roc_rotation" if enable_roc else "temporal_control_parity_replay",
+        "decision_policy": "temporal_control_plus_qualified_relative_roc_rotation" if enable_roc else "temporal_control_parity_replay",
     })
     return {
         "metrics": metrics,

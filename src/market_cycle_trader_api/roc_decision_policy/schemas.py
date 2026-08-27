@@ -12,6 +12,9 @@ class RocDecisionPolicySettings(BaseModel):
     minimum_class_samples: int = Field(ge=2, le=500_000)
     max_curve_points: int = Field(ge=21, le=1001)
     max_pairs_per_timestamp: int = Field(ge=1, le=10000)
+    qualification_method: str = Field(min_length=3, max_length=96)
+    qualification_confidence_level: float = Field(gt=0.5, lt=1.0)
+    minimum_qualification_action_samples: int = Field(ge=2, le=500_000)
 
     @field_validator("selection_metric")
     @classmethod
@@ -20,6 +23,15 @@ class RocDecisionPolicySettings(BaseModel):
         supported = {"youden_j", "balanced_accuracy", "distance_to_top_left"}
         if normalized not in supported:
             raise ValueError(f"selection_metric must be one of {sorted(supported)}.")
+        return normalized
+
+    @field_validator("qualification_method")
+    @classmethod
+    def validate_qualification_method(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        supported = {"auc_and_net_edge_confidence"}
+        if normalized not in supported:
+            raise ValueError(f"qualification_method must be one of {sorted(supported)}.")
         return normalized
 
 

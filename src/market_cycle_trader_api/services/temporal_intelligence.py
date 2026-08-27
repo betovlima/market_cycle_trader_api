@@ -1521,6 +1521,26 @@ def build_temporal_intelligence_export(
                 for item in (roc_export.get("fold_horizons") or []) if isinstance(item, dict)
             ]))
             archive.writestr("strategy_research_roc_decision_policy_stability.csv", _csv_text(roc_export.get("threshold_stability") or []))
+            archive.writestr("strategy_research_roc_decision_policy_qualification.csv", _csv_text([
+                {
+                    "fold_id": item.get("fold_id"),
+                    "horizon": item.get("horizon"),
+                    "signal_qualified": item.get("signal_qualified"),
+                    "qualification_status": item.get("qualification_status"),
+                    "qualification_reasons": "|".join(item.get("qualification_reasons") or []),
+                    "qualification_method": item.get("qualification_method"),
+                    "qualification_confidence_level": item.get("qualification_confidence_level"),
+                    "calibration_auc": item.get("calibration_auc"),
+                    "calibration_auc_ci_lower": item.get("calibration_auc_ci_lower"),
+                    "calibration_auc_ci_upper": item.get("calibration_auc_ci_upper"),
+                    "qualification_action_samples": item.get("qualification_action_samples"),
+                    "qualification_action_positive_rate": item.get("qualification_action_positive_rate"),
+                    "qualification_net_edge_mean": item.get("qualification_net_edge_mean"),
+                    "qualification_net_edge_ci_lower": item.get("qualification_net_edge_ci_lower"),
+                    "qualification_net_edge_ci_upper": item.get("qualification_net_edge_ci_upper"),
+                }
+                for item in (roc_export.get("fold_horizons") or []) if isinstance(item, dict)
+            ]))
             parity = roc_export.get("control_parity") if isinstance(roc_export.get("control_parity"), dict) else {}
             parity_checks = parity.get("checks") if isinstance(parity.get("checks"), dict) else {}
             archive.writestr("strategy_research_roc_decision_policy_control_parity.csv", _csv_text([

@@ -4,5 +4,8 @@
   "minimum_calibration_samples": 100,
   "minimum_class_samples": 20,
   "max_curve_points": 121,
-  "max_pairs_per_timestamp": 48
+  "max_pairs_per_timestamp": 48,
+  "qualification_method": "auc_and_net_edge_confidence",
+  "qualification_confidence_level": 0.95,
+  "minimum_qualification_action_samples": 20
 }

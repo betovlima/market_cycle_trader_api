@@ -27,8 +27,8 @@ from .validation import (
 )
 
 
-ROC_POLICY_SCHEMA_VERSION = 3
-ROC_POLICY_ENGINE_VERSION = "7.1.0-relative-rotation-policy"
+ROC_POLICY_SCHEMA_VERSION = 4
+ROC_POLICY_ENGINE_VERSION = "7.2.0-relative-rotation-abstention"
 
 
 def _stamp(value: Any) -> pd.Timestamp | None:
@@ -126,6 +126,8 @@ def _build_relative_oos_scores(
         weighted_probability = 0.0
         weighted_threshold = 0.0
         used_weight = 0.0
+        qualified_horizons: list[int] = []
+        abstained_horizons: list[int] = []
         for horizon in entry_horizons:
             calibration = calibration_by_key.get((fold_id, int(horizon)))
             if calibration is None:
@@ -142,27 +144,55 @@ def _build_relative_oos_scores(
             if detail is None:
                 continue
             weight = float(horizon_weights[int(horizon)])
-            details.append({**detail, "weight": weight})
-            weighted_probability += weight * float(detail["probability"])
-            weighted_threshold += weight * float(detail["threshold"])
-            used_weight += weight
-        if not details or used_weight <= 0.0:
+            detail = {**detail, "weight": weight}
+            details.append(detail)
+            if bool(calibration.get("signal_qualified")):
+                qualified_horizons.append(int(horizon))
+                weighted_probability += weight * float(detail["probability"])
+                weighted_threshold += weight * float(detail["threshold"])
+                used_weight += weight
+            else:
+                abstained_horizons.append(int(horizon))
+
+        if not details:
             continue
-        aggregate_probability = weighted_probability / used_weight
-        aggregate_threshold = weighted_threshold / used_weight
+        signal_qualified = used_weight > 0.0
+        aggregate_probability = (weighted_probability / used_weight) if signal_qualified else None
+        aggregate_threshold = (weighted_threshold / used_weight) if signal_qualified else None
+        aggregate_margin = (aggregate_probability - aggregate_threshold) if signal_qualified else None
         output.append({
             "fold_id": fold_id,
             "decision_timestamp": decision,
             "execution_date": execution,
             "control_asset": temporal_target,
             "challenger_asset": challenger,
+            "signal_qualified": bool(signal_qualified),
+            "qualification_status": "qualified" if signal_qualified else "abstain",
+            "qualified_horizons": qualified_horizons,
+            "abstained_horizons": abstained_horizons,
             "aggregate_probability": aggregate_probability,
             "aggregate_threshold": aggregate_threshold,
-            "aggregate_margin": aggregate_probability - aggregate_threshold,
+            "aggregate_margin": aggregate_margin,
             "horizons": details,
         })
     return output
 
+
+def _qualification_summary(calibrations: list[dict[str, Any]], relative_scores: list[dict[str, Any]]) -> dict[str, Any]:
+    eligible = [row for row in calibrations if row.get("eligible")]
+    qualified = [row for row in eligible if row.get("signal_qualified")]
+    abstained = [row for row in eligible if not row.get("signal_qualified")]
+    candidate_sessions = len(relative_scores)
+    qualified_sessions = sum(1 for row in relative_scores if row.get("signal_qualified"))
+    return {
+        "method": next((row.get("qualification_method") for row in eligible if row.get("qualification_method")), None),
+        "eligible_fold_horizons": len(eligible),
+        "qualified_fold_horizons": len(qualified),
+        "abstained_fold_horizons": len(abstained),
+        "candidate_sessions": candidate_sessions,
+        "qualified_candidate_sessions": qualified_sessions,
+        "abstained_candidate_sessions": max(0, candidate_sessions - qualified_sessions),
+    }
 
 def _oos_roc_rows(
     relative_scores: list[dict[str, Any]],
@@ -286,6 +316,7 @@ def run(
         for row in relative_scores
         if _stamp(row.get("decision_timestamp")) is not None
     }
+    signal_qualification = _qualification_summary(eligible, relative_scores)
 
     source_capital = temporal_capital(source)
     initial_capital = finite(source_capital.get("initial_capital"))
@@ -365,6 +396,8 @@ def run(
         "policy_target": "challenger_relative_outperformance_net_rotation_cost",
         "threshold_origin": "chronological_relative_pair_calibration",
         "threshold_is_dynamic": True,
+        "signal_qualification": signal_qualification,
+        "abstention_enabled": True,
         "oos_used_for_threshold_selection": False,
         "control_source": "frozen_temporal_multi_horizon_equity_curve",
         "control_parity": control_parity,
