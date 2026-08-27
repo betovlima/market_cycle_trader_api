@@ -130,7 +130,7 @@ def _reject(db: Database, run_id: str, reason: str) -> None:
     _increment(db, run_id, {"rejected_count": 1, f"rejection_summary.{safe_reason}": 1})
 
 
-def _discover_symbols(db: Database) -> list[str]:
+def _discover_asset_metadata(db: Database) -> dict[str, dict[str, str | None]]:
     credentials = get_alpaca_credentials(db)
     response = requests.get(
         f"{_trading_base_url()}/v2/assets",
@@ -142,7 +142,7 @@ def _discover_symbols(db: Database) -> list[str]:
     payload = response.json()
     if not isinstance(payload, list):
         raise RuntimeError("Alpaca returned an unexpected US-equity universe payload.")
-    result: list[str] = []
+    result: dict[str, dict[str, str | None]] = {}
     for item in payload:
         if not isinstance(item, dict):
             continue
@@ -152,8 +152,56 @@ def _discover_symbols(db: Database) -> list[str]:
             continue
         if exchange not in SUPPORTED_EXCHANGES or not bool(item.get("tradable")):
             continue
-        result.append(symbol)
-    return sorted(set(result))
+        company_name = str(item.get("name") or "").strip() or None
+        result[symbol] = {
+            "symbol": symbol,
+            "company_name": company_name,
+            "exchange": exchange or None,
+        }
+    return result
+
+
+def _discover_symbols(db: Database) -> list[str]:
+    return sorted(_discover_asset_metadata(db))
+
+
+def _backfill_company_metadata(db: Database, document: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(document, dict):
+        return document
+    rows = document.get("results") if isinstance(document.get("results"), list) else []
+    missing = [
+        str(row.get("symbol") or "").strip().upper()
+        for row in rows
+        if isinstance(row, dict) and str(row.get("symbol") or "").strip() and not str(row.get("company_name") or "").strip()
+    ]
+    if not missing:
+        return document
+    try:
+        metadata = _discover_asset_metadata(db)
+    except Exception:
+        return document
+    changed = False
+    updated_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            updated_rows.append(row)
+            continue
+        copy = dict(row)
+        symbol = str(copy.get("symbol") or "").strip().upper()
+        asset = metadata.get(symbol) or {}
+        if not str(copy.get("company_name") or "").strip() and asset.get("company_name"):
+            copy["company_name"] = asset.get("company_name")
+            copy["exchange"] = asset.get("exchange")
+            changed = True
+        updated_rows.append(copy)
+    if changed:
+        db[COLLECTION].update_one(
+            {"_id": document.get("_id", CURRENT_ID)},
+            {"$set": {"results": bson_value(updated_rows), "updated_at": utc_now()}},
+        )
+        document = dict(document)
+        document["results"] = updated_rows
+    return document
 
 
 def _baseline_frames(config: Any, end_session: str) -> dict[str, pd.DataFrame]:
@@ -1004,6 +1052,8 @@ def _persist_shortlist_to_catalog(db: Database, document: dict[str, Any], result
         }
         set_fields = {
             "symbol": symbol,
+            "company_name": item.get("company_name") or existing.get("company_name"),
+            "exchange": item.get("exchange") or existing.get("exchange"),
             "status": str(existing.get("status") or "discovered"),
             "last_seen_at": now,
             "latest_run_id": run_id,
@@ -1056,6 +1106,24 @@ def get_discovery_catalog(db: Database) -> dict[str, Any]:
         }
         if not _item_is_persistent_candidate(persisted_view):
             db[CATALOG_COLLECTION].delete_one({"_id": stored.get("_id")})
+    missing_company = [
+        str(item.get("symbol") or item.get("_id") or "").strip().upper()
+        for item in db[CATALOG_COLLECTION].find({"$or": [{"company_name": {"$exists": False}}, {"company_name": None}, {"company_name": ""}]}, {"symbol": 1})
+        if str(item.get("symbol") or item.get("_id") or "").strip()
+    ]
+    if missing_company:
+        try:
+            metadata = _discover_asset_metadata(db)
+            now = utc_now()
+            for symbol in missing_company:
+                asset = metadata.get(symbol) or {}
+                if asset.get("company_name"):
+                    db[CATALOG_COLLECTION].update_one(
+                        {"_id": symbol},
+                        {"$set": {"company_name": asset.get("company_name"), "exchange": asset.get("exchange"), "updated_at": now}},
+                    )
+        except Exception:
+            pass
     assets = [_public(item) for item in db[CATALOG_COLLECTION].find({}).sort([("last_seen_at", -1), ("times_discovered", -1), ("best_rank", 1)])]
     clean_assets = [item for item in assets if item is not None]
     return {
@@ -1156,7 +1224,8 @@ def _run_worker(db: Database, run_id: str) -> None:
             _finish(db, run_id, "stopped", "Asset Discovery stopped after Learning-to-Rank training and before the first external batch.", results=[])
             return
 
-        universe = _discover_symbols(db)
+        universe_metadata = _discover_asset_metadata(db)
+        universe = sorted(universe_metadata)
         baseline_symbols = {str(item).upper() for item in config.assets}
         external = [symbol for symbol in universe if symbol not in baseline_symbols]
         random.Random(seed).shuffle(external)
@@ -1183,6 +1252,9 @@ def _run_worker(db: Database, run_id: str) -> None:
                         db, symbol, config, safe_session, required_sessions
                     )
                     result = _score_candidate(bundle, symbol, frame, baseline_returns)
+                    asset_metadata = universe_metadata.get(symbol) or {}
+                    result["company_name"] = asset_metadata.get("company_name")
+                    result["exchange"] = asset_metadata.get("exchange")
                     result.update(coverage)
                     evaluated.append(result)
                     _increment(db, run_id, {"attempted_count": 1, "evaluated_count": 1})
@@ -1254,7 +1326,7 @@ def _run_worker(db: Database, run_id: str) -> None:
 
 
 def get_asset_discovery_status(db: Database) -> dict[str, Any]:
-    document = _campaign(db)
+    document = _backfill_company_metadata(db, _campaign(db))
     if document and str(document.get("status") or "") in ACTIVE_STATUSES and not _worker_alive():
         phase = str(document.get("phase") or "").strip().lower()
         interrupted_marginal = phase == "marginal_replay"
