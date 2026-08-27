@@ -2472,9 +2472,44 @@ def _reference_cost_sides(previous: str | None, target: str | None) -> int:
     return 2
 
 
-def _reference_counts_cash_transitions_as_rotations(reference_analytics: dict[str, Any]) -> bool:
+def _reference_rotation_semantics(reference_analytics: dict[str, Any]) -> str:
+    protocol = reference_analytics.get("protocol") if isinstance(reference_analytics.get("protocol"), dict) else {}
+    explicit = str(protocol.get("rotation_semantics") or reference_analytics.get("rotation_semantics") or "").strip().lower()
+    if explicit in {"all_position_changes", "invested_asset_to_invested_asset"}:
+        return explicit
+
+    metrics = reference_analytics.get("metrics") if isinstance(reference_analytics.get("metrics"), dict) else {}
+    expected_value = metrics.get("capital_rotations")
+    if expected_value is None:
+        expected_value = metrics.get("position_changes")
+    try:
+        expected_switches = int(expected_value) if expected_value is not None else None
+    except (TypeError, ValueError):
+        expected_switches = None
+
+    rotations = [row for row in (reference_analytics.get("rotations") or []) if isinstance(row, dict)]
+    if expected_switches is not None and rotations:
+        all_position_changes = sum(
+            _reference_rotation_increment(row.get("from_asset"), row.get("to_asset"), count_cash_transitions=True)
+            for row in rotations
+        )
+        invested_asset_changes = sum(
+            _reference_rotation_increment(row.get("from_asset"), row.get("to_asset"), count_cash_transitions=False)
+            for row in rotations
+        )
+        all_matches = all_position_changes == expected_switches
+        invested_matches = invested_asset_changes == expected_switches
+        if all_matches != invested_matches:
+            return "all_position_changes" if all_matches else "invested_asset_to_invested_asset"
+
     processing_kind = str(reference_analytics.get("processing_kind") or "").strip().lower()
-    return processing_kind in {"strategy_research_temporal", "strategy_research_stateful", "strategy_research_decision_optimization"}
+    if processing_kind in {"strategy_research_temporal", "strategy_research_stateful", "strategy_research_decision_optimization"}:
+        return "all_position_changes"
+    return "invested_asset_to_invested_asset"
+
+
+def _reference_counts_cash_transitions_as_rotations(reference_analytics: dict[str, Any]) -> bool:
+    return _reference_rotation_semantics(reference_analytics) == "all_position_changes"
 
 
 def _reference_rotation_increment(
@@ -3514,6 +3549,7 @@ def _bind_strategy_research_reference_analytics(
         "exposure": _finite(metrics.get("market_exposure")),
         "cash_days": int(metrics.get("cash_days") or 0),
         "switch_count": switch_count,
+        "rotation_semantics": _reference_rotation_semantics(reference_analytics),
         "folds": exact_folds,
         "oos_start": bson_value(coverage_start),
         "oos_end": bson_value(coverage_end),
@@ -3536,6 +3572,9 @@ def _bind_strategy_research_reference_analytics(
 def _strategy_research_reference_parity(
     reference: dict[str, Any],
     replay: dict[str, Any],
+    *,
+    reference_daily_rows: list[dict[str, Any]] | None = None,
+    reference_analytics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reference_capital = _finite(reference.get("ending_capital"))
     replay_capital = _finite(replay.get("ending_capital"))
@@ -3557,18 +3596,93 @@ def _strategy_research_reference_parity(
         if replay_exposure is not None and reference_exposure is not None
         else None
     )
+
+    reference_path_rows = [row for row in (reference_daily_rows or []) if isinstance(row, dict)]
+    replay_curve_rows = [row for row in (replay.get("economic_curve") or []) if isinstance(row, dict)]
+    decision_path_match = bool(reference_path_rows) and len(reference_path_rows) == len(replay_curve_rows)
+    decision_path_mismatch = None
+    if decision_path_match:
+        for index, (source, candidate) in enumerate(zip(reference_path_rows, replay_curve_rows)):
+            source_timestamp = _reference_timestamp(source.get("timestamp"))
+            replay_timestamp = _reference_timestamp(candidate.get("execution_date"))
+            source_asset = _reference_asset(
+                source.get("strategy_research_control_asset")
+                or source.get("selected_asset")
+                or source.get("final_action_asset")
+            )
+            replay_asset = _reference_asset(candidate.get("target_symbol"))
+            if source_timestamp != replay_timestamp or source_asset != replay_asset:
+                decision_path_match = False
+                decision_path_mismatch = {
+                    "index": int(index),
+                    "reference_timestamp": bson_value(source_timestamp),
+                    "replay_timestamp": bson_value(replay_timestamp),
+                    "reference_asset": source_asset,
+                    "replay_asset": replay_asset,
+                }
+                break
+    elif reference_path_rows or replay_curve_rows:
+        decision_path_mismatch = {
+            "reason": "session_count_mismatch",
+            "reference_sessions": int(len(reference_path_rows)),
+            "replay_sessions": int(len(replay_curve_rows)),
+        }
+
+    analytics = reference_analytics if isinstance(reference_analytics, dict) else {}
+    reference_equity_rows = [
+        row for row in (analytics.get("equity") or [])
+        if isinstance(row, dict) and _reference_timestamp(row.get("timestamp")) is not None
+        and _finite(row.get("simulation_equity")) is not None
+    ]
+    reference_equity_rows.sort(key=lambda row: _reference_timestamp(row.get("timestamp")))
+    equity_curve_match = bool(reference_equity_rows) and len(reference_equity_rows) == len(replay_curve_rows)
+    equity_curve_mismatch = None
+    max_equity_delta_rate = 0.0
+    if equity_curve_match:
+        for index, (source, candidate) in enumerate(zip(reference_equity_rows, replay_curve_rows)):
+            source_value = _finite(source.get("simulation_equity"))
+            replay_value = _finite(candidate.get("strategy_equity"))
+            if source_value in {None, 0.0} or replay_value is None:
+                equity_curve_match = False
+                equity_curve_mismatch = {"index": int(index), "reason": "missing_equity_value"}
+                break
+            delta = abs(float(replay_value) / float(source_value) - 1.0)
+            max_equity_delta_rate = max(max_equity_delta_rate, delta)
+            if delta > 1e-10:
+                equity_curve_match = False
+                equity_curve_mismatch = {
+                    "index": int(index),
+                    "timestamp": bson_value(_reference_timestamp(source.get("timestamp"))),
+                    "reference_equity": _finite(source_value),
+                    "replay_equity": _finite(replay_value),
+                    "delta_rate": _finite(delta),
+                }
+                break
+    elif reference_equity_rows or replay_curve_rows:
+        equity_curve_mismatch = {
+            "reason": "session_count_mismatch",
+            "reference_sessions": int(len(reference_equity_rows)),
+            "replay_sessions": int(len(replay_curve_rows)),
+        }
+
     checks = {
         "ending_capital": capital_delta is not None and abs(capital_delta) <= 1e-10,
         "cash_days": replay_cash == reference_cash,
         "market_exposure": exposure_delta is not None and abs(exposure_delta) <= 1e-12,
         "switches": replay_switches == reference_switches,
         "equity_sessions": replay_sessions == reference_sessions,
+        "decision_path": decision_path_match,
+        "equity_curve": equity_curve_match,
     }
     return {
         "status": "passed" if all(checks.values()) else "failed",
         "checks": checks,
+        "rotation_semantics": str(reference.get("rotation_semantics") or _reference_rotation_semantics(analytics)),
         "ending_capital_delta_rate": _finite(capital_delta),
         "market_exposure_delta": _finite(exposure_delta),
+        "max_equity_delta_rate": _finite(max_equity_delta_rate),
+        "decision_path_mismatch": decision_path_mismatch,
+        "equity_curve_mismatch": equity_curve_mismatch,
         "reference": {
             "ending_capital": reference_capital,
             "cash_days": reference_cash,
@@ -3584,7 +3698,6 @@ def _strategy_research_reference_parity(
             "equity_sessions": replay_sessions,
         },
     }
-
 
 def _replace_reference_with_stateful_strategy(
     *,
@@ -3967,7 +4080,7 @@ def run_temporal_intelligence(
     if strategy_research_reference_analytics:
         winner_anchor_replay = _strategy_research_reference_study(
             multi_horizon_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
-            open_prices, config, enable_timing_override=False,
+            open_prices, config, include_economic_curve=True, enable_timing_override=False,
         ) if not multi_horizon_frame.empty else {}
         multi_horizon_shadow = _strategy_research_reference_study(
             multi_horizon_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
@@ -3986,16 +4099,26 @@ def run_temporal_intelligence(
 
     reference_parity = None
     if strategy_research_reference_analytics:
-        reference_parity = _strategy_research_reference_parity(winner_reference, winner_anchor_replay)
+        reference_parity = _strategy_research_reference_parity(
+            winner_reference,
+            winner_anchor_replay,
+            reference_daily_rows=winner_reference_daily_rows,
+            reference_analytics=strategy_research_reference_analytics,
+        )
         if str(reference_parity.get("status") or "") != "passed":
             raise ValueError(
                 "Selected Strategy Research reference replay failed exact parity before Temporal timing. "
                 + json.dumps({
                     "checks": reference_parity.get("checks") or {},
+                    "rotation_semantics": reference_parity.get("rotation_semantics"),
+                    "decision_path_mismatch": reference_parity.get("decision_path_mismatch"),
+                    "equity_curve_mismatch": reference_parity.get("equity_curve_mismatch"),
+                    "max_equity_delta_rate": reference_parity.get("max_equity_delta_rate"),
                     "reference": reference_parity.get("reference") or {},
                     "replay": reference_parity.get("replay") or {},
                 }, sort_keys=True)
             )
+        winner_anchor_replay.pop("economic_curve", None)
 
     multi_horizon_fold_metrics: list[dict[str, Any]] = []
     for fold in folds:
