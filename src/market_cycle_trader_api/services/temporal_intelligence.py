@@ -246,8 +246,10 @@ def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str
         raise TemporalIntelligenceConflict(str(exc)) from exc
     if milp_context is not None:
         return milp_context
+    derived_policy_active = strategy.get("derived_policy_invalidated_at") is None
     is_stateful = (
-        str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
+        derived_policy_active
+        and str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
         and str(strategy.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
         and str(strategy.get("tuning_target") or "") == "stateful_transition"
     )
@@ -266,7 +268,7 @@ def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str
             bundle,
         )
 
-    if str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
+    if derived_policy_active and str(strategy.get("strategy_kind") or "") == "temporal_intelligence":
         source_run_id = str(strategy.get("source_temporal_run_id") or "").strip()
         policy = strategy.get("temporal_policy") if isinstance(strategy.get("temporal_policy"), dict) else {}
         source_run_id = source_run_id or str(policy.get("source_run_id") or "").strip()

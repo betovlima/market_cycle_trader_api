@@ -31,6 +31,7 @@ def is_milp_strategy(strategy: dict[str, Any] | None) -> bool:
         str(strategy.get("strategy_kind") or "") == "temporal_intelligence"
         and str(strategy.get("temporal_strategy_variant") or "") == "milp_decision_overlay"
         and str(strategy.get("tuning_target") or "") == "decision_optimization"
+        and strategy.get("derived_policy_invalidated_at") is None
     )
 
 
@@ -63,6 +64,7 @@ def processing_analytics(db: Any, value: str) -> dict[str, Any] | None:
             "tuning_target": 1,
             "source_decision_optimization_id": 1,
             "decision_replay_snapshot": 1,
+            "derived_policy_invalidated_at": 1,
         },
     )
     if profile is None:

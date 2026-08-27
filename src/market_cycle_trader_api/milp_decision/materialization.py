@@ -73,6 +73,8 @@ def materialize(db: Any, run_id: str, optimization_id: str, *, actor_email: str 
         },
     }
     replay_snapshot = bson_value(optimization.get("analytics") or {})
+    attribution = optimization.get("attribution") if isinstance(optimization.get("attribution"), dict) else {}
+    identity_overlay = int(attribution.get("different_decision") or 0) == 0 and int(attribution.get("same_decision") or 0) > 0
     now = utc_now()
     updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
         {"_id": created["id"], "revision": int(created["revision"])},
@@ -88,8 +90,7 @@ def materialize(db: Any, run_id: str, optimization_id: str, *, actor_email: str 
                 "temporal_policy_revision": 1,
                 "temporal_policy_snapshot": bson_value(policy_snapshot),
                 "decision_replay_snapshot": replay_snapshot,
-                "research_only": True,
-                "research_only_reason": "milp_live_runtime_not_available",
+                "milp_identity_overlay": bool(identity_overlay),
                 "updated_at": now,
                 "updated_by": (actor_email or "").strip().lower() or None,
             },

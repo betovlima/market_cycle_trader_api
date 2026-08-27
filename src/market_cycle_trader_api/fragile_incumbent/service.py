@@ -89,6 +89,18 @@ def build_and_persist(
         raise ValueError("Fragile Incumbent Research requires completed Leadership Regime diagnostics.")
     analytics = processing_analytics(db, processing_id)
     monthly_returns = analytics.get("monthly_returns") or ((analytics.get("metrics") or {}).get("monthly_returns")) or []
+    if not any(isinstance(row, dict) and row.get("simulation_return") is not None for row in monthly_returns):
+        monthly_returns = [
+            {
+                "month": row.get("month"),
+                "simulation_return": row.get("monthly_return"),
+                "reference_return": None,
+                "excess_return": None,
+                "source": "leadership_regime_reference_daily",
+            }
+            for row in (leadership.get("monthly") or [])
+            if isinstance(row, dict) and row.get("month") and row.get("monthly_return") is not None
+        ]
     winner_rows = _artifact_rows(db, run_id, "winner_reference_daily")
     result = build_analysis(
         leadership,

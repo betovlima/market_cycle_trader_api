@@ -141,7 +141,7 @@ def run(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month
             "stateful_candidate_consumed_as_input": False,
             "parallel_candidate_comparison": True,
             "configuration_origin": "fixed_non_tuned_research_baseline",
-            "promotion_policy": "research_only_until_live_runtime_parity",
+            "promotion_policy": "catalog_strategy_uses_backend_runtime_compatibility",
         },
         "control_parity": control_parity,
         "control_replay": {

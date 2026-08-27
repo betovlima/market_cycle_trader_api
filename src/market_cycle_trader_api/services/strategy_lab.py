@@ -569,14 +569,24 @@ def _strategy_model_detail(document: dict[str, Any]) -> dict[str, Any] | None:
     return public
 
 
-def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
-    """Return the backend-owned live Trader compatibility contract for a Strategy.
+def _milp_identity_overlay(document: dict[str, Any]) -> bool:
+    if (
+        str(document.get("strategy_kind") or "").strip().lower() != "temporal_intelligence"
+        or str(document.get("temporal_strategy_variant") or "").strip().lower() != "milp_decision_overlay"
+    ):
+        return False
+    policy = document.get("temporal_policy_snapshot") if isinstance(document.get("temporal_policy_snapshot"), dict) else {}
+    validation = policy.get("validation") if isinstance(policy.get("validation"), dict) else {}
+    attribution = validation.get("attribution") if isinstance(validation.get("attribution"), dict) else {}
+    try:
+        return int(attribution.get("different_decision") or 0) == 0 and int(attribution.get("same_decision") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
-    Catalog status is intentionally not part of this decision. Lifecycle state still
-    controls when a compatible Strategy may be marked Candidate or promoted, but the
-    runtime capability is exclusively technical.
-    """
+
+def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     strategy_kind = str(document.get("strategy_kind") or "standard").strip().lower()
+    variant = str(document.get("temporal_strategy_variant") or "").strip().lower()
     snapshot = (
         document.get("research_model_snapshot")
         if isinstance(document.get("research_model_snapshot"), dict)
@@ -584,25 +594,6 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     )
     model_family = str((snapshot or {}).get("family") or "").strip().lower() or None
 
-    if strategy_kind == "temporal_intelligence":
-        stateful = str(document.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
-        if stateful and model_family == "lightgbm_utility" and str(document.get("source_stateful_replay_id") or "").strip():
-            return {
-                "eligible": True,
-                "code": "stateful_conservative_live_runtime_ready",
-                "reason": None,
-                "strategy_kind": strategy_kind,
-                "model_family": model_family,
-            }
-        return {
-            "eligible": False,
-            "code": "temporal_live_runtime_unavailable",
-            "reason": (
-                "Temporal Intelligence strategies require a supported live execution policy before Trader Winner promotion."
-            ),
-            "strategy_kind": strategy_kind,
-            "model_family": model_family,
-        }
     if model_family == "iqn":
         return {
             "eligible": False,
@@ -619,6 +610,51 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
             "strategy_kind": strategy_kind,
             "model_family": model_family,
         }
+
+    if document.get("derived_policy_invalidated_at") is not None:
+        return {
+            "eligible": True,
+            "code": "derived_policy_invalidated_base_runtime_ready",
+            "reason": None,
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
+
+    if strategy_kind == "temporal_intelligence" and variant == "winner_transition_stateful":
+        stateful_ready = bool(str(document.get("source_stateful_replay_id") or "").strip())
+        if not stateful_ready:
+            return {
+                "eligible": False,
+                "code": "stateful_runtime_snapshot_missing",
+                "reason": "The Stateful Strategy is missing its live runtime snapshot.",
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
+        return {
+            "eligible": True,
+            "code": "stateful_conservative_live_runtime_ready",
+            "reason": None,
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
+
+    if strategy_kind == "temporal_intelligence" and variant == "milp_decision_overlay":
+        if _milp_identity_overlay(document):
+            return {
+                "eligible": True,
+                "code": "milp_identity_overlay_live_parity_ready",
+                "reason": None,
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
+        return {
+            "eligible": False,
+            "code": "milp_overlay_requires_live_runtime",
+            "reason": "This MILP overlay changes Control decisions and requires an equivalent live execution runtime before it can be the Trader Winner.",
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
+
     return {
         "eligible": True,
         "code": "protected_live_runtime_ready",
@@ -626,7 +662,6 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         "strategy_kind": strategy_kind,
         "model_family": model_family,
     }
-
 
 def _assert_trader_runtime_compatible(document: dict[str, Any]) -> dict[str, Any]:
     compatibility = _trader_runtime_compatibility(document)
@@ -656,6 +691,8 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "source_temporal_run_id": document.get("source_temporal_run_id"),
         "source_temporal_experiment": document.get("source_temporal_experiment"),
         "temporal_strategy_variant": document.get("temporal_strategy_variant"),
+        "derived_policy_invalidated_at": bson_value(document.get("derived_policy_invalidated_at")),
+        "derived_policy_invalidated_reason": document.get("derived_policy_invalidated_reason"),
         "source_stateful_replay_id": document.get("source_stateful_replay_id"),
         "source_stateful_processing_id": document.get("source_stateful_processing_id"),
         "stateful_candidate_key": document.get("stateful_candidate_key"),
@@ -1638,11 +1675,15 @@ def materialize_temporal_stateful_strategy(
     return {"created": True, "strategy": _public_profile(updated)}
 
 
-def _assert_standard_strategy_action(profile: dict[str, Any], action: str) -> None:
-    if str(profile.get("strategy_kind") or "standard") == "temporal_intelligence":
-        raise StrategyLabConflict(
-            f"Temporal Intelligence Strategies are immutable policy snapshots for research. {action} must use the dedicated Temporal Policy workflow."
-        )
+def _derived_policy_edit_updates(profile: dict[str, Any], *, reason: str, now: Any) -> dict[str, Any]:
+    if str(profile.get("strategy_kind") or "standard").strip().lower() != "temporal_intelligence":
+        return {}
+    return {
+        "research_only": False,
+        "research_only_reason": None,
+        "derived_policy_invalidated_at": now,
+        "derived_policy_invalidated_reason": str(reason),
+    }
 
 
 def _assert_strategy_not_under_model_tuning(db: Any, strategy_id: str) -> None:
@@ -1675,7 +1716,6 @@ def update_strategy(
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    _assert_standard_strategy_action(current, "Editing")
     if bool(current.get("locked")):
         raise StrategyLabConflict(
             "Protected winner snapshots cannot be edited. Clone the strategy to create a test version."
@@ -1717,6 +1757,7 @@ def update_strategy(
                 "candidate_revision": None,
                 "candidate_backtest_id": None,
                 "candidate_model_snapshot": None,
+                **_derived_policy_edit_updates(current, reason="strategy_configuration_changed", now=now),
             },
             "$inc": {"revision": 1},
         },
@@ -1815,7 +1856,6 @@ def update_strategy_model(
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
         raise StrategyLabNotFound("Strategy profile not found.")
-    _assert_standard_strategy_action(current, "Editing")
     if bool(current.get("locked")):
         raise StrategyLabConflict(
             "Protected lifecycle snapshots cannot change model configuration. Clone the strategy first."
@@ -1884,6 +1924,7 @@ def update_strategy_model(
                 "candidate_revision": None,
                 "candidate_backtest_id": None,
                 "candidate_model_snapshot": None,
+                **_derived_policy_edit_updates(current, reason="strategy_model_changed", now=now),
             },
             "$inc": {"research_model_revision": 1},
         },
@@ -2141,6 +2182,7 @@ def _is_stateful_temporal_strategy(profile: dict[str, Any] | None) -> bool:
         str(profile.get("strategy_kind") or "") == "temporal_intelligence"
         and str(profile.get("temporal_strategy_variant") or "") == "winner_transition_stateful"
         and str(profile.get("tuning_target") or "") == "stateful_transition"
+        and profile.get("derived_policy_invalidated_at") is None
     )
 
 
