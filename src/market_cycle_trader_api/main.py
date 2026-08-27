@@ -51,6 +51,7 @@ from .services.paper_market_scheduler import (
 from .services.model_tuning import recover_integrated_model_tuning_runs
 from .services.temporal_intelligence import recover_temporal_intelligence_runs
 from .services.temporal_research_settings import ensure_temporal_research_settings
+from .services.asset_discovery import purge_legacy_non_persistent_asset_discovery_records
 from .roc_decision_policy.config import ensure_settings as ensure_roc_decision_policy_settings
 
 
@@ -60,6 +61,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     if bool(MONGO_STATUS.get("available")):
         ensure_temporal_research_settings(database())
         ensure_roc_decision_policy_settings(database())
+        purge_legacy_non_persistent_asset_discovery_records(database())
         recover_integrated_model_tuning_runs(database())
         recover_temporal_intelligence_runs(database())
     get_auth_settings().validate_runtime()

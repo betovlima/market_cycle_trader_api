@@ -96,6 +96,80 @@ def _campaign(db: Database) -> dict[str, Any] | None:
     return db[COLLECTION].find_one({"_id": CURRENT_ID})
 
 
+def _sanitize_completed_campaign_persistence(db: Database, document: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(document, dict):
+        return document
+    if str(document.get("status") or "").strip().lower() in ACTIVE_STATUSES:
+        return document
+
+    stored_results = list(document.get("results") or []) if isinstance(document.get("results"), list) else []
+    visible_results = [item for item in stored_results if _item_is_persistent_candidate(item)]
+
+    marginal = dict(document.get("marginal_replay") or {}) if isinstance(document.get("marginal_replay"), dict) else {}
+    stored_replay_rows = list(marginal.get("results") or []) if isinstance(marginal.get("results"), list) else []
+    visible_replay_rows = [row for row in stored_replay_rows if _marginal_replay_is_persistent_candidate(row)]
+
+    changed = len(visible_results) != len(stored_results) or len(visible_replay_rows) != len(stored_replay_rows)
+    if not changed:
+        return document
+
+    marginal["results"] = visible_replay_rows
+    marginal["persistent_candidate_count"] = len(visible_replay_rows)
+    changes = {
+        "results": bson_value(visible_results),
+        "shortlisted_count": len(visible_results),
+        "marginal_replay": bson_value(marginal),
+        "updated_at": utc_now(),
+    }
+    db[COLLECTION].update_one({"_id": document.get("_id", CURRENT_ID)}, {"$set": changes})
+    sanitized = dict(document)
+    sanitized.update(changes)
+    return sanitized
+
+
+def purge_legacy_non_persistent_asset_discovery_records(db: Database) -> dict[str, int]:
+    research_documents_scanned = 0
+    research_results_removed = 0
+    marginal_rows_removed = 0
+    catalog_records_removed = 0
+
+    for document in list(db[COLLECTION].find({})):
+        if not isinstance(document, dict):
+            continue
+        research_documents_scanned += 1
+        if str(document.get("status") or "").strip().lower() in ACTIVE_STATUSES:
+            continue
+        stored_results = list(document.get("results") or []) if isinstance(document.get("results"), list) else []
+        marginal = dict(document.get("marginal_replay") or {}) if isinstance(document.get("marginal_replay"), dict) else {}
+        stored_replay_rows = list(marginal.get("results") or []) if isinstance(marginal.get("results"), list) else []
+        sanitized = _sanitize_completed_campaign_persistence(db, document) or document
+        current_results = list(sanitized.get("results") or []) if isinstance(sanitized.get("results"), list) else []
+        current_marginal = sanitized.get("marginal_replay") if isinstance(sanitized.get("marginal_replay"), dict) else {}
+        current_replay_rows = list(current_marginal.get("results") or []) if isinstance(current_marginal.get("results"), list) else []
+        research_results_removed += max(0, len(stored_results) - len(current_results))
+        marginal_rows_removed += max(0, len(stored_replay_rows) - len(current_replay_rows))
+
+    for stored in list(db[CATALOG_COLLECTION].find({})):
+        if not isinstance(stored, dict):
+            continue
+        metrics = stored.get("latest_metrics") if isinstance(stored.get("latest_metrics"), dict) else {}
+        persisted_view = {
+            "history_window_complete": bool(stored.get("history_window_complete")),
+            **metrics,
+        }
+        if _item_is_persistent_candidate(persisted_view):
+            continue
+        result = db[CATALOG_COLLECTION].delete_one({"_id": stored.get("_id")})
+        catalog_records_removed += int(getattr(result, "deleted_count", 0) or 0)
+
+    return {
+        "research_documents_scanned": research_documents_scanned,
+        "research_results_removed": research_results_removed,
+        "marginal_rows_removed": marginal_rows_removed,
+        "catalog_records_removed": catalog_records_removed,
+    }
+
+
 def _worker_alive() -> bool:
     with _worker_lock:
         return bool(_worker_thread and _worker_thread.is_alive())
@@ -816,7 +890,7 @@ def _run_marginal_capital_replay(
                 "baseline": None,
                 "results": [],
             },
-            "results": shortlist,
+            "results": [],
             "shortlisted_count": len(shortlist),
         },
     )
@@ -855,7 +929,7 @@ def _run_marginal_capital_replay(
         symbol = str(item.get("symbol") or "").strip().upper()
         _event(
             db, run_id,
-            f"Marginal Capital Replay {index}/{len(shortlist)}: {symbol}.",
+            f"Marginal Capital Replay {index}/{len(shortlist)}.",
             phase="marginal_replay",
             changes={
                 "marginal_replay.current_symbol": symbol,
@@ -921,17 +995,37 @@ def _run_marginal_capital_replay(
                 })
         except Exception as exc:
             row.update({"status": "failed", "error": str(exc)[:700]})
+
         row["persistence_eligible"] = _marginal_replay_is_persistent_candidate(row)
         row["persistence_reason"] = "positive_marginal_capital" if row["persistence_eligible"] else "low_strategy_adherence"
         replay_rows.append(row)
+
         target = result_map.get(symbol)
-        if target is not None:
-            target["marginal_replay"] = row
-            target["persistence_eligible"] = bool(row["persistence_eligible"])
-            target["persistence_reason"] = row["persistence_reason"]
+        if row["persistence_eligible"]:
+            if target is not None:
+                target["marginal_replay"] = row
+                target["persistence_eligible"] = True
+                target["persistence_reason"] = "positive_marginal_capital"
+        else:
+            updated_results = [item for item in updated_results if str(item.get("symbol") or "").strip().upper() != symbol]
+            result_map.pop(symbol, None)
+            if row.get("rejection_reason") != "research_context_incomplete":
+                error_text = str(row.get("error") or "").lower()
+                if "not enough history" in error_text or "available_test_rows" in error_text or "minimum_test" in error_text:
+                    _reject(db, run_id, "insufficient_walk_forward_history")
+                elif row.get("status") == "completed":
+                    _reject(db, run_id, "low_strategy_adherence")
+                else:
+                    _increment(db, run_id, {"technical_failure_count": 1})
+
+        persisted_replay_rows = [candidate for candidate in replay_rows if bool(candidate.get("persistence_eligible"))]
         _event(
             db, run_id,
-            f"Marginal Capital Replay finished for {symbol}.",
+            (
+                f"Marginal Capital Replay retained {symbol}."
+                if row["persistence_eligible"]
+                else "Marginal Capital Replay discarded one non-adherent asset."
+            ),
             changes={
                 "marginal_replay": {
                     "status": "running",
@@ -939,21 +1033,21 @@ def _run_marginal_capital_replay(
                     "completed_count": index,
                     "current_symbol": None,
                     "current_index": index,
-                    "current_stage": f"Replay completed for {symbol}",
+                    "current_stage": "Asset replay completed",
                     "progress_percent": round(100.0 * (index + 1) / total_runs, 1),
                     "baseline": baseline_metrics,
-                    "results": replay_rows,
+                    "results": persisted_replay_rows,
+                    "persistent_candidate_count": len(persisted_replay_rows),
+                    "low_adherence_count": sum(1 for candidate in replay_rows if not bool(candidate.get("persistence_eligible"))),
                 },
                 "results": updated_results,
+                "shortlisted_count": len(updated_results),
             },
         )
         if _should_stop_after_batch(db, run_id):
             break
 
-    comparable = [
-        row for row in replay_rows
-        if row.get("status") == "completed" and row.get("ending_capital_delta_rate") is not None
-    ]
+    comparable = [row for row in replay_rows if bool(row.get("persistence_eligible"))]
     comparable.sort(key=lambda row: float(row.get("ending_capital_delta_rate") or 0.0), reverse=True)
     marginal_rank = {str(row.get("symbol") or ""): index for index, row in enumerate(comparable, start=1)}
     for item in updated_results:
@@ -961,17 +1055,13 @@ def _run_marginal_capital_replay(
         replay = item.get("marginal_replay") if isinstance(item.get("marginal_replay"), dict) else None
         if replay is not None and symbol in marginal_rank:
             replay["marginal_rank"] = marginal_rank[symbol]
-    for row in replay_rows:
+    for row in comparable:
         symbol = str(row.get("symbol") or "")
         if symbol in marginal_rank:
             row["marginal_rank"] = marginal_rank[symbol]
 
-    eligible_results = [
-        item for item in updated_results
-        if isinstance(item.get("marginal_replay"), dict)
-        and item["marginal_replay"].get("status") == "completed"
-        and bool(item["marginal_replay"].get("research_context_compatible", True))
-    ]
+    eligible_results = [item for item in updated_results if _item_is_persistent_candidate(item)]
+    persisted_replay_rows = [row for row in comparable if _marginal_replay_is_persistent_candidate(row)]
 
     replay_summary = {
         "status": "completed" if len(replay_rows) == len(shortlist) else "stopped",
@@ -982,10 +1072,10 @@ def _run_marginal_capital_replay(
         "current_stage": "Marginal Capital Replay completed" if len(replay_rows) == len(shortlist) else "Marginal Capital Replay stopped",
         "progress_percent": 100.0 if len(replay_rows) == len(shortlist) else round(100.0 * (len(replay_rows) + 1) / total_runs, 1),
         "baseline": baseline_metrics,
-        "results": replay_rows,
+        "results": persisted_replay_rows,
         "eligible_count": len(eligible_results),
-        "persistent_candidate_count": sum(1 for row in replay_rows if bool(row.get("persistence_eligible"))),
-        "low_adherence_count": sum(1 for row in replay_rows if row.get("status") == "completed" and not bool(row.get("persistence_eligible"))),
+        "persistent_candidate_count": len(persisted_replay_rows),
+        "low_adherence_count": sum(1 for row in replay_rows if not bool(row.get("persistence_eligible"))),
         "research_context_rejected_count": sum(1 for row in replay_rows if row.get("rejection_reason") == "research_context_incomplete"),
     }
     return eligible_results, replay_summary
@@ -1274,8 +1364,8 @@ def _run_worker(db: Database, run_id: str) -> None:
                     db,
                     run_id,
                     "stopped",
-                    f"Asset Discovery stopped after batch {batch_index}; completed batch results were preserved.",
-                    results=shortlist,
+                    f"Asset Discovery stopped after batch {batch_index}; unvalidated shortlist data was discarded.",
+                    results=[],
                 )
                 return
 
@@ -1286,7 +1376,7 @@ def _run_worker(db: Database, run_id: str) -> None:
                 run_id,
                 f"Asset Discovery ranked {len(evaluated)} evaluable external assets; starting Marginal Capital Replay for all {len(shortlist)} shortlisted assets.",
                 phase="marginal_replay",
-                changes={"results": shortlist, "shortlisted_count": len(shortlist)},
+                changes={"results": [], "shortlisted_count": len(shortlist)},
             )
             shortlist, marginal_replay = _run_marginal_capital_replay(
                 db,
@@ -1326,7 +1416,8 @@ def _run_worker(db: Database, run_id: str) -> None:
 
 
 def get_asset_discovery_status(db: Database) -> dict[str, Any]:
-    document = _backfill_company_metadata(db, _campaign(db))
+    document = _sanitize_completed_campaign_persistence(db, _campaign(db))
+    document = _backfill_company_metadata(db, document)
     if document and str(document.get("status") or "") in ACTIVE_STATUSES and not _worker_alive():
         phase = str(document.get("phase") or "").strip().lower()
         interrupted_marginal = phase == "marginal_replay"
@@ -1388,7 +1479,7 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
             "marginal_replay": "shortlist_only_in_memory_market_data",
             "history": "latest_campaign_only",
             "discovery_catalog": "positive_marginal_candidates_only",
-            "low_adherence_assets": "visible_in_campaign_not_persisted",
+            "low_adherence_assets": "aggregate_only_not_visible_or_persisted",
         },
         "campaign": _public(document),
     }
@@ -2315,7 +2406,7 @@ def create_research_strategy_from_discovery(
 
 
 def export_asset_discovery(db: Database, *, front_version: str | None = None) -> dict[str, Any]:
-    document = _campaign(db)
+    document = _sanitize_completed_campaign_persistence(db, _campaign(db))
     if not document:
         raise AssetDiscoveryConflict("There is no Asset Discovery campaign to export.")
     payload = _public(document) or {}
