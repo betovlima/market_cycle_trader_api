@@ -888,6 +888,7 @@ def _control_response(db: Any, control: dict[str, Any]) -> dict[str, Any]:
         "live_market_refresh_in_progress": bool(control.get("live_market_refresh_in_progress")),
         "live_market_refresh_started_at": bson_value(control.get("live_market_refresh_started_at")),
         "live_market_refresh_source": control.get("live_market_refresh_source"),
+        "winner_promotion_guard": _winner_promotion_guard(db),
     }
 
 
@@ -2433,7 +2434,7 @@ def _acquire_winner_promotion_lock(
         current = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or {}
         if bool(current.get("live_market_refresh_in_progress")):
             raise StrategyLabConflict(
-                "Trader Winner promotion is temporarily unavailable while the temporal market-series synchronization is running."
+                "Winner promotion is temporarily unavailable while the daily market-data synchronization used by calibration is running."
             )
         raise StrategyLabConflict(
             "Strategy selection changed or another Winner promotion is already in progress."
@@ -2470,82 +2471,157 @@ def _regular_market_is_open() -> bool:
     return bool(calendar.is_open_on_minute(stamp.floor("min"), ignore_breaks=True))
 
 
+def _winner_promotion_guard(db: Any, *, include_promotion_lock: bool = True) -> dict[str, Any]:
+    control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": CONTROL_ID}) or {}
+    if include_promotion_lock and bool(control.get("winner_promotion_in_progress")):
+        return {
+            "available": False,
+            "code": "promotion_in_progress",
+            "reason": "Another Winner promotion is already in progress.",
+        }
+
+    active_run = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
+        {"active_key": ACTIVE_PAPER_KEY},
+        {"_id": 0, "run_id": 1, "status": 1, "phase": 1, "plan_id": 1, "execution_session": 1, "premarket_analysis_at": 1},
+    )
+    status = str((active_run or {}).get("status") or "").strip().lower()
+    phase = str((active_run or {}).get("phase") or "").strip().lower()
+
+    calibration_running = status == "preparing" or phase in {
+        "refreshing_market_data_and_preparing_premarket_plan",
+        "preparing_premarket_plan",
+    }
+    if calibration_running:
+        return {
+            "available": False,
+            "code": "daily_calibration_running",
+            "reason": "Winner promotion is temporarily unavailable while the daily calibration and pre-market plan are being prepared.",
+            "active_run_id": (active_run or {}).get("run_id"),
+            "active_run_status": (active_run or {}).get("status"),
+            "active_run_phase": (active_run or {}).get("phase"),
+        }
+
+    execution_running = status == "executing" or phase == "submitting_alpaca_paper_orders"
+    executing_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+        {"status": "executing"},
+        {"_id": 0, "plan_id": 1, "status": 1, "execution_session": 1},
+    )
+    if execution_running or executing_plan is not None:
+        return {
+            "available": False,
+            "code": "order_execution_running",
+            "reason": "Winner promotion is temporarily unavailable while the current buy/sell operation is being executed.",
+            "active_run_id": (active_run or {}).get("run_id"),
+            "active_run_status": (active_run or {}).get("status"),
+            "active_run_phase": (active_run or {}).get("phase"),
+            "plan_id": (executing_plan or {}).get("plan_id"),
+        }
+
+    if bool(control.get("live_market_refresh_in_progress")):
+        return {
+            "available": False,
+            "code": "daily_calibration_data_sync",
+            "reason": "Winner promotion is temporarily unavailable while the daily market-data synchronization used by calibration is running.",
+            "refresh_source": control.get("live_market_refresh_source"),
+        }
+
+    return {
+        "available": True,
+        "code": "available",
+        "reason": None,
+        "active_run_id": (active_run or {}).get("run_id"),
+        "active_run_status": (active_run or {}).get("status"),
+        "active_run_phase": (active_run or {}).get("phase"),
+    }
+
+
 def _assert_trader_safe_for_promotion(
     db: Any,
     *,
     strategy_assets: list[str],
 ) -> dict[str, Any]:
-    
-
-
-
-
-
-
-    regular_market_open = _regular_market_is_open()
-
-    _assert_no_active_backtest(db)
-
-    active_run = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
-        {"active_key": ACTIVE_PAPER_KEY},
-        {
-            "_id": 0,
-            "run_id": 1,
-            "status": 1,
-            "phase": 1,
-            "plan_id": 1,
-            "execution_session": 1,
-            "premarket_analysis_at": 1,
-        },
-    )
-    if active_run is not None:
-        status = str(active_run.get("status") or "").strip().lower()
-        if status != "armed":
-            raise StrategyLabConflict(
-                "Winner promotion requires the Paper pipeline to be idle before calibration, "
-                "prediction or order execution. Current run status: "
-                f"{status or 'unknown'}."
-            )
-        if active_run.get("plan_id"):
-            raise StrategyLabConflict(
-                "A Paper plan already exists for the next session. Promote only before the "
-                "scheduled pre-market calibration and prediction cycle starts."
-            )
-
-    pending_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
-        {"status": {"$in": ["prepared", "executing", "submitted", "pending"]}},
-        {"_id": 0, "plan_id": 1, "status": 1},
-    )
-    if pending_plan is not None:
-        raise StrategyLabConflict(
-            "A Paper plan is already pending or executing. Promote only before the next "
-            "scheduled calibration and prediction cycle."
-        )
+    guard = _winner_promotion_guard(db, include_promotion_lock=False)
+    if not bool(guard.get("available")):
+        raise StrategyLabConflict(str(guard.get("reason") or "Winner promotion is temporarily unavailable."))
 
     state = db[PAPER_TRADING_STATE_COLLECTION].find_one({"_id": "default"}) or {}
-    managed_symbol = str(state.get("managed_symbol") or "").strip().upper() or None
-    normalized_assets = {str(symbol).strip().upper() for symbol in strategy_assets}
-    if managed_symbol and managed_symbol not in normalized_assets:
-        raise StrategyLabConflict(
-            "The currently managed position is not part of the Strategy asset universe: "
-            f"{managed_symbol}. Promotion was blocked without contacting Alpaca or changing the position."
-        )
-
     controller = db[PAPER_MARKET_AUTOMATION_COLLECTION].find_one({"_id": "default"}) or {}
     return {
-        "regular_market_open_at_promotion": regular_market_open,
+        "regular_market_open_at_promotion": _regular_market_is_open(),
         "trader_control_mode": str(controller.get("control_mode") or "stopped").strip().lower(),
-        "active_run_id": (active_run or {}).get("run_id"),
-        "active_run_status": (active_run or {}).get("status"),
-        "active_run_phase": (active_run or {}).get("phase"),
-        "active_run_execution_session": (active_run or {}).get("execution_session"),
-        "active_run_premarket_analysis_at": bson_value(
-            (active_run or {}).get("premarket_analysis_at")
-        ),
-        "managed_symbol": managed_symbol,
+        "active_run_id": guard.get("active_run_id"),
+        "active_run_status": guard.get("active_run_status"),
+        "active_run_phase": guard.get("active_run_phase"),
+        "managed_symbol": str(state.get("managed_symbol") or "").strip().upper() or None,
         "managed_quantity": float(state.get("managed_quantity") or 0.0),
         "strategy_cash": float(state.get("strategy_cash") or 0.0),
         "holding_sessions": int(state.get("holding_sessions") or 0),
+        "promotion_guard": guard,
+    }
+
+
+def _rearm_prepared_paper_plan_after_winner_promotion(db: Any, *, new_winner_strategy_id: str) -> dict[str, Any]:
+    now = utc_now()
+    active_run = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"active_key": ACTIVE_PAPER_KEY})
+    cancelled_plans: list[str] = []
+
+    prepared_plans = list(db[PAPER_TRADE_PLANS_COLLECTION].find({"status": "prepared"}, {"_id": 0, "plan_id": 1}))
+    for plan in prepared_plans:
+        plan_id = str(plan.get("plan_id") or "").strip()
+        if not plan_id:
+            continue
+        result = db[PAPER_TRADE_PLANS_COLLECTION].update_one(
+            {"plan_id": plan_id, "status": "prepared"},
+            {"$set": {
+                "status": "cancelled",
+                "cancelled_at": now,
+                "cancel_reason": "Trader Winner changed before execution; daily calibration must rebuild the plan.",
+                "updated_at": now,
+            }},
+        )
+        if result.modified_count:
+            cancelled_plans.append(plan_id)
+
+    rearmed_run_id = None
+    if active_run is not None and str(active_run.get("status") or "").strip().lower() == "prepared":
+        run_id = str(active_run.get("run_id") or "").strip()
+        update = {
+            "$set": {
+                "status": "armed",
+                "phase": "waiting_for_premarket_analysis",
+                "updated_at": now,
+                "next_retry_at": now,
+                "last_message": "Trader Winner changed; the prepared plan was invalidated and will be recalibrated before execution.",
+                "winner_strategy_id": str(new_winner_strategy_id),
+            },
+            "$unset": {
+                "plan_id": "",
+                "action": "",
+                "target_asset": "",
+                "decision_date": "",
+                "premarket_analysis_started_at": "",
+                "premarket_analysis_completed_at": "",
+                "worker_id": "",
+                "lease_expires_at": "",
+            },
+            "$push": {
+                "logs": {
+                    "$each": [f"{now.isoformat()} — Trader Winner changed; stale prepared plan invalidated for recalibration."],
+                    "$slice": -100,
+                }
+            },
+        }
+        result = db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "prepared"},
+            update,
+        )
+        if result.modified_count:
+            rearmed_run_id = run_id
+
+    return {
+        "prepared_plans_cancelled": cancelled_plans,
+        "paper_run_rearmed": bool(rearmed_run_id),
+        "paper_run_id": rearmed_run_id,
     }
 
 def promote_strategy_to_trader(
@@ -2719,6 +2795,9 @@ def promote_strategy_to_trader(
             {"$set": {"status": "completed", "control_revision_after": int(updated_control.get("revision") or 0), "completed_at": utc_now()}},
         )
         completed = True
+        paper_rearm = _rearm_prepared_paper_plan_after_winner_promotion(
+            db, new_winner_strategy_id=strategy_id
+        )
         refreshed_source = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id}) or updated_source
         return {
             "status": "promoted",
@@ -2733,6 +2812,8 @@ def promote_strategy_to_trader(
                 "operational_state_preserved": True,
                 "current_position_preserved": True,
                 "paper_pipeline_preserved": True,
+                "paper_pipeline_rearmed_for_new_winner": bool(paper_rearm.get("paper_run_rearmed")),
+                "cancelled_prepared_plan_ids": list(paper_rearm.get("prepared_plans_cancelled") or []),
                 "next_scheduled_evaluation_uses_new_winner": True,
                 "winner_model": public_model_snapshot(winner_model_snapshot),
                 "trader_compatibility": bson_value(runtime_compatibility),

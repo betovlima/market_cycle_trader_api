@@ -112,6 +112,7 @@ def build_analysis(
     processing_id: str,
     period_start: str,
     period_end: str,
+    initial_capital: float | None = None,
 ) -> dict[str, Any]:
     period_rows = [
         dict(row)
@@ -250,18 +251,37 @@ def build_analysis(
     for row, source in zip(session_rows, period_rows):
         by_month[row["month"]].append(row)
         source_by_month[row["month"]].append(source)
+
+    all_month_ends: dict[str, float] = {}
+    for source in sorted((dict(row) for row in winner_rows), key=lambda row: str(row.get("timestamp") or "")):
+        month_key = _month_key(source.get("timestamp"))
+        equity_value = _number(source.get("strategy_equity"))
+        if month_key and equity_value is not None:
+            all_month_ends[month_key] = equity_value
+    ordered_all_months = sorted(all_month_ends)
+    month_starts: dict[str, float | None] = {}
+    previous_ending = _number(initial_capital)
+    for month_key in ordered_all_months:
+        month_starts[month_key] = previous_ending
+        previous_ending = all_month_ends[month_key]
+
     for month in sorted(by_month):
         rows = by_month[month]
         source_rows = source_by_month[month]
         counts = Counter(row["state"] for row in rows)
         dominant_state, dominant_count = counts.most_common(1)[0]
-        first_equity = _number(source_rows[0].get("strategy_equity"))
-        last_equity = _number(source_rows[-1].get("strategy_equity"))
-        monthly_return = (last_equity / first_equity - 1.0) if first_equity not in {None, 0.0} and last_equity is not None else None
+        starting_equity = month_starts.get(month)
+        last_equity = all_month_ends.get(month)
+        if starting_equity is None:
+            starting_equity = _number(source_rows[0].get("strategy_equity"))
+        monthly_return = (last_equity / starting_equity - 1.0) if starting_equity not in {None, 0.0} and last_equity is not None else None
         monthly.append({
             "month": month,
             "sessions": len(rows),
             "monthly_return": monthly_return,
+            "starting_equity": starting_equity,
+            "ending_equity": last_equity,
+            "monthly_return_method": "previous_month_end_to_current_month_end",
             "dominant_state": dominant_state,
             "dominant_share": dominant_count / len(rows),
             "state_counts": {state: int(counts.get(state, 0)) for state in STATES},

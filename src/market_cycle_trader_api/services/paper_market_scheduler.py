@@ -889,8 +889,26 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
         )
         return
 
+    strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
+    if bool(strategy_control.get("winner_promotion_in_progress")):
+        return
     claimed = _claim_for_preparation(db, run_id, worker_id)
     if claimed is None:
+        return
+    strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
+    if bool(strategy_control.get("winner_promotion_in_progress")):
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "preparing", "worker_id": worker_id},
+            {
+                "$set": {
+                    "status": "armed",
+                    "phase": "waiting_for_premarket_analysis",
+                    "updated_at": utc_now(),
+                    "last_message": "Winner promotion took priority before daily calibration started.",
+                },
+                "$unset": {"worker_id": "", "lease_expires_at": ""},
+            },
+        )
         return
     started_at = utc_now()
     db[PAPER_MARKET_RUNS_COLLECTION].update_one(
@@ -1124,8 +1142,26 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             )
             return
 
+    strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
+    if bool(strategy_control.get("winner_promotion_in_progress")):
+        return
     claimed = _claim_for_execution(db, run_id, worker_id)
     if claimed is None:
+        return
+    strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
+    if bool(strategy_control.get("winner_promotion_in_progress")):
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "executing", "worker_id": worker_id},
+            {
+                "$set": {
+                    "status": "prepared",
+                    "phase": "waiting_for_next_market_open",
+                    "updated_at": utc_now(),
+                    "last_message": "Winner promotion took priority before order execution started.",
+                },
+                "$unset": {"worker_id": "", "lease_expires_at": "", "execution_started_at": ""},
+            },
+        )
         return
     _append_log(
         db,

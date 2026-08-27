@@ -11,6 +11,7 @@ from pymongo import ASCENDING, DESCENDING
 from ..infrastructure.persistence.mongo_repository import (
     TEMPORAL_INTELLIGENCE_ARTIFACTS_COLLECTION,
     TEMPORAL_INTELLIGENCE_OBSERVATIONS_COLLECTION,
+    TEMPORAL_INTELLIGENCE_RUNS_COLLECTION,
     TEMPORAL_LEADERSHIP_REGIME_RESEARCH_COLLECTION,
     bson_value,
 )
@@ -112,6 +113,10 @@ def build_and_persist(
         if _date_key(row.get("timestamp"))
     }
     selected_features = _selected_asset_features(db, run_id, selected_by_day)
+    run_document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)}, {"_id": 0, "result.winner_reference.initial_capital": 1}) or {}
+    result_payload = run_document.get("result") if isinstance(run_document.get("result"), dict) else {}
+    reference_payload = result_payload.get("winner_reference") if isinstance(result_payload.get("winner_reference"), dict) else {}
+    initial_capital = reference_payload.get("initial_capital")
     result = build_analysis(
         winner_rows,
         selected_features,
@@ -119,6 +124,7 @@ def build_and_persist(
         processing_id=processing_id,
         period_start=start_month,
         period_end=end_month,
+        initial_capital=initial_capital,
     )
     now = datetime.now(timezone.utc)
     result.update({"id": str(uuid.uuid4()), "created_at": now, "updated_at": now})

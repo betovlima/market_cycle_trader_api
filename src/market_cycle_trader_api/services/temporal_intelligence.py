@@ -67,7 +67,7 @@ _ACTIVE_PIPELINE_WORKERS: set[str] = set()
 _ACTIVE_PIPELINE_LOCK = threading.Lock()
 _logger = logging.getLogger(__name__)
 
-STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "roc_policy", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation")
+STRATEGY_RESEARCH_PIPELINE_STAGES = ("reference", "temporal", "roc_policy", "clustering", "opportunity_drought", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation")
 STRATEGY_RESEARCH_PIPELINE_STAGE_STATES = frozenset({"waiting", "running", "completed", "paused", "stopped", "failed", "skipped"})
 STRATEGY_RESEARCH_PIPELINE_STATUSES = frozenset({"idle", "running", "pause_requested", "paused", "stop_requested", "stopped", "completed", "failed"})
 STRATEGY_RESEARCH_HISTORY_KEEP = 5
@@ -1838,6 +1838,32 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
             try:
                 regime_clustering_unavailable(
                     db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(clustering_exc)
+                )
+            except Exception:
+                pass
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_complete(db, run_id, current_stage)
+
+        current_stage = "opportunity_drought"
+        if _pipeline_stop_requested(db, run_id):
+            return
+        _pipeline_stage_start(db, run_id, current_stage)
+        try:
+            from ..opportunity_drought.service import build_and_persist as build_opportunity_drought, unavailable as opportunity_drought_unavailable
+            if leadership and str(leadership.get("status") or "").lower() == "completed":
+                build_opportunity_drought(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month
+                )
+            else:
+                opportunity_drought_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month,
+                    message="Leadership Regime diagnostics are unavailable for Opportunity Drought Research.",
+                )
+        except Exception as drought_exc:
+            try:
+                opportunity_drought_unavailable(
+                    db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month, message=str(drought_exc)
                 )
             except Exception:
                 pass
