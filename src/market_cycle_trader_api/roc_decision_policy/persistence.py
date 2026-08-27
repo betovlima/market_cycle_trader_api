@@ -37,4 +37,5 @@ def public_summary(document: dict[str, Any] | None) -> dict[str, Any] | None:
     payload.pop("technical_error", None)
     payload.pop("decision_diagnostics", None)
     payload.pop("equity", None)
+    payload.pop("relative_oos_scores", None)
     return bson_value(payload)

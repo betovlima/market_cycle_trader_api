@@ -1528,9 +1528,18 @@ def build_temporal_intelligence_export(
             ]))
             archive.writestr("strategy_research_roc_decision_policy_equity.csv", _csv_text(roc_export.get("equity") or []))
             archive.writestr("strategy_research_roc_decision_policy_decisions.csv", _csv_text([
-                {key: value for key, value in item.items() if key not in {"base_horizons", "challenger_horizons"}}
+                {key: value for key, value in item.items() if key != "relative_horizons"}
                 for item in (roc_export.get("decision_diagnostics") or []) if isinstance(item, dict)
             ]))
+            relative_score_rows = []
+            for item in (roc_export.get("relative_oos_scores") or []):
+                if not isinstance(item, dict):
+                    continue
+                base = {key: value for key, value in item.items() if key != "horizons"}
+                for horizon in item.get("horizons") or []:
+                    if isinstance(horizon, dict):
+                        relative_score_rows.append({**base, **horizon})
+            archive.writestr("strategy_research_roc_decision_policy_relative_scores.csv", _csv_text(relative_score_rows))
             roc_policy_curves = []
             for item in (roc_export.get("fold_horizons") or []):
                 if not isinstance(item, dict):

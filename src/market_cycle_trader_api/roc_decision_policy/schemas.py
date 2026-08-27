@@ -7,9 +7,11 @@ class RocDecisionPolicySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     selection_metric: str = Field(min_length=3, max_length=64)
+    minimum_training_samples: int = Field(ge=20, le=1_000_000)
     minimum_calibration_samples: int = Field(ge=20, le=1_000_000)
     minimum_class_samples: int = Field(ge=2, le=500_000)
     max_curve_points: int = Field(ge=21, le=1001)
+    max_pairs_per_timestamp: int = Field(ge=1, le=10000)
 
     @field_validator("selection_metric")
     @classmethod

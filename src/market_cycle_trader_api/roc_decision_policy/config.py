@@ -18,7 +18,7 @@ from ..infrastructure.persistence.mongo_repository import (
 from .schemas import RocDecisionPolicySettings, RocDecisionPolicySettingsUpdateRequest
 
 SETTINGS_ID = "roc-decision-policy"
-SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_SCHEMA_VERSION = 3
 PARAMETERIZATION_FILE = "004_roc_decision_policy.json"
 
 
@@ -62,10 +62,36 @@ def ensure_settings(db: Any) -> dict[str, Any]:
     document = db[SETTINGS_COLLECTION].find_one({"_id": SETTINGS_ID})
     if document is None:
         raise RuntimeError("ROC Decision Policy settings could not be initialized.")
-    raw = {key: document.get(key) for key in seed}
-    settings = _validated_settings(raw)
+    merged = {key: document.get(key, seed[key]) for key in seed}
+    settings = _validated_settings(merged)
     expected_hash = _settings_hash(settings)
-    if raw != settings or document.get("settings_hash") != expected_hash:
+    needs_migration = int(document.get("schema_version") or 0) < SETTINGS_SCHEMA_VERSION or any(key not in document for key in seed)
+    if needs_migration:
+        previous_revision = int(document.get("revision") or 1)
+        updated = db[SETTINGS_COLLECTION].find_one_and_update(
+            {"_id": SETTINGS_ID, "revision": previous_revision},
+            {"$set": {
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                **settings,
+                "settings_hash": expected_hash,
+                "updated_at": now,
+                "bootstrap_source": PARAMETERIZATION_FILE,
+            }, "$inc": {"revision": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is not None:
+            db[SETTINGS_HISTORY_COLLECTION].insert_one(bson_value({
+                "settings_id": SETTINGS_ID,
+                "previous_revision": previous_revision,
+                "revision": previous_revision + 1,
+                "reason": "automatic schema migration",
+                "settings": settings,
+                "settings_hash": expected_hash,
+                "updated_at": now,
+                "updated_by": None,
+            }))
+            document = updated
+    elif document.get("settings_hash") != expected_hash:
         db[SETTINGS_COLLECTION].update_one(
             {"_id": SETTINGS_ID},
             {"$set": {**settings, "settings_hash": expected_hash, "updated_at": now}},

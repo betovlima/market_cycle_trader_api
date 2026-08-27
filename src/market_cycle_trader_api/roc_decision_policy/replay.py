@@ -83,8 +83,7 @@ def run_replay(
     observations: list[dict[str, Any]],
     winner_daily: list[dict[str, Any]],
     temporal_curve: list[dict[str, Any]],
-    thresholds: dict[tuple[int, int], float],
-    entry_horizons: list[int],
+    relative_scores: dict[pd.Timestamp, dict[str, Any]],
     one_side_cost: float,
     initial_capital: float,
     count_cash_transitions_as_rotations: bool,
@@ -123,27 +122,6 @@ def run_replay(
     cash_days = 0
     temporal_override_count = 0
 
-    def roc_margin(rows: dict[str, dict[str, Any]], symbol: str, fold_id: int) -> tuple[float | None, list[dict[str, Any]]]:
-        if symbol == "CASH" or symbol not in rows:
-            return None, []
-        margins: list[float] = []
-        detail: list[dict[str, Any]] = []
-        row = rows[symbol]
-        for horizon in entry_horizons:
-            threshold = thresholds.get((fold_id, int(horizon)))
-            probability = finite(row.get(f"profit_before_loss_probability_h{int(horizon)}"))
-            if threshold is None or probability is None:
-                continue
-            margin = float(probability) - float(threshold)
-            margins.append(margin)
-            detail.append({
-                "horizon": int(horizon),
-                "probability": probability,
-                "threshold": float(threshold),
-                "margin": margin,
-            })
-        return (sum(margins) / len(margins) if margins else None), detail
-
     for index, temporal in enumerate(temporal_rows):
         decision = _stamp(temporal.get("decision_timestamp"))
         execution = _stamp(temporal.get("execution_date"))
@@ -159,9 +137,8 @@ def run_replay(
         winner_anchor = _asset(temporal.get("winner_anchor_symbol"))
         top1 = _asset(winner.get("top_1_asset") or winner.get("raw_best_asset") or winner.get("best_asset"))
         challenger = _asset(temporal.get("winner_top2_symbol") or winner.get("top_2_asset") or winner.get("second_asset"))
-
-        base_margin, base_detail = roc_margin(rows, temporal_target, fold_id)
-        challenger_margin, challenger_detail = roc_margin(rows, challenger, fold_id)
+        score = relative_scores.get(decision) if decision is not None else None
+        relative_margin = finite((score or {}).get("aggregate_margin"))
 
         override = bool(
             enable_roc
@@ -170,10 +147,11 @@ def run_replay(
             and temporal_target == winner_anchor
             and temporal_target == top1
             and challenger not in {"CASH", temporal_target}
-            and base_margin is not None
-            and challenger_margin is not None
-            and base_margin < 0.0
-            and challenger_margin >= 0.0
+            and score is not None
+            and _asset(score.get("control_asset")) == temporal_target
+            and _asset(score.get("challenger_asset")) == challenger
+            and relative_margin is not None
+            and relative_margin >= 0.0
         )
         target = challenger if override else temporal_target
 
@@ -218,10 +196,10 @@ def run_replay(
             "target_asset": target,
             "temporal_timing_override": temporal_override,
             "roc_override": override,
-            "base_roc_margin": base_margin,
-            "challenger_roc_margin": challenger_margin,
-            "base_horizons": base_detail,
-            "challenger_horizons": challenger_detail,
+            "relative_probability": (score or {}).get("aggregate_probability"),
+            "relative_threshold": (score or {}).get("aggregate_threshold"),
+            "relative_margin": relative_margin,
+            "relative_horizons": (score or {}).get("horizons") or [],
         })
 
         if index < len(temporal_rows) - 1:
@@ -267,7 +245,7 @@ def run_replay(
         "temporal_timing_override_count": int(temporal_override_count),
         "exposure": exposure_days / max(1, len(equity_values)),
         "cash_days": int(cash_days),
-        "decision_policy": "temporal_control_plus_dynamic_roc_overlay" if enable_roc else "temporal_control_parity_replay",
+        "decision_policy": "temporal_control_plus_relative_roc_rotation" if enable_roc else "temporal_control_parity_replay",
     })
     return {
         "metrics": metrics,
