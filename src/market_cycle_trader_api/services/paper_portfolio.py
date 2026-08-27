@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from pydantic import ValidationError
+
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION,
     PAPER_TRADE_ORDERS_COLLECTION,
     bson_value,
     get_paper_trading_state,
+    replace_paper_trading_state,
     utc_now,
 )
 from ..infrastructure.trading.alpaca_paper import (
@@ -79,9 +82,28 @@ def _record_snapshot(db: Any, snapshot: dict[str, Any]) -> None:
 
 
 def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
-    state = PaperTradingState.model_validate(get_paper_trading_state(db))
+    raw_state = get_paper_trading_state(db)
     client = create_paper_trading_client(db)
     positions = position_snapshots(client)
+    try:
+        state = PaperTradingState.model_validate(raw_state)
+    except ValidationError:
+        symbol = str(raw_state.get("managed_symbol") or "").strip().upper() or None
+        quantity = float(raw_state.get("managed_quantity") or 0.0)
+        if symbol is None and quantity > 0.0 and not positions:
+            repaired = {
+                **raw_state,
+                "managed_symbol": None,
+                "managed_quantity": 0.0,
+                "average_entry_price": None,
+                "holding_sessions": 0,
+            }
+            state = PaperTradingState.model_validate(repaired)
+            replace_paper_trading_state(db, state.model_dump(mode="python"))
+        else:
+            raise RuntimeError(
+                "Paper portfolio state is inconsistent with the Alpaca account and requires reconciliation before display."
+            )
     clock = clock_snapshot(client)
 
     position: dict[str, Any] | None = None

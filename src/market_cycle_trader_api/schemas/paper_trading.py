@@ -19,7 +19,7 @@ class PaperTradingSettings(BaseModel):
     enabled: bool
     paper_account_id: str | None = None
     client_order_id_prefix: str = Field(min_length=3, max_length=32)
-    premarket_analysis_minutes: int = Field(default=90, ge=15, le=360)
+    premarket_analysis_minutes: int = Field(default=0, ge=0, le=360)
     market_open_delay_seconds: int = Field(ge=0, le=1_800)
     market_execution_window_seconds: int = Field(ge=60, le=7_200)
     order_fill_timeout_seconds: int = Field(ge=10, le=900)

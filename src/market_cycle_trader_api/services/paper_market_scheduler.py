@@ -16,6 +16,7 @@ from ..infrastructure.persistence.mongo_repository import (
     ADMIN_OPERATION_LOGS_COLLECTION,
     PAPER_MARKET_AUTOMATION_COLLECTION,
     PAPER_MARKET_RUNS_COLLECTION,
+    PAPER_TRADE_ORDERS_COLLECTION,
     PAPER_TRADE_PLANS_COLLECTION,
     STRATEGY_CONTROL_COLLECTION,
     bson_value,
@@ -31,6 +32,8 @@ from ..schemas.paper_trading import PaperTradingSettings
 from .system_settings import get_system_settings
 from .strategy_lab import get_trader_winner_summary
 from .paper_trading import (
+    RECOVERABLE_CONTINGENCY_FAILURES,
+    execute_failed_paper_plan_contingency,
     execute_prepared_paper_plan,
     paper_market_readiness,
     prepare_next_paper_plan,
@@ -42,7 +45,7 @@ ACTIVE_KEY = "alpaca-paper-next-session"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 AUTOMATION_ID = "default"
 AUTOMATION_MODE = "continuous_regular_sessions"
-PREMARKET_ANALYSIS_POLICY = "mandatory_premarket_refresh_v1"
+PREMARKET_ANALYSIS_POLICY = "post_close_and_market_open_recalibration_v2"
 TRADER_CONTROL_MODES = frozenset({"active", "paused", "exit_only", "stopped"})
 EXIT_ONLY_ALLOWED_ACTIONS = frozenset({"sell_to_cash", "stay_in_cash", "hold"})
 
@@ -80,10 +83,8 @@ def _premarket_analysis_at(
     expected_open: Any,
     settings: PaperTradingSettings,
 ) -> pd.Timestamp:
-    return _utc_stamp(expected_open) - pd.Timedelta(
-        int(settings.premarket_analysis_minutes),
-        unit="m",
-    )
+    del settings
+    return _utc_stamp(expected_open)
 
 
 def _utc_stamp(value: Any) -> pd.Timestamp:
@@ -298,6 +299,54 @@ def list_admin_operation_logs(db: Any, *, limit: int = 50) -> list[dict[str, Any
 
 
 
+def _infer_recoverable_contingency(db: Any, plan: dict[str, Any] | None) -> tuple[str | None, bool]:
+    if not isinstance(plan, dict) or not plan.get("plan_id"):
+        return None, False
+    failure_code = str(plan.get("failure_code") or "").strip().upper() or None
+    recovery_required = bool(plan.get("recovery_required"))
+    order_rows = list(db[PAPER_TRADE_ORDERS_COLLECTION].find({"plan_id": plan.get("plan_id")}))
+    sell_filled = any(
+        str(row.get("side") or "").lower() == "sell"
+        and str(row.get("status") or "").lower() == "filled"
+        and float(row.get("filled_quantity") or 0.0) > 0.0
+        for row in order_rows
+    )
+    buy_filled = any(
+        str(row.get("side") or "").lower() == "buy"
+        and str(row.get("status") or "").lower() == "filled"
+        and float(row.get("filled_quantity") or 0.0) > 0.0
+        for row in order_rows
+    )
+    target = str(plan.get("target_asset") or "").strip().upper()
+    if sell_filled and target and target != "CASH" and not buy_filled:
+        failure_code = "SELL_FILLED_BUY_FAILED"
+        recovery_required = True
+        if str(plan.get("status") or "").lower() == "failed" and (
+            str(plan.get("failure_code") or "").strip().upper() != failure_code
+            or not bool(plan.get("recovery_required"))
+        ):
+            update_paper_trade_plan(db, str(plan["plan_id"]), {
+                "failure_code": failure_code,
+                "recovery_required": True,
+                "failed_execution_stage": plan.get("failed_execution_stage") or "post_sell",
+            })
+    return failure_code, recovery_required
+
+
+def _latest_unresolved_contingency_plan(db: Any) -> dict[str, Any] | None:
+    candidates = list(
+        db[PAPER_TRADE_PLANS_COLLECTION]
+        .find({"status": "failed"})
+        .sort([("created_at", -1)])
+        .limit(20)
+    )
+    for plan in candidates:
+        failure_code, recovery_required = _infer_recoverable_contingency(db, plan)
+        if recovery_required and failure_code in RECOVERABLE_CONTINGENCY_FAILURES:
+            return {**plan, "failure_code": failure_code, "recovery_required": True}
+    return None
+
+
 def _manual_recovery_context(db: Any) -> dict[str, Any]:
     readiness = paper_market_readiness(db)
     clock = readiness["clock"]
@@ -307,17 +356,20 @@ def _manual_recovery_context(db: Any) -> dict[str, Any]:
         {"execution_session": current_session},
         sort=[("created_at", -1)],
     )
-    plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+    current_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
         {"execution_session": current_session},
         sort=[("created_at", -1)],
     )
+    contingency_plan = _latest_unresolved_contingency_plan(db)
     return {
         "readiness": readiness,
         "clock": clock,
         "timestamp": timestamp,
         "current_session": current_session,
         "run": run,
-        "plan": plan,
+        "plan": current_plan,
+        "contingency_plan": contingency_plan,
+        "execution_plan": contingency_plan or current_plan,
     }
 
 
@@ -334,49 +386,68 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
 
     clock = context["clock"]
     run = context["run"] or {}
-    plan = context["plan"] or {}
+    current_plan = context["plan"] or {}
+    plan = context["execution_plan"] or {}
     market_open = bool(clock.get("is_open"))
-    plan_status = str(plan.get("status") or "")
+    plan_status = str(plan.get("status") or "").lower()
     run_present = bool(run)
-    blocked_plan = plan_status == "executing"
-    can_prepare = market_open and run_present and not blocked_plan
-    can_execute = market_open and plan_status == "prepared"
+    failure_code, recovery_required = _infer_recoverable_contingency(db, plan)
+    recoverable_contingency = bool(
+        plan_status == "failed"
+        and recovery_required
+        and failure_code in RECOVERABLE_CONTINGENCY_FAILURES
+    )
+    current_plan_status = str(current_plan.get("status") or "").lower()
+    blocked_current_plan = current_plan_status in {"executing", "recovering"} or bool(current_plan.get("contingency_execution_in_progress"))
+    blocked_execution_plan = plan_status in {"executing", "recovering"} or bool(plan.get("contingency_execution_in_progress"))
+    can_prepare = market_open and run_present and not blocked_current_plan
+    can_execute = market_open and (plan_status == "prepared" or recoverable_contingency) and not blocked_execution_plan
 
     if not market_open:
         prepare_reason = "Manual same-session recovery is available only while the regular market is open."
     elif not run_present:
         prepare_reason = "No scheduled Paper run exists for the current regular session."
-    elif blocked_plan:
-        prepare_reason = f"The current-session Paper plan cannot be replaced while status={plan_status}."
+    elif blocked_current_plan:
+        prepare_reason = f"The current-session Paper plan cannot be replaced while status={current_plan_status}."
     else:
         prepare_reason = None
 
     if not market_open:
-        execute_reason = "Manual execution is available only while the regular market is open."
+        execute_reason = "Manual contingency execution requires the regular market to be open."
+    elif blocked_execution_plan:
+        execute_reason = "A Paper execution is already in progress."
+    elif recoverable_contingency:
+        execute_reason = None
     elif plan_status != "prepared":
-        execute_reason = "Run manual analysis first to create a fresh prepared plan for the current session."
+        execute_reason = "No prepared or unresolved contingency Paper plan is available."
     else:
         execute_reason = None
 
     return {
-        "available": bool(market_open and run_present),
+        "available": bool(market_open and (run_present or plan.get("plan_id"))),
         "market_open": market_open,
         "current_session": context["current_session"],
         "can_prepare": can_prepare,
         "prepare_reason": prepare_reason,
         "can_execute": can_execute,
         "execute_reason": execute_reason,
+        "recoverable_contingency": recoverable_contingency,
         "run_id": run.get("run_id"),
         "run_status": run.get("status"),
         "run_phase": run.get("phase"),
         "expected_market_open": bson_value(run.get("expected_market_open")),
         "plan_id": plan.get("plan_id"),
         "plan_status": plan_status or None,
+        "plan_execution_session": plan.get("execution_session"),
         "decision_date": plan.get("decision_date"),
         "current_asset": plan.get("current_asset"),
         "target_asset": plan.get("target_asset"),
         "action": plan.get("action"),
         "manual_current_session_recovery": bool(plan.get("manual_current_session_recovery")),
+        "failure_code": failure_code,
+        "recovery_required": recovery_required,
+        "failed_execution_stage": plan.get("failed_execution_stage"),
+        "error": plan.get("error"),
     }
 
 
@@ -445,44 +516,70 @@ def execute_manual_current_session_plan(
     context = _manual_recovery_context(db)
     clock = context["clock"]
     if not bool(clock.get("is_open")):
-        raise RuntimeError("Manual same-session execution requires the regular market to be open.")
-    mode = _control_mode(_automation_document(db))
-    if mode in {"paused", "stopped"}:
-        raise RuntimeError(
-            f"Manual execution is blocked while Trader control mode is {mode}. Start the Trader first."
-        )
+        raise RuntimeError("Manual contingency execution requires the regular market to be open.")
 
-    query: dict[str, Any] = {
-        "execution_session": context["current_session"],
-        "status": "prepared",
-    }
     if plan_id:
-        query["plan_id"] = str(plan_id)
-    plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(query, sort=[("created_at", -1)])
+        plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one({"plan_id": str(plan_id)})
+    else:
+        plan = context.get("execution_plan")
     if plan is None:
-        raise RuntimeError("No prepared manual-recovery Paper plan was found for the current session.")
-    action = str(plan.get("action") or "").strip().lower()
-    if mode == "exit_only" and action not in EXIT_ONLY_ALLOWED_ACTIONS:
-        raise RuntimeError(
-            f"Manual action {action!r} is blocked by exit-only Trader mode."
-        )
+        raise RuntimeError("No Paper plan or unresolved contingency was found for manual execution.")
 
-    try:
-        result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
-    except Exception as exc:
-        _record_admin_operation(
-            db,
-            action="manual_current_session_execution",
-            previous_mode=mode,
-            new_mode=mode,
-            reason=str(exc),
-            actor_email=actor_email,
-            success=False,
-        )
-        raise
+    mode = _control_mode(_automation_document(db))
+    plan_status = str(plan.get("status") or "").lower()
+    failure_code, recovery_required = _infer_recoverable_contingency(db, plan)
+    if recovery_required and failure_code:
+        plan = {**plan, "failure_code": failure_code, "recovery_required": recovery_required}
+    recoverable_contingency = bool(
+        plan_status == "failed"
+        and recovery_required
+        and failure_code in RECOVERABLE_CONTINGENCY_FAILURES
+    )
+
+    if recoverable_contingency:
+        try:
+            result = execute_failed_paper_plan_contingency(db, plan_id=str(plan["plan_id"]))
+        except Exception as exc:
+            _record_admin_operation(
+                db,
+                action="manual_contingency_execution",
+                previous_mode=mode,
+                new_mode=mode,
+                reason=str(exc),
+                actor_email=actor_email,
+                success=False,
+            )
+            raise
+    else:
+        if plan_status != "prepared":
+            raise RuntimeError(
+                f"The current-session Paper plan is not prepared or recoverable: status={plan_status or 'unknown'}."
+            )
+        if mode in {"paused", "stopped"}:
+            raise RuntimeError(
+                f"Manual execution is blocked while Trader control mode is {mode}. Start the Trader first."
+            )
+        action = str(plan.get("action") or "").strip().lower()
+        if mode == "exit_only" and action not in EXIT_ONLY_ALLOWED_ACTIONS:
+            raise RuntimeError(
+                f"Manual action {action!r} is blocked by exit-only Trader mode."
+            )
+        try:
+            result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
+        except Exception as exc:
+            _record_admin_operation(
+                db,
+                action="manual_current_session_execution",
+                previous_mode=mode,
+                new_mode=mode,
+                reason=str(exc),
+                actor_email=actor_email,
+                success=False,
+            )
+            raise
 
     run = context["run"] or {}
-    if run.get("run_id"):
+    if run.get("run_id") and str(run.get("execution_session") or "") == str(plan.get("execution_session") or ""):
         now = utc_now()
         db[PAPER_MARKET_RUNS_COLLECTION].update_one(
             {"run_id": str(run["run_id"])},
@@ -495,10 +592,14 @@ def execute_manual_current_session_plan(
         )
     _record_admin_operation(
         db,
-        action="manual_current_session_execution",
+        action="manual_contingency_execution" if recoverable_contingency else "manual_current_session_execution",
         previous_mode=mode,
         new_mode=mode,
-        reason=f"Executed manual recovery plan {plan['plan_id']} for {context['current_session']}.",
+        reason=(
+            f"Recovered failed Paper plan {plan['plan_id']} for {context['current_session']}."
+            if recoverable_contingency
+            else f"Executed manual recovery plan {plan['plan_id']} for {context['current_session']}."
+        ),
         actor_email=actor_email,
     )
     return {
@@ -525,6 +626,8 @@ def _public_robot_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
         "premarket_analysis_at",
         "premarket_analysis_started_at",
         "premarket_analysis_completed_at",
+        "post_close_calibration_completed_at",
+        "market_open_calibration_completed_at",
         "winner_strategy_id",
         "winner_strategy_name",
         "winner_strategy_revision",
@@ -554,12 +657,12 @@ def _create_next_session_run(db: Any) -> dict[str, Any]:
     now = utc_now()
     market_timestamp = _utc_stamp(clock["timestamp"])
     phase = (
-        "ready_for_premarket_analysis"
+        "ready_for_post_close_calibration"
         if market_timestamp >= analysis_at and not bool(clock["is_open"])
-        else "waiting_for_premarket_analysis"
+        else "waiting_for_post_close_calibration"
     )
     first_message = (
-        "Paper market run armed for mandatory pre-market analysis. "
+        "Paper market run armed for post-close calibration. "
         f"Analysis begins at or after {analysis_at.isoformat()}; "
         f"expected open: {expected_open.isoformat()}."
     )
@@ -575,7 +678,7 @@ def _create_next_session_run(db: Any) -> dict[str, Any]:
         "execution_session": execution_session,
         "requested_market_was_open": bool(clock["is_open"]),
         "analysis_policy": PREMARKET_ANALYSIS_POLICY,
-        "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+        "premarket_analysis_minutes": 0,
         "premarket_analysis_at": analysis_at.to_pydatetime(),
         "plan_id": None,
         "action": None,
@@ -798,7 +901,7 @@ def _claim_for_preparation(db: Any, run_id: str, worker_id: str) -> dict[str, An
         {
             "$set": {
                 "status": "preparing",
-                "phase": "refreshing_market_data_and_preparing_premarket_plan",
+                "phase": "refreshing_market_data_and_preparing_post_close_plan",
                 "worker_id": worker_id,
                 "lease_expires_at": now + timedelta(hours=6),
                 "updated_at": now,
@@ -838,46 +941,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     now = _utc_stamp(clock["timestamp"])
     current_session = now.tz_convert(EASTERN).date().isoformat()
 
-    if now >= expected_open:
-        _finish_run(
-            db,
-            run_id,
-            status="failed",
-            message="The expected market open arrived before mandatory pre-market analysis completed.",
-        )
-        return
-
-    if now < analysis_at:
-        if (
-            str(run.get("phase") or "") != "waiting_for_premarket_analysis"
-            or str(run.get("analysis_policy") or "") != PREMARKET_ANALYSIS_POLICY
-            or run.get("premarket_analysis_at") is None
-            or int(run.get("premarket_analysis_minutes") or 0) != int(settings.premarket_analysis_minutes)
-        ):
-            db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-                {"run_id": run_id, "status": "armed"},
-                {
-                    "$set": {
-                        "phase": "waiting_for_premarket_analysis",
-                        "analysis_policy": PREMARKET_ANALYSIS_POLICY,
-                        "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
-                        "premarket_analysis_at": analysis_at.to_pydatetime(),
-                        "updated_at": utc_now(),
-                        "last_message": (
-                            "Waiting for the mandatory pre-market analysis window before refreshing data and retraining XGBoost."
-                        ),
-                    }
-                },
-            )
-        return
-
     if bool(clock["is_open"]):
-        _finish_run(
-            db,
-            run_id,
-            status="failed",
-            message="The regular market opened before mandatory pre-market analysis completed.",
-        )
         return
 
     if current_session > str(run["execution_session"]):
@@ -902,7 +966,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             {
                 "$set": {
                     "status": "armed",
-                    "phase": "waiting_for_premarket_analysis",
+                    "phase": "waiting_for_post_close_calibration",
                     "updated_at": utc_now(),
                     "last_message": "Winner promotion took priority before daily calibration started.",
                 },
@@ -916,7 +980,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
         {
             "$set": {
                 "analysis_policy": PREMARKET_ANALYSIS_POLICY,
-                "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+                "premarket_analysis_minutes": 0,
                 "premarket_analysis_at": analysis_at.to_pydatetime(),
                 "premarket_analysis_started_at": started_at,
             }
@@ -957,7 +1021,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 {
                     "status": "cancelled",
                     "cancelled_at": utc_now(),
-                    "cancel_reason": "Cancellation requested during mandatory pre-market analysis.",
+                    "cancel_reason": "Cancellation requested during post-close calibration.",
                 },
             )
             _finish_run(
@@ -976,9 +1040,10 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                     "status": "prepared",
                     "phase": "waiting_for_next_market_open",
                     "analysis_policy": PREMARKET_ANALYSIS_POLICY,
-                    "premarket_analysis_minutes": int(settings.premarket_analysis_minutes),
+                    "premarket_analysis_minutes": 0,
                     "premarket_analysis_at": analysis_at.to_pydatetime(),
                     "premarket_analysis_completed_at": completed_at,
+                    "post_close_calibration_completed_at": completed_at,
                     "plan_id": str(plan["plan_id"]),
                     "action": str(plan["action"]),
                     "target_asset": str(plan["target_asset"]),
@@ -990,7 +1055,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                     "winner_assets_count": len(plan["winner_assets"]),
                     "updated_at": completed_at,
                     "last_message": (
-                        f"Mandatory pre-market XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
+                        f"Post-close XGBoost calibration prepared: action={plan['action']}, target={plan['target_asset']}."
                     ),
                 },
                 "$unset": {
@@ -1002,7 +1067,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 "$push": {
                     "logs": {
                         "$each": [
-                            f"{completed_at.isoformat()} — Mandatory pre-market XGBoost plan prepared: action={plan['action']}, target={plan['target_asset']}."
+                            f"{completed_at.isoformat()} — Post-close XGBoost calibration prepared: action={plan['action']}, target={plan['target_asset']}."
                         ],
                         "$slice": -100,
                     }
@@ -1040,7 +1105,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 db,
                 run_id,
                 status="failed",
-                message=f"Could not complete mandatory pre-market analysis before market open: {exc}",
+                message=f"Could not complete post-close calibration before market open: {exc}",
             )
 
 
@@ -1108,9 +1173,67 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
             message="The prepared Alpaca plan is stale for the current session.",
         )
         return
-    if not bool(clock["is_open"]) or now < earliest:
+    if not bool(clock["is_open"]):
         return
     if current_session != str(run["execution_session"]):
+        return
+
+    # Recalibrate once as soon as the regular session opens. The daily model still
+    # uses only completed candles; order submission remains subject to the separate
+    # configured execution delay.
+    if run.get("market_open_calibration_completed_at") is None:
+        strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
+        if bool(strategy_control.get("winner_promotion_in_progress")):
+            return
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "prepared"},
+            {"$set": {"phase": "market_open_recalibration", "updated_at": utc_now()}},
+        )
+        try:
+            recalibrated = prepare_next_paper_plan(
+                db,
+                replace=True,
+                allow_open_market=True,
+                execution_session_override=current_session,
+                expected_market_open_override=expected_open,
+                refresh_source="market_open_recalibration",
+            )
+        except Exception as exc:
+            db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+                {"run_id": run_id, "status": "prepared"},
+                {"$set": {"phase": "waiting_to_retry_market_open_recalibration", "updated_at": utc_now()}},
+            )
+            _append_log(db, run_id, f"Market-open recalibration failed and will retry inside the execution window: {exc}")
+            return
+        old_plan_id = plan_id
+        plan_id = str(recalibrated["plan_id"])
+        completed_at = utc_now()
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "prepared"},
+            {
+                "$set": {
+                    "plan_id": plan_id,
+                    "action": str(recalibrated["action"]),
+                    "target_asset": str(recalibrated["target_asset"]),
+                    "decision_date": str(recalibrated["decision_date"]),
+                    "market_open_calibration_completed_at": completed_at,
+                    "phase": "waiting_for_open_execution_delay",
+                    "updated_at": completed_at,
+                    "last_message": "Market-open Winner recalibration completed; waiting for the execution delay.",
+                },
+                "$push": {
+                    "logs": {
+                        "$each": [
+                            f"{completed_at.isoformat()} — Market-open recalibration completed; plan {old_plan_id} replaced by {plan_id}."
+                        ],
+                        "$slice": -100,
+                    }
+                },
+            },
+        )
+        run = db[PAPER_MARKET_RUNS_COLLECTION].find_one({"run_id": run_id}) or run
+
+    if now < earliest:
         return
 
     controller = _automation_document(db) or {}
@@ -1166,7 +1289,7 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     _append_log(
         db,
         run_id,
-        "The regular market is open and the configured delay elapsed; executing the paper plan.",
+        "Market-open recalibration is complete and the configured delay elapsed; executing the paper plan.",
     )
     try:
         result = execute_prepared_paper_plan(db, plan_id=plan_id)
@@ -1183,13 +1306,15 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     except Exception as exc:
         plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one({"plan_id": plan_id}) or {}
         plan_status = str(plan.get("status") or "")
-        if plan_status == "executing":
+        recovery_required = bool(plan.get("recovery_required"))
+        if plan_status == "executing" or recovery_required:
+            failure_code = str(plan.get("failure_code") or "EXECUTION_FAILED")
             _mark_review_required(
                 db,
                 run_id,
                 message=(
-                    "Execution failed after the Alpaca plan was claimed. "
-                    f"Manual review is required: {exc}"
+                    f"Execution requires reconciliation ({failure_code}). "
+                    f"Alpaca and the strategy state must be checked before another order is submitted: {exc}"
                 ),
             )
         else:
@@ -1204,13 +1329,12 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
 def _prepared_run_has_valid_premarket_analysis(run: dict[str, Any]) -> bool:
     if str(run.get("analysis_policy") or "") != PREMARKET_ANALYSIS_POLICY:
         return False
-    completed = run.get("premarket_analysis_completed_at")
-    analysis_at = run.get("premarket_analysis_at")
+    completed = run.get("post_close_calibration_completed_at") or run.get("premarket_analysis_completed_at")
     expected_open = run.get("expected_market_open")
-    if completed is None or analysis_at is None or expected_open is None:
+    if completed is None or expected_open is None:
         return False
     completed_at = _utc_stamp(completed)
-    return _utc_stamp(analysis_at) <= completed_at < _utc_stamp(expected_open)
+    return completed_at < _utc_stamp(expected_open)
 
 
 def _rearm_prepared_run_for_premarket_analysis(
@@ -1237,7 +1361,7 @@ def _rearm_prepared_run_for_premarket_analysis(
         {
             "$set": {
                 "status": "armed",
-                "phase": "waiting_for_premarket_analysis",
+                "phase": "waiting_for_post_close_calibration",
                 "analysis_policy": PREMARKET_ANALYSIS_POLICY,
                 "updated_at": now,
                 "next_retry_at": now,

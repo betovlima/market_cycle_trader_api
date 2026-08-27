@@ -2490,6 +2490,8 @@ def _winner_promotion_guard(db: Any, *, include_promotion_lock: bool = True) -> 
     calibration_running = status == "preparing" or phase in {
         "refreshing_market_data_and_preparing_premarket_plan",
         "preparing_premarket_plan",
+        "refreshing_market_data_and_preparing_post_close_plan",
+        "market_open_recalibration",
     }
     if calibration_running:
         return {

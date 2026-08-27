@@ -133,7 +133,28 @@ def _validated_context(
             }
         )
         settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
-        state = PaperTradingState.model_validate(get_paper_trading_state(db))
+        raw_state = get_paper_trading_state(db)
+        try:
+            state = PaperTradingState.model_validate(raw_state)
+        except ValidationError:
+            symbol = str(raw_state.get("managed_symbol") or "").strip().upper() or None
+            quantity = float(raw_state.get("managed_quantity") or 0.0)
+            if symbol is None and quantity > 0.0:
+                repair_client = create_paper_trading_client(db)
+                repair_positions = position_snapshots(repair_client)
+                if repair_positions:
+                    raise
+                repaired = {
+                    **raw_state,
+                    "managed_symbol": None,
+                    "managed_quantity": 0.0,
+                    "average_entry_price": None,
+                    "holding_sessions": 0,
+                }
+                state = PaperTradingState.model_validate(repaired)
+                replace_paper_trading_state(db, state.model_dump(mode="python"))
+            else:
+                raise
     except (RuntimeError, ValidationError) as exc:
         raise RuntimeError(f"Paper-trading configuration is unavailable or invalid: {exc}") from exc
 
@@ -783,6 +804,7 @@ def _execute_buy(
     settings: PaperTradingSettings,
     state: PaperTradingState,
     target_symbol: str,
+    client_order_key: str = "buy",
 ) -> PaperTradingState:
     account = account_snapshot(client)
     assert_account_can_trade(account)
@@ -802,7 +824,7 @@ def _execute_buy(
     client_order_id = _client_order_id(
         settings.client_order_id_prefix,
         plan["plan_id"],
-        "buy",
+        client_order_key,
         target_symbol,
     )
     _record_submitted_order(
@@ -864,6 +886,187 @@ def _execute_buy(
         )
     return state
 
+
+
+RECOVERABLE_CONTINGENCY_FAILURES = frozenset({"SELL_FILLED_BUY_FAILED", "BUY_INCOMPLETE"})
+
+
+def execute_failed_paper_plan_contingency(db: Any, *, plan_id: str) -> dict[str, Any]:
+    plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one({"plan_id": str(plan_id)})
+    if plan is None:
+        raise RuntimeError("The requested Paper contingency plan was not found.")
+
+    settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
+    client = create_paper_trading_client(db)
+    account = account_snapshot(client)
+    assert_account_can_trade(account)
+    raw_state = get_paper_trading_state(db)
+    try:
+        state = PaperTradingState.model_validate(raw_state)
+    except ValidationError:
+        symbol = str(raw_state.get("managed_symbol") or "").strip().upper() or None
+        quantity = float(raw_state.get("managed_quantity") or 0.0)
+        positions_for_repair = position_snapshots(client)
+        if symbol is None and quantity > 0.0 and not positions_for_repair:
+            repaired = {
+                **raw_state,
+                "managed_symbol": None,
+                "managed_quantity": 0.0,
+                "average_entry_price": None,
+                "holding_sessions": 0,
+            }
+            state = PaperTradingState.model_validate(repaired)
+            replace_paper_trading_state(db, state.model_dump(mode="python"))
+        else:
+            raise RuntimeError(
+                "Paper contingency state is inconsistent with Alpaca and cannot be reconciled automatically."
+            )
+
+    failure_code = str(plan.get("failure_code") or "").strip().upper()
+    if str(plan.get("status") or "").lower() != "failed" or not bool(plan.get("recovery_required")):
+        raise RuntimeError("The requested Paper plan does not require contingency execution.")
+    if failure_code not in RECOVERABLE_CONTINGENCY_FAILURES:
+        raise RuntimeError(
+            f"The failed Paper plan is not eligible for automatic contingency execution: {failure_code or 'UNKNOWN'}."
+        )
+
+    target = str(plan.get("target_asset") or "").strip().upper()
+    if not target or target == "CASH":
+        raise RuntimeError("The failed Paper plan has no pending target purchase to recover.")
+
+    clock = clock_snapshot(client)
+    if not bool(clock.get("is_open")):
+        raise RuntimeError(
+            f"The Alpaca regular market is closed. Next open: {_iso(clock['next_open'])}."
+        )
+
+    claimed = db[PAPER_TRADE_PLANS_COLLECTION].find_one_and_update(
+        {
+            "plan_id": str(plan_id),
+            "status": "failed",
+            "recovery_required": True,
+            "contingency_execution_in_progress": {"$ne": True},
+        },
+        {
+            "$set": {
+                "contingency_execution_in_progress": True,
+                "contingency_execution_started_at": utc_now(),
+                "execution_stage": "contingency_reconciling",
+                "updated_at": utc_now(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if claimed is None:
+        raise RuntimeError("The Paper contingency is already being executed by another request.")
+    plan = claimed
+
+    try:
+        plan_assets = [str(value).strip().upper() for value in plan.get("winner_assets") or [] if str(value).strip()]
+        if target not in plan_assets:
+            plan_assets.append(target)
+        current_plan_asset = str(plan.get("current_asset") or "").strip().upper()
+        if current_plan_asset and current_plan_asset != "CASH" and current_plan_asset not in plan_assets:
+            plan_assets.append(current_plan_asset)
+        _assert_no_conflicting_orders(client, assets=plan_assets)
+        positions = position_snapshots(client)
+        strategy_positions = {
+            symbol: item
+            for symbol, item in positions.items()
+            if symbol in set(plan_assets) and abs(float(item.get("quantity") or 0.0)) > 1e-9
+        }
+        unexpected = sorted(set(strategy_positions) - {target})
+        if unexpected:
+            raise RuntimeError(
+                "The Alpaca account contains a different strategy position during contingency: "
+                + ", ".join(unexpected)
+            )
+
+        actual_target = strategy_positions.get(target)
+        if actual_target is not None:
+            quantity = float(actual_target.get("quantity") or 0.0)
+            average_entry = float(actual_target.get("average_entry_price") or 0.0)
+            if quantity <= 0.0:
+                raise RuntimeError("Alpaca returned a non-positive target position during contingency reconciliation.")
+            if state.managed_symbol not in {None, target}:
+                raise RuntimeError(
+                    f"MongoDB still manages {state.managed_symbol} while Alpaca holds contingency target {target}."
+                )
+            if state.managed_symbol != target or abs(float(state.managed_quantity) - quantity) > max(1e-6, abs(quantity) * 1e-6):
+                estimated_cost = max(0.0, quantity * average_entry)
+                state = state.model_copy(update={
+                    "strategy_cash": max(0.0, float(state.strategy_cash) - estimated_cost) if state.managed_symbol is None else float(state.strategy_cash),
+                    "managed_symbol": target,
+                    "managed_quantity": quantity,
+                    "average_entry_price": average_entry if average_entry > 0.0 else None,
+                    "holding_sessions": max(1, int(state.holding_sessions or 0)),
+                })
+                replace_paper_trading_state(db, state.model_dump(mode="python"))
+        else:
+            if state.managed_symbol is not None or float(state.managed_quantity) > 1e-8:
+                raise RuntimeError(
+                    "The contingency expects the strategy sleeve to be in cash after the completed sell, "
+                    f"but MongoDB still manages {state.managed_symbol or 'UNKNOWN'}."
+                )
+            prior_buy_attempts = int(db[PAPER_TRADE_ORDERS_COLLECTION].count_documents({
+                "plan_id": str(plan["plan_id"]),
+                "side": "buy",
+            }))
+            update_paper_trade_plan(
+                db,
+                str(plan["plan_id"]),
+                {"execution_stage": "contingency_buying", "contingency_attempt": prior_buy_attempts + 1},
+            )
+            state = _execute_buy(
+                db,
+                client,
+                plan=plan,
+                settings=settings,
+                state=state,
+                target_symbol=target,
+                client_order_key=f"buy-r{prior_buy_attempts + 1}",
+            )
+
+        state = state.model_copy(update={
+            "last_decision_date": str(plan.get("decision_date") or state.last_decision_date or "") or None,
+            "last_execution_session": str(plan.get("execution_session") or state.last_execution_session or "") or None,
+            "stateful_defer_cooldown": bool(plan.get("stateful_defer_cooldown_after")),
+            "stateful_last_intervention_date": (
+                str(plan.get("decision_date"))
+                if bool(plan.get("stateful_intervention")) and plan.get("decision_date")
+                else state.stateful_last_intervention_date
+            ),
+        })
+        replace_paper_trading_state(db, state.model_dump(mode="python"))
+        report = {
+            "status": "executed",
+            "executed_at": utc_now(),
+            "execution_stage": "contingency_completed",
+            "recovery_required": False,
+            "contingency_execution_in_progress": False,
+            "contingency_completed_at": utc_now(),
+            "contingency_recovered_failure_code": failure_code,
+            "final_state": state.model_dump(mode="python"),
+            "account": account_snapshot(client),
+        }
+        update_paper_trade_plan(db, str(plan["plan_id"]), report)
+        return {
+            "plan_id": str(plan["plan_id"]),
+            "action": "contingency_buy",
+            "target_asset": target,
+            "recovered_failure_code": failure_code,
+            **bson_value(report),
+        }
+    except Exception as exc:
+        update_paper_trade_plan(db, str(plan["plan_id"]), {
+            "status": "failed",
+            "contingency_execution_in_progress": False,
+            "contingency_failed_at": utc_now(),
+            "execution_stage": "contingency_failed",
+            "error": str(exc),
+            "recovery_required": True,
+        })
+        raise
 
 def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[str, Any]:
     strategy, settings, state, winner_profile, winner_model = _validated_context(db)
@@ -947,6 +1150,7 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
     plan = claimed
 
     try:
+        update_paper_trade_plan(db, plan["plan_id"], {"execution_stage": "reconciling_before_orders"})
         _assert_no_conflicting_orders(client, assets=strategy.assets)
         _reconcile_state_with_account(client, assets=strategy.assets, state=state)
 
@@ -959,6 +1163,7 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
             )
 
         if current != target and current != "CASH":
+            update_paper_trade_plan(db, plan["plan_id"], {"execution_stage": "selling"})
             state = _execute_sell(
                 db,
                 client,
@@ -966,8 +1171,18 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
                 settings=settings,
                 state=state,
             )
+            update_paper_trade_plan(
+                db,
+                plan["plan_id"],
+                {
+                    "execution_stage": "sell_filled",
+                    "sell_filled_at": utc_now(),
+                    "post_sell_state": state.model_dump(mode="python"),
+                },
+            )
 
         if target != "CASH" and (state.managed_symbol or "CASH") != target:
+            update_paper_trade_plan(db, plan["plan_id"], {"execution_stage": "buying"})
             state = _execute_buy(
                 db,
                 client,
@@ -975,6 +1190,15 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
                 settings=settings,
                 state=state,
                 target_symbol=target,
+            )
+            update_paper_trade_plan(
+                db,
+                plan["plan_id"],
+                {
+                    "execution_stage": "buy_filled",
+                    "buy_filled_at": utc_now(),
+                    "post_buy_state": state.model_dump(mode="python"),
+                },
             )
         elif target != "CASH" and state.managed_symbol == target:
             state = state.model_copy(update={"holding_sessions": state.holding_sessions + 1})
@@ -1008,6 +1232,24 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
             **bson_value(report),
         }
     except Exception as exc:
+        latest_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one({"plan_id": plan["plan_id"]}) or {}
+        execution_stage = str(latest_plan.get("execution_stage") or "")
+        order_rows = list(db[PAPER_TRADE_ORDERS_COLLECTION].find({"plan_id": plan["plan_id"]}))
+        sell_rows = [row for row in order_rows if str(row.get("side") or "").lower() == "sell"]
+        buy_rows = [row for row in order_rows if str(row.get("side") or "").lower() == "buy"]
+        sell_filled = any(str(row.get("status") or "").lower() == "filled" and float(row.get("filled_quantity") or 0.0) > 0 for row in sell_rows)
+        buy_filled = any(str(row.get("status") or "").lower() == "filled" and float(row.get("filled_quantity") or 0.0) > 0 for row in buy_rows)
+        failure_code = "EXECUTION_FAILED"
+        recovery_required = False
+        if sell_filled and not buy_filled and str(plan.get("target_asset") or "").upper() != "CASH":
+            failure_code = "SELL_FILLED_BUY_FAILED"
+            recovery_required = True
+        elif execution_stage == "selling" and sell_rows:
+            failure_code = "SELL_INCOMPLETE"
+            recovery_required = True
+        elif execution_stage == "buying" and buy_rows:
+            failure_code = "BUY_INCOMPLETE"
+            recovery_required = True
         update_paper_trade_plan(
             db,
             plan["plan_id"],
@@ -1015,6 +1257,9 @@ def execute_prepared_paper_plan(db: Any, *, plan_id: str | None = None) -> dict[
                 "status": "failed",
                 "failed_at": utc_now(),
                 "error": str(exc),
+                "failure_code": failure_code,
+                "recovery_required": recovery_required,
+                "failed_execution_stage": execution_stage,
             },
         )
         raise
