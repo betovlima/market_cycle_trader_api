@@ -48,7 +48,7 @@ DEFINITIONS: tuple[ParameterizationDefinition, ...] = (
         schema_version=SETTINGS_SCHEMA_VERSION,
         configuration_name="winner-v1.13.2",
         configuration_note=(
-            "Validated multi-horizon XGBoost CPU configuration. After installation, valid "
+            "Validated multi-horizon utility-model CPU configuration. After installation, valid "
             "strategy parameters are managed through the protected administration API."
         ),
     ),

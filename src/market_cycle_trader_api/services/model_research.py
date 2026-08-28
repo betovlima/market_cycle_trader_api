@@ -24,7 +24,7 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 
 _SETTINGS_ID = "default"
-_SETTINGS_SCHEMA_VERSION = 3
+_SETTINGS_SCHEMA_VERSION = 4
 _PROFILE_ID = "baseline"
 
 _XGBOOST_DEFAULTS: dict[str, Any] = {
@@ -172,7 +172,6 @@ def _default_document() -> dict[str, Any]:
         "updated_by": None,
         "seeded_api_version": API_VERSION,
         "profiles": {
-            "xgboost_utility": {"active_profile_id": _PROFILE_ID, "profiles": {_PROFILE_ID: deepcopy(_XGBOOST_DEFAULTS)}},
             "lightgbm_utility": {"active_profile_id": _PROFILE_ID, "profiles": {_PROFILE_ID: deepcopy(_LIGHTGBM_DEFAULTS)}},
             "iqn": {"active_profile_id": _PROFILE_ID, "profiles": {_PROFILE_ID: deepcopy(_IQN_DEFAULTS)}},
         },
@@ -200,7 +199,7 @@ def _normalized_document(document: dict[str, Any]) -> dict[str, Any]:
     raw_profiles = normalized.get("profiles") if isinstance(normalized.get("profiles"), dict) else {}
 
     result_profiles: dict[str, Any] = {}
-    for family, defaults in (("xgboost_utility", _XGBOOST_DEFAULTS), ("lightgbm_utility", _LIGHTGBM_DEFAULTS), ("iqn", _IQN_DEFAULTS)):
+    for family, defaults in (("lightgbm_utility", _LIGHTGBM_DEFAULTS), ("iqn", _IQN_DEFAULTS)):
         raw_family = raw_profiles.get(family) if isinstance(raw_profiles.get(family), dict) else {}
         active_profile_id = str(raw_family.get("active_profile_id") or _PROFILE_ID).strip() or _PROFILE_ID
         raw_family_profiles = raw_family.get("profiles") if isinstance(raw_family.get("profiles"), dict) else {}
@@ -403,8 +402,7 @@ def public_model_research_catalog(db: Any) -> dict[str, Any]:
     document = get_model_research_settings(db)
     return {
         "models": [
-            {"id": "xgboost_utility", "label": "XGBoost Utility", "role": "baseline"},
-            {"id": "lightgbm_utility", "label": "LightGBM Utility", "role": "challenger"},
+            {"id": "lightgbm_utility", "label": "LightGBM Utility", "role": "primary"},
             {"id": "iqn", "label": "IQN", "role": "challenger"},
         ],
         "settings_revision": int(document.get("revision") or 1),
@@ -449,7 +447,7 @@ def _editable_model_payload(document: dict[str, Any], model_family: str) -> dict
     return {
         "id": model_family,
         "label": model_label(model_family),
-        "role": "baseline" if model_family == "xgboost_utility" else "challenger",
+        "role": "primary" if model_family == "lightgbm_utility" else "challenger",
         "configuration_owner": "model_research",
         "editable": True,
         "active_profile_id": profile_id,
@@ -466,7 +464,6 @@ def public_model_research_settings(db: Any) -> dict[str, Any]:
         "updated_at": bson_value(document.get("updated_at")),
         "updated_by": document.get("updated_by"),
         "models": [
-            _editable_model_payload(document, "xgboost_utility"),
             _editable_model_payload(document, "lightgbm_utility"),
             _editable_model_payload(document, "iqn"),
         ],
@@ -480,8 +477,8 @@ def update_model_research_settings(
     *,
     actor_email: str | None,
 ) -> dict[str, Any]:
-    if model_family not in {"xgboost_utility", "lightgbm_utility", "iqn"}:
-        raise ValueError("Unsupported research model settings.")
+    if model_family not in {"lightgbm_utility", "iqn"}:
+        raise ValueError("XGBoost settings are retired; only LightGBM and IQN are editable.")
 
     previous = get_model_research_settings(db)
     current_revision = int(previous.get("revision") or 1)

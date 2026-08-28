@@ -8,7 +8,7 @@ import pandas as pd
 
 from ..core.config import RESEARCH_ONLY_SWING_STRATEGY_MODES
 
-from .capital_rotation import SUPPORTED_ROTATION_MODES, _risk_off_enabled, _simple_policy_growth, _xgb_policy, _xgb_utilities, prepare_rotation_panel
+from .capital_rotation import SUPPORTED_ROTATION_MODES, _risk_off_enabled, _simple_policy_growth, _utility_policy, _model_utilities, prepare_rotation_panel
 from .live_policy import build_live_rotation_policy, live_model_utilities
 from .research_challengers import _lightgbm_fit_models
 from .selective_opportunity import evaluate_opportunity, fit_selective_opportunity_gate, selective_opportunity_enabled
@@ -57,8 +57,6 @@ def build_live_lightgbm_decision(
         raise ValueError(f"Unsupported Paper compound-rotation strategy mode: {config.strategy_mode}.")
     if str(config.strategy_mode) in RESEARCH_ONLY_SWING_STRATEGY_MODES:
         raise ValueError("Opportunity Cash Gate / Absolute Utility Cash Gate / Portfolio Allocation / Compound Risk Overlay v3.12.0 is research/backtest-only until the compatible Paper executor is enabled.")
-    if list(config.rotation_models) != ["xgboost_utility"]:
-        raise ValueError("The legacy strategy model marker changed unexpectedly.")
     if config.timeframe != "1Day":
         raise ValueError("Paper execution requires 1Day market data.")
     if str(getattr(config, "research_model_family", "")) != "lightgbm_utility":
@@ -122,7 +120,7 @@ def build_live_lightgbm_decision(
             frames,
             symbols,
             calibration_dates,
-            lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, config),
+            lambda fitted, panel, labels, ts: _model_utilities(fitted, panel, labels, ts, config),
             random_state=int(config.random_state),
             label_horizon=max(int(item) for item in config.rotation_target_horizons),
         )
@@ -139,7 +137,7 @@ def build_live_lightgbm_decision(
         else config
     )
     for candidate in candidates:
-        calibration_policy = _xgb_policy(
+        calibration_policy = _utility_policy(
             calibration_models,
             frames,
             symbols,

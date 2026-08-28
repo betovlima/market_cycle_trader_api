@@ -27,8 +27,8 @@ from .capital_rotation import (
     _simple_policy_growth,
     _simulate_exact,
     _training_transition_log_return,
-    _xgb_policy,
-    _xgb_utilities,
+    _utility_policy,
+    _model_utilities,
     prepare_rotation_panel,
 )
 from .optimized_allocation import fit_expected_return_calibrator
@@ -92,9 +92,6 @@ def _build_execution_context(
 ]:
     if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
         raise ValueError(f"Unsupported research strategy mode: {config.strategy_mode}.")
-    if list(config.rotation_models) != ["xgboost_utility"]:
-        raise ValueError("Research challengers cannot mutate the locked strategy model contract.")
-
     frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
     symbols = sorted(frames)
     folds = _build_walk_forward_folds(common_dates, config)
@@ -321,7 +318,7 @@ def _run_lightgbm(
                     frames,
                     symbols,
                     calibration_dates,
-                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    lambda fitted, panel, labels, ts: _model_utilities(fitted, panel, labels, ts, rep_config),
                     random_state=int(rep_config.random_state),
                     label_horizon=label_horizon,
                     hysteresis=False,
@@ -332,7 +329,7 @@ def _run_lightgbm(
                     frames,
                     symbols,
                     calibration_dates,
-                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    lambda fitted, panel, labels, ts: _model_utilities(fitted, panel, labels, ts, rep_config),
                     label_horizon=label_horizon,
                 )
             candidate_margins = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
@@ -344,7 +341,7 @@ def _run_lightgbm(
                 else rep_config
             )
             for candidate in candidate_margins:
-                calibration_policy = _xgb_policy(
+                calibration_policy = _utility_policy(
                     calibration_models,
                     frames,
                     symbols,
@@ -396,7 +393,7 @@ def _run_lightgbm(
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             if opportunity_cash_gate_enabled(rep_config):
                 gate_base_config = rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
-                calibration_base_policy = _xgb_policy(
+                calibration_base_policy = _utility_policy(
                     calibration_models,
                     frames,
                     symbols,
@@ -409,7 +406,7 @@ def _run_lightgbm(
                     frames,
                     symbols,
                     calibration_dates,
-                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
+                    lambda fitted, panel, labels, ts: _model_utilities(fitted, panel, labels, ts, rep_config),
                     calibration_base_policy,
                     lambda now, nxt, from_pos, to_pos: _cash_gate_action_log_return(
                         frames, symbols, now, nxt, from_pos, to_pos, rep_config
@@ -445,7 +442,7 @@ def _run_lightgbm(
                     fold_id=fold_id,
                 )
             else:
-                policies[fold_id] = _xgb_policy(
+                policies[fold_id] = _utility_policy(
                     final_models,
                     frames,
                     symbols,
@@ -1421,7 +1418,7 @@ def run_research_challenger(
         )
     if model_family == "iqn":
         if allocation_execution_enabled(config):
-            raise ValueError("Portfolio Allocation / Compound Risk Overlay v3.12.0 supports Ranking Utility models (XGBoost/LightGBM); IQN allocation is not enabled in this release.")
+            raise ValueError("Portfolio Allocation / Compound Risk Overlay v3.12.0 supports Ranking Utility models (LightGBM); IQN allocation is not enabled in this release.")
         return _run_iqn(
             bars_by_symbol,
             config,

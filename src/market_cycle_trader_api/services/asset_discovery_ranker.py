@@ -42,6 +42,7 @@ class AssetDiscoveryRankerCancelled(RuntimeError):
 
 
 StopCheck = Callable[[], bool]
+ProgressCallback = Callable[[float, str], None]
 
 
 def _clean_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -190,28 +191,50 @@ def _fit_ranker(
     *,
     random_state: int,
     stop_check: StopCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 100.0,
+    progress_step: str = "ranker_fit",
 ) -> Any:
     model = _new_ranker(random_state)
     callbacks: list[Any] = []
-    if stop_check is not None:
-        last_poll = [0.0]
+    last_poll = [0.0]
+    last_progress_bucket = [-1]
 
-        def cancellation_checkpoint(_: Any) -> None:
+    if stop_check is not None or progress_callback is not None:
+        def execution_checkpoint(env: Any) -> None:
             now = time.monotonic()
-            if now - last_poll[0] < 0.5:
+            if stop_check is not None and now - last_poll[0] >= 0.5:
+                last_poll[0] = now
+                if stop_check():
+                    raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
+
+            if progress_callback is None:
                 return
-            last_poll[0] = now
-            if stop_check():
-                raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
+            begin = int(getattr(env, "begin_iteration", 0) or 0)
+            end = int(getattr(env, "end_iteration", 0) or 0)
+            iteration = int(getattr(env, "iteration", begin) or begin)
+            total = max(1, end - begin)
+            completed = max(0, min(total, iteration - begin + 1))
+            fraction = completed / total
+            progress = float(progress_start) + (float(progress_end) - float(progress_start)) * fraction
+            bucket = min(4, int(fraction * 4.0))
+            if bucket != last_progress_bucket[0] or completed >= total:
+                last_progress_bucket[0] = bucket
+                progress_callback(max(0.0, min(100.0, progress)), progress_step)
 
-        callbacks.append(cancellation_checkpoint)
+        callbacks.append(execution_checkpoint)
 
+    if progress_callback is not None:
+        progress_callback(max(0.0, min(100.0, float(progress_start))), progress_step)
     model.fit(
         dataset[list(FEATURE_COLUMNS)],
         dataset["relevance"],
         group=_group_sizes(dataset),
         callbacks=callbacks or None,
     )
+    if progress_callback is not None:
+        progress_callback(max(0.0, min(100.0, float(progress_end))), progress_step)
     return model
 
 
@@ -243,6 +266,7 @@ def _walk_forward_validation(
     *,
     random_state: int,
     stop_check: StopCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     unique_dates = list(pd.unique(dataset["date"])) if not dataset.empty else []
     if len(unique_dates) < 360:
@@ -272,7 +296,17 @@ def _walk_forward_validation(
             continue
 
         fold_seed = int(random_state) + fold_index + 1
-        model = _fit_ranker(train, random_state=fold_seed, stop_check=stop_check)
+        fold_start = 10.0 + (70.0 * fold_index / VALIDATION_FOLDS)
+        fold_end = 10.0 + (70.0 * (fold_index + 1) / VALIDATION_FOLDS)
+        model = _fit_ranker(
+            train,
+            random_state=fold_seed,
+            stop_check=stop_check,
+            progress_callback=progress_callback,
+            progress_start=fold_start,
+            progress_end=fold_end,
+            progress_step=f"walk_forward:{fold_index + 1}:{VALIDATION_FOLDS}",
+        )
         ranker_predictions = model.predict(validation[list(FEATURE_COLUMNS)])
         ranker_ndcg = _average_ndcg(validation, ranker_predictions, 5)
         momentum_ndcg = _average_ndcg(
@@ -332,8 +366,13 @@ def train_ranker(
     *,
     random_state: int,
     stop_check: StopCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> RankerBundle:
+    if progress_callback is not None:
+        progress_callback(1.0, "training_dataset")
     dataset = build_training_dataset(frames)
+    if progress_callback is not None:
+        progress_callback(8.0, "training_dataset")
     unique_dates = list(pd.unique(dataset["date"])) if not dataset.empty else []
     if len(unique_dates) < 360 or len(dataset) < 2_000:
         raise RuntimeError(
@@ -342,10 +381,20 @@ def train_ranker(
 
     if stop_check is not None and stop_check():
         raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
-    validation = _walk_forward_validation(dataset, random_state=random_state, stop_check=stop_check)
+    validation = _walk_forward_validation(dataset, random_state=random_state, stop_check=stop_check, progress_callback=progress_callback)
     if stop_check is not None and stop_check():
         raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
-    final_model = _fit_ranker(dataset, random_state=random_state, stop_check=stop_check)
+    final_model = _fit_ranker(
+        dataset,
+        random_state=random_state,
+        stop_check=stop_check,
+        progress_callback=progress_callback,
+        progress_start=82.0,
+        progress_end=99.0,
+        progress_step="final_refit",
+    )
+    if progress_callback is not None:
+        progress_callback(100.0, "ranker_completed")
     summary = validation.get("summary") or {}
 
     diagnostics = {

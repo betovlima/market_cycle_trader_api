@@ -133,15 +133,13 @@ _MONGODB_CREDENTIAL_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 _SAFE_PROGRESS_PATTERNS = (
-    re.compile(r"^Prepared \d+ assets and \d+ folds — XGBoost=(?:CPU|CUDA(?: — .+)?)$"),
-    re.compile(r"^Prepared \d+ assets and \d+ folds — LightGBM=CPU$"),
+        re.compile(r"^Prepared \d+ assets and \d+ folds — LightGBM=CPU$"),
     re.compile(r"^Prepared \d+ assets and \d+ folds — IQN=(?:CPU|CUDA(?: — .+)?)$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — (?:calibration training|final training) \d+/\d+$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — evaluating rotation policy candidates$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ completed$"),
     re.compile(r"^Run \d+/\d+ — simulating out-of-sample portfolio$"),
-    re.compile(r"^XGBoost Utility run \d+/\d+ completed$"),
-    re.compile(r"^LightGBM Utility run \d+/\d+ completed$"),
+        re.compile(r"^LightGBM Utility run \d+/\d+ completed$"),
     re.compile(r"^IQN run \d+/\d+ completed$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — IQN training \d+%$"),
 )
@@ -337,7 +335,7 @@ def append_log(job_id: str, raw_line: str) -> None:
             {"$set": {"progress_detail": clean, "updated_at": utc_now()}},
         )
         return
-    if stripped.startswith("XGB_TECH|") or stripped.startswith("RESEARCH_TECH|"):
+    if stripped.startswith("RESEARCH_TECH|"):
         return
     if stripped.startswith("JOB_TRADE|"):
         try:
@@ -393,9 +391,6 @@ def _write_child_line_to_console(job_id: str, raw_line: str) -> None:
                 parts[3],
             )
         return
-    if line.startswith("XGB_TECH|"):
-        logger.info("Backtest %s | XGBoost | %s", job_id, line.removeprefix("XGB_TECH|"))
-        return
     if line.startswith("RESEARCH_TECH|"):
         logger.info("Backtest %s | Model Research | %s", job_id, line.removeprefix("RESEARCH_TECH|"))
         return
@@ -430,14 +425,14 @@ def run_job(job_id: str) -> None:
     research_model_family = str(
         job_document.get("research_model_family")
         or request_payload.get("research_model_family")
-        or "xgboost_utility"
+        or "lightgbm_utility"
     )
     research_model_settings = (
         request_payload.get("research_model_settings")
         if isinstance(request_payload.get("research_model_settings"), dict)
         else {}
     )
-    certifies_strategy = research_model_family in {"xgboost_utility", "lightgbm_utility"}
+    certifies_strategy = research_model_family == "lightgbm_utility"
     certifies_strategy = certifies_strategy and bool(job_document.get("certifies_strategy", True))
     db[JOBS_COLLECTION].update_one({"id": job_id}, {"$set": {"status": "running", "stage": "Starting backtest", "started_at": utc_now(), "updated_at": utc_now(), "progress": 0, "progress_detail": {}}})
     python_path = str(SOURCE_ROOT)

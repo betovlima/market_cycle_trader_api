@@ -164,9 +164,7 @@ def _validated_context(
         raise RuntimeError("Paper trading requires the validated compound-rotation strategy contract.")
     if strategy.strategy_mode in RESEARCH_ONLY_SWING_STRATEGY_MODES:
         raise RuntimeError("Opportunity Cash Gate / Absolute Utility Cash Gate / Portfolio Allocation / Compound Risk Overlay v3.12.0 is research/backtest-only until the compatible Paper executor is enabled.")
-    if strategy.rotation_models != ["xgboost_utility"]:
-        raise RuntimeError("The legacy strategy model marker changed unexpectedly.")
-    if winner_model["family"] not in {"xgboost_utility", "lightgbm_utility"}:
+    if winner_model["family"] != "lightgbm_utility":
         raise RuntimeError(
             f"Trader Winner model {winner_model['family']!r} does not have a protected live engine."
         )
@@ -440,7 +438,7 @@ def initialize_paper_state(db: Any, *, replace: bool = False) -> dict[str, Any]:
     if not settings.enabled:
         raise RuntimeError("Paper trading is disabled in MongoDB.")
     if strategy.strategy_mode not in SWING_STRATEGY_MODES:
-        raise RuntimeError("The locked strategy is not the XGBoost swing strategy.")
+        raise RuntimeError("The locked strategy is not a supported utility swing strategy.")
     if strategy.strategy_mode in RESEARCH_ONLY_SWING_STRATEGY_MODES:
         raise RuntimeError("Opportunity Cash Gate / Absolute Utility Cash Gate / Portfolio Allocation / Compound Risk Overlay v3.12.0 is research/backtest-only until the compatible Paper executor is enabled.")
 

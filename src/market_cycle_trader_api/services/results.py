@@ -193,7 +193,7 @@ def build_robustness_summary(comparison_rows: list[dict[str, Any]]) -> list[dict
         summaries.append(
             {
                 "model_family": family,
-                "model_label": "XGBoost Utility" if family == "xgboost_utility" else family,
+                "model_label": "Legacy XGBoost (retired)" if family == "xgboost_utility" else family,
                 "runs": len(rows),
                 "beat_buy_hold_runs": int((excess > 0).sum()),
                 "beat_buy_hold_rate": float((excess > 0).mean()),

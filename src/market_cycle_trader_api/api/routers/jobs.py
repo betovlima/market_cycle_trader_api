@@ -88,7 +88,7 @@ def queue_backtest_job(
                 raise RuntimeError("An immutable execution snapshot is valid only for an internal tuning candidate.")
             request_payload = deepcopy(execution_request_override)
             research_model_family = str(request_payload.get("research_model_family") or "")
-            if research_model_family not in {"xgboost_utility", "lightgbm_utility", "iqn"}:
+            if research_model_family not in {"lightgbm_utility", "iqn"}:
                 raise RuntimeError("The immutable tuning snapshot has an unsupported research model family.")
             research_model_settings = execution_settings_from_values(
                 research_model_family,
@@ -132,6 +132,8 @@ def queue_backtest_job(
             selected_configuration, selected_strategy = get_research_strategy_context(db)
             selected_model_snapshot = get_research_strategy_model_snapshot(db)
             research_model_family = str(selected_model_snapshot["family"])
+            if research_model_family == "xgboost_utility":
+                raise RuntimeError("This Strategy is bound to retired XGBoost Utility. Bind/clone it to LightGBM Utility before running a new Backtest.")
             research_model_settings = (
                 dict(selected_model_snapshot.get("settings_snapshot") or {})
                 if isinstance(selected_model_snapshot.get("settings_snapshot"), dict)

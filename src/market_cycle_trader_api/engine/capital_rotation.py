@@ -3,8 +3,6 @@ from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 import math
-import subprocess
-import time
 from typing import Any, Callable
 import numpy as np
 import pandas as pd
@@ -83,74 +81,6 @@ class RotationRunResult:
     summary: str
     metrics: dict[str, Any]
 
-@dataclass(frozen=True)
-class RotationComputePlan:
-    framework: str
-    requested: str
-    selected: str
-    cuda_available: bool
-    gpu_name: str | None
-    framework_version: str | None
-    cuda_runtime_version: str | None
-    cuda_build: bool | None
-    fallback_used: bool
-    fallback_reason: str | None
-
-def _truthy_build_flag(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
-
-def _nvidia_gpu_name() -> str | None:
-    try:
-        completed = subprocess.run(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], capture_output=True, text=True, timeout=3, check=False)
-        if completed.returncode == 0:
-            names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-            if names:
-                return names[0]
-    except Exception:
-        pass
-    return None
-
-def resolve_xgboost_compute_plan(config: Any) -> RotationComputePlan:
-    requested = str(config.rotation_accelerator).strip().lower()
-    allow_fallback = bool(config.rotation_allow_cpu_fallback)
-    if requested not in {'auto', 'cpu', 'cuda'}:
-        raise ValueError('ROTATION_ACCELERATOR must be auto, cpu or cuda.')
-    version = None
-    cuda_build = None
-    error = None
-    try:
-        import xgboost as xgb
-        version = str(xgb.__version__)
-        build = xgb.build_info()
-        if isinstance(build, dict):
-            cuda_build = _truthy_build_flag(build.get('USE_CUDA'))
-    except Exception as exc:
-        error = str(exc)
-    gpu_name = _nvidia_gpu_name()
-    cuda_available = bool(cuda_build and gpu_name)
-    if requested == 'cpu':
-        selected = 'cpu'
-    elif cuda_available:
-        selected = 'cuda'
-    else:
-        selected = 'cpu'
-    reason = None
-    fallback_used = False
-    if requested == 'cuda' and (not cuda_available):
-        if error is not None:
-            reason = f'XGBoost CUDA detection failed: {error}'
-        elif not cuda_build:
-            reason = 'The installed XGBoost build does not expose CUDA support'
-        else:
-            reason = 'No NVIDIA GPU/driver is visible to XGBoost'
-        if not allow_fallback:
-            raise RuntimeError(f'{reason}. Enable CPU fallback or use accelerator=auto.')
-        fallback_used = True
-    return RotationComputePlan(framework='xgboost', requested=requested, selected=selected, cuda_available=cuda_available, gpu_name=gpu_name, framework_version=version, cuda_runtime_version=None, cuda_build=cuda_build, fallback_used=fallback_used, fallback_reason=reason)
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     clean = denominator.replace(0, np.nan)
@@ -461,116 +391,8 @@ def _numeric_thread_context(config: Any):
     return threadpool_limits(limits=int(config.numeric_thread_limit))
 
 
-def _fit_xgb_models(
-    frames: dict[str, pd.DataFrame],
-    symbols: list[str],
-    train_dates: pd.DatetimeIndex,
-    config: Any,
-    device_name: str,
-    *,
-    phase: str = 'training',
-    progress_callback: Callable[[int, int, str], None] | None = None,
-    technical_log_callback: Callable[[str], None] | None = None,
-    target_column: str = 'forward_risk_adjusted_utility',
-) -> tuple[dict[str, Any], str, str | None]:
-    try:
-        from xgboost import XGBRegressor
-    except ImportError as exc:
-        raise RuntimeError('XGBoost Utility requires xgboost. Install requirements.txt.') from exc
-    allow_fallback = bool(config.rotation_allow_cpu_fallback)
-    anchor_assets = set(getattr(config, 'calendar_anchor_assets', []) or [])
-    minimum_rows = int(config.rotation_minimum_training_rows)
 
-    def technical(message: str) -> None:
-        if technical_log_callback is not None:
-            technical_log_callback(message)
-
-    def fit_on_device(effective_device: str) -> dict[str, Any]:
-        fitted: dict[str, Any] = {}
-        total_symbols = len(symbols)
-        fit_started = time.perf_counter()
-        technical(
-            f'phase={phase} event=fit_start device={effective_device} '
-            f'models={total_symbols} train_sessions={len(train_dates)} '
-            f'estimators={int(config.rotation_xgb_n_estimators)} '
-            f'workers={int(config.xgb_n_jobs)} seed={int(config.random_state)}'
-        )
-        with _numeric_thread_context(config):
-            for position, symbol in enumerate(symbols, start=1):
-                frame = frames[symbol].loc[train_dates].dropna(
-                    subset=[target_column, *ROTATION_FEATURES]
-                )
-                if len(frame) < minimum_rows:
-                    if symbol in anchor_assets:
-                        raise ValueError(
-                            f'{symbol}: only {len(frame)} utility rows are available; '
-                            f'{minimum_rows} are required for an anchor asset.'
-                        )
-                    technical(
-                        f'phase={phase} event=model_deferred model={position}/{total_symbols} '
-                        f'asset={symbol} rows={len(frame)} required={minimum_rows}'
-                    )
-                    if progress_callback is not None:
-                        progress_callback(position, total_symbols, effective_device)
-                    continue
-                model_started = time.perf_counter()
-                technical(
-                    f'phase={phase} event=model_start model={position}/{total_symbols} '
-                    f'asset={symbol} rows={len(frame)} features={len(ROTATION_FEATURES)} '
-                    f'target={target_column} device={effective_device}'
-                )
-                model = XGBRegressor(
-                    n_estimators=int(config.rotation_xgb_n_estimators),
-                    learning_rate=float(config.rotation_xgb_learning_rate),
-                    max_depth=int(config.rotation_xgb_max_depth),
-                    min_child_weight=float(config.xgb_min_child_weight),
-                    subsample=float(config.xgb_subsample),
-                    colsample_bytree=float(config.xgb_colsample_bytree),
-                    reg_alpha=float(config.xgb_reg_alpha),
-                    reg_lambda=float(config.xgb_reg_lambda),
-                    objective='reg:squarederror',
-                    tree_method='hist',
-                    random_state=int(config.random_state),
-                    n_jobs=int(config.xgb_n_jobs),
-                    device=effective_device,
-                    verbosity=0,
-                )
-                model.fit(
-                    frame[ROTATION_FEATURES],
-                    frame[target_column],
-                )
-                fitted[symbol] = model
-                duration = time.perf_counter() - model_started
-                technical(
-                    f'phase={phase} event=model_complete model={position}/{total_symbols} '
-                    f'asset={symbol} rows={len(frame)} device={effective_device} '
-                    f'duration_seconds={duration:.3f}'
-                )
-                if progress_callback is not None:
-                    progress_callback(position, total_symbols, effective_device)
-        technical(
-            f'phase={phase} event=fit_complete device={effective_device} '
-            f'models={total_symbols} duration_seconds={time.perf_counter() - fit_started:.3f}'
-        )
-        return fitted
-
-    try:
-        return (fit_on_device(device_name), device_name, None)
-    except Exception as exc:
-        if device_name != 'cuda' or not allow_fallback:
-            technical(
-                f'phase={phase} event=fit_failed device={device_name} '
-                f'error_type={type(exc).__name__} error={exc}'
-            )
-            raise
-        fallback_reason = f'XGBoost CUDA initialization/training failed; using CPU instead: {exc}'
-        technical(
-            f'phase={phase} event=device_fallback from=cuda to=cpu '
-            f'error_type={type(exc).__name__} error={exc}'
-        )
-        return (fit_on_device('cpu'), 'cpu', fallback_reason)
-
-def _xgb_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], timestamp: pd.Timestamp, config: Any) -> np.ndarray:
+def _model_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], timestamp: pd.Timestamp, config: Any) -> np.ndarray:
     
 
     values = [0.0]
@@ -601,7 +423,7 @@ def _xgb_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symb
         values.append(prediction)
     return np.asarray(values, dtype=np.float64)
 
-def _xgb_policy(
+def _utility_policy(
     models: dict[str, Any],
     frames: dict[str, pd.DataFrame],
     symbols: list[str],
@@ -648,7 +470,7 @@ def _xgb_policy(
         else:
             base_config = copy(config)
             setattr(base_config, 'strategy_mode', LEGACY_ROTATION_MODE)
-        cash_gate_base_policy = _xgb_policy(
+        cash_gate_base_policy = _utility_policy(
             models,
             frames,
             symbols,
@@ -688,12 +510,12 @@ def _xgb_policy(
                 cash_gate_state["pending_sample"] = None
                 opportunity_gate.refresh_if_needed()
 
-        utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
+        utilities = _model_utilities(models, frames, symbols, timestamp, config)
         if not np.isfinite(utilities[1:]).any():
             return (0, 0.0)
 
         cash_edges = (
-            _xgb_utilities(cash_edge_models or {}, frames, symbols, timestamp, config)
+            _model_utilities(cash_edge_models or {}, frames, symbols, timestamp, config)
             if risk_off
             else utilities.copy()
         )
@@ -1345,7 +1167,7 @@ def _optimized_policy(
         raise ValueError("Optimized allocation requires an out-of-sample cross-sectional relative-alpha calibrator.")
 
     def policy(timestamp: pd.Timestamp, current_weights: dict[str, float]) -> AllocationDecision:
-        utilities = _xgb_utilities(models, frames, symbols, timestamp, config)
+        utilities = _model_utilities(models, frames, symbols, timestamp, config)
         opportunity = evaluate_opportunity(opportunity_gate, utilities, frames, symbols, timestamp)
         allocator = optimize_concentrated_allocation if concentrated_allocation_enabled(config) else optimize_allocation
         decision = allocator(
@@ -1434,7 +1256,7 @@ def _compound_risk_overlay_policy(
     calibrated_switch_margin: float | None = None,
     state: dict[str, int] | None = None,
 ) -> Callable[[pd.Timestamp, dict[str, float]], AllocationDecision]:
-    base_policy = _xgb_policy(
+    base_policy = _utility_policy(
         models,
         frames,
         symbols,
@@ -1530,7 +1352,7 @@ def _simulate_optimized_allocation(
     policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     trade_callback: Callable[[dict[str, Any]], None] | None = None,
     *,
-    model_label: str = "XGBoost Utility",
+    model_label: str = "LightGBM Utility",
     method_line: str | None = None,
 ) -> RotationRunResult:
     if len(decision_dates) < 2:
@@ -1934,7 +1756,7 @@ def _simulate_optimized_allocation(
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 
-def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None, *, model_label: str='XGBoost Utility', method_line: str | None=None) -> RotationRunResult:
+def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None, *, model_label: str='LightGBM Utility', method_line: str | None=None) -> RotationRunResult:
     if len(decision_dates) < 2:
         raise ValueError('The final-test interval is too short.')
     execution_dates = decision_dates[1:]
@@ -2376,7 +2198,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     if not getattr(config, 'research_candidate_assets', None):
         candidate_assets = [symbol for symbol in symbols if symbol not in reference_set]
     metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_cash_gate_enabled': bool(opportunity_cash_gate_enabled(config)), 'absolute_utility_cash_gate_enabled': bool(absolute_utility_cash_gate_enabled(config)), 'absolute_utility_entry_threshold': (float(config.opportunity_utility_entry_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_exit_threshold': (float(config.opportunity_utility_exit_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_gate_decisions': int(len(absolute_utility_rows)), 'absolute_utility_gate_accepted': absolute_utility_accepted_count, 'absolute_utility_gate_rejected': absolute_utility_rejected_count, 'absolute_utility_gate_acceptance_rate': (float(absolute_utility_accepted_count / len(absolute_utility_rows)) if absolute_utility_rows else None), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'opportunity_entry_threshold_mean': float(np.mean(opportunity_entry_thresholds)) if opportunity_entry_thresholds else None, 'opportunity_exit_threshold_mean': float(np.mean(opportunity_exit_thresholds)) if opportunity_exit_thresholds else None, 'opportunity_gate_adaptive_refreshes': opportunity_adaptive_refreshes, 'opportunity_gate_regularized_sessions': opportunity_regularized_sessions, 'opportunity_target_horizon_sessions': int(round(float(np.mean(opportunity_target_horizons)))) if opportunity_target_horizons else None, 'cash_gate_changed_base_action_sessions': int(len(cash_gate_rows)), 'cash_gate_entries': cash_gate_entries, 'cash_gate_exits': cash_gate_exits, 'cash_gate_counterfactual_negative_sessions': int(sum(value < 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_counterfactual_positive_sessions': int(sum(value > 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_avoided_loss_return_sum': cash_gate_avoided_loss_sum, 'cash_gate_missed_gain_return_sum': cash_gate_missed_gain_sum, 'cash_gate_net_avoided_return_sum': float(cash_gate_avoided_loss_sum - cash_gate_missed_gain_sum), 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
-    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- XGBoost Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
+    summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- LightGBM Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 def _build_walk_forward_folds(common_dates: pd.DatetimeIndex, config: Any) -> list[dict[str, Any]]:
@@ -2553,601 +2375,6 @@ def _fold_performance(predictions: pd.DataFrame, folds: list[dict[str, Any]], in
         })
     return output
 
-def _run_xgboost_rotation_models(
-    bars_by_symbol: dict[str, pd.DataFrame],
-    config: Any,
-    fee_calculator: Callable,
-    slippage: Callable,
-    progress_callback: Callable[[float, str, int], None] | None = None,
-    trade_callback: Callable[[dict[str, Any]], None] | None = None,
-    progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
-    technical_log_callback: Callable[[str], None] | None = None,
-) -> list[RotationRunResult]:
-    
-    if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
-        raise ValueError(f'Unsupported compound-rotation strategy mode: {config.strategy_mode}.')
-    if list(config.rotation_models) != ['xgboost_utility']:
-        raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
-    frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
-    symbols = sorted(frames)
-    folds = _build_walk_forward_folds(common_dates, config)
-    xgb_plan = resolve_xgboost_compute_plan(config)
-    repetitions = int(config.rotation_xgb_repetitions)
-    seed_step = int(config.rotation_seed_step)
-    if repetitions <= 0:
-        raise ValueError('At least one XGBoost repetition is required.')
-    all_decision_dates = _analysis_decision_dates(common_dates, folds, config)
-    decision_to_fold: dict[pd.Timestamp, int] = {}
-    decision_metadata: dict[pd.Timestamp, dict[str, Any]] = {}
-    for fold in folds:
-        for timestamp in fold['decision_dates'][:-1]:
-            key = pd.Timestamp(timestamp)
-            decision_to_fold[key] = int(fold['fold_id'])
-            decision_metadata[key] = {
-                'fold_id': int(fold['fold_id']),
-                'test_start': fold['test_start'],
-                'test_end': fold['test_end'],
-            }
-    device_label = f'CUDA — {xgb_plan.gpu_name}' if xgb_plan.selected == 'cuda' else 'CPU'
-    if progress_callback is not None:
-        progress_callback(
-            18.0,
-            f'Prepared {len(symbols)} assets and {len(folds)} folds — XGBoost={device_label}',
-            0,
-        )
-
-    def technical(message: str) -> None:
-        if technical_log_callback is not None:
-            technical_log_callback(message)
-
-    def emit_detail(**values: Any) -> None:
-        if progress_detail_callback is not None:
-            progress_detail_callback(values)
-
-    def report(fraction: float, stage: str, completed: int) -> None:
-        if progress_callback is not None:
-            progress_callback(
-                20.0 + 72.0 * max(0.0, min(1.0, float(fraction))),
-                stage,
-                completed,
-            )
-
-    def backend_id(seed: int) -> str:
-        return 'xgboost_utility' if repetitions <= 1 else f'xgboost_utility_seed_{seed}'
-
-    def trade_wrapper(seed: int, repetition_index: int) -> Callable[[dict[str, Any]], None] | None:
-        if trade_callback is None:
-            return None
-
-        def emit(trade: dict[str, Any]) -> None:
-            payload = dict(trade)
-            payload['model_family'] = 'xgboost_utility'
-            payload['random_seed'] = seed
-            payload['repetition_index'] = repetition_index
-            payload['model'] = 'XGBoost Utility' + (f' · seed {seed}' if repetitions > 1 else '')
-            trade_callback(payload)
-        return emit
-
-    results: list[RotationRunResult] = []
-    effective_device = xgb_plan.selected
-    total_folds = len(folds)
-    total_models = len(symbols)
-    technical(
-        f'event=walk_forward_start runs={repetitions} folds={total_folds} '
-        f'assets={total_models} device={effective_device} '
-        f'xgboost_version={xgb_plan.framework_version or "unknown"}'
-    )
-
-    for repetition in range(repetitions):
-        run_index = repetition + 1
-        seed = int(config.random_state) + repetition * seed_step
-        rep_config = config.model_copy(update={'random_state': seed})
-        policies: dict[int, Callable] = {}
-        risk_overlay_state = {"position": 0, "holding_days": 0}
-        cash_gate_base_state: dict[str, Any] = {"position": 0, "holding_days": 0, "pending_sample": None}
-        cash_gate_oos_history: list[dict[str, Any]] = []
-        decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
-        margin_details: list[dict[str, Any]] = []
-        fallback_reasons: list[str] = []
-        technical(
-            f'event=run_start run={run_index}/{repetitions} seed={seed} '
-            f'device={effective_device}'
-        )
-        emit_detail(
-            run_index=run_index,
-            run_count=repetitions,
-            fold_index=0,
-            fold_count=total_folds,
-            phase='Preparing run',
-            trained_models=0,
-            total_models=total_models,
-            device=effective_device.upper(),
-        )
-
-        run_base = repetition / repetitions
-        run_span = 1.0 / repetitions
-        training_span = run_span * 0.90
-        for fold_position, fold in enumerate(folds, start=1):
-            fold_span = training_span / max(1, total_folds)
-            fold_base = run_base + (fold_position - 1) * fold_span
-            fold_id = int(fold['fold_id'])
-            train_dates = common_dates[:int(fold['train_end_index'])]
-            calibration_dates = common_dates[
-                int(fold['calibration_start_index']):int(fold['calibration_end_index'])
-            ]
-            final_fit_dates = common_dates[:int(fold['final_fit_end_index'])]
-            technical(
-                f'event=fold_start run={run_index}/{repetitions} '
-                f'fold={fold_position}/{total_folds} fold_id={fold_id} '
-                f'train_sessions={len(train_dates)} calibration_sessions={len(calibration_dates)} '
-                f'final_fit_sessions={len(final_fit_dates)} device={effective_device}'
-            )
-
-            def phase_progress(
-                phase_label: str,
-                phase_start: float,
-                phase_end: float,
-            ) -> Callable[[int, int, str], None]:
-                def callback(position: int, total: int, model_device: str) -> None:
-                    fraction_in_phase = position / max(1, total)
-                    overall = fold_base + fold_span * (
-                        phase_start + (phase_end - phase_start) * fraction_in_phase
-                    )
-                    stage = (
-                        f'Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} '
-                        f'— {phase_label} {position}/{total}'
-                    )
-                    report(overall, stage, repetition)
-                    emit_detail(
-                        run_index=run_index,
-                        run_count=repetitions,
-                        fold_index=fold_position,
-                        fold_count=total_folds,
-                        phase=phase_label.title(),
-                        trained_models=position,
-                        total_models=total,
-                        device=model_device.upper(),
-                    )
-                return callback
-
-            report(
-                fold_base,
-                f'Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} — calibration training 0/{total_models}',
-                repetition,
-            )
-            emit_detail(
-                run_index=run_index,
-                run_count=repetitions,
-                fold_index=fold_position,
-                fold_count=total_folds,
-                phase='Calibration training',
-                trained_models=0,
-                total_models=total_models,
-                device=effective_device.upper(),
-            )
-            calibration_models, effective_device, fallback_reason = _fit_xgb_models(
-                frames,
-                symbols,
-                train_dates,
-                rep_config,
-                effective_device,
-                phase=f'run_{run_index}_fold_{fold_position}_calibration',
-                progress_callback=phase_progress('calibration training', 0.02, 0.38),
-                technical_log_callback=technical_log_callback,
-            )
-            if fallback_reason:
-                fallback_reasons.append(fallback_reason)
-            calibration_cash_edge_models = None
-            if _risk_off_enabled(rep_config):
-                calibration_cash_edge_models, effective_device, fallback_reason = _fit_xgb_models(
-                    frames,
-                    symbols,
-                    train_dates,
-                    rep_config,
-                    effective_device,
-                    phase=f'run_{run_index}_fold_{fold_position}_calibration_cash_edge',
-                    technical_log_callback=technical_log_callback,
-                    target_column='forward_cash_edge',
-                )
-                if fallback_reason:
-                    fallback_reasons.append(fallback_reason)
-            opportunity_gate = None
-            expected_return_calibrator = None
-            label_horizon = max(int(item) for item in rep_config.rotation_target_horizons)
-            if selective_opportunity_enabled(rep_config) and not opportunity_cash_gate_enabled(rep_config):
-                opportunity_gate = fit_selective_opportunity_gate(
-                    calibration_models,
-                    frames,
-                    symbols,
-                    calibration_dates,
-                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
-                    random_state=int(rep_config.random_state),
-                    label_horizon=label_horizon,
-                    hysteresis=False,
-                )
-            if portfolio_allocation_enabled(rep_config):
-                expected_return_calibrator = fit_expected_return_calibrator(
-                    calibration_models,
-                    frames,
-                    symbols,
-                    calibration_dates,
-                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
-                    label_horizon=label_horizon,
-                )
-
-            report(
-                fold_base + fold_span * 0.42,
-                f'Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} — evaluating rotation policy candidates',
-                repetition,
-            )
-            emit_detail(
-                run_index=run_index,
-                run_count=repetitions,
-                fold_index=fold_position,
-                fold_count=total_folds,
-                phase='Policy calibration',
-                trained_models=total_models,
-                total_models=total_models,
-                device=effective_device.upper(),
-            )
-            candidate_margins = tuple(
-                float(value) for value in rep_config.rotation_switch_margin_candidates
-            )
-            best_candidate = candidate_margins[0]
-            best_score = float('-inf')
-            margin_config = (
-                rep_config.model_copy(update={'strategy_mode': LEGACY_ROTATION_MODE})
-                if selective_opportunity_enabled(rep_config)
-                else rep_config
-            )
-            for candidate in candidate_margins:
-                calibration_policy = _xgb_policy(
-                    calibration_models,
-                    frames,
-                    symbols,
-                    margin_config,
-                    candidate,
-                    cash_edge_models=calibration_cash_edge_models,
-                )
-                score = _simple_policy_growth(
-                    calibration_policy,
-                    frames,
-                    symbols,
-                    calibration_dates,
-                    rep_config,
-                )
-                if score > best_score:
-                    best_score = score
-                    best_candidate = candidate
-
-            report(
-                fold_base + fold_span * 0.48,
-                f'Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} — final training 0/{total_models}',
-                repetition,
-            )
-            emit_detail(
-                run_index=run_index,
-                run_count=repetitions,
-                fold_index=fold_position,
-                fold_count=total_folds,
-                phase='Final training',
-                trained_models=0,
-                total_models=total_models,
-                device=effective_device.upper(),
-            )
-            final_models, effective_device, fallback_reason = _fit_xgb_models(
-                frames,
-                symbols,
-                final_fit_dates,
-                rep_config,
-                effective_device,
-                phase=f'run_{run_index}_fold_{fold_position}_final',
-                progress_callback=phase_progress('final training', 0.50, 0.90),
-                technical_log_callback=technical_log_callback,
-            )
-            if fallback_reason:
-                fallback_reasons.append(fallback_reason)
-            final_cash_edge_models = None
-            if _risk_off_enabled(rep_config):
-                final_cash_edge_models, effective_device, fallback_reason = _fit_xgb_models(
-                    frames,
-                    symbols,
-                    final_fit_dates,
-                    rep_config,
-                    effective_device,
-                    phase=f'run_{run_index}_fold_{fold_position}_final_cash_edge',
-                    technical_log_callback=technical_log_callback,
-                    target_column='forward_cash_edge',
-                )
-                if fallback_reason:
-                    fallback_reasons.append(fallback_reason)
-            effective_margin = max(
-                float(rep_config.rotation_switch_margin),
-                float(best_candidate),
-            )
-            if opportunity_cash_gate_enabled(rep_config):
-                if hasattr(rep_config, 'model_copy'):
-                    gate_base_config = rep_config.model_copy(update={'strategy_mode': LEGACY_ROTATION_MODE})
-                else:
-                    gate_base_config = copy(rep_config)
-                    setattr(gate_base_config, 'strategy_mode', LEGACY_ROTATION_MODE)
-                calibration_base_policy = _xgb_policy(
-                    calibration_models,
-                    frames,
-                    symbols,
-                    gate_base_config,
-                    effective_margin,
-                    calibrated_switch_margin=float(best_candidate),
-                )
-                initial_gate_samples = build_base_policy_opportunity_samples(
-                    calibration_models,
-                    frames,
-                    symbols,
-                    calibration_dates,
-                    lambda fitted, panel, labels, ts: _xgb_utilities(fitted, panel, labels, ts, rep_config),
-                    calibration_base_policy,
-                    lambda now, nxt, from_pos, to_pos: _cash_gate_action_log_return(
-                        frames, symbols, now, nxt, from_pos, to_pos, rep_config
-                    ),
-                )
-                opportunity_gate = fit_adaptive_opportunity_cash_gate(
-                    initial_gate_samples,
-                    random_state=int(rep_config.random_state),
-                    shared_history=cash_gate_oos_history,
-                    fold_id=fold_id,
-                )
-            if compound_risk_overlay_enabled(rep_config):
-                policies[fold_id] = _compound_risk_overlay_policy(
-                    final_models,
-                    frames,
-                    symbols,
-                    rep_config,
-                    effective_margin,
-                    decision_diagnostics=decision_diagnostics,
-                    fold_id=fold_id,
-                    calibrated_switch_margin=float(best_candidate),
-                    state=risk_overlay_state,
-                )
-            elif portfolio_allocation_enabled(rep_config):
-                policies[fold_id] = _optimized_policy(
-                    final_models,
-                    frames,
-                    symbols,
-                    rep_config,
-                    opportunity_gate=opportunity_gate,
-                    expected_return_calibrator=expected_return_calibrator,
-                    decision_diagnostics=decision_diagnostics,
-                    fold_id=fold_id,
-                )
-            else:
-                policies[fold_id] = _xgb_policy(
-                    final_models,
-                    frames,
-                    symbols,
-                    rep_config,
-                    effective_margin,
-                    cash_edge_models=final_cash_edge_models,
-                    opportunity_gate=opportunity_gate,
-                    cash_gate_base_state=cash_gate_base_state if (opportunity_cash_gate_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)) else None,
-                    decision_diagnostics=decision_diagnostics,
-                    fold_id=fold_id,
-                    calibrated_switch_margin=float(best_candidate),
-                )
-            margin_detail = {
-                'fold_id': fold_id,
-                'calibrated_candidate_margin': float(best_candidate),
-                'effective_switch_margin': float(effective_margin),
-                'calibration_risk_adjusted_score': float(best_score),
-            }
-            if opportunity_gate is not None:
-                margin_detail.update({
-                    'opportunity_threshold': float(opportunity_gate.threshold),
-                    'opportunity_entry_threshold': (float(opportunity_gate.entry_threshold) if opportunity_gate.entry_threshold is not None else None),
-                    'opportunity_exit_threshold': (float(opportunity_gate.exit_threshold) if opportunity_gate.exit_threshold is not None else None),
-                    'opportunity_training_rows': int(opportunity_gate.training_rows),
-                    'opportunity_positive_rate': float(opportunity_gate.positive_rate),
-                    'opportunity_threshold_validation_rows': int(opportunity_gate.threshold_validation_rows),
-                    'opportunity_threshold_validation_score': float(opportunity_gate.threshold_validation_score),
-                    'opportunity_threshold_validation_accepted': int(opportunity_gate.threshold_validation_accepted),
-                    'opportunity_threshold_validation_transitions': int(opportunity_gate.threshold_validation_transitions),
-                    'opportunity_calibration_method': str(opportunity_gate.calibration_method),
-                    'opportunity_threshold_basis': str(opportunity_gate.threshold_basis),
-                    'opportunity_target_basis': str(getattr(opportunity_gate, 'target_basis', 'weighted_forward_net_log_return')),
-                    'opportunity_target_horizon_sessions': getattr(opportunity_gate, 'target_horizon_sessions', None),
-                    'opportunity_regularized_to_base_policy': bool(getattr(opportunity_gate, 'regularized_to_base_policy', False)),
-                    'opportunity_threshold_validation_alpha': getattr(opportunity_gate, 'threshold_validation_alpha', None),
-                    'opportunity_threshold_validation_exposure_ratio': getattr(opportunity_gate, 'threshold_validation_exposure_ratio', None),
-                    'opportunity_refresh_interval_sessions': (int(opportunity_gate.refresh_interval) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else None),
-                    'opportunity_rolling_sample_window': (int(opportunity_gate.rolling_window) if isinstance(opportunity_gate, AdaptiveOpportunityCashGate) else None),
-                })
-            if expected_return_calibrator is not None:
-                margin_detail.update({
-                    'allocation_relative_alpha_calibration_method': str(expected_return_calibrator.method),
-                    'allocation_relative_alpha_calibration_rows': int(expected_return_calibrator.sample_count),
-                    'allocation_relative_alpha_mean': float(expected_return_calibrator.realized_alpha_mean),
-                    'allocation_relative_alpha_std': float(expected_return_calibrator.realized_alpha_std),
-                    'allocation_expected_return_calibration_method': str(expected_return_calibrator.method),
-                    'allocation_expected_return_calibration_rows': int(expected_return_calibrator.sample_count),
-                    'allocation_expected_return_mean': float(expected_return_calibrator.realized_return_mean),
-                    'allocation_expected_return_std': float(expected_return_calibrator.realized_return_std),
-                })
-            margin_details.append(margin_detail)
-            report(
-                fold_base + fold_span,
-                f'Run {run_index}/{repetitions} — fold {fold_position}/{total_folds} completed',
-                repetition,
-            )
-            emit_detail(
-                run_index=run_index,
-                run_count=repetitions,
-                fold_index=fold_position,
-                fold_count=total_folds,
-                phase='Fold completed',
-                trained_models=total_models,
-                total_models=total_models,
-                device=effective_device.upper(),
-            )
-            technical(
-                f'event=fold_complete run={run_index}/{repetitions} '
-                f'fold={fold_position}/{total_folds} fold_id={fold_id} '
-                f'device={effective_device}'
-            )
-
-        report(
-            run_base + run_span * 0.94,
-            f'Run {run_index}/{repetitions} — simulating out-of-sample portfolio',
-            repetition,
-        )
-        emit_detail(
-            run_index=run_index,
-            run_count=repetitions,
-            fold_index=total_folds,
-            fold_count=total_folds,
-            phase='Out-of-sample simulation',
-            trained_models=total_models,
-            total_models=total_models,
-            device=effective_device.upper(),
-        )
-        technical(
-            f'event=simulation_start run={run_index}/{repetitions} '
-            f'decision_sessions={max(0, len(all_decision_dates) - 1)}'
-        )
-        if allocation_execution_enabled(rep_config):
-            scheduled = _scheduled_allocation_policy(policies, decision_to_fold)
-            result = _simulate_optimized_allocation(
-                'xgboost_utility',
-                scheduled,
-                frames,
-                symbols,
-                all_decision_dates,
-                rep_config,
-                fee_calculator,
-                slippage,
-                decision_metadata=decision_metadata,
-                policy_decision_diagnostics=decision_diagnostics,
-                trade_callback=trade_wrapper(seed, run_index),
-            )
-        else:
-            scheduled = _scheduled_policy(policies, decision_to_fold)
-            result = _simulate_exact(
-                'xgboost_utility',
-                scheduled,
-                frames,
-                symbols,
-                all_decision_dates,
-                rep_config,
-                fee_calculator,
-                slippage,
-                decision_metadata=decision_metadata,
-                policy_decision_diagnostics=decision_diagnostics,
-                trade_callback=trade_wrapper(seed, run_index),
-            )
-        unique_backend = backend_id(seed)
-        result.backend = unique_backend
-        result.metrics['backend'] = unique_backend
-        result.metrics['model_family'] = 'xgboost_utility'
-        result.metrics['champion_fold_schedule_locked'] = True
-        result.metrics['champion_oos_start'] = folds[0]['test_start']
-        result.metrics['requested_analysis_start'] = pd.Timestamp(all_decision_dates[1])
-        result.metrics['requested_analysis_end'] = pd.Timestamp(all_decision_dates[-1])
-        result.metrics['random_seed'] = seed
-        result.metrics['repetition_index'] = run_index
-        result.metrics['repetition_count'] = repetitions
-        result.metrics['strategy_label'] = 'XGBoost Utility' + (
-            f' · seed {seed}' if repetitions > 1 else ''
-        )
-        fold_metrics = _fold_performance(
-            result.predictions,
-            folds,
-            float(rep_config.initial_capital),
-        )
-        margin_by_fold = {item['fold_id']: item for item in margin_details}
-        for item in fold_metrics:
-            item.update(margin_by_fold.get(item['fold_id'], {}))
-        effective_values = [item['effective_switch_margin'] for item in margin_details]
-        candidate_values = [item['calibrated_candidate_margin'] for item in margin_details]
-        result.metrics.update({
-            'walk_forward_fold_count': len(folds),
-            'walk_forward_folds': fold_metrics,
-            'calibrated_candidate_margin_mean': float(np.mean(candidate_values)),
-            'effective_switch_margin_mean': float(np.mean(effective_values)),
-            'effective_switch_margin_min': float(np.min(effective_values)),
-            'effective_switch_margin_max': float(np.max(effective_values)),
-            'calibrated_switch_margin': float(np.mean(candidate_values)),
-            'effective_switch_margin': float(np.mean(effective_values)),
-            'requested_accelerator': xgb_plan.requested,
-            'effective_compute_device': effective_device,
-            'cuda_available': xgb_plan.cuda_available,
-            'gpu_name': xgb_plan.gpu_name,
-            'framework_version': xgb_plan.framework_version,
-            'cuda_build': xgb_plan.cuda_build,
-            'cpu_fallback_used': bool(xgb_plan.fallback_used or fallback_reasons),
-            'compute_fallback_reason': (
-                fallback_reasons[-1] if fallback_reasons else xgb_plan.fallback_reason
-            ),
-            'deterministic_execution': bool(rep_config.deterministic_execution),
-            'numeric_thread_limit': int(rep_config.numeric_thread_limit),
-            'xgb_n_jobs': int(rep_config.xgb_n_jobs),
-            'decision_diagnostics_schema_version': (
-                11 if compound_risk_overlay_enabled(rep_config)
-                else 10 if concentrated_allocation_enabled(rep_config)
-                else 9 if portfolio_allocation_enabled(rep_config)
-                else 8 if absolute_utility_cash_gate_enabled(rep_config)
-                else 7 if opportunity_cash_gate_enabled(rep_config)
-                else 5 if selective_opportunity_enabled(rep_config)
-                else 3 if _risk_off_enabled(rep_config)
-                else 2
-            ),
-            'position_risk_diagnostics_schema_version': 1,
-            'market_regime_diagnostics_schema_version': 1,
-            'decision_diagnostics_rows': int(len(decision_diagnostics)),
-            'position_risk_diagnostics_rows': int(
-                result.predictions.get('position_risk_diagnostics_schema_version', pd.Series(dtype=float)).notna().sum()
-            ),
-            'market_regime_diagnostics_rows': int(
-                result.predictions.get('market_regime_diagnostics_schema_version', pd.Series(dtype=float)).notna().sum()
-            ),
-            'decision_diagnostics_rotation_rows': int(sum(
-                bool(item.get('decision_is_rotation')) for item in decision_diagnostics.values()
-            )),
-            'decision_diagnostics_hold_rows': int(sum(
-                str(item.get('decision_reason') or '').startswith(('HOLD_', 'SWITCH_MARGIN_', 'MIN_HOLD_'))
-                for item in decision_diagnostics.values()
-            )),
-        })
-        result.summary += '\n\nROBUSTNESS / COMPUTE\n'
-        result.summary += f'Seed: {seed}\n'
-        result.summary += f'Repetition: {run_index}/{repetitions}\n'
-        result.summary += f'Compute device: {effective_device.upper()}\n'
-        result.summary += f'Deterministic execution: {bool(rep_config.deterministic_execution)}\n'
-        result.summary += f'XGBoost workers: {int(rep_config.xgb_n_jobs)}\n'
-        result.summary += f'Numeric thread limit: {int(rep_config.numeric_thread_limit)}\n'
-        if fallback_reasons:
-            result.summary += f'Fallback: {fallback_reasons[-1]}\n'
-        results.append(result)
-        technical(
-            f'event=run_complete run={run_index}/{repetitions} seed={seed} '
-            f'device={effective_device} rotations={result.metrics.get("capital_rotations")} '
-            f'ending_capital={result.metrics.get("strategy_ending_capital")}'
-        )
-        report(
-            run_index / repetitions,
-            f'XGBoost Utility run {run_index}/{repetitions} completed',
-            run_index,
-        )
-        emit_detail(
-            run_index=run_index,
-            run_count=repetitions,
-            fold_index=total_folds,
-            fold_count=total_folds,
-            phase='Run completed',
-            trained_models=total_models,
-            total_models=total_models,
-            device=effective_device.upper(),
-        )
-    results.sort(key=lambda result: int(result.metrics.get('repetition_index', 1)))
-    technical(f'event=walk_forward_complete runs={repetitions} results={len(results)}')
-    return results
 
 def run_rotation_models(
     bars_by_symbol: dict[str, pd.DataFrame],
@@ -3164,18 +2391,9 @@ def run_rotation_models(
 
 
 
-    model_family = str(getattr(config, 'research_model_family', 'xgboost_utility'))
+    model_family = str(getattr(config, 'research_model_family', 'lightgbm_utility'))
     if model_family == 'xgboost_utility':
-        return _run_xgboost_rotation_models(
-            bars_by_symbol,
-            config,
-            fee_calculator,
-            slippage,
-            progress_callback=progress_callback,
-            trade_callback=trade_callback,
-            progress_detail_callback=progress_detail_callback,
-            technical_log_callback=technical_log_callback,
-        )
+        raise ValueError('XGBoost Utility was retired in API v8.0.0. Use LightGBM Utility.')
     from .research_challengers import run_research_challenger
     return run_research_challenger(
         model_family,

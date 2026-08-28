@@ -260,7 +260,7 @@ class BacktestExecutionRequest(BacktestRequest):
     calendar_anchor_assets: list[str]
     research_reference_assets: list[str] = Field(default_factory=list)
     research_candidate_assets: list[str] = Field(default_factory=list)
-    research_model_family: ResearchModelFamily = "xgboost_utility"
+    research_model_family: ResearchModelFamily = "lightgbm_utility"
     research_model_settings: dict[str, object] = Field(default_factory=dict)
     research_market_data_mode: ResearchMarketDataMode = "database_only"
     expected_market_data_signature_sha256: str | None = None

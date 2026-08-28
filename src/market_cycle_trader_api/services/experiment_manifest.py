@@ -45,7 +45,6 @@ def build_experiment_manifest(
         "engine_source_sha256": metrics.get("engine_source_sha256"),
         "package_source_sha256": metrics.get("package_source_sha256"),
         "runtime_versions": metrics.get("runtime_versions") or {},
-        "xgboost_build_info": metrics.get("xgboost_build_info"),
         "numeric_thread_environment": metrics.get("numeric_thread_environment"),
         "threadpool_runtime": metrics.get("threadpool_runtime"),
         "deployment_runtime": metrics.get("deployment_runtime"),

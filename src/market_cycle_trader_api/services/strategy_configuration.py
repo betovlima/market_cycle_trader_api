@@ -251,7 +251,7 @@ def _replace_configuration(
         "updated_at": now,
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "revision": next_revision,
-        "configuration_name": "api-managed-xgboost-strategy",
+        "configuration_name": "api-managed-utility-strategy",
         "configuration_note": note,
         "bootstrap_source": source,
     }

@@ -989,7 +989,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
     _append_log(
         db,
         run_id,
-        "Refreshing completed daily data and training the locked XGBoost decision during the mandatory pre-market window.",
+        "Refreshing completed daily data and training the locked LightGBM decision during the mandatory pre-market window.",
     )
     try:
         existing = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
@@ -1055,7 +1055,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                     "winner_assets_count": len(plan["winner_assets"]),
                     "updated_at": completed_at,
                     "last_message": (
-                        f"Post-close XGBoost calibration prepared: action={plan['action']}, target={plan['target_asset']}."
+                        f"Post-close LightGBM calibration prepared: action={plan['action']}, target={plan['target_asset']}."
                     ),
                 },
                 "$unset": {
@@ -1067,7 +1067,7 @@ def _prepare_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
                 "$push": {
                     "logs": {
                         "$each": [
-                            f"{completed_at.isoformat()} — Post-close XGBoost calibration prepared: action={plan['action']}, target={plan['target_asset']}."
+                            f"{completed_at.isoformat()} — Post-close LightGBM calibration prepared: action={plan['action']}, target={plan['target_asset']}."
                         ],
                         "$slice": -100,
                     }
@@ -1366,7 +1366,7 @@ def _rearm_prepared_run_for_premarket_analysis(
                 "updated_at": now,
                 "next_retry_at": now,
                 "last_message": (
-                    "A plan created before the mandatory pre-market policy was discarded; current data will be refreshed and XGBoost retrained before the next open."
+                    "A plan created before the mandatory pre-market policy was discarded; current data will be refreshed and LightGBM retrained before the next open."
                 ),
             },
             "$unset": {

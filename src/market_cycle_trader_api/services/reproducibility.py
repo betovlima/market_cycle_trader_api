@@ -86,16 +86,6 @@ def _git_commit() -> str | None:
     return None
 
 
-def _xgboost_build_info() -> dict[str, Any] | None:
-    try:
-        import xgboost as xgb
-
-        info = xgb.build_info()
-        return _json_safe(info) if isinstance(info, dict) else {"value": str(info)}
-    except Exception:
-        return None
-
-
 def _threadpool_runtime() -> list[dict[str, Any]]:
     try:
         from threadpoolctl import threadpool_info
@@ -143,7 +133,6 @@ def runtime_versions() -> dict[str, Any]:
         "railway_environment_id": os.getenv("RAILWAY_ENVIRONMENT_ID"),
         "container_image_digest": image_digest,
     }
-    xgb_build = _xgboost_build_info()
     threadpools = _threadpool_runtime()
     runtime = {
         "api_version": API_VERSION,
@@ -160,10 +149,8 @@ def runtime_versions() -> dict[str, Any]:
         "release": platform.release(),
         "machine": platform.machine(),
         "processor": platform.processor() or None,
-        "xgboost": _package_version("xgboost"),
         "lightgbm": _package_version("lightgbm"),
         "torch": _package_version("torch"),
-        "xgboost_build_info": xgb_build,
         "scikit_learn": _package_version("scikit-learn"),
         "numpy": _package_version("numpy"),
         "pandas": _package_version("pandas"),
@@ -350,15 +337,13 @@ def build_reproducibility_manifest(
         "git_commit": versions.get("git_commit"),
         "engine_source_sha256": versions.get("engine_source_sha256"),
         "package_source_sha256": versions.get("package_source_sha256"),
-        "xgboost_build_info": versions.get("xgboost_build_info"),
         "numeric_thread_environment": versions.get("numeric_thread_environment"),
         "threadpool_runtime": versions.get("threadpool_runtime"),
         "deployment_runtime": versions.get("deployment"),
         "python_version": versions.get("python"),
-        "xgboost_version": versions.get("xgboost"),
         "lightgbm_version": versions.get("lightgbm"),
         "torch_version": versions.get("torch"),
-        "research_model_family": str(getattr(config, "research_model_family", "xgboost_utility")),
+        "research_model_family": str(getattr(config, "research_model_family", "lightgbm_utility")),
         "research_model_settings": getattr(config, "research_model_settings", {}) or {},
         "scikit_learn_version": versions.get("scikit_learn"),
         "numpy_version": versions.get("numpy"),
@@ -367,7 +352,6 @@ def build_reproducibility_manifest(
         "threadpoolctl_version": versions.get("threadpoolctl"),
         "deterministic_execution": bool(config.deterministic_execution),
         "numeric_thread_limit": int(config.numeric_thread_limit),
-        "xgb_n_jobs": int(config.xgb_n_jobs),
         "alpaca_historical_feed": str(config.alpaca_historical_feed),
         "alpaca_live_feed": str(config.alpaca_live_feed),
         "alpaca_adjustment": str(config.alpaca_adjustment),

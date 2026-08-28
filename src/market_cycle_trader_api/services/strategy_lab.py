@@ -276,22 +276,8 @@ STRATEGY_PARAMETER_GROUPS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "model",
-        "label": "XGBoost",
+        "label": "Execution",
         "fields": (
-            "rotation_models",
-            "rotation_xgb_n_estimators",
-            "rotation_xgb_learning_rate",
-            "rotation_xgb_max_depth",
-            "rotation_accelerator",
-            "rotation_allow_cpu_fallback",
-            "rotation_xgb_repetitions",
-            "rotation_seed_step",
-            "xgb_min_child_weight",
-            "xgb_subsample",
-            "xgb_colsample_bytree",
-            "xgb_reg_alpha",
-            "xgb_reg_lambda",
-            "xgb_n_jobs",
             "deterministic_execution",
             "numeric_thread_limit",
             "random_state",
@@ -534,8 +520,8 @@ def _resolved_strategy_model_snapshot(db: Any, document: dict[str, Any]) -> dict
         legacy["source"] = "legacy_strategy_owned"
         return legacy
 
-    settings = execution_settings_for(db, "xgboost_utility")
-    resolved = model_execution_snapshot("xgboost_utility", settings)
+    settings = execution_settings_for(db, "lightgbm_utility")
+    resolved = model_execution_snapshot("lightgbm_utility", settings)
     resolved["source"] = "default_strategy_binding"
     return resolved
 
@@ -602,7 +588,7 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
             "strategy_kind": strategy_kind,
             "model_family": model_family,
         }
-    if model_family not in {"xgboost_utility", "lightgbm_utility"}:
+    if model_family != "lightgbm_utility":
         return {
             "eligible": False,
             "code": "unsupported_live_model",
@@ -1853,6 +1839,8 @@ def update_strategy_model(
 
 
     ensure_strategy_catalog(db)
+    if model_family == "xgboost_utility":
+        raise StrategyLabConflict("XGBoost Utility was retired in API v8.0.0. Save LightGBM Utility instead.")
     _assert_strategy_not_under_model_tuning(db, strategy_id)
     current = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if current is None:
@@ -2307,7 +2295,7 @@ def mark_strategy_as_candidate(
         )
     completed_job_id = str(completed_job.get("id") or "")
     completed_family = str(candidate_model_snapshot.get("family") or "")
-    if completed_family not in {"xgboost_utility", "lightgbm_utility"}:
+    if completed_family != "lightgbm_utility":
         raise StrategyLabConflict("The certified Backtest model is not supported by the installed protected live Trader engine.")
     if not _same_model_values(candidate_model_snapshot, bound_model_snapshot):
         raise StrategyLabConflict(
@@ -2660,7 +2648,7 @@ def promote_strategy_to_trader(
     if stored_hash and stored_hash != configuration_hash:
         raise StrategyLabConflict("Strategy configuration hash does not match its saved revision.")
     winner_model_snapshot = _resolved_strategy_model_snapshot(db, source)
-    if str(winner_model_snapshot.get("family") or "") not in {"xgboost_utility", "lightgbm_utility"}:
+    if str(winner_model_snapshot.get("family") or "") != "lightgbm_utility":
         raise StrategyLabConflict("The Strategy model is not supported by the installed protected live Trader engine.")
 
     policy_snapshot = deepcopy(source.get("temporal_policy_snapshot") or {}) if isinstance(source.get("temporal_policy_snapshot"), dict) else None
@@ -3073,7 +3061,7 @@ def mark_strategy_backtest(
     strategy_revision: int | None,
     job_id: str,
     status: str,
-    research_model_family: str = "xgboost_utility",
+    research_model_family: str = "lightgbm_utility",
     research_model_settings: dict[str, Any] | None = None,
 ) -> None:
     if not strategy_id or not strategy_revision:

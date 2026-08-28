@@ -129,12 +129,6 @@ def emit_progress_detail(detail: dict[str, Any]) -> None:
     )
 
 
-def emit_xgboost_technical(message: str) -> None:
-    safe_message = str(message).replace("\n", " ").replace("\r", " ").strip()
-    if safe_message:
-        print(f"XGB_TECH|{safe_message}", flush=True)
-
-
 def emit_research_technical(message: str) -> None:
     safe_message = str(message).replace("\n", " ").replace("\r", " ").strip()
     if safe_message:
@@ -214,7 +208,6 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "gpu_name",
         "deterministic_execution",
         "numeric_thread_limit",
-        "xgb_n_jobs",
         "lightgbm_version",
         "lightgbm_settings_revision",
         "lightgbm_profile_id",
@@ -227,7 +220,6 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "market_data_incomplete_assets",
         "market_data_backfilled_assets",
         "python_version",
-        "xgboost_version",
         "scikit_learn_version",
         "numpy_version",
         "pandas_version",
@@ -317,11 +309,7 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         progress_callback=emit_progress,
         trade_callback=emit_trade,
         progress_detail_callback=emit_progress_detail,
-        technical_log_callback=(
-            emit_xgboost_technical
-            if str(getattr(config, "research_model_family", "xgboost_utility")) == "xgboost_utility"
-            else emit_research_technical
-        ),
+        technical_log_callback=emit_research_technical,
     )
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
@@ -342,13 +330,11 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
             f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
         )
         result.summary += f"Python: {reproducibility.get('python_version')}\n"
-        model_family = str(getattr(config, "research_model_family", "xgboost_utility"))
+        model_family = str(getattr(config, "research_model_family", "lightgbm_utility"))
         if model_family == "lightgbm_utility":
             result.summary += f"LightGBM: {reproducibility.get('lightgbm_version')}\n"
         elif model_family == "iqn":
             result.summary += f"PyTorch: {reproducibility.get('torch_version')}\n"
-        else:
-            result.summary += f"XGBoost: {reproducibility.get('xgboost_version')}\n"
         emit_progress(
             92.0 + 6.0 * ((result_position - 1) / total_results),
             f"Saving {result.metrics.get('strategy_label', result.backend)} results to MongoDB",
@@ -386,9 +372,8 @@ def main() -> None:
         print("Local simulation only. No broker order will be created.", flush=True)
         print(f"Assets: {', '.join(config.assets)}", flush=True)
         print(f"Strategy: {config.strategy_mode}", flush=True)
-        model_family = str(getattr(config, "research_model_family", "xgboost_utility"))
+        model_family = str(getattr(config, "research_model_family", "lightgbm_utility"))
         model_label = {
-            "xgboost_utility": "XGBoost Utility",
             "lightgbm_utility": "LightGBM Utility",
             "iqn": "IQN",
         }.get(model_family, model_family)

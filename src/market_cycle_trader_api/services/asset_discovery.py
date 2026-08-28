@@ -242,6 +242,73 @@ def _event(db: Database, run_id: str, message: str, *, phase: str | None = None,
     )
 
 
+def _set_stage_progress(
+    db: Database,
+    run_id: str,
+    *,
+    step: str,
+    percent: float | None,
+    label: str,
+    current: int | None = None,
+    total: int | None = None,
+) -> None:
+    changes: dict[str, Any] = {
+        "progress_step": str(step or "")[:80],
+        "stage_progress_percent": None if percent is None else round(max(0.0, min(100.0, float(percent))), 1),
+        "current_stage": str(label or "")[:240],
+        "stage_current": int(current) if current is not None else None,
+        "stage_total": int(total) if total is not None else None,
+        "updated_at": utc_now(),
+    }
+    db[COLLECTION].update_one(
+        {"_id": CURRENT_ID, "run_id": run_id},
+        {"$set": bson_value(changes)},
+    )
+
+
+def _ranker_progress_callback(db: Database, run_id: str) -> Any:
+    last_percent = [-1.0]
+    last_step = [""]
+
+    def emit(percent: float, step: str) -> None:
+        rounded = round(max(0.0, min(100.0, float(percent or 0.0))), 1)
+        safe_step = str(step or "ranker_fit")[:80]
+        if safe_step == last_step[0] and rounded < 100.0 and rounded - last_percent[0] < 1.0:
+            return
+        last_percent[0] = rounded
+        last_step[0] = safe_step
+        current = None
+        total = None
+        label = "Training Learning-to-Rank"
+        if safe_step == "training_dataset":
+            label = "Preparing Learning-to-Rank training dataset"
+        elif safe_step.startswith("walk_forward:"):
+            parts = safe_step.split(":")
+            if len(parts) == 3:
+                try:
+                    current = int(parts[1])
+                    total = int(parts[2])
+                except ValueError:
+                    current = None
+                    total = None
+            label = "Running purged walk-forward validation"
+        elif safe_step == "final_refit":
+            label = "Refitting final Learning-to-Rank model"
+        elif safe_step == "ranker_completed":
+            label = "Learning-to-Rank training completed"
+        _set_stage_progress(
+            db,
+            run_id,
+            step=safe_step.split(":", 1)[0],
+            percent=rounded,
+            label=label,
+            current=current,
+            total=total,
+        )
+
+    return emit
+
+
 def _increment(db: Database, run_id: str, values: dict[str, int]) -> None:
     db[COLLECTION].update_one(
         {"_id": CURRENT_ID, "run_id": run_id},
@@ -798,7 +865,9 @@ def _marginal_execution_request(
     candidate_assets: list[str],
 ) -> BacktestExecutionRequest:
     snapshot = get_strategy_model_snapshot(db, str(strategy.get("id") or ""))
-    family = str(snapshot.get("family") or "xgboost_utility")
+    family = str(snapshot.get("family") or "lightgbm_utility")
+    if family != "lightgbm_utility":
+        raise RuntimeError("Asset Discovery requires a LightGBM Utility Strategy; XGBoost was retired in API v8.0.0.")
     settings = dict(snapshot.get("settings_snapshot") or {}) if isinstance(snapshot.get("settings_snapshot"), dict) else {}
     locked = base_config.model_copy(update={"assets": assets, "end_date": end_session})
     locked = apply_training_runtime_settings(db, locked)
@@ -875,6 +944,11 @@ def _marginal_progress_callback(
                 "marginal_replay.current_index": int(current_index),
                 "marginal_replay.completed_count": int(completed_count),
                 "marginal_replay.current_stage": safe_stage,
+                "progress_step": "marginal_replay",
+                "stage_progress_percent": rounded,
+                "current_stage": safe_stage or "Running Marginal Capital Replay",
+                "stage_current": int(current_index),
+                "stage_total": max(0, int(total_runs) - 1),
             }},
         )
 
@@ -1310,6 +1384,11 @@ def _finish(db: Database, run_id: str, status: str, message: str, *, results: li
         "message": message,
         "worker_active": False,
         "worker_finished_at": utc_now(),
+        "stage_progress_percent": 100.0 if status == "completed" else None,
+        "progress_step": "completed" if status == "completed" else status,
+        "current_stage": "Asset Discovery completed" if status == "completed" else message,
+        "stage_current": None,
+        "stage_total": None,
     }
     if results is not None:
         changes["results"] = results
@@ -1341,7 +1420,21 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         document = _campaign(db) or {}
         requested = int(document.get("research_size") or 24)
         seed = int(document.get("random_seed") or 0)
-        _event(db, run_id, "Loading the Strategy Research baseline.", phase="baseline", changes={"status": "running", "started_at": utc_now()})
+        _event(
+            db,
+            run_id,
+            "Loading the Strategy Research baseline.",
+            phase="baseline",
+            changes={
+                "status": "running",
+                "started_at": utc_now(),
+                "progress_step": "baseline",
+                "stage_progress_percent": 0.0,
+                "current_stage": "Preparing Strategy Research baseline",
+                "stage_current": None,
+                "stage_total": None,
+            },
+        )
         config, strategy = get_research_strategy_context(db)
         winner_config, winner_strategy = get_trader_winner_context(db)
         _event(
@@ -1349,6 +1442,13 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
             run_id,
             "Synchronizing the Strategy Research market-data cache before freezing the Discovery snapshot.",
             phase="baseline_sync",
+            changes={
+                "progress_step": "baseline_sync",
+                "stage_progress_percent": None,
+                "current_stage": "Synchronizing Strategy Research market data",
+                "stage_current": None,
+                "stage_total": None,
+            },
         )
         baseline_sync = refresh_market_data_to_live_cutoff(config)
         end_session = str(baseline_sync.get("live_market_cutoff") or "").strip()
@@ -1386,6 +1486,11 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                     "asset_count": len(winner_config.assets),
                     "assets": list(winner_config.assets),
                 },
+                "progress_step": "training_dataset",
+                "stage_progress_percent": 0.0,
+                "current_stage": "Preparing Learning-to-Rank training dataset",
+                "stage_current": None,
+                "stage_total": None,
             },
         )
         required_sessions = _baseline_required_sessions(baseline_frames, config, safe_session)
@@ -1394,6 +1499,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 baseline_frames,
                 random_state=seed,
                 stop_check=lambda: _should_stop_after_batch(db, run_id),
+                progress_callback=_ranker_progress_callback(db, run_id),
             )
         except AssetDiscoveryRankerCancelled:
             _finish(
@@ -1404,7 +1510,20 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 results=[],
             )
             return
-        _event(db, run_id, "Learning-to-Rank training completed.", phase="scanning", changes={"model": bundle.diagnostics})
+        _event(
+            db,
+            run_id,
+            "Learning-to-Rank training completed.",
+            phase="scanning",
+            changes={
+                "model": bundle.diagnostics,
+                "progress_step": "external_scan",
+                "stage_progress_percent": 0.0,
+                "current_stage": "Preparing external asset scan",
+                "stage_current": 0,
+                "stage_total": requested,
+            },
+        )
         if _should_stop_after_batch(db, run_id):
             _finish(db, run_id, "stopped", "Asset Discovery stopped after Learning-to-Rank training and before the first external batch.", results=[])
             return
@@ -1427,6 +1546,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
             return
 
         evaluated: list[dict[str, Any]] = []
+        scan_completed = 0
         for batch_index, batch_start in enumerate(range(0, len(selected), BATCH_SIZE), start=1):
             batch = selected[batch_start: batch_start + BATCH_SIZE]
             _event(
@@ -1471,6 +1591,17 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                             _increment(db, run_id, {"attempted_count": 1, "technical_failure_count": 1})
                     except Exception:
                         _increment(db, run_id, {"attempted_count": 1, "technical_failure_count": 1})
+                    finally:
+                        scan_completed += 1
+                        _set_stage_progress(
+                            db,
+                            run_id,
+                            step="external_scan",
+                            percent=(100.0 * scan_completed / max(1, scan_budget)),
+                            label="Scanning external assets",
+                            current=scan_completed,
+                            total=scan_budget,
+                        )
 
             if _should_stop_after_batch(db, run_id):
                 _finish(
@@ -1490,8 +1621,17 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
             run_id,
             f"Fast scan ranked {len(ranked_fast)} assets. Validating complete walk-forward history only in ranking order until {min(8, len(ranked_fast))} adherent assets are found.",
             phase="scanning",
-            changes={"fast_evaluated_count": len(ranked_fast), "adherence_validated_count": 0},
+            changes={
+                "fast_evaluated_count": len(ranked_fast),
+                "adherence_validated_count": 0,
+                "progress_step": "adherence_validation",
+                "stage_progress_percent": 0.0,
+                "current_stage": "Validating shortlist adherence",
+                "stage_current": 0,
+                "stage_total": len(ranked_fast),
+            },
         )
+        adherence_checked = 0
         for ranked_item in ranked_fast:
             if len(shortlist) >= 8:
                 break
@@ -1514,6 +1654,18 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
             except Exception:
                 _increment(db, run_id, {"technical_failure_count": 1})
 
+            adherence_checked += 1
+            adherence_complete = len(shortlist) >= 8 or adherence_checked >= len(ranked_fast)
+            _set_stage_progress(
+                db,
+                run_id,
+                step="adherence_validation",
+                percent=100.0 if adherence_complete else (100.0 * adherence_checked / max(1, len(ranked_fast))),
+                label="Validating shortlist adherence",
+                current=adherence_checked,
+                total=len(ranked_fast),
+            )
+
             if _should_stop_after_batch(db, run_id):
                 _finish(
                     db,
@@ -1530,7 +1682,15 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 run_id,
                 f"Asset Discovery fast-ranked {len(evaluated)} evaluable external assets; {len(shortlist)} passed full-history adherence and will enter Marginal Capital Replay.",
                 phase="marginal_replay",
-                changes={"results": [], "shortlisted_count": len(shortlist)},
+                changes={
+                    "results": [],
+                    "shortlisted_count": len(shortlist),
+                    "progress_step": "marginal_replay",
+                    "stage_progress_percent": 0.0,
+                    "current_stage": "Preparing Marginal Capital Replay",
+                    "stage_current": 0,
+                    "stage_total": len(shortlist),
+                },
             )
             shortlist, marginal_replay = _run_marginal_capital_replay(
                 db,
@@ -1717,6 +1877,11 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
             "current_symbol": None,
             "current_batch": 0,
             "message": "Manual Asset Discovery campaign queued.",
+            "progress_step": "queued",
+            "stage_progress_percent": 0.0,
+            "current_stage": "Asset Discovery queued",
+            "stage_current": None,
+            "stage_total": None,
         }
         db[COLLECTION].replace_one({"_id": CURRENT_ID}, bson_value(document), upsert=True)
         _worker_thread = threading.Thread(target=_run_worker, args=(db, run_id, worker_id), name="asset-discovery-ranker", daemon=True)
