@@ -249,7 +249,7 @@ def build_analysis(
             "balanced_accuracy": float(balanced_accuracy_score(truth, prediction)),
             "positive_rate": float(truth.mean()) if len(truth) else None,
         }
-        fit_diagnostics = assess_binary_fit(training_metrics, validation_metrics, oos_metrics)
+        fit_diagnostics = assess_binary_fit(training_metrics, validation_metrics, oos_metrics, evaluation_level="session")
         fold_reports.append({
             "fold_id": int(test_fold),
             "train_rows": int(len(train)),

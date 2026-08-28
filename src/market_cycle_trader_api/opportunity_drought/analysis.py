@@ -318,8 +318,8 @@ def build_analysis(
             validation_metric_value=threshold_score,
         )
         fit_diagnostics = {
-            "session": assess_binary_fit(training_session_metrics, validation_session_metrics, oos_session_metrics),
-            "monthly": assess_binary_fit(training_monthly_metrics, validation_monthly_metrics, oos_monthly_metrics),
+            "session": assess_binary_fit(training_session_metrics, validation_session_metrics, oos_session_metrics, evaluation_level="session"),
+            "monthly": assess_binary_fit(training_monthly_metrics, validation_monthly_metrics, oos_monthly_metrics, evaluation_level="monthly"),
         }
         fold_reports.append({
             "fold_id": int(test_fold),
