@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re
+import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -35,7 +37,13 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     get_alpaca_credentials,
 )
-from .asset_discovery_ranker import FEATURE_COLUMNS, latest_feature_snapshot, market_quality, train_ranker
+from .asset_discovery_ranker import (
+    FEATURE_COLUMNS,
+    AssetDiscoveryRankerCancelled,
+    latest_feature_snapshot,
+    market_quality,
+    train_ranker,
+)
 from ..engine.capital_rotation import run_rotation_models
 from ..engine.compound_rotation_backtest import apply_slippage, calculate_reference_fees
 from .model_research import apply_execution_profile
@@ -61,6 +69,10 @@ ACTIVE_STATUSES = frozenset({"queued", "running", "stopping"})
 TICKER_IDENTITY_GAP_SESSIONS = 20
 MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE = 0.0
 DEFAULT_SEVERE_MONTH_THRESHOLD = -0.05
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+WORKER_HEARTBEAT_STALE_SECONDS = 20.0
+
+logger = logging.getLogger(__name__)
 
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
@@ -176,6 +188,37 @@ def _worker_alive() -> bool:
         return bool(_worker_thread and _worker_thread.is_alive())
 
 
+def _utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _worker_heartbeat_fresh(document: dict[str, Any] | None) -> bool:
+    if not isinstance(document, dict):
+        return False
+    heartbeat = _utc_datetime(document.get("worker_heartbeat_at"))
+    if heartbeat is None:
+        return False
+    return max(0.0, (utc_now() - heartbeat).total_seconds()) <= WORKER_HEARTBEAT_STALE_SECONDS
+
+
+def _heartbeat_worker(db: Database, run_id: str, worker_id: str, stop_event: threading.Event) -> None:
+    while not stop_event.wait(WORKER_HEARTBEAT_INTERVAL_SECONDS):
+        now = utc_now()
+        result = db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "status": {"$in": list(ACTIVE_STATUSES)}},
+            {"$set": {
+                "worker_id": worker_id,
+                "worker_active": True,
+                "worker_heartbeat_at": now,
+                "updated_at": now,
+            }},
+        )
+        if int(getattr(result, "matched_count", 0) or 0) == 0:
+            return
+
+
 def _event(db: Database, run_id: str, message: str, *, phase: str | None = None, changes: dict[str, Any] | None = None) -> None:
     update: dict[str, Any] = {
         "$set": {"updated_at": utc_now()},
@@ -191,6 +234,12 @@ def _event(db: Database, run_id: str, message: str, *, phase: str | None = None,
     if changes:
         update["$set"].update(bson_value(changes))
     db[COLLECTION].update_one({"_id": CURRENT_ID, "run_id": run_id}, update)
+    logger.info(
+        "asset_discovery_event run_id=%s phase=%s message=%s",
+        run_id,
+        phase or "",
+        str(message)[:500],
+    )
 
 
 def _increment(db: Database, run_id: str, values: dict[str, int]) -> None:
@@ -1259,6 +1308,8 @@ def _finish(db: Database, run_id: str, status: str, message: str, *, results: li
         "completed_at": utc_now(),
         "current_symbol": None,
         "message": message,
+        "worker_active": False,
+        "worker_finished_at": utc_now(),
     }
     if results is not None:
         changes["results"] = results
@@ -1277,7 +1328,15 @@ def _should_stop_after_batch(db: Database, run_id: str) -> bool:
     return str(document.get("run_id") or "") != run_id or bool(document.get("cancel_requested"))
 
 
-def _run_worker(db: Database, run_id: str) -> None:
+def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_worker,
+        args=(db, run_id, worker_id, heartbeat_stop),
+        name="asset-discovery-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     try:
         document = _campaign(db) or {}
         requested = int(document.get("research_size") or 24)
@@ -1330,7 +1389,21 @@ def _run_worker(db: Database, run_id: str) -> None:
             },
         )
         required_sessions = _baseline_required_sessions(baseline_frames, config, safe_session)
-        bundle = train_ranker(baseline_frames, random_state=seed)
+        try:
+            bundle = train_ranker(
+                baseline_frames,
+                random_state=seed,
+                stop_check=lambda: _should_stop_after_batch(db, run_id),
+            )
+        except AssetDiscoveryRankerCancelled:
+            _finish(
+                db,
+                run_id,
+                "stopped",
+                "Asset Discovery stopped during Learning-to-Rank at a safe model checkpoint.",
+                results=[],
+            )
+            return
         _event(db, run_id, "Learning-to-Rank training completed.", phase="scanning", changes={"model": bundle.diagnostics})
         if _should_stop_after_batch(db, run_id):
             _finish(db, run_id, "stopped", "Asset Discovery stopped after Learning-to-Rank training and before the first external batch.", results=[])
@@ -1492,6 +1565,12 @@ def _run_worker(db: Database, run_id: str) -> None:
     except Exception as exc:
         _finish(db, run_id, "failed", f"Asset Discovery failed: {str(exc)[:900]}")
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "worker_id": worker_id},
+            {"$set": {"worker_active": False, "worker_finished_at": utc_now(), "updated_at": utc_now()}},
+        )
         global _worker_thread
         with _worker_lock:
             _worker_thread = None
@@ -1500,32 +1579,39 @@ def _run_worker(db: Database, run_id: str) -> None:
 def get_asset_discovery_status(db: Database) -> dict[str, Any]:
     document = _sanitize_completed_campaign_persistence(db, _campaign(db))
     document = _backfill_company_metadata(db, document)
-    if document and str(document.get("status") or "") in ACTIVE_STATUSES and not _worker_alive():
+    if document and str(document.get("status") or "") in ACTIVE_STATUSES and not _worker_heartbeat_fresh(document):
         phase = str(document.get("phase") or "").strip().lower()
+        stop_was_requested = bool(document.get("cancel_requested")) or str(document.get("status") or "") == "stopping"
         interrupted_marginal = phase == "marginal_replay"
         interrupted_full_validation = phase == "full_strategy_validation"
         changes: dict[str, Any] = {
-            "status": "interrupted",
-            "phase": phase if (interrupted_marginal or interrupted_full_validation) else "interrupted",
+            "status": "stopped" if stop_was_requested else "interrupted",
+            "phase": "stopped" if stop_was_requested else (phase if (interrupted_marginal or interrupted_full_validation) else "interrupted"),
             "message": (
-                "Marginal Capital Replay worker was interrupted. Run Marginal Capital Replay again to restart the replay."
-                if interrupted_marginal
+                "Asset Discovery stop completed; no active worker heartbeat remains."
+                if stop_was_requested
                 else (
-                    "Full Strategy validation was interrupted. Validate the exact selection again."
-                    if interrupted_full_validation
-                    else "The previous Asset Discovery worker is no longer active. Start a new manual campaign to continue research."
+                    "Marginal Capital Replay worker was interrupted. Run Marginal Capital Replay again to restart the replay."
+                    if interrupted_marginal
+                    else (
+                        "Full Strategy validation was interrupted. Validate the exact selection again."
+                        if interrupted_full_validation
+                        else "The previous Asset Discovery worker is no longer active. Start a new manual campaign to continue research."
+                    )
                 )
             ),
+            "worker_active": False,
+            "worker_finished_at": utc_now(),
             "completed_at": utc_now(),
             "updated_at": utc_now(),
         }
-        if interrupted_marginal:
+        if interrupted_marginal and not stop_was_requested:
             changes.update({
                 "marginal_replay.status": "interrupted",
                 "marginal_replay.current_symbol": None,
                 "marginal_replay.current_stage": "Replay interrupted",
             })
-        if interrupted_full_validation:
+        if interrupted_full_validation and not stop_was_requested:
             changes.update({
                 "full_strategy_validation.status": "interrupted",
                 "full_strategy_validation.current_stage": "Validation interrupted",
@@ -1578,17 +1664,27 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
         if _worker_thread and _worker_thread.is_alive():
             raise AssetDiscoveryConflict("An Asset Discovery campaign is already running.")
         if str(current.get("status") or "") in ACTIVE_STATUSES:
+            if _worker_heartbeat_fresh(current):
+                raise AssetDiscoveryConflict("An Asset Discovery campaign is already running.")
             db[COLLECTION].update_one(
                 {"_id": CURRENT_ID},
-                {"$set": {"status": "interrupted", "phase": "interrupted", "completed_at": utc_now(), "updated_at": utc_now()}},
+                {"$set": {
+                    "status": "interrupted",
+                    "phase": "interrupted",
+                    "worker_active": False,
+                    "completed_at": utc_now(),
+                    "updated_at": utc_now(),
+                }},
             )
 
         run_id = f"asset-discovery-{utc_now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:8]}"
+        worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         seed = int.from_bytes(uuid4().bytes[:4], "big")
+        now = utc_now()
         document = {
             "_id": CURRENT_ID,
             "run_id": run_id,
-            "schema_version": 1,
+            "schema_version": 2,
             "api_version": API_VERSION,
             "status": "queued",
             "phase": "queued",
@@ -1608,8 +1704,14 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
             "full_strategy_validation": {"status": "idle", "selected_assets": [], "decision": None},
             "events": [{"at": utc_now(), "message": "Manual Asset Discovery campaign queued."}],
             "cancel_requested": False,
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
+            "stop_requested_at": None,
+            "worker_id": worker_id,
+            "worker_active": True,
+            "worker_heartbeat_at": now,
+            "worker_started_at": now,
+            "worker_finished_at": None,
+            "created_at": now,
+            "updated_at": now,
             "started_at": None,
             "completed_at": None,
             "current_symbol": None,
@@ -1617,8 +1719,9 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
             "message": "Manual Asset Discovery campaign queued.",
         }
         db[COLLECTION].replace_one({"_id": CURRENT_ID}, bson_value(document), upsert=True)
-        _worker_thread = threading.Thread(target=_run_worker, args=(db, run_id), name="asset-discovery-ranker", daemon=True)
+        _worker_thread = threading.Thread(target=_run_worker, args=(db, run_id, worker_id), name="asset-discovery-ranker", daemon=True)
         _worker_thread.start()
+        logger.info("asset_discovery_started run_id=%s worker_id=%s research_size=%s", run_id, worker_id, requested)
     return get_asset_discovery_status(db)
 
 
@@ -1626,18 +1729,40 @@ def stop_asset_discovery(db: Database) -> dict[str, Any]:
     document = _campaign(db)
     if not document or str(document.get("status") or "") not in ACTIVE_STATUSES:
         return get_asset_discovery_status(db)
+    run_id = str(document.get("run_id") or "")
+    now = utc_now()
+    heartbeat_fresh = _worker_heartbeat_fresh(document)
+    logger.info(
+        "asset_discovery_stop_received run_id=%s status=%s phase=%s worker_id=%s heartbeat_fresh=%s local_worker_alive=%s",
+        run_id,
+        document.get("status"),
+        document.get("phase"),
+        document.get("worker_id"),
+        heartbeat_fresh,
+        _worker_alive(),
+    )
     db[COLLECTION].update_one(
-        {"_id": CURRENT_ID, "run_id": document.get("run_id")},
+        {"_id": CURRENT_ID, "run_id": run_id},
         {
             "$set": {
                 "cancel_requested": True,
                 "status": "stopping",
-                "message": "Stop requested. The current batch will finish before the campaign stops.",
-                "updated_at": utc_now(),
+                "stop_requested_at": now,
+                "message": "Stop requested. Active processing is being cancelled and no new batch will start.",
+                "updated_at": now,
             },
-            "$push": {"events": {"$each": [{"at": utc_now(), "message": "Stop requested; finishing the current batch."}], "$slice": -24}},
+            "$push": {"events": {"$each": [{"at": now, "message": "Stop requested; active processing will stop at the next safe checkpoint."}], "$slice": -24}},
         },
     )
+    logger.info("asset_discovery_stop_persisted run_id=%s worker_id=%s", run_id, document.get("worker_id"))
+    if not heartbeat_fresh:
+        _finish(
+            db,
+            run_id,
+            "stopped",
+            "Asset Discovery stop completed immediately because no active worker heartbeat remains.",
+            results=[],
+        )
     return get_asset_discovery_status(db)
 
 

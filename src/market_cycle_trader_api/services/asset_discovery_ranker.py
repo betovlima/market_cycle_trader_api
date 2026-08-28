@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import sqrt
-from typing import Any
+from typing import Any, Callable
+import time
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,13 @@ RANDOM_BASELINE_REPEATS = 24
 class RankerBundle:
     model: Any
     diagnostics: dict[str, Any]
+
+
+class AssetDiscoveryRankerCancelled(RuntimeError):
+    pass
+
+
+StopCheck = Callable[[], bool]
 
 
 def _clean_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -177,12 +185,32 @@ def _new_ranker(random_state: int) -> Any:
     )
 
 
-def _fit_ranker(dataset: pd.DataFrame, *, random_state: int) -> Any:
+def _fit_ranker(
+    dataset: pd.DataFrame,
+    *,
+    random_state: int,
+    stop_check: StopCheck | None = None,
+) -> Any:
     model = _new_ranker(random_state)
+    callbacks: list[Any] = []
+    if stop_check is not None:
+        last_poll = [0.0]
+
+        def cancellation_checkpoint(_: Any) -> None:
+            now = time.monotonic()
+            if now - last_poll[0] < 0.5:
+                return
+            last_poll[0] = now
+            if stop_check():
+                raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
+
+        callbacks.append(cancellation_checkpoint)
+
     model.fit(
         dataset[list(FEATURE_COLUMNS)],
         dataset["relevance"],
         group=_group_sizes(dataset),
+        callbacks=callbacks or None,
     )
     return model
 
@@ -210,7 +238,12 @@ def _minimum(values: list[float | None]) -> float | None:
     return float(min(clean)) if clean else None
 
 
-def _walk_forward_validation(dataset: pd.DataFrame, *, random_state: int) -> dict[str, Any]:
+def _walk_forward_validation(
+    dataset: pd.DataFrame,
+    *,
+    random_state: int,
+    stop_check: StopCheck | None = None,
+) -> dict[str, Any]:
     unique_dates = list(pd.unique(dataset["date"])) if not dataset.empty else []
     if len(unique_dates) < 360:
         raise RuntimeError("Learning-to-Rank walk-forward validation requires at least 360 chronological sessions.")
@@ -223,6 +256,8 @@ def _walk_forward_validation(dataset: pd.DataFrame, *, random_state: int) -> dic
     boundaries = np.linspace(initial_train_sessions, len(unique_dates), VALIDATION_FOLDS + 1, dtype=int)
     folds: list[dict[str, Any]] = []
     for fold_index in range(VALIDATION_FOLDS):
+        if stop_check is not None and stop_check():
+            raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
         validation_start_index = int(boundaries[fold_index])
         validation_end_index = int(boundaries[fold_index + 1])
         validation_dates = unique_dates[validation_start_index:validation_end_index]
@@ -237,7 +272,7 @@ def _walk_forward_validation(dataset: pd.DataFrame, *, random_state: int) -> dic
             continue
 
         fold_seed = int(random_state) + fold_index + 1
-        model = _fit_ranker(train, random_state=fold_seed)
+        model = _fit_ranker(train, random_state=fold_seed, stop_check=stop_check)
         ranker_predictions = model.predict(validation[list(FEATURE_COLUMNS)])
         ranker_ndcg = _average_ndcg(validation, ranker_predictions, 5)
         momentum_ndcg = _average_ndcg(
@@ -292,7 +327,12 @@ def _walk_forward_validation(dataset: pd.DataFrame, *, random_state: int) -> dic
     }
 
 
-def train_ranker(frames: dict[str, pd.DataFrame], *, random_state: int) -> RankerBundle:
+def train_ranker(
+    frames: dict[str, pd.DataFrame],
+    *,
+    random_state: int,
+    stop_check: StopCheck | None = None,
+) -> RankerBundle:
     dataset = build_training_dataset(frames)
     unique_dates = list(pd.unique(dataset["date"])) if not dataset.empty else []
     if len(unique_dates) < 360 or len(dataset) < 2_000:
@@ -300,8 +340,12 @@ def train_ranker(frames: dict[str, pd.DataFrame], *, random_state: int) -> Ranke
             "The selected Strategy Research baseline does not provide enough cross-sectional history for Learning-to-Rank."
         )
 
-    validation = _walk_forward_validation(dataset, random_state=random_state)
-    final_model = _fit_ranker(dataset, random_state=random_state)
+    if stop_check is not None and stop_check():
+        raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
+    validation = _walk_forward_validation(dataset, random_state=random_state, stop_check=stop_check)
+    if stop_check is not None and stop_check():
+        raise AssetDiscoveryRankerCancelled("Asset Discovery Learning-to-Rank cancellation requested.")
+    final_model = _fit_ranker(dataset, random_state=random_state, stop_check=stop_check)
     summary = validation.get("summary") or {}
 
     diagnostics = {
