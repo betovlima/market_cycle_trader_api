@@ -18,7 +18,11 @@ def _safe_order(order: dict[str, Any]) -> dict[str, Any]:
         "created_at",
         "updated_at",
     )
-    return {key: order.get(key) for key in allowed if order.get(key) is not None}
+    output = {key: order.get(key) for key in allowed if order.get(key) is not None}
+    decision_audit = order.get("decision_audit")
+    if isinstance(decision_audit, dict):
+        output["decision_audit"] = decision_audit
+    return output
 
 
 def public_paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
