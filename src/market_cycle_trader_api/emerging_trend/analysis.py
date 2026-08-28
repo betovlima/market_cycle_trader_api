@@ -23,6 +23,9 @@ from .config import (
     MIN_TRAIN_ROWS,
     RANDOM_STATE,
     SCHEMA_VERSION,
+    TEMPORAL_RECENCY_MIN_OOS_AUC_CONFIRMATION,
+    TEMPORAL_RECENCY_MIN_VALIDATION_AUC_GAIN,
+    TEMPORAL_TRAINING_WINDOWS_MONTHS,
 )
 
 
@@ -103,6 +106,169 @@ def _select_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> tuple[fl
     score, _, threshold = max(ranked)
     return threshold, score
 
+
+
+
+def _binary_metrics(y_true: np.ndarray, probabilities: np.ndarray, threshold: float) -> dict[str, Any]:
+    prediction = probabilities >= threshold
+    positives = int(np.sum(y_true == 1))
+    negatives = int(np.sum(y_true == 0))
+    return {
+        "rows": int(len(y_true)),
+        "positive_count": positives,
+        "negative_count": negatives,
+        "positive_rate": float(y_true.mean()) if len(y_true) else None,
+        "auc": _safe_auc(y_true, probabilities),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, prediction)) if len(y_true) else None,
+    }
+
+
+def _window_fit_rows(fit: pd.DataFrame, validation: pd.DataFrame, months: int) -> pd.DataFrame:
+    if fit.empty or validation.empty:
+        return fit.iloc[0:0].copy()
+    validation_start = pd.to_datetime(validation["timestamp"], utc=True, errors="coerce").min()
+    if pd.isna(validation_start):
+        return fit.iloc[0:0].copy()
+    cutoff = validation_start - pd.DateOffset(months=int(months))
+    return fit[pd.to_datetime(fit["timestamp"], utc=True, errors="coerce") >= cutoff].copy()
+
+
+def _temporal_stability_probe(
+    fit: pd.DataFrame,
+    validation: pd.DataFrame,
+    test: pd.DataFrame,
+    *,
+    reference_training_metrics: dict[str, Any],
+    reference_validation_metrics: dict[str, Any],
+    reference_oos_metrics: dict[str, Any],
+    reference_threshold: float,
+    reference_best_iteration: int,
+) -> dict[str, Any]:
+    validation_truth = validation["persistent_emerging_leader"].to_numpy(dtype=int)
+    test_truth = test["persistent_emerging_leader"].to_numpy(dtype=int)
+    variants: list[dict[str, Any]] = [{
+        "label": "expanding",
+        "window_months": None,
+        "eligible": True,
+        "training_rows": int(len(fit)),
+        "training_metrics": reference_training_metrics,
+        "validation_metrics": reference_validation_metrics,
+        "oos_metrics": reference_oos_metrics,
+        "threshold": float(reference_threshold),
+        "best_iteration": int(reference_best_iteration),
+    }]
+
+    for months in TEMPORAL_TRAINING_WINDOWS_MONTHS:
+        candidate_fit = _window_fit_rows(fit, validation, int(months))
+        if len(candidate_fit) < MIN_TRAIN_ROWS or candidate_fit["persistent_emerging_leader"].nunique() < 2:
+            variants.append({
+                "label": f"recent_{int(months)}m",
+                "window_months": int(months),
+                "eligible": False,
+                "training_rows": int(len(candidate_fit)),
+                "reason": "insufficient_training_rows_or_classes",
+            })
+            continue
+        model, medians = _fit_model(candidate_fit, validation)
+        x_candidate_fit, _ = _prepare_matrix(candidate_fit, medians)
+        x_validation, _ = _prepare_matrix(validation, medians)
+        x_test, _ = _prepare_matrix(test, medians)
+        training_probability = np.asarray(model.predict_proba(x_candidate_fit)[:, 1], dtype=float)
+        validation_probability = np.asarray(model.predict_proba(x_validation)[:, 1], dtype=float)
+        test_probability = np.asarray(model.predict_proba(x_test)[:, 1], dtype=float)
+        threshold, validation_balanced_accuracy = _select_threshold(validation_truth, validation_probability)
+        training_truth = candidate_fit["persistent_emerging_leader"].to_numpy(dtype=int)
+        variants.append({
+            "label": f"recent_{int(months)}m",
+            "window_months": int(months),
+            "eligible": True,
+            "training_rows": int(len(candidate_fit)),
+            "training_metrics": _binary_metrics(training_truth, training_probability, threshold),
+            "validation_metrics": _binary_metrics(validation_truth, validation_probability, threshold),
+            "oos_metrics": _binary_metrics(test_truth, test_probability, threshold),
+            "threshold": float(threshold),
+            "validation_balanced_accuracy": float(validation_balanced_accuracy),
+            "best_iteration": reference_best_iteration,
+        })
+
+    reference_validation_auc = _number(reference_validation_metrics.get("auc"))
+    reference_oos_auc = _number(reference_oos_metrics.get("auc"))
+    eligible_recent = [row for row in variants if row.get("eligible") and row.get("window_months") is not None and _number((row.get("validation_metrics") or {}).get("auc")) is not None]
+    best_by_validation = max(eligible_recent, key=lambda row: float((row.get("validation_metrics") or {}).get("auc"))) if eligible_recent else None
+    selected_label = best_by_validation.get("label") if best_by_validation else None
+    validation_delta = None
+    oos_delta = None
+    if best_by_validation is not None and reference_validation_auc is not None:
+        validation_delta = _number((best_by_validation.get("validation_metrics") or {}).get("auc"))
+        validation_delta = None if validation_delta is None else float(validation_delta - reference_validation_auc)
+    if best_by_validation is not None and reference_oos_auc is not None:
+        oos_delta = _number((best_by_validation.get("oos_metrics") or {}).get("auc"))
+        oos_delta = None if oos_delta is None else float(oos_delta - reference_oos_auc)
+
+    status = "INCONCLUSIVE"
+    reason = "insufficient_probe_metrics"
+    if best_by_validation is not None and validation_delta is not None:
+        if validation_delta >= TEMPORAL_RECENCY_MIN_VALIDATION_AUC_GAIN:
+            if oos_delta is not None and oos_delta >= TEMPORAL_RECENCY_MIN_OOS_AUC_CONFIRMATION:
+                status = "RECENCY_SUPPORTED"
+                reason = "shorter_history_improves_validation_and_is_confirmed_out_of_sample"
+            else:
+                status = "VALIDATION_ONLY_RECENCY"
+                reason = "shorter_history_improves_validation_but_is_not_confirmed_out_of_sample"
+        else:
+            status = "NO_RECENCY_BENEFIT"
+            reason = "shorter_history_does_not_materially_improve_internal_validation"
+
+    return {
+        "probe_version": "9.2.0",
+        "status": status,
+        "reason": reason,
+        "selection_rule": "training_window_selected_on_internal_validation_only",
+        "selected_validation_window": selected_label,
+        "validation_auc_delta_vs_expanding": validation_delta,
+        "oos_auc_delta_vs_expanding": oos_delta,
+        "variants": variants,
+        "thresholds": {
+            "minimum_validation_auc_gain": TEMPORAL_RECENCY_MIN_VALIDATION_AUC_GAIN,
+            "minimum_oos_auc_confirmation": TEMPORAL_RECENCY_MIN_OOS_AUC_CONFIRMATION,
+        },
+        "oos_role": "confirmation_only_not_selection",
+        "diagnostic_only": True,
+        "changes_model_parameters": False,
+        "changes_strategy_decisions": False,
+    }
+
+
+def _aggregate_temporal_stability(probes: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [dict(row) for row in probes if isinstance(row, dict)]
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("status") or "INCONCLUSIVE")
+        counts[key] = counts.get(key, 0) + 1
+    supported = counts.get("RECENCY_SUPPORTED", 0)
+    validation_only = counts.get("VALIDATION_ONLY_RECENCY", 0)
+    no_benefit = counts.get("NO_RECENCY_BENEFIT", 0)
+    status = "INCONCLUSIVE"
+    reason = "temporal_recency_effect_not_repeated"
+    if supported >= 2:
+        status = "RECENCY_SUPPORTED"
+        reason = "shorter_training_history_improves_multiple_chronological_folds"
+    elif no_benefit >= 2:
+        status = "NO_RECENCY_BENEFIT"
+        reason = "shorter_training_history_does_not_improve_multiple_chronological_folds"
+    elif supported >= 1 and validation_only >= 1:
+        status = "MIXED_RECENCY_EVIDENCE"
+        reason = "recency_improves_validation_but_oos_confirmation_is_inconsistent"
+    return {
+        "probe_version": "9.2.0",
+        "status": status,
+        "reason": reason,
+        "folds": len(rows),
+        "status_counts": counts,
+        "diagnostic_only": True,
+        "changes_model_parameters": False,
+        "changes_strategy_decisions": False,
+    }
 
 def _compound(values: list[Any]) -> float | None:
     clean = [_number(value) for value in values]
@@ -231,25 +397,21 @@ def build_analysis(
         validation_truth = validation["persistent_emerging_leader"].to_numpy(dtype=int)
         training_prediction = fit_probability >= threshold
         validation_prediction = validation_probability >= threshold
-        training_metrics = {
-            "rows": int(len(training_truth)),
-            "auc": _safe_auc(training_truth, fit_probability),
-            "balanced_accuracy": float(balanced_accuracy_score(training_truth, training_prediction)),
-            "positive_rate": float(training_truth.mean()) if len(training_truth) else None,
-        }
-        validation_metrics = {
-            "rows": int(len(validation_truth)),
-            "auc": _safe_auc(validation_truth, validation_probability),
-            "balanced_accuracy": float(balanced_accuracy_score(validation_truth, validation_prediction)),
-            "positive_rate": float(validation_truth.mean()) if len(validation_truth) else None,
-        }
-        oos_metrics = {
-            "rows": int(len(truth)),
-            "auc": _safe_auc(truth, probability),
-            "balanced_accuracy": float(balanced_accuracy_score(truth, prediction)),
-            "positive_rate": float(truth.mean()) if len(truth) else None,
-        }
+        training_metrics = _binary_metrics(training_truth, fit_probability, threshold)
+        validation_metrics = _binary_metrics(validation_truth, validation_probability, threshold)
+        oos_metrics = _binary_metrics(truth, probability, threshold)
         fit_diagnostics = assess_binary_fit(training_metrics, validation_metrics, oos_metrics, evaluation_level="session")
+        reference_best_iteration = int(getattr(model, "best_iteration_", 0) or getattr(model, "n_estimators_", 0) or 0)
+        temporal_stability_probe = _temporal_stability_probe(
+            fit,
+            validation,
+            test,
+            reference_training_metrics=training_metrics,
+            reference_validation_metrics=validation_metrics,
+            reference_oos_metrics=oos_metrics,
+            reference_threshold=float(threshold),
+            reference_best_iteration=reference_best_iteration,
+        )
         fold_reports.append({
             "fold_id": int(test_fold),
             "train_rows": int(len(train)),
@@ -260,6 +422,7 @@ def build_analysis(
             "training_metrics": training_metrics,
             "validation_metrics": validation_metrics,
             "fit_diagnostics": fit_diagnostics,
+            "temporal_stability_probe": temporal_stability_probe,
             "auc": _safe_auc(truth, probability),
             "threshold": float(threshold),
             "validation_balanced_accuracy": float(validation_balanced_accuracy),
@@ -274,7 +437,7 @@ def build_analysis(
                 validation_metric_name="balanced_accuracy",
                 validation_metric_value=validation_balanced_accuracy,
             ),
-            "best_iteration": int(getattr(model, "best_iteration_", 0) or getattr(model, "n_estimators_", 0) or 0),
+            "best_iteration": reference_best_iteration,
         })
 
     oos = pd.concat(oos_frames, ignore_index=True) if oos_frames else pd.DataFrame()
@@ -388,6 +551,9 @@ def build_analysis(
     }
     result["fit_diagnostics"] = aggregate_fit_assessments([
         row.get("fit_diagnostics") or {} for row in fold_reports
+    ])
+    result["temporal_stability_probe"] = _aggregate_temporal_stability([
+        row.get("temporal_stability_probe") or {} for row in fold_reports
     ])
     result["readiness"] = _readiness(fold_reports)
     return result

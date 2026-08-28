@@ -1282,6 +1282,7 @@ def build_temporal_intelligence_export(
     emerging_trend_roc_rows: list[dict[str, Any]] = []
     emerging_trend_feature_rows: list[dict[str, Any]] = []
     emerging_trend_session_rows: list[dict[str, Any]] = []
+    emerging_trend_temporal_stability_rows: list[dict[str, Any]] = []
     if pipeline_emerging_trend is not None:
         for item in pipeline_emerging_trend.get("monthly") or []:
             if isinstance(item, dict):
@@ -1292,6 +1293,26 @@ def build_temporal_intelligence_export(
                 row = {key: value for key, value in item.items() if key not in {"roc", "training_metrics", "validation_metrics", "fit_diagnostics"}}
                 row.update({f"fit_{key}": value for key, value in fit_diagnostic.items() if key not in {"thresholds"}})
                 emerging_trend_fold_rows.append(bson_value(row))
+                probe = item.get("temporal_stability_probe") if isinstance(item.get("temporal_stability_probe"), dict) else {}
+                for variant in probe.get("variants") or []:
+                    if isinstance(variant, dict):
+                        emerging_trend_temporal_stability_rows.append(bson_value({
+                            "fold_id": item.get("fold_id"),
+                            "probe_status": probe.get("status"),
+                            "probe_reason": probe.get("reason"),
+                            "selected_validation_window": probe.get("selected_validation_window"),
+                            "validation_auc_delta_vs_expanding": probe.get("validation_auc_delta_vs_expanding"),
+                            "oos_auc_delta_vs_expanding": probe.get("oos_auc_delta_vs_expanding"),
+                            "variant": variant.get("label"),
+                            "window_months": variant.get("window_months"),
+                            "eligible": variant.get("eligible"),
+                            "training_rows": variant.get("training_rows"),
+                            "training_auc": ((variant.get("training_metrics") or {}).get("auc")),
+                            "validation_auc": ((variant.get("validation_metrics") or {}).get("auc")),
+                            "oos_auc": ((variant.get("oos_metrics") or {}).get("auc")),
+                            "threshold": variant.get("threshold"),
+                            "best_iteration": variant.get("best_iteration"),
+                        }))
                 if fit_diagnostic:
                     model_fit_diagnostic_rows.append(bson_value({"analysis": "emerging_trend", "evaluation_level": "session", "fold_id": item.get("fold_id"), **{key: value for key, value in fit_diagnostic.items() if key not in {"thresholds"}}}))
                 append_roc_rows(emerging_trend_roc_rows, item.get("roc"), analysis="emerging_trend", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
@@ -1531,6 +1552,7 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_emerging_trend_roc.csv", _csv_text(emerging_trend_roc_rows))
             archive.writestr("strategy_research_emerging_trend_feature_importance.csv", _csv_text(emerging_trend_feature_rows))
             archive.writestr("strategy_research_emerging_trend_sessions.csv", _csv_text(emerging_trend_session_rows))
+            archive.writestr("strategy_research_emerging_trend_temporal_stability.csv", _csv_text(emerging_trend_temporal_stability_rows))
         if pipeline_roc_policy is not None:
             roc_export = pipeline_roc_policy_raw or pipeline_roc_policy
             archive.writestr("strategy_research_roc_decision_policy.json", json.dumps(roc_export, indent=2, ensure_ascii=False, default=str))

@@ -15,7 +15,7 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
 )
 from .analysis import build_analysis
-from .config import SCHEMA_VERSION
+from .config import ANALYSIS_VERSION, SCHEMA_VERSION
 
 
 def _artifact_rows(db: Any, run_id: str, kind: str) -> list[dict[str, Any]]:
@@ -77,7 +77,11 @@ def _save(db: Any, document: dict[str, Any]) -> dict[str, Any]:
 
 def build_and_persist(db: Any, run_id: str, *, processing_id: str, start_month: str, end_month: str) -> dict[str, Any]:
     existing = get_persisted(db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month)
-    if existing and str(existing.get("status") or "").lower() == "completed":
+    if (
+        existing
+        and str(existing.get("status") or "").lower() == "completed"
+        and str(existing.get("analysis_version") or "") == ANALYSIS_VERSION
+    ):
         return existing
     winner_rows = _artifact_rows(db, run_id, "winner_reference_daily")
     observation_rows = _observation_rows(db, run_id)
