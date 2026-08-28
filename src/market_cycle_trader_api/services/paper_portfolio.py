@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Any
 
 from pydantic import ValidationError
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 from ..infrastructure.persistence.mongo_repository import (
     PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION,
     PAPER_TRADE_ORDERS_COLLECTION,
+    PAPER_TRADE_PLANS_COLLECTION,
     bson_value,
     get_paper_trading_state,
     replace_paper_trading_state,
@@ -47,6 +49,103 @@ def _public_order(document: dict[str, Any]) -> dict[str, Any]:
         if document.get(key) is not None
     }
 
+
+
+def _public_decision_audit(document: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not document:
+        return None
+    raw_utilities = document.get("utilities") if isinstance(document.get("utilities"), dict) else {}
+    raw_cash_edges = document.get("cash_edges") if isinstance(document.get("cash_edges"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+    for symbol, raw_value in raw_utilities.items():
+        try:
+            utility = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if symbol == "CASH" or not math.isfinite(utility):
+            continue
+        cash_edge = None
+        try:
+            candidate_cash_edge = float(raw_cash_edges.get(symbol))
+            if math.isfinite(candidate_cash_edge):
+                cash_edge = candidate_cash_edge
+        except (TypeError, ValueError):
+            pass
+        candidates.append({
+            "symbol": str(symbol),
+            "utility": utility,
+            "cash_edge": cash_edge,
+            "is_target": str(symbol) == str(document.get("target_asset") or ""),
+            "is_current": str(symbol) == str(document.get("current_asset") or ""),
+            "is_raw_best": str(symbol) == str(document.get("raw_best_asset") or ""),
+        })
+    candidates.sort(key=lambda item: (-float(item["utility"]), str(item["symbol"])))
+
+    current_asset = str(document.get("current_asset") or "")
+    target_asset = str(document.get("target_asset") or "")
+    current_utility = raw_utilities.get(current_asset)
+    target_utility = raw_utilities.get(target_asset)
+    try:
+        current_utility = float(current_utility) if current_utility is not None else None
+    except (TypeError, ValueError):
+        current_utility = None
+    try:
+        target_utility = float(target_utility) if target_utility is not None else None
+    except (TypeError, ValueError):
+        target_utility = None
+
+    if bool(document.get("stateful_intervention")):
+        selection_reason = "stateful_intervention"
+    elif target_asset == "CASH":
+        selection_reason = "cash_selected"
+    elif target_asset and target_asset == current_asset:
+        selection_reason = "hold_current"
+    elif target_asset and target_asset == str(document.get("raw_best_asset") or ""):
+        selection_reason = "raw_best_selected"
+    else:
+        selection_reason = "policy_selected_non_raw_best"
+
+    return {
+        key: bson_value(document.get(key))
+        for key in (
+            "plan_id",
+            "winner_strategy_id",
+            "winner_strategy_name",
+            "winner_strategy_revision",
+            "winner_configuration_hash",
+            "decision_date",
+            "execution_session",
+            "current_asset",
+            "target_asset",
+            "raw_best_asset",
+            "action",
+            "selected_utility",
+            "effective_switch_margin",
+            "calibrated_candidate_margin",
+            "calibration_score",
+            "training_end",
+            "calibration_start",
+            "calibration_end",
+            "final_fit_end",
+            "stateful_intervention",
+            "stateful_control_target_asset",
+            "stateful_risk_score",
+            "stateful_risk_threshold",
+            "stateful_confidence_margin",
+            "stateful_confidence_threshold",
+        )
+        if document.get(key) is not None
+    } | {
+        "selection_reason": selection_reason,
+        "current_utility": current_utility,
+        "target_utility": target_utility,
+        "target_vs_current_utility": (
+            target_utility - current_utility
+            if target_utility is not None and current_utility is not None
+            else None
+        ),
+        "top_candidates": candidates[:8],
+    }
 
 def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
@@ -168,6 +267,20 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
     orders = list(
         db[PAPER_TRADE_ORDERS_COLLECTION].find({}).sort("created_at", -1).limit(20)
     )
+    plan_ids = sorted({str(item.get("plan_id")) for item in orders if item.get("plan_id")})
+    plan_map: dict[str, dict[str, Any]] = {}
+    if plan_ids:
+        for plan in db[PAPER_TRADE_PLANS_COLLECTION].find({"plan_id": {"$in": plan_ids}}):
+            plan_map[str(plan.get("plan_id"))] = plan
+
     snapshot["history"] = [bson_value(item) for item in history]
-    snapshot["recent_orders"] = [_public_order(item) for item in orders]
+    snapshot["recent_orders"] = [
+        {
+            **_public_order(item),
+            "decision_audit": _public_decision_audit(plan_map.get(str(item.get("plan_id"))))
+            if item.get("plan_id")
+            else None,
+        }
+        for item in orders
+    ]
     return snapshot
