@@ -29,6 +29,9 @@ MIN_FEATURE_SESSIONS = 126
 VALIDATION_FOLDS = 4
 INITIAL_TRAIN_FRACTION = 0.50
 RANDOM_BASELINE_REPEATS = 24
+FIT_MIN_EXCESS_NDCG = 0.04
+FIT_MAX_HEALTHY_GAP = 0.08
+FIT_OVERFIT_GAP = 0.10
 
 
 @dataclass(frozen=True)
@@ -307,6 +310,9 @@ def _walk_forward_validation(
             progress_end=fold_end,
             progress_step=f"walk_forward:{fold_index + 1}:{VALIDATION_FOLDS}",
         )
+        train_predictions = model.predict(train[list(FEATURE_COLUMNS)])
+        train_ranker_ndcg = _average_ndcg(train, train_predictions, 5)
+        train_random_ndcg = _random_baseline_ndcg(train, random_state=fold_seed + 5_000)
         ranker_predictions = model.predict(validation[list(FEATURE_COLUMNS)])
         ranker_ndcg = _average_ndcg(validation, ranker_predictions, 5)
         momentum_ndcg = _average_ndcg(
@@ -315,6 +321,21 @@ def _walk_forward_validation(
             5,
         )
         random_ndcg = _random_baseline_ndcg(validation, random_state=fold_seed + 10_000)
+        generalization_gap = (
+            float(train_ranker_ndcg) - float(ranker_ndcg)
+            if train_ranker_ndcg is not None and ranker_ndcg is not None
+            else None
+        )
+        train_excess_vs_random = (
+            float(train_ranker_ndcg) - float(train_random_ndcg)
+            if train_ranker_ndcg is not None and train_random_ndcg is not None
+            else None
+        )
+        oos_excess_vs_random = (
+            float(ranker_ndcg) - float(random_ndcg)
+            if ranker_ndcg is not None and random_ndcg is not None
+            else None
+        )
         beats_momentum = (
             ranker_ndcg is not None
             and momentum_ndcg is not None
@@ -331,9 +352,14 @@ def _walk_forward_validation(
                 "train_sessions": int(train["date"].nunique()),
                 "validation_rows": int(len(validation)),
                 "validation_sessions": int(validation["date"].nunique()),
+                "train_ranker_ndcg_at_5": train_ranker_ndcg,
+                "train_random_ndcg_at_5": train_random_ndcg,
                 "ranker_ndcg_at_5": ranker_ndcg,
                 "momentum_ndcg_at_5": momentum_ndcg,
                 "random_ndcg_at_5": random_ndcg,
+                "generalization_gap": generalization_gap,
+                "train_excess_vs_random": train_excess_vs_random,
+                "oos_excess_vs_random": oos_excess_vs_random,
                 "beats_momentum": bool(beats_momentum),
             }
         )
@@ -341,9 +367,33 @@ def _walk_forward_validation(
     if len(folds) != VALIDATION_FOLDS:
         raise RuntimeError("Learning-to-Rank walk-forward validation could not build all chronological folds.")
 
+    train_ranker_scores = [item.get("train_ranker_ndcg_at_5") for item in folds]
+    train_random_scores = [item.get("train_random_ndcg_at_5") for item in folds]
     ranker_scores = [item.get("ranker_ndcg_at_5") for item in folds]
     momentum_scores = [item.get("momentum_ndcg_at_5") for item in folds]
     random_scores = [item.get("random_ndcg_at_5") for item in folds]
+    generalization_gaps = [item.get("generalization_gap") for item in folds]
+    train_excess_scores = [item.get("train_excess_vs_random") for item in folds]
+    oos_excess_scores = [item.get("oos_excess_vs_random") for item in folds]
+    train_median = _median(train_ranker_scores)
+    oos_median = _median(ranker_scores)
+    train_random_median = _median(train_random_scores)
+    oos_random_median = _median(random_scores)
+    gap_median = _median(generalization_gaps)
+    train_excess_median = _median(train_excess_scores)
+    oos_excess_median = _median(oos_excess_scores)
+
+    fit_status = "inconclusive"
+    capacity_probe_recommended = False
+    if train_excess_median is not None and oos_excess_median is not None:
+        if train_excess_median <= FIT_MIN_EXCESS_NDCG and oos_excess_median <= FIT_MIN_EXCESS_NDCG:
+            fit_status = "possible_underfitting"
+            capacity_probe_recommended = True
+        elif gap_median is not None and gap_median >= FIT_OVERFIT_GAP and train_excess_median > FIT_MIN_EXCESS_NDCG:
+            fit_status = "overfitting_risk"
+        elif oos_excess_median >= FIT_MIN_EXCESS_NDCG and (gap_median is None or gap_median <= FIT_MAX_HEALTHY_GAP):
+            fit_status = "healthy_fit"
+
     comparable = [item for item in folds if item.get("ranker_ndcg_at_5") is not None and item.get("momentum_ndcg_at_5") is not None]
     wins = sum(1 for item in comparable if bool(item.get("beats_momentum")))
     return {
@@ -352,11 +402,31 @@ def _walk_forward_validation(
         "fold_count": len(folds),
         "folds": folds,
         "summary": {
-            "ranker_median_ndcg_at_5": _median(ranker_scores),
+            "train_ranker_median_ndcg_at_5": train_median,
+            "train_random_median_ndcg_at_5": train_random_median,
+            "ranker_median_ndcg_at_5": oos_median,
             "ranker_worst_ndcg_at_5": _minimum(ranker_scores),
             "momentum_median_ndcg_at_5": _median(momentum_scores),
-            "random_median_ndcg_at_5": _median(random_scores),
+            "random_median_ndcg_at_5": oos_random_median,
+            "median_generalization_gap": gap_median,
+            "train_excess_vs_random": train_excess_median,
+            "oos_excess_vs_random": oos_excess_median,
             "win_rate_vs_momentum": float(wins / len(comparable)) if comparable else None,
+            "fit_assessment": {
+                "status": fit_status,
+                "capacity_probe_recommended": bool(capacity_probe_recommended),
+                "automatic_parameter_change": False,
+                "train_median_ndcg_at_5": train_median,
+                "oos_median_ndcg_at_5": oos_median,
+                "median_generalization_gap": gap_median,
+                "train_excess_vs_random": train_excess_median,
+                "oos_excess_vs_random": oos_excess_median,
+                "thresholds": {
+                    "minimum_excess_ndcg": FIT_MIN_EXCESS_NDCG,
+                    "maximum_healthy_gap": FIT_MAX_HEALTHY_GAP,
+                    "overfitting_gap": FIT_OVERFIT_GAP,
+                },
+            },
         },
     }
 

@@ -1208,6 +1208,7 @@ def build_temporal_intelligence_export(
             row.update({f"state_count_{key}": value for key, value in (item.get("state_counts") or {}).items()})
             row.update({f"state_share_{key}": value for key, value in (item.get("state_shares") or {}).items()})
             leadership_monthly_rows.append(bson_value(row))
+    model_fit_diagnostic_rows: list[dict[str, Any]] = []
     opportunity_drought_monthly_rows: list[dict[str, Any]] = []
     opportunity_drought_fold_rows: list[dict[str, Any]] = []
     opportunity_drought_roc_rows: list[dict[str, Any]] = []
@@ -1229,10 +1230,14 @@ def build_temporal_intelligence_export(
                 continue
             session_metrics = item.get("session_metrics") if isinstance(item.get("session_metrics"), dict) else {}
             monthly_metrics = item.get("monthly_metrics") if isinstance(item.get("monthly_metrics"), dict) else {}
-            row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics"}}
+            row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics", "training_session_metrics", "validation_session_metrics", "training_monthly_metrics", "validation_monthly_metrics", "fit_diagnostics"}}
             row.update({f"session_{key}": value for key, value in session_metrics.items() if key != "roc"})
             row.update({f"monthly_{key}": value for key, value in monthly_metrics.items() if key != "roc"})
+            fit_diagnostic = ((item.get("fit_diagnostics") or {}).get("monthly") or {}) if isinstance(item.get("fit_diagnostics"), dict) else {}
+            row.update({f"fit_{key}": value for key, value in fit_diagnostic.items() if key not in {"thresholds"}})
             opportunity_drought_fold_rows.append(bson_value(row))
+            if fit_diagnostic:
+                model_fit_diagnostic_rows.append(bson_value({"analysis": "opportunity_drought", "evaluation_level": "monthly", "fold_id": item.get("fold_id"), **{key: value for key, value in fit_diagnostic.items() if key not in {"thresholds"}}}))
             append_roc_rows(opportunity_drought_roc_rows, session_metrics.get("roc"), analysis="opportunity_drought", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
             append_roc_rows(opportunity_drought_roc_rows, monthly_metrics.get("roc"), analysis="opportunity_drought", fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
         opportunity_drought_feature_rows = [
@@ -1283,7 +1288,12 @@ def build_temporal_intelligence_export(
                 emerging_trend_monthly_rows.append(bson_value(dict(item)))
         for item in pipeline_emerging_trend.get("folds") or []:
             if isinstance(item, dict):
-                emerging_trend_fold_rows.append(bson_value({key: value for key, value in item.items() if key != "roc"}))
+                fit_diagnostic = item.get("fit_diagnostics") if isinstance(item.get("fit_diagnostics"), dict) else {}
+                row = {key: value for key, value in item.items() if key not in {"roc", "training_metrics", "validation_metrics", "fit_diagnostics"}}
+                row.update({f"fit_{key}": value for key, value in fit_diagnostic.items() if key not in {"thresholds"}})
+                emerging_trend_fold_rows.append(bson_value(row))
+                if fit_diagnostic:
+                    model_fit_diagnostic_rows.append(bson_value({"analysis": "emerging_trend", "evaluation_level": "session", "fold_id": item.get("fold_id"), **{key: value for key, value in fit_diagnostic.items() if key not in {"thresholds"}}}))
                 append_roc_rows(emerging_trend_roc_rows, item.get("roc"), analysis="emerging_trend", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
         emerging_trend_feature_rows = [bson_value(dict(item)) for item in (pipeline_emerging_trend.get("feature_importance") or []) if isinstance(item, dict)]
         for item in pipeline_emerging_trend.get("sessions") or []:
@@ -1318,10 +1328,14 @@ def build_temporal_intelligence_export(
                 continue
             session_metrics = item.get("session_metrics") if isinstance(item.get("session_metrics"), dict) else {}
             monthly_metrics = item.get("monthly_metrics") if isinstance(item.get("monthly_metrics"), dict) else {}
-            row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics"}}
+            row = {key: value for key, value in item.items() if key not in {"session_metrics", "monthly_metrics", "training_session_metrics", "validation_session_metrics", "training_monthly_metrics", "validation_monthly_metrics", "fit_diagnostics"}}
             row.update({f"session_{key}": value for key, value in session_metrics.items() if key != "roc"})
             row.update({f"monthly_{key}": value for key, value in monthly_metrics.items() if key != "roc"})
+            fit_diagnostic = ((item.get("fit_diagnostics") or {}).get("monthly") or {}) if isinstance(item.get("fit_diagnostics"), dict) else {}
+            row.update({f"fit_{key}": value for key, value in fit_diagnostic.items() if key not in {"thresholds"}})
             fragile_incumbent_fold_rows.append(bson_value(row))
+            if fit_diagnostic:
+                model_fit_diagnostic_rows.append(bson_value({"analysis": "fragile_incumbent", "evaluation_level": "monthly", "fold_id": item.get("fold_id"), **{key: value for key, value in fit_diagnostic.items() if key not in {"thresholds"}}}))
             append_roc_rows(fragile_incumbent_roc_rows, session_metrics.get("roc"), analysis="fragile_incumbent", fold_id=item.get("fold_id"), evaluation_scope="session_oos")
             append_roc_rows(fragile_incumbent_roc_rows, monthly_metrics.get("roc"), analysis="fragile_incumbent", fold_id=item.get("fold_id"), evaluation_scope="monthly_oos")
         fragile_incumbent_feature_rows = [
@@ -1494,6 +1508,8 @@ def build_temporal_intelligence_export(
             archive.writestr("strategy_research_regime_clustering_monthly.csv", _csv_text(clustering_monthly_rows))
             archive.writestr("strategy_research_regime_clustering_clusters.csv", _csv_text(clustering_cluster_rows))
             archive.writestr("strategy_research_regime_clustering_feature_importance.csv", _csv_text(clustering_feature_rows))
+        if model_fit_diagnostic_rows:
+            archive.writestr("strategy_research_model_fit_diagnostics.csv", _csv_text(model_fit_diagnostic_rows))
         if pipeline_opportunity_drought is not None:
             archive.writestr("strategy_research_opportunity_drought.json", json.dumps(pipeline_opportunity_drought, indent=2, ensure_ascii=False, default=str))
             archive.writestr("strategy_research_opportunity_drought_monthly.csv", _csv_text(opportunity_drought_monthly_rows))

@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.metrics import balanced_accuracy_score, brier_score_loss, log_loss, precision_score, recall_score, roc_auc_score
 
 from ..classification_evaluation import roc_curve_payload
+from ..research_fit_diagnostics import aggregate_fit_assessments, assess_binary_fit
 
 from .config import (
     ANALYSIS_VERSION,
@@ -273,9 +274,35 @@ def build_analysis(
         if fit.empty or validation.empty or fit["target_negative_month"].nunique() < 2:
             continue
         model, medians = _fit_lightgbm(fit, validation)
+        x_fit, _ = _prepare_matrix(fit, medians)
+        fit_probability = np.asarray(model.predict_proba(x_fit)[:, 1], dtype=float)
         x_validation, _ = _prepare_matrix(validation, medians)
         validation_probability = np.asarray(model.predict_proba(x_validation)[:, 1], dtype=float)
         threshold, threshold_score = _select_threshold(validation["target_negative_month"].to_numpy(dtype=int), validation_probability)
+        training_session_metrics = _metrics(fit["target_negative_month"].to_numpy(dtype=int), fit_probability, threshold)
+        training_session_metrics.pop("roc", None)
+        validation_session_metrics = _metrics(validation["target_negative_month"].to_numpy(dtype=int), validation_probability, threshold)
+        validation_session_metrics.pop("roc", None)
+        training_monthly_frame = fit.assign(_probability=fit_probability).groupby("month", as_index=False).agg(
+            target_negative_month=("target_negative_month", "first"),
+            probability=("_probability", "mean"),
+        )
+        validation_monthly_frame = validation.assign(_probability=validation_probability).groupby("month", as_index=False).agg(
+            target_negative_month=("target_negative_month", "first"),
+            probability=("_probability", "mean"),
+        )
+        training_monthly_metrics = _metrics(
+            training_monthly_frame["target_negative_month"].to_numpy(dtype=int),
+            training_monthly_frame["probability"].to_numpy(dtype=float),
+            threshold,
+        )
+        training_monthly_metrics.pop("roc", None)
+        validation_monthly_metrics = _metrics(
+            validation_monthly_frame["target_negative_month"].to_numpy(dtype=int),
+            validation_monthly_frame["probability"].to_numpy(dtype=float),
+            threshold,
+        )
+        validation_monthly_metrics.pop("roc", None)
         x_test, _ = _prepare_matrix(test, medians)
         probability = np.asarray(model.predict_proba(x_test)[:, 1], dtype=float)
         contributions = np.asarray(model.predict(x_test, pred_contrib=True), dtype=float)
@@ -291,6 +318,22 @@ def build_analysis(
             oos_fragility_probability=("oos_fragility_probability", "mean"),
             fragility_signal_share=("fragility_signal", "mean"),
         )
+        oos_session_metrics = _metrics(
+            test["target_negative_month"].to_numpy(dtype=int), probability, threshold,
+            threshold_origin="validation_balanced_accuracy",
+            validation_metric_value=threshold_score,
+        )
+        oos_monthly_metrics = _metrics(
+            monthly_test["target_negative_month"].to_numpy(dtype=int),
+            monthly_test["oos_fragility_probability"].to_numpy(dtype=float),
+            threshold,
+            threshold_origin="validation_balanced_accuracy",
+            validation_metric_value=threshold_score,
+        )
+        fit_diagnostics = {
+            "session": assess_binary_fit(training_session_metrics, validation_session_metrics, oos_session_metrics),
+            "monthly": assess_binary_fit(training_monthly_metrics, validation_monthly_metrics, oos_monthly_metrics),
+        }
         fold_reports.append({
             "fold_id": int(test_fold),
             "train_months": int(train["month"].nunique()),
@@ -300,18 +343,13 @@ def build_analysis(
             "threshold": float(threshold),
             "threshold_validation_balanced_accuracy": float(threshold_score),
             "best_iteration": int(getattr(model, "best_iteration_", 0) or getattr(model, "n_estimators_", 0) or 0),
-            "session_metrics": _metrics(
-                test["target_negative_month"].to_numpy(dtype=int), probability, threshold,
-                threshold_origin="validation_balanced_accuracy",
-                validation_metric_value=threshold_score,
-            ),
-            "monthly_metrics": _metrics(
-                monthly_test["target_negative_month"].to_numpy(dtype=int),
-                monthly_test["oos_fragility_probability"].to_numpy(dtype=float),
-                threshold,
-                threshold_origin="validation_balanced_accuracy",
-                validation_metric_value=threshold_score,
-            ),
+            "training_session_metrics": training_session_metrics,
+            "validation_session_metrics": validation_session_metrics,
+            "session_metrics": oos_session_metrics,
+            "training_monthly_metrics": training_monthly_metrics,
+            "validation_monthly_metrics": validation_monthly_metrics,
+            "monthly_metrics": oos_monthly_metrics,
+            "fit_diagnostics": fit_diagnostics,
         })
 
     oos = pd.concat(oos_frames, ignore_index=True) if oos_frames else pd.DataFrame()
@@ -486,5 +524,8 @@ def build_analysis(
         "monthly": monthly,
         "oos_sessions": oos_sessions,
     }
+    result["fit_diagnostics"] = aggregate_fit_assessments([
+        ((row.get("fit_diagnostics") or {}).get("monthly") or {}) for row in fold_reports
+    ])
     result["readiness"] = _readiness(fold_reports)
     return result

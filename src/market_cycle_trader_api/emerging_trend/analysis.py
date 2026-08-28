@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score, roc_auc_score
 
 from ..classification_evaluation import roc_curve_payload
+from ..research_fit_diagnostics import aggregate_fit_assessments, assess_binary_fit
 
 from .config import (
     ANALYSIS_VERSION,
@@ -210,6 +211,8 @@ def build_analysis(
         if fit.empty or validation.empty or fit["persistent_emerging_leader"].nunique() < 2:
             continue
         model, medians = _fit_model(fit, validation)
+        x_fit, _ = _prepare_matrix(fit, medians)
+        fit_probability = np.asarray(model.predict_proba(x_fit)[:, 1], dtype=float)
         x_validation, _ = _prepare_matrix(validation, medians)
         validation_probability = np.asarray(model.predict_proba(x_validation)[:, 1], dtype=float)
         threshold, validation_balanced_accuracy = _select_threshold(validation["persistent_emerging_leader"].to_numpy(dtype=int), validation_probability)
@@ -224,6 +227,29 @@ def build_analysis(
         oos_frames.append(output)
         truth = test["persistent_emerging_leader"].to_numpy(dtype=int)
         prediction = probability >= threshold
+        training_truth = fit["persistent_emerging_leader"].to_numpy(dtype=int)
+        validation_truth = validation["persistent_emerging_leader"].to_numpy(dtype=int)
+        training_prediction = fit_probability >= threshold
+        validation_prediction = validation_probability >= threshold
+        training_metrics = {
+            "rows": int(len(training_truth)),
+            "auc": _safe_auc(training_truth, fit_probability),
+            "balanced_accuracy": float(balanced_accuracy_score(training_truth, training_prediction)),
+            "positive_rate": float(training_truth.mean()) if len(training_truth) else None,
+        }
+        validation_metrics = {
+            "rows": int(len(validation_truth)),
+            "auc": _safe_auc(validation_truth, validation_probability),
+            "balanced_accuracy": float(balanced_accuracy_score(validation_truth, validation_prediction)),
+            "positive_rate": float(validation_truth.mean()) if len(validation_truth) else None,
+        }
+        oos_metrics = {
+            "rows": int(len(truth)),
+            "auc": _safe_auc(truth, probability),
+            "balanced_accuracy": float(balanced_accuracy_score(truth, prediction)),
+            "positive_rate": float(truth.mean()) if len(truth) else None,
+        }
+        fit_diagnostics = assess_binary_fit(training_metrics, validation_metrics, oos_metrics)
         fold_reports.append({
             "fold_id": int(test_fold),
             "train_rows": int(len(train)),
@@ -231,6 +257,9 @@ def build_analysis(
             "test_rows": int(len(test)),
             "positive_test_rows": int(truth.sum()),
             "positive_rate": float(truth.mean()),
+            "training_metrics": training_metrics,
+            "validation_metrics": validation_metrics,
+            "fit_diagnostics": fit_diagnostics,
             "auc": _safe_auc(truth, probability),
             "threshold": float(threshold),
             "validation_balanced_accuracy": float(validation_balanced_accuracy),
@@ -357,5 +386,8 @@ def build_analysis(
         "monthly": monthly,
         "sessions": session_rows,
     }
+    result["fit_diagnostics"] = aggregate_fit_assessments([
+        row.get("fit_diagnostics") or {} for row in fold_reports
+    ])
     result["readiness"] = _readiness(fold_reports)
     return result
