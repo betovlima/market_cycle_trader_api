@@ -2570,7 +2570,15 @@ def _update_catalog_full_validation(
         )
 
 
-def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_id: str) -> None:
+def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_id: str, worker_id: str) -> None:
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_worker,
+        args=(db, run_id, worker_id, heartbeat_stop),
+        name="asset-discovery-full-strategy-validation-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     try:
         document = _campaign(db) or {}
         validation = document.get("full_strategy_validation") if isinstance(document.get("full_strategy_validation"), dict) else {}
@@ -2752,6 +2760,12 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
             }},
         )
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
+        db[COLLECTION].update_one(
+            {"_id": CURRENT_ID, "run_id": run_id, "worker_id": worker_id},
+            {"$set": {"worker_active": False, "worker_finished_at": utc_now(), "updated_at": utc_now()}},
+        )
         global _worker_thread
         with _worker_lock:
             _worker_thread = None
@@ -2769,9 +2783,19 @@ def start_full_strategy_validation(
 
     with _worker_lock:
         document = _campaign(db) or {}
-        if _worker_thread and _worker_thread.is_alive():
-            raise AssetDiscoveryConflict("An Asset Discovery operation is already running.")
         current_run_id = str(document.get("run_id") or "").strip()
+        existing_validation = document.get("full_strategy_validation") if isinstance(document.get("full_strategy_validation"), dict) else {}
+        existing_validation_status = str(existing_validation.get("status") or "").strip().lower()
+        same_active_validation = (
+            existing_validation_status in ACTIVE_STATUSES
+            and _selection_matches(existing_validation.get("selected_assets"), requested_symbols)
+            and (not run_id or str(run_id).strip() == current_run_id)
+        )
+        active_heartbeat = str(document.get("status") or "").strip().lower() in ACTIVE_STATUSES and _worker_heartbeat_fresh(document)
+        if same_active_validation and active_heartbeat:
+            return get_asset_discovery_status(db)
+        if active_heartbeat or (_worker_thread and _worker_thread.is_alive()):
+            raise AssetDiscoveryConflict("An Asset Discovery operation is already running.")
         if not current_run_id:
             raise AssetDiscoveryConflict("Complete an Asset Discovery search before validating a selection.")
         normalized_run_id = str(run_id or "").strip()
@@ -2798,6 +2822,8 @@ def start_full_strategy_validation(
         if not snapshot_end:
             snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
         validation_id = f"asset-full-{uuid4().hex[:12]}"
+        worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
+        now = utc_now()
         validation = {
             "validation_id": validation_id,
             "status": "queued",
@@ -2816,7 +2842,7 @@ def start_full_strategy_validation(
             "current_stage": "Queued",
             "progress_percent": 0.0,
             "decision": None,
-            "created_at": utc_now(),
+            "created_at": now,
         }
         db[COLLECTION].update_one(
             {"_id": CURRENT_ID, "run_id": current_run_id},
@@ -2825,14 +2851,19 @@ def start_full_strategy_validation(
                 "phase": "full_strategy_validation",
                 "cancel_requested": False,
                 "completed_at": None,
-                "updated_at": utc_now(),
+                "updated_at": now,
                 "message": "Full-history selected-universe validation queued.",
                 "full_strategy_validation": bson_value(validation),
+                "worker_id": worker_id,
+                "worker_active": True,
+                "worker_heartbeat_at": now,
+                "worker_started_at": now,
+                "worker_finished_at": None,
             }},
         )
         _worker_thread = threading.Thread(
             target=_run_full_strategy_validation_worker,
-            args=(db, current_run_id, validation_id),
+            args=(db, current_run_id, validation_id, worker_id),
             name="asset-discovery-full-strategy-validation",
             daemon=True,
         )
