@@ -51,6 +51,19 @@ def _public_order(document: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _paper_execution_origin(document: dict[str, Any] | None) -> str:
+    if not document:
+        return "unknown"
+    explicit = str(document.get("execution_origin") or "").strip().lower()
+    if explicit:
+        return explicit
+    if bool(document.get("manual_current_session_recovery")) or str(document.get("plan_source") or "").strip().lower() == "manual_current_session_recovery":
+        return "manual_recovery"
+    if document.get("contingency_completed_at") is not None or document.get("contingency_execution_started_at") is not None:
+        return "manual_contingency"
+    return "historical_unknown"
+
+
 def _public_decision_audit(document: dict[str, Any] | None) -> dict[str, Any] | None:
     if not document:
         return None
@@ -133,9 +146,17 @@ def _public_decision_audit(document: dict[str, Any] | None) -> dict[str, Any] | 
             "stateful_risk_threshold",
             "stateful_confidence_margin",
             "stateful_confidence_threshold",
+            "plan_source",
+            "manual_current_session_recovery",
+            "execution_trigger",
+            "manual_execution_requested_at",
+            "manual_execution_actor_email",
+            "contingency_completed_at",
         )
         if document.get(key) is not None
     } | {
+        "decision_origin": "model_generated_plan",
+        "execution_origin": _paper_execution_origin(document),
         "selection_reason": selection_reason,
         "current_utility": current_utility,
         "target_utility": target_utility,

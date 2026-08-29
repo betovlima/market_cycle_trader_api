@@ -537,6 +537,17 @@ def execute_manual_current_session_plan(
     )
 
     if recoverable_contingency:
+        now = utc_now()
+        db[PAPER_TRADE_PLANS_COLLECTION].update_one(
+            {"plan_id": str(plan["plan_id"])},
+            {"$set": {
+                "execution_origin": "manual_contingency",
+                "execution_trigger": "manual",
+                "manual_execution_requested_at": now,
+                "manual_execution_actor_email": (actor_email or "").strip().lower() or None,
+                "updated_at": now,
+            }},
+        )
         try:
             result = execute_failed_paper_plan_contingency(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
@@ -564,6 +575,17 @@ def execute_manual_current_session_plan(
             raise RuntimeError(
                 f"Manual action {action!r} is blocked by exit-only Trader mode."
             )
+        now = utc_now()
+        db[PAPER_TRADE_PLANS_COLLECTION].update_one(
+            {"plan_id": str(plan["plan_id"])},
+            {"$set": {
+                "execution_origin": "manual_recovery",
+                "execution_trigger": "manual",
+                "manual_execution_requested_at": now,
+                "manual_execution_actor_email": (actor_email or "").strip().lower() or None,
+                "updated_at": now,
+            }},
+        )
         try:
             result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
@@ -1292,6 +1314,15 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
         "Market-open recalibration is complete and the configured delay elapsed; executing the paper plan.",
     )
     try:
+        now = utc_now()
+        db[PAPER_TRADE_PLANS_COLLECTION].update_one(
+            {"plan_id": plan_id},
+            {"$set": {
+                "execution_origin": "scheduled_automatic",
+                "execution_trigger": "automatic",
+                "updated_at": now,
+            }},
+        )
         result = execute_prepared_paper_plan(db, plan_id=plan_id)
         _finish_run(
             db,
