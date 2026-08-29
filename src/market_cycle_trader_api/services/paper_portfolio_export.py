@@ -132,6 +132,12 @@ def build_paper_portfolio_export(db: Any) -> bytes:
                 'stateful_risk_threshold': audit.get('stateful_risk_threshold'),
                 'stateful_confidence_margin': audit.get('stateful_confidence_margin'),
                 'stateful_confidence_threshold': audit.get('stateful_confidence_threshold'),
+                'decision_origin': audit.get('decision_origin'),
+                'execution_origin': audit.get('execution_origin'),
+                'execution_trigger': audit.get('execution_trigger'),
+                'plan_source': audit.get('plan_source'),
+                'manual_current_session_recovery': audit.get('manual_current_session_recovery'),
+                'manual_execution_requested_at': audit.get('manual_execution_requested_at'),
             })
         candidate_rows.extend(_all_candidates(plan))
 
@@ -169,6 +175,11 @@ def build_paper_portfolio_export(db: Any) -> bytes:
             'calibrated_candidate_margin': audit.get('calibrated_candidate_margin') if audit else None,
             'calibration_score': audit.get('calibration_score') if audit else None,
             'stateful_intervention': audit.get('stateful_intervention') if audit else None,
+            'decision_origin': audit.get('decision_origin') if audit else None,
+            'execution_origin': audit.get('execution_origin') if audit else None,
+            'execution_trigger': audit.get('execution_trigger') if audit else None,
+            'plan_source': audit.get('plan_source') if audit else None,
+            'manual_current_session_recovery': audit.get('manual_current_session_recovery') if audit else None,
         })
 
     current_summary = {key: current.get(key) for key in (
@@ -203,7 +214,8 @@ def build_paper_portfolio_export(db: Any) -> bytes:
         'execution_session', 'current_asset', 'target_asset', 'raw_best_asset',
         'selection_reason', 'current_utility', 'target_utility', 'target_vs_current_utility',
         'effective_switch_margin', 'calibrated_candidate_margin', 'calibration_score',
-        'stateful_intervention',
+        'stateful_intervention', 'decision_origin', 'execution_origin', 'execution_trigger',
+        'plan_source', 'manual_current_session_recovery',
     ]
     decision_fields = [
         'plan_id', 'status', 'decision_date', 'execution_session', 'strategy_id', 'strategy_name',
@@ -213,6 +225,8 @@ def build_paper_portfolio_export(db: Any) -> bytes:
         'calibration_score', 'training_end', 'calibration_start', 'calibration_end', 'final_fit_end',
         'stateful_intervention', 'stateful_control_target_asset', 'stateful_risk_score',
         'stateful_risk_threshold', 'stateful_confidence_margin', 'stateful_confidence_threshold',
+        'decision_origin', 'execution_origin', 'execution_trigger', 'plan_source',
+        'manual_current_session_recovery', 'manual_execution_requested_at',
     ]
     candidate_fields = [
         'plan_id', 'decision_date', 'execution_session', 'strategy_name', 'strategy_revision',

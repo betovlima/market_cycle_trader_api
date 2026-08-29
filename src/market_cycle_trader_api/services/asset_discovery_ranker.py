@@ -484,6 +484,7 @@ def train_ranker(
     }
     return RankerBundle(model=final_model, diagnostics=diagnostics)
 
+
 def latest_feature_snapshot(frame: pd.DataFrame) -> tuple[pd.Series, pd.Timestamp]:
     features = feature_frame(frame).dropna(subset=list(FEATURE_COLUMNS))
     if features.empty:
