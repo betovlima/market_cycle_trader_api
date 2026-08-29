@@ -1181,8 +1181,12 @@ def _run_marginal_capital_replay(
     selection_cutoff = str(causal_window.get("selection_cutoff") or "").strip()
     if not evaluation_start or not evaluation_end or not selection_cutoff:
         raise RuntimeError("Asset Discovery causal validation window is incomplete.")
+    validation_baseline_frames = {
+        symbol: _frame_through(frame, evaluation_end)
+        for symbol, frame in baseline_frames.items()
+    }
     baseline_request = _marginal_execution_request(
-        db, config, strategy, winner_config, end_session,
+        db, config, strategy, winner_config, evaluation_end,
         assets=baseline_assets,
         reference_assets=baseline_assets,
         candidate_assets=[],
@@ -1220,7 +1224,7 @@ def _run_marginal_capital_replay(
     )
     total_runs = len(shortlist) + 1
     baseline_metrics, baseline_decision_sessions = _run_rotation_replay(
-        baseline_frames,
+        validation_baseline_frames,
         baseline_request,
         progress_callback=_marginal_progress_callback(
             db,
@@ -1267,24 +1271,24 @@ def _run_marginal_capital_replay(
         try:
             cached_frame = (candidate_frame_cache or {}).get(symbol)
             if cached_frame is not None and not cached_frame.empty:
-                candidate_frame = cached_frame
+                candidate_frame = _frame_through(cached_frame, evaluation_end)
                 coverage = _history_coverage_against_baseline(
                     symbol, candidate_frame, config, required_sessions
                 )
             else:
                 candidate_frame, coverage = _candidate_history_coverage(
-                    db, symbol, config, pd.Timestamp(end_session), required_sessions
+                    db, symbol, config, pd.Timestamp(evaluation_end), required_sessions
                 )
             candidate_assets = list(dict.fromkeys([*baseline_assets, symbol]))
             candidate_request = _marginal_execution_request(
-                db, config, strategy, winner_config, end_session,
+                db, config, strategy, winner_config, evaluation_end,
                 assets=candidate_assets,
                 reference_assets=baseline_assets,
                 candidate_assets=[symbol],
                 analysis_start_date=evaluation_start,
                 analysis_end_date=evaluation_end,
             )
-            candidate_frames = dict(baseline_frames)
+            candidate_frames = dict(validation_baseline_frames)
             candidate_frames[symbol] = candidate_frame
             candidate_metrics, candidate_decision_sessions = _run_rotation_replay(
                 candidate_frames,
@@ -2008,7 +2012,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 winner_config=winner_config,
                 end_session=end_session,
                 baseline_frames=baseline_frames,
-                required_sessions=required_sessions,
+                required_sessions=validation_required_sessions,
                 shortlist=shortlist,
                 causal_window=causal_window,
                 candidate_frame_cache=validated_candidate_frames,
