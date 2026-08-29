@@ -73,11 +73,6 @@ MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE = 0.0
 DEFAULT_SEVERE_MONTH_THRESHOLD = -0.05
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
 WORKER_HEARTBEAT_STALE_SECONDS = 20.0
-CAUSAL_HOLDOUT_SESSIONS = 252
-CAUSAL_VALIDATION_SESSIONS = 126
-CAUSAL_CERTIFICATION_SESSIONS = 126
-CAUSAL_MIN_TRAINING_SESSIONS = 720
-CERTIFICATION_LEDGER_COLLECTION = "asset_discovery_certification_ledger"
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +157,7 @@ def _sanitize_completed_campaign_persistence(db: Database, document: dict[str, A
             "symbol": symbol,
             "history_window_complete": True,
             "persistence_eligible": True,
-            "persistence_reason": "positive_causal_validation_capital",
+            "persistence_reason": "positive_full_history_strategy_capital",
             "marginal_replay": dict(row),
         })
         visible_result_symbols.add(symbol)
@@ -740,135 +735,39 @@ def _frame_through(frame: pd.DataFrame, end_session: str | pd.Timestamp) -> pd.D
     return frame.loc[index <= cutoff].copy()
 
 
-def _causal_validation_window(required_sessions: pd.DatetimeIndex) -> dict[str, Any]:
+def _full_history_research_window(
+    config: Any,
+    end_session: str | pd.Timestamp,
+    required_sessions: pd.DatetimeIndex,
+) -> dict[str, Any]:
     sessions = pd.DatetimeIndex(required_sessions).tz_localize(None).normalize().unique().sort_values()
-    if CAUSAL_VALIDATION_SESSIONS + CAUSAL_CERTIFICATION_SESSIONS != CAUSAL_HOLDOUT_SESSIONS:
-        raise RuntimeError("Asset Discovery causal holdout partition is inconsistent.")
-    minimum = CAUSAL_MIN_TRAINING_SESSIONS + CAUSAL_HOLDOUT_SESSIONS + 1
-    if len(sessions) < minimum:
-        raise RuntimeError(
-            "Asset Discovery causal validation requires enough history to reserve an untouched temporal holdout."
-        )
-    selection_index = len(sessions) - CAUSAL_HOLDOUT_SESSIONS - 1
-    validation_start_index = selection_index + 1
-    validation_end_index = validation_start_index + CAUSAL_VALIDATION_SESSIONS - 1
-    certification_start_index = validation_end_index + 1
-    certification_end_index = certification_start_index + CAUSAL_CERTIFICATION_SESSIONS - 1
-    if certification_end_index != len(sessions) - 1:
-        raise RuntimeError("Asset Discovery causal holdout does not end at the synchronized market cutoff.")
-
-    selection_cutoff = pd.Timestamp(sessions[selection_index])
-    validation_start = pd.Timestamp(sessions[validation_start_index])
-    validation_end = pd.Timestamp(sessions[validation_end_index])
-    certification_start = pd.Timestamp(sessions[certification_start_index])
-    certification_end = pd.Timestamp(sessions[certification_end_index])
+    if sessions.empty:
+        raise RuntimeError("Asset Discovery could not derive the full Strategy research window.")
     return {
-        "method": "historical_selection_then_validation_then_certification",
-        "holdout_sessions": int(CAUSAL_HOLDOUT_SESSIONS),
-        "validation_sessions": int(CAUSAL_VALIDATION_SESSIONS),
-        "certification_sessions": int(CAUSAL_CERTIFICATION_SESSIONS),
-        "selection_cutoff": selection_cutoff.date().isoformat(),
-        "validation_start": validation_start.date().isoformat(),
-        "validation_end": validation_end.date().isoformat(),
-        "certification_start": certification_start.date().isoformat(),
-        "certification_end": certification_end.date().isoformat(),
-        # Compatibility aliases used by older UI/export consumers. They now refer only
-        # to the candidate-screening validation slice, never to final certification.
-        "evaluation_start": validation_start.date().isoformat(),
-        "evaluation_end": validation_end.date().isoformat(),
-        "selection_precedes_evaluation": bool(selection_cutoff < validation_start),
-        "validation_precedes_certification": bool(validation_end < certification_start),
-        "historical_gain_used_for_selection": False,
-        "validation_gain_can_select_candidate": True,
-        "promotion_uses_holdout_only": True,
-        "promotion_uses_certification_only": True,
-        "certification_reuse_policy": "non_overlapping_windows",
+        "method": "full_strategy_history_replay",
+        "strategy_start_date": str(config.start_date),
+        "research_start": pd.Timestamp(sessions[0]).date().isoformat(),
+        "research_end": pd.Timestamp(sessions[-1]).date().isoformat(),
+        "expected_sessions": int(len(sessions)),
+        "history_must_start_with_strategy": True,
+        "continuous_history_required": True,
+        "fixed_calendar_dates": False,
+        "approval_metric": "ending_capital_delta_rate",
+        "approval_rule": "candidate_or_selected_universe_must_increase_final_strategy_capital",
         "external_universe_snapshot": "current_active_alpaca_universe",
         "survivorship_bias_fully_eliminated": False,
-        "historical_certification_is_protocol_isolated": True,
-        "globally_unseen_to_project": False,
-        "forward_confirmation_required_for_strongest_evidence": True,
     }
 
-
-def _causal_sample_seed(strategy_hash: str, selection_cutoff: str) -> int:
-    material = f"{str(strategy_hash or '').strip()}|{str(selection_cutoff or '').strip()}|asset-discovery-causal-v10"
+def _research_sample_seed(strategy_hash: str, snapshot_end: str) -> int:
+    material = f"{str(strategy_hash or '').strip()}|{str(snapshot_end or '').strip()}|asset-discovery-full-history-v10.3"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return int(digest[:8], 16)
 
 
-def _causal_sample_priority(strategy_hash: str, selection_cutoff: str, symbol: str) -> str:
-    material = f"{str(strategy_hash or '').strip()}|{str(selection_cutoff or '').strip()}|{str(symbol or '').strip().upper()}"
+def _research_sample_priority(strategy_hash: str, snapshot_end: str, symbol: str) -> str:
+    material = f"{str(strategy_hash or '').strip()}|{str(snapshot_end or '').strip()}|{str(symbol or '').strip().upper()}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
-
-def _certification_window_status(db: Database, causal_window: dict[str, Any]) -> dict[str, Any]:
-    certification_start = str(causal_window.get("certification_start") or "").strip()
-    certification_end = str(causal_window.get("certification_end") or "").strip()
-    latest = db[CERTIFICATION_LEDGER_COLLECTION].find_one(
-        {"status": "consumed"},
-        sort=[("certification_end", -1)],
-    )
-    last_end = str((latest or {}).get("certification_end") or "").strip()
-    available = bool(certification_start and certification_end) and (not last_end or certification_start > last_end)
-    return {
-        "certification_available": available,
-        "last_consumed_certification_end": last_end or None,
-        "certification_reuse_policy": "non_overlapping_windows",
-        "certification_block_reason": None if available else "certification_window_overlaps_previously_consumed_data",
-    }
-
-
-def _consume_certification_window(
-    db: Database,
-    *,
-    run_id: str,
-    validation_id: str,
-    source_strategy_id: str,
-    source_strategy_hash: str,
-    selected_assets: list[str],
-    causal_window: dict[str, Any],
-    decision: str,
-) -> dict[str, Any]:
-    certification_start = str(causal_window.get("certification_start") or "").strip()
-    certification_end = str(causal_window.get("certification_end") or "").strip()
-    if not certification_start or not certification_end:
-        raise AssetDiscoveryConflict("The causal certification window is incomplete.")
-    status = _certification_window_status(db, causal_window)
-    if not bool(status.get("certification_available")):
-        raise AssetDiscoveryConflict(
-            "This certification period overlaps data already exposed by a previous Asset Discovery certification. "
-            "Wait for a new non-overlapping certification period before validating another promotion."
-        )
-    window_id = f"{certification_start}__{certification_end}"
-    now = utc_now()
-    document = {
-        "_id": window_id,
-        "status": "consumed",
-        "certification_start": certification_start,
-        "certification_end": certification_end,
-        "selection_cutoff": causal_window.get("selection_cutoff"),
-        "validation_start": causal_window.get("validation_start"),
-        "validation_end": causal_window.get("validation_end"),
-        "run_id": run_id,
-        "validation_id": validation_id,
-        "source_strategy_id": source_strategy_id,
-        "source_strategy_hash": source_strategy_hash,
-        "selected_assets": _selection_symbols(selected_assets),
-        "decision": str(decision or "").upper(),
-        "consumed_at": now,
-        "updated_at": now,
-    }
-    try:
-        db[CERTIFICATION_LEDGER_COLLECTION].insert_one(bson_value(document))
-    except Exception as exc:
-        # A duplicate window means another certification has already consumed it.
-        if db[CERTIFICATION_LEDGER_COLLECTION].find_one({"_id": window_id}) is not None:
-            raise AssetDiscoveryConflict(
-                "This certification period has already been consumed and cannot be reused for another asset selection."
-            ) from exc
-        raise
-    return document
 
 def _annotate_causal_ranks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     eligible = [
@@ -1182,15 +1081,14 @@ def _marginal_replay_is_persistent_candidate(replay: Any) -> bool:
         return False
     if str(replay.get("status") or "").lower() != "completed":
         return False
-    if str(replay.get("validation_method") or "") != "causal_temporal_validation":
+    if str(replay.get("validation_method") or "") != "full_strategy_history_replay":
         return False
-    if not bool(replay.get("selection_precedes_evaluation")):
+    if replay.get("history_window_complete") is not True:
         return False
     if not bool(replay.get("research_context_compatible", True)):
         return False
     delta = _finite_number(replay.get("ending_capital_delta_rate"))
     return delta is not None and delta > MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE
-
 
 def _item_is_persistent_candidate(item: Any) -> bool:
     if not isinstance(item, dict):
@@ -1220,14 +1118,13 @@ def _evaluate_marginal_candidate(
     strategy: dict[str, Any],
     winner_config: BacktestRequest,
     baseline_assets: list[str],
-    validation_baseline_frames: dict[str, pd.DataFrame],
+    replay_baseline_frames: dict[str, pd.DataFrame],
     baseline_metrics: dict[str, Any],
     baseline_decision_sessions: pd.DatetimeIndex,
     required_sessions: pd.DatetimeIndex,
     evaluation_start: str,
     evaluation_end: str,
-    selection_cutoff: str,
-    causal_window: dict[str, Any],
+    research_window: dict[str, Any],
     candidate_frame_cache: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     symbol = str(item.get("symbol") or "").strip().upper()
@@ -1241,6 +1138,7 @@ def _evaluate_marginal_candidate(
             candidate_frame, coverage = _candidate_history_coverage(
                 db, symbol, config, pd.Timestamp(evaluation_end), required_sessions
             )
+        row.update(coverage)
         row["history_window_complete"] = bool(coverage.get("history_window_complete"))
         candidate_assets = list(dict.fromkeys([*baseline_assets, symbol]))
         candidate_request = _marginal_execution_request(
@@ -1255,7 +1153,7 @@ def _evaluate_marginal_candidate(
             analysis_start_date=evaluation_start,
             analysis_end_date=evaluation_end,
         )
-        candidate_frames = dict(validation_baseline_frames)
+        candidate_frames = dict(replay_baseline_frames)
         candidate_frames[symbol] = candidate_frame
         candidate_metrics, candidate_decision_sessions = _run_rotation_replay(
             candidate_frames,
@@ -1274,17 +1172,10 @@ def _evaluate_marginal_candidate(
         else:
             row.update({
                 **context_compatibility,
-                "validation_method": "causal_temporal_validation",
-                "selection_cutoff": selection_cutoff,
+                "validation_method": "full_strategy_history_replay",
                 "evaluation_start": evaluation_start,
                 "evaluation_end": evaluation_end,
-                "validation_sessions": int(causal_window.get("validation_sessions") or 0),
-                "certification_start": causal_window.get("certification_start"),
-                "certification_end": causal_window.get("certification_end"),
-                "certification_sessions": int(causal_window.get("certification_sessions") or 0),
-                "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
-                "selection_precedes_evaluation": bool(causal_window.get("selection_precedes_evaluation")),
-                "historical_gain_used_for_selection": False,
+                "research_expected_sessions": int(research_window.get("expected_sessions") or 0),
                 "baseline": baseline_metrics,
                 "candidate": candidate_metrics,
                 "ending_capital_delta": _delta(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
@@ -1303,9 +1194,6 @@ def _evaluate_marginal_candidate(
             "insufficient_history",
             "discontinuous_history",
             "ticker_identity_discontinuity",
-            "price_filter",
-            "liquidity_filter",
-            "volume_quality_filter",
         }:
             row.update({"status": "rejected", "rejection_reason": reason, "history_window_complete": False})
         else:
@@ -1315,12 +1203,11 @@ def _evaluate_marginal_candidate(
 
     row["persistence_eligible"] = _marginal_replay_is_persistent_candidate(row)
     row["persistence_reason"] = (
-        "positive_causal_validation_capital"
+        "positive_full_history_strategy_capital"
         if row["persistence_eligible"]
-        else "causal_validation_not_positive"
+        else "full_history_strategy_capital_not_positive"
     )
     return row
-
 
 def _run_marginal_capital_replay(
     db: Database,
@@ -1333,17 +1220,13 @@ def _run_marginal_capital_replay(
     baseline_frames: dict[str, pd.DataFrame],
     required_sessions: pd.DatetimeIndex,
     shortlist: list[dict[str, Any]],
-    causal_window: dict[str, Any],
+    research_window: dict[str, Any],
     candidate_frame_cache: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     baseline_assets = [str(symbol).strip().upper() for symbol in config.assets]
-    evaluation_start = str(causal_window.get("validation_start") or causal_window.get("evaluation_start") or "").strip()
-    evaluation_end = str(causal_window.get("validation_end") or causal_window.get("evaluation_end") or "").strip()
-    selection_cutoff = str(causal_window.get("selection_cutoff") or "").strip()
-    if not evaluation_start or not evaluation_end or not selection_cutoff:
-        raise RuntimeError("Asset Discovery causal validation window is incomplete.")
-
-    validation_baseline_frames = {
+    evaluation_start = str(config.start_date)
+    evaluation_end = str(end_session)
+    replay_baseline_frames = {
         symbol: _frame_through(frame, evaluation_end)
         for symbol, frame in baseline_frames.items()
     }
@@ -1363,7 +1246,7 @@ def _run_marginal_capital_replay(
     _event(
         db,
         run_id,
-        "Running the baseline replay once before parallel causal validation.",
+        "Running the full-history Strategy baseline once before parallel candidate replays.",
         phase="marginal_replay",
         changes={
             "marginal_replay": {
@@ -1372,19 +1255,14 @@ def _run_marginal_capital_replay(
                 "completed_count": 0,
                 "current_symbol": None,
                 "current_index": 0,
-                "current_stage": "Preparing baseline replay",
+                "current_stage": "Preparing full-history baseline replay",
                 "progress_percent": 0.0,
                 "baseline": None,
                 "results": [],
-                "validation_method": "causal_temporal_validation",
-                "selection_cutoff": selection_cutoff,
+                "validation_method": "full_strategy_history_replay",
                 "evaluation_start": evaluation_start,
                 "evaluation_end": evaluation_end,
-                "validation_sessions": int(causal_window.get("validation_sessions") or 0),
-                "certification_start": causal_window.get("certification_start"),
-                "certification_end": causal_window.get("certification_end"),
-                "certification_sessions": int(causal_window.get("certification_sessions") or 0),
-                "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
+                "research_expected_sessions": int(research_window.get("expected_sessions") or 0),
                 "parallel_workers": replay_workers,
                 "persistence_policy": "retained_candidates_and_aggregate_counts_only",
             },
@@ -1394,7 +1272,7 @@ def _run_marginal_capital_replay(
         },
     )
     baseline_metrics, baseline_decision_sessions = _run_rotation_replay(
-        validation_baseline_frames,
+        replay_baseline_frames,
         baseline_request,
         progress_callback=_marginal_progress_callback(
             db,
@@ -1416,7 +1294,7 @@ def _run_marginal_capital_replay(
             "marginal_replay.progress_percent": round(100.0 / max(1, len(shortlist) + 1), 1),
             "marginal_replay.current_symbol": None,
             "marginal_replay.current_index": 0,
-            "marginal_replay.current_stage": "Baseline replay completed; validating candidates in parallel",
+            "marginal_replay.current_stage": "Baseline replay completed; validating complete candidate histories in parallel",
             "marginal_replay.baseline": bson_value(baseline_metrics),
         }},
     )
@@ -1436,7 +1314,7 @@ def _run_marginal_capital_replay(
     rankable_count = len(candidate_map)
     ordered_candidates = sorted(
         candidate_map.values(),
-        key=lambda item: int((item.get("causal_selection") or {}).get("rank") or item.get("rank") or 999999),
+        key=lambda item: int((item.get("discovery_selection") or item.get("causal_selection") or {}).get("rank") or item.get("rank") or 999999),
     )
 
     for batch_index, batch_start in enumerate(range(0, len(ordered_candidates), replay_workers), start=1):
@@ -1446,13 +1324,13 @@ def _run_marginal_capital_replay(
         _event(
             db,
             run_id,
-            f"Parallel causal validation batch {batch_index} started with {len(batch)} candidates.",
+            f"Parallel full-history replay batch {batch_index} started with {len(batch)} candidates.",
             phase="marginal_replay",
             changes={
                 "current_batch": batch_index,
                 "current_symbol": None,
                 "marginal_replay.current_symbol": None,
-                "marginal_replay.current_stage": "Running candidate replays in parallel",
+                "marginal_replay.current_stage": "Running full-history candidate replays in parallel",
             },
         )
         with ThreadPoolExecutor(
@@ -1468,14 +1346,13 @@ def _run_marginal_capital_replay(
                     strategy=strategy,
                     winner_config=winner_config,
                     baseline_assets=baseline_assets,
-                    validation_baseline_frames=validation_baseline_frames,
+                    replay_baseline_frames=replay_baseline_frames,
                     baseline_metrics=baseline_metrics,
                     baseline_decision_sessions=baseline_decision_sessions,
                     required_sessions=required_sessions,
                     evaluation_start=evaluation_start,
                     evaluation_end=evaluation_end,
-                    selection_cutoff=selection_cutoff,
-                    causal_window=causal_window,
+                    research_window=research_window,
                     candidate_frame_cache=candidate_frame_cache,
                 )
                 for item in batch
@@ -1491,10 +1368,18 @@ def _run_marginal_capital_replay(
                     retained_row = dict(row)
                     retained_replay_rows.append(retained_row)
                     source = dict(candidate_map.get(symbol) or {"symbol": symbol})
+                    for key in (
+                        "history_required_start", "history_required_end", "history_start_tolerance_days",
+                        "history_actual_start", "history_actual_end", "history_expected_sessions",
+                        "history_observed_required_sessions", "history_missing_required_sessions",
+                        "history_internal_missing_sessions", "history_longest_internal_gap_sessions",
+                    ):
+                        if key in retained_row:
+                            source[key] = retained_row.get(key)
                     source["history_window_complete"] = True
                     source["marginal_replay"] = retained_row
                     source["persistence_eligible"] = True
-                    source["persistence_reason"] = "positive_causal_validation_capital"
+                    source["persistence_reason"] = "positive_full_history_strategy_capital"
                     retained_results.append(source)
                 else:
                     rejection_reason = str(row.get("rejection_reason") or "").strip().lower()
@@ -1536,7 +1421,7 @@ def _run_marginal_capital_replay(
                         "marginal_replay.completed_count": completed_count,
                         "marginal_replay.current_symbol": None,
                         "marginal_replay.current_index": completed_count,
-                        "marginal_replay.current_stage": "Running candidate replays in parallel",
+                        "marginal_replay.current_stage": "Running full-history candidate replays in parallel",
                         "marginal_replay.progress_percent": progress,
                         "marginal_replay.results": retained_replay_rows,
                         "marginal_replay.persistent_candidate_count": len(retained_replay_rows),
@@ -1547,7 +1432,7 @@ def _run_marginal_capital_replay(
                         "results": retained_results,
                         "shortlisted_count": len(retained_results),
                         "stage_progress_percent": progress,
-                        "current_stage": "Running candidate replays in parallel",
+                        "current_stage": "Running full-history candidate replays in parallel",
                         "stage_current": completed_count,
                         "stage_total": rankable_count,
                         "current_symbol": None,
@@ -1580,17 +1465,10 @@ def _run_marginal_capital_replay(
         "current_stage": "Marginal Capital Replay stopped" if stopped else "Marginal Capital Replay completed",
         "progress_percent": round(100.0 * (completed_count + 1) / max(1, rankable_count + 1), 1) if stopped else 100.0,
         "baseline": baseline_metrics,
-        "validation_method": "causal_temporal_validation",
-        "selection_cutoff": selection_cutoff,
+        "validation_method": "full_strategy_history_replay",
         "evaluation_start": evaluation_start,
         "evaluation_end": evaluation_end,
-        "validation_sessions": int(causal_window.get("validation_sessions") or 0),
-        "certification_start": causal_window.get("certification_start"),
-        "certification_end": causal_window.get("certification_end"),
-        "certification_sessions": int(causal_window.get("certification_sessions") or 0),
-        "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
-        "selection_precedes_evaluation": bool(causal_window.get("selection_precedes_evaluation")),
-        "historical_gain_used_for_selection": False,
+        "research_expected_sessions": int(research_window.get("expected_sessions") or 0),
         "parallel_workers": replay_workers,
         "persistence_policy": "retained_candidates_and_aggregate_counts_only",
         "results": retained_replay_rows,
@@ -1618,6 +1496,8 @@ def _catalog_metrics(item: dict[str, Any]) -> dict[str, Any]:
     metrics = {key: item.get(key) for key in keys}
     if isinstance(item.get("causal_selection"), dict):
         metrics["causal_selection"] = dict(item.get("causal_selection") or {})
+    if isinstance(item.get("discovery_selection"), dict):
+        metrics["discovery_selection"] = dict(item.get("discovery_selection") or {})
     if isinstance(item.get("current_snapshot"), dict):
         metrics["current_snapshot"] = dict(item.get("current_snapshot") or {})
     marginal = item.get("marginal_replay") if isinstance(item.get("marginal_replay"), dict) else None
@@ -1636,15 +1516,9 @@ def _catalog_metrics(item: dict[str, Any]) -> dict[str, Any]:
             "research_context_compatible": marginal.get("research_context_compatible"),
             "research_context_missing_sessions": marginal.get("research_context_missing_sessions"),
             "validation_method": marginal.get("validation_method"),
-            "selection_cutoff": marginal.get("selection_cutoff"),
             "evaluation_start": marginal.get("evaluation_start"),
             "evaluation_end": marginal.get("evaluation_end"),
-            "validation_sessions": marginal.get("validation_sessions"),
-            "certification_start": marginal.get("certification_start"),
-            "certification_end": marginal.get("certification_end"),
-            "certification_sessions": marginal.get("certification_sessions"),
-            "holdout_sessions": marginal.get("holdout_sessions"),
-            "selection_precedes_evaluation": marginal.get("selection_precedes_evaluation"),
+            "research_expected_sessions": marginal.get("research_expected_sessions"),
         }
     return metrics
 
@@ -1668,9 +1542,11 @@ def _persist_shortlist_to_catalog(db: Database, document: dict[str, Any], result
         existing = db[CATALOG_COLLECTION].find_one({"_id": symbol}) or {}
         recent_run_ids = [str(value) for value in existing.get("recent_run_ids") or []]
         already_counted = run_id in recent_run_ids
-        causal_selection = item.get("causal_selection") if isinstance(item.get("causal_selection"), dict) else {}
-        rank = int(causal_selection.get("rank") or item.get("rank") or 0) or None
-        raw_score = causal_selection.get("raw_score") if causal_selection else item.get("raw_score")
+        discovery_selection = item.get("discovery_selection") if isinstance(item.get("discovery_selection"), dict) else {}
+        legacy_selection = item.get("causal_selection") if isinstance(item.get("causal_selection"), dict) else {}
+        selection = discovery_selection or legacy_selection
+        rank = int(selection.get("rank") or item.get("rank") or 0) or None
+        raw_score = selection.get("raw_score") if selection else item.get("raw_score")
         discovery = {
             "run_id": run_id,
             "seen_at": now,
@@ -1763,12 +1639,10 @@ def get_discovery_catalog(db: Database) -> dict[str, Any]:
             "rejected_assets": "not_stored",
             "low_adherence_assets": "not_stored",
             "minimum_marginal_capital_delta_rate": MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE,
-            "validation_method": "causal_temporal_validation",
-            "holdout_sessions": CAUSAL_HOLDOUT_SESSIONS,
-            "validation_sessions": CAUSAL_VALIDATION_SESSIONS,
-            "certification_sessions": CAUSAL_CERTIFICATION_SESSIONS,
-            "certification_reuse_policy": "non_overlapping_windows",
-            "historical_full_replay_not_eligible": True,
+            "validation_method": "full_strategy_history_replay",
+            "history_must_start_with_strategy": True,
+            "continuous_history_required": True,
+            "full_history_capital_lift_required": True,
             "recent_discoveries_per_asset": 12,
         },
     }
@@ -1855,25 +1729,16 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         safe_session = pd.Timestamp(end_session)
         baseline_frames = _baseline_frames(config, end_session)
         required_sessions = _baseline_required_sessions(baseline_frames, config, safe_session)
-        causal_window = _causal_validation_window(required_sessions)
-        causal_window.update(_certification_window_status(db, causal_window))
-        validation_end_stamp = pd.Timestamp(str(causal_window["validation_end"]))
-        validation_required_sessions = pd.DatetimeIndex(required_sessions)[
-            pd.DatetimeIndex(required_sessions).tz_localize(None).normalize() <= validation_end_stamp.normalize()
-        ]
-        causal_cutoff = str(causal_window["selection_cutoff"])
-        causal_seed = _causal_sample_seed(str(strategy.get("configuration_hash") or ""), causal_cutoff)
-        causal_window["deterministic_sample_seed"] = int(causal_seed)
-        causal_window["candidate_sample_policy"] = "stable_hash_order_for_strategy_and_cutoff"
-        causal_baseline_frames = {
-            symbol: _frame_through(frame, causal_cutoff)
-            for symbol, frame in baseline_frames.items()
-        }
-        causal_baseline_returns = _baseline_recent_returns(causal_baseline_frames)
+        research_window = _full_history_research_window(config, end_session, required_sessions)
+        research_seed = _research_sample_seed(str(strategy.get("configuration_hash") or ""), end_session)
+        research_window["deterministic_sample_seed"] = int(research_seed)
+        research_window["candidate_sample_policy"] = "stable_hash_order_for_strategy_and_snapshot"
+        baseline_returns = _baseline_recent_returns(baseline_frames)
+
         _event(
             db,
             run_id,
-            "Training the causal ranking model using only history available before the reserved validation and certification periods.",
+            "Training Learning-to-Rank on the Strategy historical dataset. Candidate approval remains based on full-history Strategy capital replay.",
             phase="training_ranker",
             changes={
                 "baseline": {
@@ -1883,6 +1748,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                     "configuration_hash": strategy.get("configuration_hash"),
                     "asset_count": len(config.assets),
                     "assets": list(config.assets),
+                    "strategy_start_date": str(config.start_date),
                     "market_snapshot_end": end_session,
                     "market_data_sync": {
                         "target_session": baseline_sync.get("target_session"),
@@ -1899,7 +1765,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                     "asset_count": len(winner_config.assets),
                     "assets": list(winner_config.assets),
                 },
-                "causal_validation": causal_window,
+                "research_window": research_window,
                 "progress_step": "training_dataset",
                 "stage_progress_percent": 0.0,
                 "current_stage": "Preparing Learning-to-Rank training dataset",
@@ -1909,8 +1775,8 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         )
         try:
             bundle = train_ranker(
-                causal_baseline_frames,
-                random_state=causal_seed,
+                baseline_frames,
+                random_state=research_seed,
                 stop_check=lambda: _should_stop_after_batch(db, run_id),
                 progress_callback=_ranker_progress_callback(db, run_id),
             )
@@ -1923,6 +1789,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 results=[],
             )
             return
+
         _event(
             db,
             run_id,
@@ -1930,13 +1797,11 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
             phase="scanning",
             changes={
                 "model": bundle.diagnostics,
-                "causal_selection_model": {
+                "discovery_selection_model": {
                     **bundle.diagnostics,
-                    "selection_cutoff": causal_window.get("selection_cutoff"),
-                    "validation_start": causal_window.get("validation_start"),
-                    "validation_end": causal_window.get("validation_end"),
-                    "certification_start": causal_window.get("certification_start"),
-                    "certification_end": causal_window.get("certification_end"),
+                    "snapshot_end": end_session,
+                    "research_start": research_window.get("research_start"),
+                    "research_end": research_window.get("research_end"),
                 },
                 "progress_step": "external_scan",
                 "stage_progress_percent": 0.0,
@@ -1954,30 +1819,30 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         baseline_symbols = {str(item).upper() for item in config.assets}
         external = [symbol for symbol in universe if symbol not in baseline_symbols]
         external.sort(
-            key=lambda symbol: _causal_sample_priority(
+            key=lambda symbol: _research_sample_priority(
                 str(strategy.get("configuration_hash") or ""),
-                causal_cutoff,
+                end_session,
                 symbol,
             )
         )
         scan_budget = min(len(external), requested)
         selected = external[:scan_budget]
-        causal_window["external_universe_count"] = len(external)
-        causal_window["selected_sample_size"] = scan_budget
-        causal_window["selected_sample_hash"] = hashlib.sha256("|".join(selected).encode("utf-8")).hexdigest()
+        research_window["external_universe_count"] = len(external)
+        research_window["selected_sample_size"] = scan_budget
+        research_window["selected_sample_hash"] = hashlib.sha256("|".join(selected).encode("utf-8")).hexdigest()
         db[COLLECTION].update_one(
             {"_id": CURRENT_ID, "run_id": run_id},
-            {"$set": {"causal_validation": bson_value(causal_window), "updated_at": utc_now()}},
+            {"$set": {"research_window": bson_value(research_window), "updated_at": utc_now()}},
         )
         _event(
             db,
             run_id,
-            f"Scanning the deterministic external sample of {scan_budget} symbols frozen for this Strategy and historical cutoff.",
+            f"Scanning the deterministic external sample of {scan_budget} symbols for the current Strategy snapshot.",
             changes={
                 "universe_size": len(universe),
                 "external_universe_size": len(external),
                 "scan_budget": scan_budget,
-                "causal_validation": causal_window,
+                "research_window": research_window,
             },
         )
         if _should_stop_after_batch(db, run_id):
@@ -1996,7 +1861,6 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 f"Fast-scanning batch {batch_index} with up to {len(batch)} concurrent market-data requests.",
                 changes={"current_batch": batch_index, "current_symbol": None},
             )
-
             scan_credentials = get_alpaca_credentials(db)
             with ThreadPoolExecutor(
                 max_workers=max(1, min(scan_workers, len(batch))),
@@ -2017,24 +1881,21 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                     symbol = futures[future]
                     try:
                         frame = future.result()
-                        causal_frame = _frame_through(frame, causal_window["selection_cutoff"])
-                        causal_score = _score_candidate(
-                            bundle, symbol, causal_frame, causal_baseline_returns
-                        )
-                        result = dict(causal_score)
-                        result["causal_selection"] = {
+                        score = _score_candidate(bundle, symbol, frame, baseline_returns)
+                        result = dict(score)
+                        result["discovery_selection"] = {
                             "available": True,
-                            "selection_cutoff": causal_window.get("selection_cutoff"),
-                            "raw_score": causal_score.get("raw_score"),
-                            "feature_at": causal_score.get("feature_at"),
-                            "latest_close": causal_score.get("latest_close"),
-                            "median_dollar_volume": causal_score.get("median_dollar_volume"),
-                            "return_20": causal_score.get("return_20"),
-                            "return_60": causal_score.get("return_60"),
-                            "volatility_20": causal_score.get("volatility_20"),
-                            "drawdown_60": causal_score.get("drawdown_60"),
-                            "trend_efficiency_20": causal_score.get("trend_efficiency_20"),
-                            "max_baseline_correlation_60": causal_score.get("max_baseline_correlation_60"),
+                            "snapshot_end": end_session,
+                            "raw_score": score.get("raw_score"),
+                            "feature_at": score.get("feature_at"),
+                            "latest_close": score.get("latest_close"),
+                            "median_dollar_volume": score.get("median_dollar_volume"),
+                            "return_20": score.get("return_20"),
+                            "return_60": score.get("return_60"),
+                            "volatility_20": score.get("volatility_20"),
+                            "drawdown_60": score.get("drawdown_60"),
+                            "trend_efficiency_20": score.get("trend_efficiency_20"),
+                            "max_baseline_correlation_60": score.get("max_baseline_correlation_60"),
                         }
                         asset_metadata = universe_metadata.get(symbol) or {}
                         result["company_name"] = asset_metadata.get("company_name")
@@ -2043,7 +1904,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                         _increment(db, run_id, {"attempted_count": 1, "evaluated_count": 1})
                     except RuntimeError as exc:
                         reason = str(exc).strip().lower()
-                        if reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity", "price_filter", "liquidity_filter", "volume_quality_filter"}:
+                        if reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity"}:
                             _increment(db, run_id, {"attempted_count": 1})
                             _reject(db, run_id, reason)
                         else:
@@ -2067,33 +1928,34 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                     db,
                     run_id,
                     "stopped",
-                    f"Asset Discovery stopped after fast-scan batch {batch_index}; unvalidated shortlist data was discarded.",
+                    f"Asset Discovery stopped after fast-scan batch {batch_index}; unvalidated candidate data was discarded.",
                     results=[],
                 )
                 return
 
-        ranked_fast = _rank_all_results(evaluated)
-        causal_ranked = _annotate_causal_ranks(ranked_fast)
-        causal_ranked.sort(key=lambda item: int((item.get("causal_selection") or {}).get("rank") or 999999))
-        causal_unavailable_count = max(0, scan_budget - len(causal_ranked))
+        ranked = _rank_all_results(evaluated)
+        for item in ranked:
+            selection = dict(item.get("discovery_selection") or {})
+            selection["rank"] = item.get("rank")
+            selection["rank_score"] = item.get("rank_score")
+            item["discovery_selection"] = selection
         _event(
             db,
             run_id,
-            f"Fast scan produced {len(causal_ranked)} historical causal candidates at {causal_window['selection_cutoff']} without using either reserved validation or certification data.",
+            f"Fast scan ranked {len(ranked)} candidates. Full-history integrity and capital contribution replay start next.",
             phase="marginal_replay",
             changes={
-                "fast_evaluated_count": len(ranked_fast),
-                "causal_ranked_count": len(causal_ranked),
-                "causal_unavailable_count": causal_unavailable_count,
+                "fast_evaluated_count": len(ranked),
+                "ranked_count": len(ranked),
                 "adherence_validated_count": 0,
-                "validation_candidate_count": len(causal_ranked),
+                "validation_candidate_count": len(ranked),
                 "results": [],
                 "shortlisted_count": 0,
                 "progress_step": "marginal_replay",
                 "stage_progress_percent": 0.0,
-                "current_stage": "Preparing parallel causal validation",
+                "current_stage": "Preparing full-history candidate replays",
                 "stage_current": 0,
-                "stage_total": len(causal_ranked),
+                "stage_total": len(ranked),
             },
         )
 
@@ -2106,7 +1968,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
             "baseline": None,
             "results": [],
         }
-        if causal_ranked:
+        if ranked:
             retained, marginal_replay = _run_marginal_capital_replay(
                 db,
                 run_id,
@@ -2115,37 +1977,37 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 winner_config=winner_config,
                 end_session=end_session,
                 baseline_frames=baseline_frames,
-                required_sessions=validation_required_sessions,
-                shortlist=causal_ranked,
-                causal_window=causal_window,
+                required_sessions=required_sessions,
+                shortlist=ranked,
+                research_window=research_window,
                 candidate_frame_cache=None,
             )
             if _should_stop_after_batch(db, run_id):
                 _event(
                     db,
                     run_id,
-                    "Asset Discovery stopped after the current parallel validation batch; non-retained candidate details were discarded.",
+                    "Asset Discovery stopped after the current parallel replay batch; rejected candidate details were discarded.",
                     changes={"marginal_replay": marginal_replay},
                 )
                 _finish(
                     db,
                     run_id,
                     "stopped",
-                    f"Asset Discovery stopped after validating {marginal_replay.get('completed_count', 0)} of {len(causal_ranked)} causal candidates in bounded parallel batches.",
+                    f"Asset Discovery stopped after replaying {marginal_replay.get('completed_count', 0)} of {len(ranked)} candidates.",
                     results=retained,
                 )
                 return
             _event(
                 db,
                 run_id,
-                "Parallel causal validation completed. Only retained candidates and aggregate rejection counts were persisted.",
+                "Parallel full-history replay completed. Only positive-capital candidates and aggregate rejection counts were persisted.",
                 changes={"marginal_replay": marginal_replay},
             )
         _finish(
             db,
             run_id,
             "completed",
-            f"Asset Discovery causally evaluated {len(evaluated)} sampled assets and retained {len(retained)} validation candidates. Final Strategy certification remains separate and uses later non-overlapping data.",
+            f"Asset Discovery evaluated {len(evaluated)} sampled assets over the complete Strategy research history and retained {len(retained)} candidates that increased final capital.",
             results=retained,
         )
     except Exception as exc:
@@ -2160,7 +2022,6 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         global _worker_thread
         with _worker_lock:
             _worker_thread = None
-
 
 def get_asset_discovery_status(db: Database) -> dict[str, Any]:
     document = _sanitize_completed_campaign_persistence(db, _campaign(db))
@@ -2233,17 +2094,18 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
             "technical_failures": "aggregate_only",
             "rejected_assets": "aggregate_only",
             "stored_shortlist_limit": None,
-            "marginal_replay": "all causal candidates are validated in bounded parallel batches; only retained candidates are persisted",
+            "marginal_replay": "all ranked candidates are checked for complete Strategy history and replayed in bounded parallel batches; only positive-capital candidates are persisted",
             "history": "latest_campaign_only",
-            "discovery_catalog": "positive_causal_validation_candidates_only",
+            "discovery_catalog": "positive_full_history_strategy_capital_candidates_only",
             "low_adherence_assets": "aggregate_only_not_visible_or_persisted",
             "candidate_test_details": "retained_candidates_only",
             "research_size_limit": "external_universe_only",
             "scan_parallelism": _scan_worker_count(),
             "validation_parallelism": _replay_worker_count(),
-            "selection_policy": "historical_cutoff_then_126_session_validation_then_126_session_certification",
-            "certification_reuse_policy": "non_overlapping_windows",
-            "historical_full_replay_promotion": "disabled",
+            "selection_policy": "full_strategy_history_replay",
+            "history_must_start_with_strategy": True,
+            "continuous_history_required": True,
+            "rejected_candidate_details_persisted": False,
         },
         "campaign": _public(document),
     }
@@ -2279,7 +2141,7 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
         document = {
             "_id": CURRENT_ID,
             "run_id": run_id,
-            "schema_version": 4,
+            "schema_version": 5,
             "api_version": API_VERSION,
             "status": "queued",
             "phase": "queued",
@@ -2420,10 +2282,10 @@ def _run_existing_marginal_worker(db: Database, run_id: str) -> None:
             changes={"status": "running", "started_at": document.get("started_at") or utc_now(), "completed_at": None, "cancel_requested": False},
         )
         config, strategy, winner_config, end_session, baseline_frames, required_sessions = _marginal_campaign_context(db, document)
-        causal_window = document.get("causal_validation") if isinstance(document.get("causal_validation"), dict) else {}
-        if str(causal_window.get("method") or "") != "historical_selection_then_validation_then_certification":
+        research_window = document.get("research_window") if isinstance(document.get("research_window"), dict) else {}
+        if str(research_window.get("method") or "") != "full_strategy_history_replay":
             raise AssetDiscoveryConflict(
-                "This campaign predates nested causal Asset Discovery validation. Start a new campaign instead of replaying the legacy shortlist."
+                "This campaign predates full-history Asset Discovery validation. Start a new campaign instead of replaying the legacy shortlist."
             )
         updated_results, replay = _run_marginal_capital_replay(
             db,
@@ -2435,7 +2297,7 @@ def _run_existing_marginal_worker(db: Database, run_id: str) -> None:
             baseline_frames=baseline_frames,
             required_sessions=required_sessions,
             shortlist=shortlist,
-            causal_window=causal_window,
+            research_window=research_window,
         )
         if _should_stop_after_batch(db, run_id):
             _event(db, run_id, "Marginal Capital Replay stopped after the current asset.", changes={"marginal_replay": replay})
@@ -2592,9 +2454,9 @@ def _discovery_metadata_for_symbols(
             missing.append(symbol)
     if missing:
         raise AssetDiscoveryConflict(
-            "Final Strategy certification can use only candidates from the current causal Discovery campaign: "
+            "Selected-universe validation can use only candidates from the current Asset Discovery campaign: "
             + ", ".join(missing)
-            + ". Historical catalog entries are reference-only and cannot be promoted with a later campaign's certification data."
+            + ". Historical catalog entries are reference-only and cannot be inserted without a new full-history replay in the current campaign."
         )
     return metadata
 
@@ -2602,9 +2464,9 @@ def _require_persistent_candidate_selection(metadata: dict[str, dict[str, Any]],
     low_adherence = [symbol for symbol in symbols if not _item_is_persistent_candidate(metadata.get(symbol))]
     if low_adherence:
         raise AssetDiscoveryConflict(
-            "Assets without positive causal validation-period evidence cannot advance to final Strategy certification: "
+            "Assets without positive full-history Strategy capital contribution cannot advance to selected-universe validation: "
             + ", ".join(low_adherence)
-            + ". Run a new causal Discovery campaign if the evidence predates this validation method."
+            + ". Run a new Asset Discovery campaign if the evidence predates the full-history replay method."
         )
 
 
@@ -2672,34 +2534,13 @@ def _full_strategy_validation_gates(
         "switches_delta": _delta(candidate.get("switches"), baseline.get("switches")),
     }
     capital_delta_rate = _finite_number(deltas.get("ending_capital_delta_rate"))
-    cagr_delta = _finite_number(deltas.get("cagr_delta"))
-    sharpe_delta = _finite_number(deltas.get("sharpe_delta"))
-    maxdd_delta = _finite_number(deltas.get("maximum_drawdown_delta"))
-    worst_fold_delta = _finite_number(deltas.get("worst_fold_return_delta"))
-    baseline_severe = _finite_number(baseline.get("severe_negative_months"))
-    candidate_severe = _finite_number(candidate.get("severe_negative_months"))
     gates = {
         "research_context": bool(context.get("research_context_compatible")),
-        "causal_temporal_certification": (
-            str(context.get("validation_method") or "") == "causal_temporal_certification"
-            and bool(context.get("selection_precedes_evaluation"))
-            and bool(context.get("validation_precedes_certification"))
-            and not bool(context.get("certification_data_used_for_selection"))
-        ),
+        "full_history_integrity": bool(context.get("full_history_integrity")),
         "capital_improves": capital_delta_rate is not None and capital_delta_rate > 0.0,
-        "cagr_not_worse": cagr_delta is not None and cagr_delta >= -1e-12,
-        "sharpe_not_worse": sharpe_delta is not None and sharpe_delta >= -1e-12,
-        "max_drawdown_not_worse": maxdd_delta is not None and maxdd_delta >= -1e-12,
-        "worst_fold_not_worse": worst_fold_delta is not None and worst_fold_delta >= -1e-12,
-        "severe_months_not_worse": (
-            baseline_severe is not None
-            and candidate_severe is not None
-            and candidate_severe <= baseline_severe
-        ),
     }
     decision = "PASS" if all(gates.values()) else "FAIL"
     return deltas, gates, decision
-
 
 def _update_catalog_full_validation(
     db: Database,
@@ -2717,8 +2558,7 @@ def _update_catalog_full_validation(
         "source_model_settings_hash": validation.get("source_model_settings_hash"),
         "source_model_settings_revision": validation.get("source_model_settings_revision"),
         "snapshot_end": validation.get("snapshot_end"),
-        "causal_validation": validation.get("causal_validation"),
-        "certification_ledger": validation.get("certification_ledger"),
+        "research_window": validation.get("research_window"),
         "deltas": validation.get("deltas"),
         "gates": validation.get("gates"),
         "completed_at": validation.get("completed_at"),
@@ -2731,7 +2571,6 @@ def _update_catalog_full_validation(
 
 
 def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_id: str) -> None:
-    certification_ledger: dict[str, Any] | None = None
     try:
         document = _campaign(db) or {}
         validation = document.get("full_strategy_validation") if isinstance(document.get("full_strategy_validation"), dict) else {}
@@ -2763,33 +2602,10 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
         snapshot_end = str(validation.get("snapshot_end") or "").strip()
         if not snapshot_end:
             snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
-        causal_window = validation.get("causal_validation") if isinstance(validation.get("causal_validation"), dict) else {}
-        certification_start = str(causal_window.get("certification_start") or "").strip()
-        certification_end = str(causal_window.get("certification_end") or "").strip()
-        selection_cutoff = str(causal_window.get("selection_cutoff") or "").strip()
-        if (
-            str(causal_window.get("method") or "") != "historical_selection_then_validation_then_certification"
-            or not certification_start
-            or not certification_end
-            or not selection_cutoff
-            or not bool(causal_window.get("selection_precedes_evaluation"))
-            or not bool(causal_window.get("validation_precedes_certification"))
-        ):
-            raise AssetDiscoveryConflict("Full Strategy validation requires the untouched causal certification slice after candidate validation.")
+        research_window = validation.get("research_window") if isinstance(validation.get("research_window"), dict) else {}
+        if str(research_window.get("method") or "") != "full_strategy_history_replay":
+            raise AssetDiscoveryConflict("Run a new Asset Discovery campaign using full-history replay before validating the selected universe.")
 
-        # Claim the certification slice before loading or validating any candidate data
-        # from it. Once exposed, this period cannot be reused to shop for another asset,
-        # even if the candidate fails coverage or the certification result is FAIL.
-        certification_ledger = _consume_certification_window(
-            db,
-            run_id=run_id,
-            validation_id=validation_id,
-            source_strategy_id=source_id,
-            source_strategy_hash=str(validation.get("source_strategy_hash") or ""),
-            selected_assets=selected_symbols,
-            causal_window=causal_window,
-            decision="PENDING",
-        )
         baseline_frames = _baseline_frames(source_config, snapshot_end)
         required_sessions = _baseline_required_sessions(baseline_frames, source_config, snapshot_end)
         combined_frames = dict(baseline_frames)
@@ -2802,6 +2618,8 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
             coverage_by_symbol[symbol] = coverage
 
         severe_threshold = _severe_month_threshold(db)
+        evaluation_start = str(source_config.start_date)
+        evaluation_end = snapshot_end
         baseline_request = _marginal_execution_request(
             db,
             source_config,
@@ -2811,8 +2629,8 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
             assets=source_assets,
             reference_assets=source_assets,
             candidate_assets=[],
-            analysis_start_date=certification_start,
-            analysis_end_date=certification_end,
+            analysis_start_date=evaluation_start,
+            analysis_end_date=evaluation_end,
         )
         db[COLLECTION].update_one(
             {"_id": CURRENT_ID, "run_id": run_id, "full_strategy_validation.validation_id": validation_id},
@@ -2821,7 +2639,7 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
                 "phase": "full_strategy_validation",
                 "updated_at": utc_now(),
                 "full_strategy_validation.status": "running",
-                "full_strategy_validation.current_stage": "Replaying current Strategy Research baseline",
+                "full_strategy_validation.current_stage": "Replaying current Strategy Research over the complete research history",
                 "full_strategy_validation.progress_percent": 0.0,
             }},
         )
@@ -2829,7 +2647,7 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
             baseline_frames,
             baseline_request,
             progress_callback=_full_strategy_validation_progress_callback(
-                db, run_id, validation_id, run_position=0, total_runs=2, label="Baseline replay"
+                db, run_id, validation_id, run_position=0, total_runs=2, label="Full-history baseline replay"
             ),
             severe_threshold=severe_threshold,
         )
@@ -2847,7 +2665,7 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
                 {"$set": {
                     "status": "stopped",
                     "phase": "full_strategy_validation",
-                    "message": "Full Strategy validation stopped after the baseline replay.",
+                    "message": "Selected-universe validation stopped after the baseline replay.",
                     "full_strategy_validation": bson_value(stopped),
                     "updated_at": utc_now(),
                 }},
@@ -2864,57 +2682,39 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
             assets=combined_assets,
             reference_assets=source_assets,
             candidate_assets=added_symbols,
-            analysis_start_date=certification_start,
-            analysis_end_date=certification_end,
+            analysis_start_date=evaluation_start,
+            analysis_end_date=evaluation_end,
         )
         candidate_metrics, candidate_sessions = _run_rotation_replay(
             combined_frames,
             combined_request,
             progress_callback=_full_strategy_validation_progress_callback(
-                db, run_id, validation_id, run_position=1, total_runs=2, label="Selected-universe replay"
+                db, run_id, validation_id, run_position=1, total_runs=2, label="Selected-universe full-history replay"
             ),
             severe_threshold=severe_threshold,
         )
         context = _research_context_compatibility(baseline_sessions, candidate_sessions)
         context.update({
-            "validation_method": "causal_temporal_certification",
-            "selection_cutoff": selection_cutoff,
-            "validation_start": causal_window.get("validation_start"),
-            "validation_end": causal_window.get("validation_end"),
-            "certification_start": certification_start,
-            "certification_end": certification_end,
-            "evaluation_start": certification_start,
-            "evaluation_end": certification_end,
-            "selection_precedes_evaluation": bool(causal_window.get("selection_precedes_evaluation")),
-            "validation_precedes_certification": bool(causal_window.get("validation_precedes_certification")),
-            "certification_data_used_for_selection": False,
-            "historical_gain_used_for_selection": False,
+            "validation_method": "full_strategy_history_replay",
+            "evaluation_start": evaluation_start,
+            "evaluation_end": evaluation_end,
+            "full_history_integrity": all(bool(item.get("history_window_complete")) for item in coverage_by_symbol.values()),
+            "history_required_start": str(source_config.start_date),
+            "history_required_end": snapshot_end,
         })
         deltas, gates, decision = _full_strategy_validation_gates(baseline_metrics, candidate_metrics, context)
         completed_at = utc_now()
-        db[CERTIFICATION_LEDGER_COLLECTION].update_one(
-            {"_id": certification_ledger.get("_id"), "validation_id": validation_id},
-            {"$set": {"decision": str(decision or "").upper(), "updated_at": completed_at, "completed_at": completed_at}},
-        )
-        certification_ledger = db[CERTIFICATION_LEDGER_COLLECTION].find_one({"_id": certification_ledger.get("_id")}) or certification_ledger
-        completed_causal_window = {
-            **causal_window,
-            "certification_available": False,
-            "last_consumed_certification_end": certification_ledger.get("certification_end"),
-            "certification_block_reason": "certification_window_consumed",
-        }
         completed = {
             **validation,
             "status": "completed",
-            "current_stage": "Full Strategy validation completed",
+            "current_stage": "Selected-universe full-history validation completed",
             "progress_percent": 100.0,
             "source_asset_count": len(source_assets),
             "candidate_asset_count": len(combined_assets),
             "added_assets": added_symbols,
             "coverage": coverage_by_symbol,
             "severe_month_threshold": severe_threshold,
-            "causal_validation": completed_causal_window,
-            "certification_ledger": certification_ledger,
+            "research_window": research_window,
             "baseline": baseline_metrics,
             "candidate": candidate_metrics,
             "context": context,
@@ -2931,31 +2731,20 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
                 "cancel_requested": False,
                 "completed_at": completed_at,
                 "updated_at": completed_at,
-                "message": f"Full Strategy validation {decision} for {', '.join(added_symbols)}.",
-                "causal_validation": bson_value(completed_causal_window),
+                "message": f"Selected-universe full-history validation {decision} for {', '.join(added_symbols)}.",
                 "full_strategy_validation": bson_value(completed),
             }},
         )
         _update_catalog_full_validation(db, selected_symbols, completed)
     except Exception as exc:
         now = utc_now()
-        if certification_ledger and certification_ledger.get("_id"):
-            db[CERTIFICATION_LEDGER_COLLECTION].update_one(
-                {"_id": certification_ledger.get("_id")},
-                {"$set": {
-                    "decision": "ERROR_AFTER_EXPOSURE",
-                    "error": str(exc)[:700],
-                    "updated_at": now,
-                    "completed_at": now,
-                }},
-            )
         db[COLLECTION].update_one(
             {"_id": CURRENT_ID, "run_id": run_id, "full_strategy_validation.validation_id": validation_id},
             {"$set": {
                 "status": "failed",
                 "phase": "full_strategy_validation",
                 "updated_at": now,
-                "message": f"Full Strategy validation failed: {str(exc)[:700]}",
+                "message": f"Selected-universe validation failed: {str(exc)[:700]}",
                 "full_strategy_validation.status": "failed",
                 "full_strategy_validation.current_stage": "Validation failed",
                 "full_strategy_validation.error": str(exc)[:700],
@@ -2966,7 +2755,6 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
         global _worker_thread
         with _worker_lock:
             _worker_thread = None
-
 
 def start_full_strategy_validation(
     db: Database,
@@ -2992,24 +2780,10 @@ def start_full_strategy_validation(
 
         metadata = _discovery_metadata_for_symbols(db, document, requested_symbols)
         _require_persistent_candidate_selection(metadata, requested_symbols)
-        causal_window = document.get("causal_validation") if isinstance(document.get("causal_validation"), dict) else {}
-        if str(causal_window.get("method") or "") != "historical_selection_then_validation_then_certification":
+        research_window = document.get("research_window") if isinstance(document.get("research_window"), dict) else {}
+        if str(research_window.get("method") or "") != "full_strategy_history_replay":
             raise AssetDiscoveryConflict(
-                "This campaign predates nested causal Asset Discovery validation. Run a new Discovery campaign before Full Strategy validation."
-            )
-        if (
-            not bool(causal_window.get("selection_precedes_evaluation"))
-            or not bool(causal_window.get("validation_precedes_certification"))
-            or not bool(causal_window.get("promotion_uses_certification_only"))
-        ):
-            raise AssetDiscoveryConflict("The Asset Discovery causal validation window is not promotion-safe.")
-        certification_status = _certification_window_status(db, causal_window)
-        causal_window = {**causal_window, **certification_status}
-        if not bool(certification_status.get("certification_available")):
-            last_end = certification_status.get("last_consumed_certification_end") or "another certification"
-            raise AssetDiscoveryConflict(
-                "The final certification period overlaps data already used by a previous Asset Discovery certification "
-                f"(last consumed end: {last_end}). Wait for a new non-overlapping certification period before promoting another discovery."
+                "This campaign does not use the full-history Asset Discovery protocol. Run a new Discovery campaign before validating the selected universe."
             )
         source_raw, source_config = _current_research_source(db)
         source_id = str(source_raw.get("_id") or "")
@@ -3038,7 +2812,7 @@ def start_full_strategy_validation(
             "source_model_settings_revision": int(source_model_snapshot.get("settings_revision") or 0),
             "source_asset_count": len(source_assets),
             "snapshot_end": snapshot_end,
-            "causal_validation": dict(causal_window),
+            "research_window": dict(research_window),
             "current_stage": "Queued",
             "progress_percent": 0.0,
             "decision": None,
@@ -3052,7 +2826,7 @@ def start_full_strategy_validation(
                 "cancel_requested": False,
                 "completed_at": None,
                 "updated_at": utc_now(),
-                "message": "Full Strategy validation queued for the selected assets.",
+                "message": "Full-history selected-universe validation queued.",
                 "full_strategy_validation": bson_value(validation),
             }},
         )
@@ -3064,7 +2838,6 @@ def start_full_strategy_validation(
         )
         _worker_thread.start()
     return get_asset_discovery_status(db)
-
 
 def _validated_creation_source(
     db: Database,
@@ -3108,11 +2881,10 @@ def append_selected_assets_to_research_strategy(
     symbols: list[str],
     actor_email: str | None,
 ) -> dict[str, Any]:
-    """Append only the explicitly selected, fully certified assets to the current RESEARCH Strategy.
+    """Append only explicitly selected assets that passed full-history selected-universe validation.
 
     Existing Strategy assets are preserved in their original order. Rejected/failed assets are never
-    persisted here. Market history is persisted only for selected assets after an exact-selection
-    final certification PASS.
+    persisted here. Market history is persisted only for selected assets after an exact-selection PASS.
     """
     current_document = _campaign(db) or {}
     current_run_id = str(current_document.get("run_id") or "").strip()
@@ -3156,14 +2928,14 @@ def append_selected_assets_to_research_strategy(
     if discarded_assets:
         discarded = ", ".join(item["symbol"] for item in discarded_assets)
         raise AssetDiscoveryConflict(
-            "The certified selection changed during market-history persistence. "
-            f"Discarded: {discarded}. Run final certification again."
+            "The validated selection changed during market-history persistence. "
+            f"Discarded: {discarded}. Run selected-universe validation again."
         )
 
     combined_assets = list(dict.fromkeys([*source_assets, *added_symbols]))
     updated_configuration = source_config.model_copy(update={"assets": combined_assets})
     previous_revision = int(source_raw.get("revision") or 1)
-    note = "Added Asset Discovery certified assets without removing existing Strategy assets: " + ", ".join(added_symbols)
+    note = "Added Asset Discovery full-history validated assets without removing existing Strategy assets: " + ", ".join(added_symbols)
     try:
         updated_strategy = update_strategy(
             db,
@@ -3350,8 +3122,7 @@ def create_research_strategy_from_discovery(
             "source_model_settings_hash": validation.get("source_model_settings_hash"),
             "source_model_settings_revision": validation.get("source_model_settings_revision"),
             "snapshot_end": validation.get("snapshot_end"),
-            "causal_validation": validation.get("causal_validation"),
-            "certification_ledger": validation.get("certification_ledger"),
+            "research_window": validation.get("research_window"),
             "baseline": validation.get("baseline"),
             "candidate": validation.get("candidate"),
             "deltas": validation.get("deltas"),
@@ -3361,10 +3132,10 @@ def create_research_strategy_from_discovery(
         "ranked_assets": [
             {
                 "symbol": symbol,
-                "causal_rank": (discovery_metadata[symbol].get("causal_selection") or {}).get("rank")
-                if isinstance(discovery_metadata[symbol].get("causal_selection"), dict) else discovery_metadata[symbol].get("rank"),
-                "causal_raw_score": (discovery_metadata[symbol].get("causal_selection") or {}).get("raw_score")
-                if isinstance(discovery_metadata[symbol].get("causal_selection"), dict) else discovery_metadata[symbol].get("raw_score"),
+                "discovery_rank": (discovery_metadata[symbol].get("discovery_selection") or {}).get("rank")
+                if isinstance(discovery_metadata[symbol].get("discovery_selection"), dict) else discovery_metadata[symbol].get("rank"),
+                "discovery_raw_score": (discovery_metadata[symbol].get("discovery_selection") or {}).get("raw_score")
+                if isinstance(discovery_metadata[symbol].get("discovery_selection"), dict) else discovery_metadata[symbol].get("raw_score"),
             }
             for symbol in valid_symbols
         ],
@@ -3459,7 +3230,7 @@ def export_asset_discovery(db: Database, *, front_version: str | None = None) ->
         raise AssetDiscoveryConflict("There is no Asset Discovery campaign to export.")
     payload = _public(document) or {}
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "package_kind": "market_cycle_trader_asset_discovery_research",
         "api_version": API_VERSION,
         "front_version": str(front_version or "") or None,
@@ -3471,16 +3242,15 @@ def export_asset_discovery(db: Database, *, front_version: str | None = None) ->
             "low_adherence_symbols_persisted": False,
             "campaign_history_persisted": False,
             "discovery_catalog_persisted": True,
-            "historical_full_replay_can_promote": False,
-            "causal_nested_validation_required": True,
-            "validation_sessions": CAUSAL_VALIDATION_SESSIONS,
-            "certification_sessions": CAUSAL_CERTIFICATION_SESSIONS,
-            "certification_windows_non_overlapping": True,
+            "full_strategy_history_replay_required": True,
+            "history_must_start_with_strategy": True,
+            "continuous_history_required": True,
+            "fixed_calendar_dates": False,
             "research_size_limit": "external_universe_only",
             "scan_parallelism": _scan_worker_count(),
             "validation_parallelism": _replay_worker_count(),
             "rejected_candidate_details_persisted": False,
-            "research_strategy_update_mode": "append_explicitly_selected_certified_assets_only",
+            "research_strategy_update_mode": "append_explicitly_selected_full_history_validated_assets_only",
             "existing_research_strategy_assets_preserved": True,
         },
         "campaign": payload,
