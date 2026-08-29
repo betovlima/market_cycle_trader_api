@@ -61,7 +61,7 @@ from .strategy_lab import (
 COLLECTION = ASSET_DISCOVERY_RESEARCH_COLLECTION
 CATALOG_COLLECTION = ASSET_DISCOVERY_CATALOG_COLLECTION
 CURRENT_ID = "current"
-BATCH_SIZE = 8
+DEFAULT_RESEARCH_SIZE = 64
 CANDIDATE_HISTORY_DAYS = 900
 SUPPORTED_EXCHANGES = frozenset({"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE"})
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.\-]+$")
@@ -78,6 +78,29 @@ CAUSAL_MIN_TRAINING_SESSIONS = 720
 CERTIFICATION_LEDGER_COLLECTION = "asset_discovery_certification_ledger"
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_env_int(name: str, fallback: int) -> int:
+    try:
+        value = int(str(os.getenv(name) or fallback).strip())
+    except (TypeError, ValueError):
+        value = int(fallback)
+    return max(1, value)
+
+
+def _scan_worker_count() -> int:
+    fallback = max(8, min(32, max(1, int(os.cpu_count() or 1)) * 4))
+    return _positive_env_int("ASSET_DISCOVERY_SCAN_WORKERS", fallback)
+
+
+def _replay_worker_count() -> int:
+    fallback = max(2, min(4, max(1, int(os.cpu_count() or 1))))
+    return _positive_env_int("ASSET_DISCOVERY_REPLAY_WORKERS", fallback)
+
+
+def _scan_batch_size() -> int:
+    return max(_scan_worker_count(), _scan_worker_count() * 4)
+
 
 _worker_lock = threading.Lock()
 _worker_thread: threading.Thread | None = None
@@ -1161,6 +1184,116 @@ def _selection_matches(left: Any, right: Any) -> bool:
     return sorted(_selection_symbols(list(left or []))) == sorted(_selection_symbols(list(right or [])))
 
 
+def _evaluate_marginal_candidate(
+    db: Database,
+    *,
+    item: dict[str, Any],
+    config: BacktestRequest,
+    strategy: dict[str, Any],
+    winner_config: BacktestRequest,
+    baseline_assets: list[str],
+    validation_baseline_frames: dict[str, pd.DataFrame],
+    baseline_metrics: dict[str, Any],
+    baseline_decision_sessions: pd.DatetimeIndex,
+    required_sessions: pd.DatetimeIndex,
+    evaluation_start: str,
+    evaluation_end: str,
+    selection_cutoff: str,
+    causal_window: dict[str, Any],
+    candidate_frame_cache: dict[str, pd.DataFrame] | None = None,
+) -> dict[str, Any]:
+    symbol = str(item.get("symbol") or "").strip().upper()
+    row: dict[str, Any] = {"symbol": symbol, "status": "completed"}
+    try:
+        cached_frame = (candidate_frame_cache or {}).get(symbol)
+        if cached_frame is not None and not cached_frame.empty:
+            candidate_frame = _frame_through(cached_frame, evaluation_end)
+            coverage = _history_coverage_against_baseline(symbol, candidate_frame, config, required_sessions)
+        else:
+            candidate_frame, coverage = _candidate_history_coverage(
+                db, symbol, config, pd.Timestamp(evaluation_end), required_sessions
+            )
+        row["history_window_complete"] = bool(coverage.get("history_window_complete"))
+        candidate_assets = list(dict.fromkeys([*baseline_assets, symbol]))
+        candidate_request = _marginal_execution_request(
+            db,
+            config,
+            strategy,
+            winner_config,
+            evaluation_end,
+            assets=candidate_assets,
+            reference_assets=baseline_assets,
+            candidate_assets=[symbol],
+            analysis_start_date=evaluation_start,
+            analysis_end_date=evaluation_end,
+        )
+        candidate_frames = dict(validation_baseline_frames)
+        candidate_frames[symbol] = candidate_frame
+        candidate_metrics, candidate_decision_sessions = _run_rotation_replay(
+            candidate_frames,
+            candidate_request,
+            progress_callback=None,
+        )
+        context_compatibility = _research_context_compatibility(
+            baseline_decision_sessions, candidate_decision_sessions
+        )
+        if not bool(context_compatibility.get("research_context_compatible")):
+            row.update({
+                "status": "rejected",
+                "rejection_reason": "research_context_incomplete",
+                **context_compatibility,
+            })
+        else:
+            row.update({
+                **context_compatibility,
+                "validation_method": "causal_temporal_validation",
+                "selection_cutoff": selection_cutoff,
+                "evaluation_start": evaluation_start,
+                "evaluation_end": evaluation_end,
+                "validation_sessions": int(causal_window.get("validation_sessions") or 0),
+                "certification_start": causal_window.get("certification_start"),
+                "certification_end": causal_window.get("certification_end"),
+                "certification_sessions": int(causal_window.get("certification_sessions") or 0),
+                "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
+                "selection_precedes_evaluation": bool(causal_window.get("selection_precedes_evaluation")),
+                "historical_gain_used_for_selection": False,
+                "baseline": baseline_metrics,
+                "candidate": candidate_metrics,
+                "ending_capital_delta": _delta(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
+                "ending_capital_delta_rate": _capital_delta_rate(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
+                "cagr_delta": _delta(candidate_metrics.get("cagr"), baseline_metrics.get("cagr")),
+                "sharpe_delta": _delta(candidate_metrics.get("sharpe"), baseline_metrics.get("sharpe")),
+                "maximum_drawdown_delta": _delta(candidate_metrics.get("maximum_drawdown"), baseline_metrics.get("maximum_drawdown")),
+                "worst_fold_return_delta": _delta(candidate_metrics.get("worst_fold_return"), baseline_metrics.get("worst_fold_return")),
+                "switches_delta": _delta(candidate_metrics.get("switches"), baseline_metrics.get("switches")),
+                "cash_days_delta": _delta(candidate_metrics.get("cash_days"), baseline_metrics.get("cash_days")),
+                "market_exposure_delta": _delta(candidate_metrics.get("market_exposure"), baseline_metrics.get("market_exposure")),
+            })
+    except RuntimeError as exc:
+        reason = str(exc).strip().lower()
+        if reason in {
+            "insufficient_history",
+            "discontinuous_history",
+            "ticker_identity_discontinuity",
+            "price_filter",
+            "liquidity_filter",
+            "volume_quality_filter",
+        }:
+            row.update({"status": "rejected", "rejection_reason": reason, "history_window_complete": False})
+        else:
+            row.update({"status": "failed", "error": str(exc)[:700]})
+    except Exception as exc:
+        row.update({"status": "failed", "error": str(exc)[:700]})
+
+    row["persistence_eligible"] = _marginal_replay_is_persistent_candidate(row)
+    row["persistence_reason"] = (
+        "positive_causal_validation_capital"
+        if row["persistence_eligible"]
+        else "causal_validation_not_positive"
+    )
+    return row
+
+
 def _run_marginal_capital_replay(
     db: Database,
     run_id: str,
@@ -1181,28 +1314,35 @@ def _run_marginal_capital_replay(
     selection_cutoff = str(causal_window.get("selection_cutoff") or "").strip()
     if not evaluation_start or not evaluation_end or not selection_cutoff:
         raise RuntimeError("Asset Discovery causal validation window is incomplete.")
+
     validation_baseline_frames = {
         symbol: _frame_through(frame, evaluation_end)
         for symbol, frame in baseline_frames.items()
     }
     baseline_request = _marginal_execution_request(
-        db, config, strategy, winner_config, evaluation_end,
+        db,
+        config,
+        strategy,
+        winner_config,
+        evaluation_end,
         assets=baseline_assets,
         reference_assets=baseline_assets,
         candidate_assets=[],
         analysis_start_date=evaluation_start,
         analysis_end_date=evaluation_end,
     )
+    replay_workers = max(1, min(_replay_worker_count(), len(shortlist) or 1))
     _event(
-        db, run_id,
-        "Running the baseline replay once before testing shortlisted assets.",
+        db,
+        run_id,
+        "Running the baseline replay once before parallel causal validation.",
         phase="marginal_replay",
         changes={
             "marginal_replay": {
                 "status": "running",
                 "total_count": len(shortlist),
                 "completed_count": 0,
-                "current_symbol": "BASELINE",
+                "current_symbol": None,
                 "current_index": 0,
                 "current_stage": "Preparing baseline replay",
                 "progress_percent": 0.0,
@@ -1217,12 +1357,14 @@ def _run_marginal_capital_replay(
                 "certification_end": causal_window.get("certification_end"),
                 "certification_sessions": int(causal_window.get("certification_sessions") or 0),
                 "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
+                "parallel_workers": replay_workers,
+                "persistence_policy": "retained_candidates_and_aggregate_counts_only",
             },
             "results": [],
-            "shortlisted_count": len(shortlist),
+            "shortlisted_count": 0,
+            "validation_candidate_count": len(shortlist),
         },
     )
-    total_runs = len(shortlist) + 1
     baseline_metrics, baseline_decision_sessions = _run_rotation_replay(
         validation_baseline_frames,
         baseline_request,
@@ -1230,7 +1372,7 @@ def _run_marginal_capital_replay(
             db,
             run_id,
             run_position=0,
-            total_runs=total_runs,
+            total_runs=max(1, len(shortlist) + 1),
             current_symbol="BASELINE",
             current_index=0,
             completed_count=0,
@@ -1238,196 +1380,176 @@ def _run_marginal_capital_replay(
     )
     if baseline_decision_sessions.empty:
         raise RuntimeError("Asset Discovery baseline replay produced no decision-session context.")
+
     db[COLLECTION].update_one(
         {"_id": CURRENT_ID, "run_id": run_id},
         {"$set": {
             "updated_at": utc_now(),
-            "marginal_replay.progress_percent": round(100.0 / total_runs, 1),
+            "marginal_replay.progress_percent": round(100.0 / max(1, len(shortlist) + 1), 1),
             "marginal_replay.current_symbol": None,
             "marginal_replay.current_index": 0,
-            "marginal_replay.current_stage": "Baseline replay completed",
+            "marginal_replay.current_stage": "Baseline replay completed; validating candidates in parallel",
             "marginal_replay.baseline": bson_value(baseline_metrics),
         }},
     )
-    replay_rows: list[dict[str, Any]] = []
-    updated_results = [dict(item) for item in shortlist]
-    result_map = {str(item.get("symbol") or "").upper(): item for item in updated_results}
 
-    for index, item in enumerate(shortlist, start=1):
-        symbol = str(item.get("symbol") or "").strip().upper()
-        _event(
-            db, run_id,
-            f"Marginal Capital Replay {index}/{len(shortlist)}.",
-            phase="marginal_replay",
-            changes={
-                "marginal_replay.current_symbol": symbol,
-                "marginal_replay.current_index": index,
-                "marginal_replay.current_stage": "Preparing asset replay",
-                "marginal_replay.completed_count": index - 1,
-                "marginal_replay.progress_percent": round(100.0 * index / total_runs, 1),
-            },
-        )
-        row: dict[str, Any] = {"symbol": symbol, "status": "completed"}
-        try:
-            cached_frame = (candidate_frame_cache or {}).get(symbol)
-            if cached_frame is not None and not cached_frame.empty:
-                candidate_frame = _frame_through(cached_frame, evaluation_end)
-                coverage = _history_coverage_against_baseline(
-                    symbol, candidate_frame, config, required_sessions
-                )
-            else:
-                candidate_frame, coverage = _candidate_history_coverage(
-                    db, symbol, config, pd.Timestamp(evaluation_end), required_sessions
-                )
-            candidate_assets = list(dict.fromkeys([*baseline_assets, symbol]))
-            candidate_request = _marginal_execution_request(
-                db, config, strategy, winner_config, evaluation_end,
-                assets=candidate_assets,
-                reference_assets=baseline_assets,
-                candidate_assets=[symbol],
-                analysis_start_date=evaluation_start,
-                analysis_end_date=evaluation_end,
-            )
-            candidate_frames = dict(validation_baseline_frames)
-            candidate_frames[symbol] = candidate_frame
-            candidate_metrics, candidate_decision_sessions = _run_rotation_replay(
-                candidate_frames,
-                candidate_request,
-                progress_callback=_marginal_progress_callback(
-                    db,
-                    run_id,
-                    run_position=index,
-                    total_runs=total_runs,
-                    current_symbol=symbol,
-                    current_index=index,
-                    completed_count=index - 1,
-                ),
-            )
-            context_compatibility = _research_context_compatibility(
-                baseline_decision_sessions, candidate_decision_sessions
-            )
-            if not bool(context_compatibility.get("research_context_compatible")):
-                row.update({
-                    "status": "rejected",
-                    "rejection_reason": "research_context_incomplete",
-                    "history_window_complete": bool(coverage.get("history_window_complete")),
-                    **context_compatibility,
-                })
-                _reject(db, run_id, "research_context_incomplete")
-            else:
-                row.update({
-                    "history_window_complete": bool(coverage.get("history_window_complete")),
-                    **context_compatibility,
-                    "validation_method": "causal_temporal_validation",
-                    "selection_cutoff": selection_cutoff,
-                    "evaluation_start": evaluation_start,
-                    "evaluation_end": evaluation_end,
-                    "validation_sessions": int(causal_window.get("validation_sessions") or 0),
-                    "certification_start": causal_window.get("certification_start"),
-                    "certification_end": causal_window.get("certification_end"),
-                    "certification_sessions": int(causal_window.get("certification_sessions") or 0),
-                    "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
-                    "selection_precedes_evaluation": bool(causal_window.get("selection_precedes_evaluation")),
-                    "historical_gain_used_for_selection": False,
-                    "baseline": baseline_metrics,
-                    "candidate": candidate_metrics,
-                    "ending_capital_delta": _delta(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
-                    "ending_capital_delta_rate": _capital_delta_rate(candidate_metrics.get("ending_capital"), baseline_metrics.get("ending_capital")),
-                    "cagr_delta": _delta(candidate_metrics.get("cagr"), baseline_metrics.get("cagr")),
-                    "sharpe_delta": _delta(candidate_metrics.get("sharpe"), baseline_metrics.get("sharpe")),
-                    "maximum_drawdown_delta": _delta(candidate_metrics.get("maximum_drawdown"), baseline_metrics.get("maximum_drawdown")),
-                    "worst_fold_return_delta": _delta(candidate_metrics.get("worst_fold_return"), baseline_metrics.get("worst_fold_return")),
-                    "switches_delta": _delta(candidate_metrics.get("switches"), baseline_metrics.get("switches")),
-                    "cash_days_delta": _delta(candidate_metrics.get("cash_days"), baseline_metrics.get("cash_days")),
-                    "market_exposure_delta": _delta(candidate_metrics.get("market_exposure"), baseline_metrics.get("market_exposure")),
-                })
-        except Exception as exc:
-            row.update({"status": "failed", "error": str(exc)[:700]})
+    retained_results: list[dict[str, Any]] = []
+    retained_replay_rows: list[dict[str, Any]] = []
+    candidate_map = {
+        str(item.get("symbol") or "").strip().upper(): dict(item)
+        for item in shortlist
+        if str(item.get("symbol") or "").strip()
+    }
+    completed_count = 0
+    low_adherence_count = 0
+    history_rejected_count = 0
+    research_context_rejected_count = 0
+    technical_failure_count = 0
+    rankable_count = len(candidate_map)
+    ordered_candidates = sorted(
+        candidate_map.values(),
+        key=lambda item: int((item.get("causal_selection") or {}).get("rank") or item.get("rank") or 999999),
+    )
 
-        row["persistence_eligible"] = _marginal_replay_is_persistent_candidate(row)
-        row["persistence_reason"] = "positive_causal_validation_capital" if row["persistence_eligible"] else "causal_validation_not_positive"
-        replay_rows.append(row)
-
-        target = result_map.get(symbol)
-        if row["persistence_eligible"]:
-            if target is not None:
-                target["marginal_replay"] = row
-                target["persistence_eligible"] = True
-                target["persistence_reason"] = "positive_causal_validation_capital"
-        else:
-            updated_results = [item for item in updated_results if str(item.get("symbol") or "").strip().upper() != symbol]
-            result_map.pop(symbol, None)
-            if row.get("rejection_reason") != "research_context_incomplete":
-                error_text = str(row.get("error") or "").lower()
-                if "not enough history" in error_text or "available_test_rows" in error_text or "minimum_test" in error_text:
-                    _reject(db, run_id, "insufficient_walk_forward_history")
-                elif row.get("status") == "completed":
-                    _reject(db, run_id, "low_strategy_adherence")
-                else:
-                    _increment(db, run_id, {"technical_failure_count": 1})
-
-        persisted_replay_rows = [candidate for candidate in replay_rows if bool(candidate.get("persistence_eligible"))]
-        _event(
-            db, run_id,
-            (
-                f"Marginal Capital Replay retained {symbol}."
-                if row["persistence_eligible"]
-                else "Marginal Capital Replay discarded one non-adherent asset."
-            ),
-            changes={
-                "marginal_replay": {
-                    "status": "running",
-                    "total_count": len(shortlist),
-                    "completed_count": index,
-                    "current_symbol": None,
-                    "current_index": index,
-                    "current_stage": "Asset replay completed",
-                    "progress_percent": round(100.0 * (index + 1) / total_runs, 1),
-                    "baseline": baseline_metrics,
-                    "validation_method": "causal_temporal_validation",
-                    "selection_cutoff": selection_cutoff,
-                    "evaluation_start": evaluation_start,
-                    "evaluation_end": evaluation_end,
-                    "validation_sessions": int(causal_window.get("validation_sessions") or 0),
-                    "certification_start": causal_window.get("certification_start"),
-                    "certification_end": causal_window.get("certification_end"),
-                    "certification_sessions": int(causal_window.get("certification_sessions") or 0),
-                    "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
-                    "results": persisted_replay_rows,
-                    "persistent_candidate_count": len(persisted_replay_rows),
-                    "low_adherence_count": sum(1 for candidate in replay_rows if not bool(candidate.get("persistence_eligible"))),
-                },
-                "results": updated_results,
-                "shortlisted_count": len(updated_results),
-            },
-        )
+    for batch_index, batch_start in enumerate(range(0, len(ordered_candidates), replay_workers), start=1):
         if _should_stop_after_batch(db, run_id):
             break
+        batch = ordered_candidates[batch_start: batch_start + replay_workers]
+        _event(
+            db,
+            run_id,
+            f"Parallel causal validation batch {batch_index} started with {len(batch)} candidates.",
+            phase="marginal_replay",
+            changes={
+                "current_batch": batch_index,
+                "current_symbol": None,
+                "marginal_replay.current_symbol": None,
+                "marginal_replay.current_stage": "Running candidate replays in parallel",
+            },
+        )
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(replay_workers, len(batch))),
+            thread_name_prefix="mct-asset-discovery-replay",
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _evaluate_marginal_candidate,
+                    db,
+                    item=item,
+                    config=config,
+                    strategy=strategy,
+                    winner_config=winner_config,
+                    baseline_assets=baseline_assets,
+                    validation_baseline_frames=validation_baseline_frames,
+                    baseline_metrics=baseline_metrics,
+                    baseline_decision_sessions=baseline_decision_sessions,
+                    required_sessions=required_sessions,
+                    evaluation_start=evaluation_start,
+                    evaluation_end=evaluation_end,
+                    selection_cutoff=selection_cutoff,
+                    causal_window=causal_window,
+                    candidate_frame_cache=candidate_frame_cache,
+                )
+                for item in batch
+            ]
+            for future in as_completed(futures):
+                row = future.result()
+                completed_count += 1
+                symbol = str(row.get("symbol") or "").strip().upper()
+                if bool(row.get("history_window_complete")):
+                    _increment(db, run_id, {"adherence_validated_count": 1})
 
-    comparable = [row for row in replay_rows if bool(row.get("persistence_eligible"))]
-    comparable.sort(key=lambda row: float(row.get("ending_capital_delta_rate") or 0.0), reverse=True)
-    marginal_rank = {str(row.get("symbol") or ""): index for index, row in enumerate(comparable, start=1)}
-    for item in updated_results:
-        symbol = str(item.get("symbol") or "")
+                if bool(row.get("persistence_eligible")):
+                    retained_row = dict(row)
+                    retained_replay_rows.append(retained_row)
+                    source = dict(candidate_map.get(symbol) or {"symbol": symbol})
+                    source["marginal_replay"] = retained_row
+                    source["persistence_eligible"] = True
+                    source["persistence_reason"] = "positive_causal_validation_capital"
+                    retained_results.append(source)
+                else:
+                    rejection_reason = str(row.get("rejection_reason") or "").strip().lower()
+                    if rejection_reason:
+                        _reject(db, run_id, rejection_reason)
+                        if rejection_reason == "research_context_incomplete":
+                            research_context_rejected_count += 1
+                        else:
+                            history_rejected_count += 1
+                    elif str(row.get("status") or "") == "completed":
+                        _reject(db, run_id, "low_strategy_adherence")
+                        low_adherence_count += 1
+                    else:
+                        _increment(db, run_id, {"technical_failure_count": 1})
+                        technical_failure_count += 1
+
+                retained_replay_rows.sort(
+                    key=lambda candidate: float(candidate.get("ending_capital_delta_rate") or 0.0),
+                    reverse=True,
+                )
+                for rank, retained in enumerate(retained_replay_rows, start=1):
+                    retained["marginal_rank"] = rank
+                retained_rank = {
+                    str(item.get("symbol") or "").strip().upper(): index
+                    for index, item in enumerate(retained_replay_rows, start=1)
+                }
+                for retained in retained_results:
+                    replay = retained.get("marginal_replay") if isinstance(retained.get("marginal_replay"), dict) else None
+                    symbol_key = str(retained.get("symbol") or "").strip().upper()
+                    if replay is not None and symbol_key in retained_rank:
+                        replay["marginal_rank"] = retained_rank[symbol_key]
+
+                progress = round(100.0 * (completed_count + 1) / max(1, rankable_count + 1), 1)
+                db[COLLECTION].update_one(
+                    {"_id": CURRENT_ID, "run_id": run_id},
+                    {"$set": bson_value({
+                        "updated_at": utc_now(),
+                        "marginal_replay.status": "running",
+                        "marginal_replay.completed_count": completed_count,
+                        "marginal_replay.current_symbol": None,
+                        "marginal_replay.current_index": completed_count,
+                        "marginal_replay.current_stage": "Running candidate replays in parallel",
+                        "marginal_replay.progress_percent": progress,
+                        "marginal_replay.results": retained_replay_rows,
+                        "marginal_replay.persistent_candidate_count": len(retained_replay_rows),
+                        "marginal_replay.low_adherence_count": low_adherence_count,
+                        "marginal_replay.history_rejected_count": history_rejected_count,
+                        "marginal_replay.research_context_rejected_count": research_context_rejected_count,
+                        "marginal_replay.technical_failure_count": technical_failure_count,
+                        "results": retained_results,
+                        "shortlisted_count": len(retained_results),
+                        "stage_progress_percent": progress,
+                        "current_stage": "Running candidate replays in parallel",
+                        "stage_current": completed_count,
+                        "stage_total": rankable_count,
+                        "current_symbol": None,
+                    })},
+                )
+
+    retained_replay_rows.sort(
+        key=lambda row: float(row.get("ending_capital_delta_rate") or 0.0),
+        reverse=True,
+    )
+    for rank, row in enumerate(retained_replay_rows, start=1):
+        row["marginal_rank"] = rank
+    rank_by_symbol = {
+        str(row.get("symbol") or "").strip().upper(): rank
+        for rank, row in enumerate(retained_replay_rows, start=1)
+    }
+    for item in retained_results:
+        symbol = str(item.get("symbol") or "").strip().upper()
         replay = item.get("marginal_replay") if isinstance(item.get("marginal_replay"), dict) else None
-        if replay is not None and symbol in marginal_rank:
-            replay["marginal_rank"] = marginal_rank[symbol]
-    for row in comparable:
-        symbol = str(row.get("symbol") or "")
-        if symbol in marginal_rank:
-            row["marginal_rank"] = marginal_rank[symbol]
+        if replay is not None and symbol in rank_by_symbol:
+            replay["marginal_rank"] = rank_by_symbol[symbol]
 
-    eligible_results = [item for item in updated_results if _item_is_persistent_candidate(item)]
-    persisted_replay_rows = [row for row in comparable if _marginal_replay_is_persistent_candidate(row)]
-
+    stopped = completed_count < rankable_count
     replay_summary = {
-        "status": "completed" if len(replay_rows) == len(shortlist) else "stopped",
-        "total_count": len(shortlist),
-        "completed_count": len(replay_rows),
+        "status": "stopped" if stopped else "completed",
+        "total_count": rankable_count,
+        "completed_count": completed_count,
         "current_symbol": None,
-        "current_index": len(replay_rows),
-        "current_stage": "Marginal Capital Replay completed" if len(replay_rows) == len(shortlist) else "Marginal Capital Replay stopped",
-        "progress_percent": 100.0 if len(replay_rows) == len(shortlist) else round(100.0 * (len(replay_rows) + 1) / total_runs, 1),
+        "current_index": completed_count,
+        "current_stage": "Marginal Capital Replay stopped" if stopped else "Marginal Capital Replay completed",
+        "progress_percent": round(100.0 * (completed_count + 1) / max(1, rankable_count + 1), 1) if stopped else 100.0,
         "baseline": baseline_metrics,
         "validation_method": "causal_temporal_validation",
         "selection_cutoff": selection_cutoff,
@@ -1440,13 +1562,17 @@ def _run_marginal_capital_replay(
         "holdout_sessions": int(causal_window.get("holdout_sessions") or 0),
         "selection_precedes_evaluation": bool(causal_window.get("selection_precedes_evaluation")),
         "historical_gain_used_for_selection": False,
-        "results": persisted_replay_rows,
-        "eligible_count": len(eligible_results),
-        "persistent_candidate_count": len(persisted_replay_rows),
-        "low_adherence_count": sum(1 for row in replay_rows if not bool(row.get("persistence_eligible"))),
-        "research_context_rejected_count": sum(1 for row in replay_rows if row.get("rejection_reason") == "research_context_incomplete"),
+        "parallel_workers": replay_workers,
+        "persistence_policy": "retained_candidates_and_aggregate_counts_only",
+        "results": retained_replay_rows,
+        "eligible_count": len(retained_results),
+        "persistent_candidate_count": len(retained_replay_rows),
+        "low_adherence_count": low_adherence_count,
+        "history_rejected_count": history_rejected_count,
+        "research_context_rejected_count": research_context_rejected_count,
+        "technical_failure_count": technical_failure_count,
     }
-    return eligible_results, replay_summary
+    return retained_results, replay_summary
 
 def _catalog_metrics(item: dict[str, Any]) -> dict[str, Any]:
     keys = (
@@ -1662,7 +1788,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
     heartbeat_thread.start()
     try:
         document = _campaign(db) or {}
-        requested = int(document.get("research_size") or 24)
+        requested = int(document.get("research_size") or DEFAULT_RESEARCH_SIZE)
         _event(
             db,
             run_id,
@@ -1831,8 +1957,10 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
 
         evaluated: list[dict[str, Any]] = []
         scan_completed = 0
-        for batch_index, batch_start in enumerate(range(0, len(selected), BATCH_SIZE), start=1):
-            batch = selected[batch_start: batch_start + BATCH_SIZE]
+        scan_batch_size = _scan_batch_size()
+        scan_workers = _scan_worker_count()
+        for batch_index, batch_start in enumerate(range(0, len(selected), scan_batch_size), start=1):
+            batch = selected[batch_start: batch_start + scan_batch_size]
             _event(
                 db,
                 run_id,
@@ -1842,7 +1970,7 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
 
             scan_credentials = get_alpaca_credentials(db)
             with ThreadPoolExecutor(
-                max_workers=max(1, min(BATCH_SIZE, len(batch))),
+                max_workers=max(1, min(scan_workers, len(batch))),
                 thread_name_prefix="mct-asset-discovery-scan",
             ) as executor:
                 futures = {
@@ -1919,92 +2047,38 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         causal_ranked = _annotate_causal_ranks(ranked_fast)
         causal_ranked.sort(key=lambda item: int((item.get("causal_selection") or {}).get("rank") or 999999))
         causal_unavailable_count = max(0, scan_budget - len(causal_ranked))
-        shortlist: list[dict[str, Any]] = []
-        validated_candidate_frames: dict[str, pd.DataFrame] = {}
         _event(
             db,
             run_id,
             f"Fast scan produced {len(causal_ranked)} historical causal candidates at {causal_window['selection_cutoff']} without using either reserved validation or certification data.",
-            phase="causal_selection",
+            phase="marginal_replay",
             changes={
                 "fast_evaluated_count": len(ranked_fast),
                 "causal_ranked_count": len(causal_ranked),
                 "causal_unavailable_count": causal_unavailable_count,
                 "adherence_validated_count": 0,
-                "progress_step": "adherence_validation",
+                "validation_candidate_count": len(causal_ranked),
+                "results": [],
+                "shortlisted_count": 0,
+                "progress_step": "marginal_replay",
                 "stage_progress_percent": 0.0,
-                "current_stage": "Validating causal shortlist history",
+                "current_stage": "Preparing parallel causal validation",
                 "stage_current": 0,
                 "stage_total": len(causal_ranked),
             },
         )
-        adherence_checked = 0
-        for ranked_item in causal_ranked:
-            if len(shortlist) >= 8:
-                break
-            symbol = str(ranked_item.get("symbol") or "").strip().upper()
-            try:
-                # History integrity used to advance a candidate may inspect only data
-                # through the validation slice.  The later certification slice remains
-                # untouched until Full Strategy validation is explicitly started.
-                frame, coverage = _candidate_history_coverage(
-                    db, symbol, config, pd.Timestamp(causal_window["validation_end"]), validation_required_sessions
-                )
-                validated = dict(ranked_item)
-                validated.update(coverage)
-                validated["history_integrity_cutoff"] = causal_window.get("validation_end")
-                validated["certification_history_inspected"] = False
-                shortlist.append(validated)
-                validated_candidate_frames[symbol] = frame
-                _increment(db, run_id, {"adherence_validated_count": 1})
-            except RuntimeError as exc:
-                reason = str(exc).strip().lower()
-                if reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity", "price_filter", "liquidity_filter", "volume_quality_filter"}:
-                    _reject(db, run_id, reason)
-                else:
-                    _increment(db, run_id, {"technical_failure_count": 1})
-            except Exception:
-                _increment(db, run_id, {"technical_failure_count": 1})
 
-            adherence_checked += 1
-            adherence_complete = len(shortlist) >= 8 or adherence_checked >= len(causal_ranked)
-            _set_stage_progress(
-                db,
-                run_id,
-                step="adherence_validation",
-                percent=100.0 if adherence_complete else (100.0 * adherence_checked / max(1, len(causal_ranked))),
-                label="Validating causal shortlist history",
-                current=adherence_checked,
-                total=len(causal_ranked),
-            )
-
-            if _should_stop_after_batch(db, run_id):
-                _finish(
-                    db,
-                    run_id,
-                    "stopped",
-                    "Asset Discovery stopped during shortlist adherence validation; transient candidate data was discarded.",
-                    results=[],
-                )
-                return
-
-        if shortlist:
-            _event(
-                db,
-                run_id,
-                f"Asset Discovery causally selected {len(causal_ranked)} historical candidates; {len(shortlist)} passed history integrity and will be screened only on the reserved validation slice. The later certification slice remains untouched.",
-                phase="marginal_replay",
-                changes={
-                    "results": [],
-                    "shortlisted_count": len(shortlist),
-                    "progress_step": "marginal_replay",
-                    "stage_progress_percent": 0.0,
-                    "current_stage": "Preparing Marginal Capital Replay",
-                    "stage_current": 0,
-                    "stage_total": len(shortlist),
-                },
-            )
-            shortlist, marginal_replay = _run_marginal_capital_replay(
+        retained: list[dict[str, Any]] = []
+        marginal_replay: dict[str, Any] = {
+            "status": "completed",
+            "total_count": 0,
+            "completed_count": 0,
+            "current_symbol": None,
+            "baseline": None,
+            "results": [],
+        }
+        if causal_ranked:
+            retained, marginal_replay = _run_marginal_capital_replay(
                 db,
                 run_id,
                 config=config,
@@ -2013,27 +2087,37 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 end_session=end_session,
                 baseline_frames=baseline_frames,
                 required_sessions=validation_required_sessions,
-                shortlist=shortlist,
+                shortlist=causal_ranked,
                 causal_window=causal_window,
-                candidate_frame_cache=validated_candidate_frames,
+                candidate_frame_cache=None,
             )
             if _should_stop_after_batch(db, run_id):
-                _event(db, run_id, "Asset Discovery stopped after the current Marginal Capital Replay asset.", changes={"marginal_replay": marginal_replay})
+                _event(
+                    db,
+                    run_id,
+                    "Asset Discovery stopped after the current parallel validation batch; non-retained candidate details were discarded.",
+                    changes={"marginal_replay": marginal_replay},
+                )
                 _finish(
                     db,
                     run_id,
                     "stopped",
-                    f"Asset Discovery stopped during Marginal Capital Replay; {marginal_replay.get('completed_count', 0)} of {len(shortlist)} shortlisted assets were replayed.",
-                    results=shortlist,
+                    f"Asset Discovery stopped after validating {marginal_replay.get('completed_count', 0)} of {len(causal_ranked)} causal candidates in bounded parallel batches.",
+                    results=retained,
                 )
                 return
-            _event(db, run_id, "Marginal Capital Replay completed for the full shortlist.", changes={"marginal_replay": marginal_replay})
+            _event(
+                db,
+                run_id,
+                "Parallel causal validation completed. Only retained candidates and aggregate rejection counts were persisted.",
+                changes={"marginal_replay": marginal_replay},
+            )
         _finish(
             db,
             run_id,
             "completed",
-            f"Asset Discovery causally evaluated {len(evaluated)} sampled assets and retained {len(shortlist)} validation candidates. Final Strategy certification remains separate and uses later non-overlapping data.",
-            results=shortlist,
+            f"Asset Discovery causally evaluated {len(evaluated)} sampled assets and retained {len(retained)} validation candidates. Final Strategy certification remains separate and uses later non-overlapping data.",
+            results=retained,
         )
     except Exception as exc:
         _finish(db, run_id, "failed", f"Asset Discovery failed: {str(exc)[:900]}")
@@ -2109,18 +2193,25 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
     return {
         "api_version": API_VERSION,
         "mode": "manual",
-        "batch_size": BATCH_SIZE,
+        "batch_size": _scan_batch_size(),
+        "scan_parallelism": _scan_worker_count(),
+        "validation_parallelism": _replay_worker_count(),
+        "research_size_default": DEFAULT_RESEARCH_SIZE,
+        "research_size_unbounded_by_application": True,
         "baseline": selected_baseline,
-        "research_size_options": [8, 16, 24, 32, 40, 48, 56, 64],
         "persistence_policy": {
             "external_market_bars": "memory_only",
             "technical_failures": "aggregate_only",
             "rejected_assets": "aggregate_only",
-            "stored_shortlist_limit": 8,
-            "marginal_replay": "shortlist_only_in_memory_market_data",
+            "stored_shortlist_limit": None,
+            "marginal_replay": "all causal candidates are validated in bounded parallel batches; only retained candidates are persisted",
             "history": "latest_campaign_only",
             "discovery_catalog": "positive_causal_validation_candidates_only",
             "low_adherence_assets": "aggregate_only_not_visible_or_persisted",
+            "candidate_test_details": "retained_candidates_only",
+            "research_size_limit": "external_universe_only",
+            "scan_parallelism": _scan_worker_count(),
+            "validation_parallelism": _replay_worker_count(),
             "selection_policy": "historical_cutoff_then_126_session_validation_then_126_session_certification",
             "certification_reuse_policy": "non_overlapping_windows",
             "historical_full_replay_promotion": "disabled",
@@ -2132,8 +2223,8 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
 def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]:
     global _worker_thread
     requested = int(research_size)
-    if requested < 8 or requested > 64 or requested % 8 != 0:
-        raise AssetDiscoveryConflict("Research size must be one of 8, 16, 24, 32, 40, 48, 56 or 64 assets.")
+    if requested < 1:
+        raise AssetDiscoveryConflict("Research size must be at least 1 asset.")
 
     with _worker_lock:
         current = _campaign(db) or {}
@@ -2165,7 +2256,9 @@ def start_asset_discovery(db: Database, *, research_size: int) -> dict[str, Any]
             "phase": "queued",
             "mode": "manual",
             "research_size": requested,
-            "batch_size": BATCH_SIZE,
+            "batch_size": _scan_batch_size(),
+            "scan_parallelism": _scan_worker_count(),
+            "validation_parallelism": _replay_worker_count(),
             "scan_budget": requested,
             "attempted_count": 0,
             "evaluated_count": 0,
@@ -3207,6 +3300,10 @@ def export_asset_discovery(db: Database, *, front_version: str | None = None) ->
             "validation_sessions": CAUSAL_VALIDATION_SESSIONS,
             "certification_sessions": CAUSAL_CERTIFICATION_SESSIONS,
             "certification_windows_non_overlapping": True,
+            "research_size_limit": "external_universe_only",
+            "scan_parallelism": _scan_worker_count(),
+            "validation_parallelism": _replay_worker_count(),
+            "rejected_candidate_details_persisted": False,
         },
         "campaign": payload,
     }
