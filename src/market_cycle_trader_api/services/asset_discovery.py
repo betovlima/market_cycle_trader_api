@@ -146,13 +146,33 @@ def _sanitize_completed_campaign_persistence(db: Database, document: dict[str, A
         return document
 
     stored_results = list(document.get("results") or []) if isinstance(document.get("results"), list) else []
-    visible_results = [item for item in stored_results if _item_is_persistent_candidate(item)]
 
     marginal = dict(document.get("marginal_replay") or {}) if isinstance(document.get("marginal_replay"), dict) else {}
     stored_replay_rows = list(marginal.get("results") or []) if isinstance(marginal.get("results"), list) else []
     visible_replay_rows = [row for row in stored_replay_rows if _marginal_replay_is_persistent_candidate(row)]
 
-    changed = len(visible_results) != len(stored_results) or len(visible_replay_rows) != len(stored_replay_rows)
+    visible_results = [item for item in stored_results if _item_is_persistent_candidate(item)]
+    visible_result_symbols = {str(item.get("symbol") or "").strip().upper() for item in visible_results if isinstance(item, dict)}
+    repaired_results: list[dict[str, Any]] = list(visible_results)
+    for row in visible_replay_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol or symbol in visible_result_symbols:
+            continue
+        repaired_results.append({
+            "symbol": symbol,
+            "history_window_complete": True,
+            "persistence_eligible": True,
+            "persistence_reason": "positive_causal_validation_capital",
+            "marginal_replay": dict(row),
+        })
+        visible_result_symbols.add(symbol)
+    visible_results = repaired_results
+
+    changed = (
+        len(visible_results) != len(stored_results)
+        or len(visible_replay_rows) != len(stored_replay_rows)
+        or any(not _item_is_persistent_candidate(item) for item in stored_results)
+    )
     if not changed:
         return document
 
@@ -1173,9 +1193,15 @@ def _marginal_replay_is_persistent_candidate(replay: Any) -> bool:
 
 
 def _item_is_persistent_candidate(item: Any) -> bool:
-    if not isinstance(item, dict) or not bool(item.get("history_window_complete")):
+    if not isinstance(item, dict):
         return False
-    return _marginal_replay_is_persistent_candidate(item.get("marginal_replay"))
+    replay = item.get("marginal_replay") if isinstance(item.get("marginal_replay"), dict) else None
+    history_complete = item.get("history_window_complete")
+    if history_complete is not True:
+        history_complete = replay.get("history_window_complete") if isinstance(replay, dict) else None
+    if history_complete is not True:
+        return False
+    return _marginal_replay_is_persistent_candidate(replay)
 
 
 def _selection_symbols(values: list[str]) -> list[str]:
@@ -1465,6 +1491,7 @@ def _run_marginal_capital_replay(
                     retained_row = dict(row)
                     retained_replay_rows.append(retained_row)
                     source = dict(candidate_map.get(symbol) or {"symbol": symbol})
+                    source["history_window_complete"] = True
                     source["marginal_replay"] = retained_row
                     source["persistence_eligible"] = True
                     source["persistence_reason"] = "positive_causal_validation_capital"
