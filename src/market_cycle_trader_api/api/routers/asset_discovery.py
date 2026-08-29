@@ -8,10 +8,10 @@ from fastapi.encoders import jsonable_encoder
 
 from ...auth.security import SessionIdentity, require_capability
 from ...core.runtime import database
-from ...schemas.asset_discovery import AssetDiscoveryCreateStrategyRequest, AssetDiscoveryStartRequest, AssetDiscoveryValidateSelectionRequest
+from ...schemas.asset_discovery import AssetDiscoveryAppendToResearchRequest, AssetDiscoveryCreateStrategyRequest, AssetDiscoveryStartRequest, AssetDiscoveryValidateSelectionRequest
 from ...services.asset_discovery import (
     AssetDiscoveryConflict,
-    create_research_strategy_from_discovery,
+    append_selected_assets_to_research_strategy,
     export_asset_discovery,
     get_asset_discovery_status,
     get_discovery_catalog,
@@ -77,13 +77,13 @@ def validate_selection(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
-@router.post("/create-strategy", status_code=status.HTTP_201_CREATED)
-def create_research_strategy(
-    payload: AssetDiscoveryCreateStrategyRequest,
+@router.post("/append-to-research-strategy", status_code=status.HTTP_200_OK)
+def append_to_research_strategy(
+    payload: AssetDiscoveryAppendToResearchRequest,
     identity: Annotated[SessionIdentity, Depends(require_capability("asset_discovery.create_strategy"))],
 ) -> dict[str, Any]:
     try:
-        return create_research_strategy_from_discovery(
+        return append_selected_assets_to_research_strategy(
             database(),
             run_id=payload.run_id,
             symbols=payload.symbols,
@@ -91,6 +91,22 @@ def create_research_strategy(
         )
     except AssetDiscoveryConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/create-strategy", status_code=status.HTTP_409_CONFLICT, deprecated=True)
+def create_research_strategy(
+    payload: AssetDiscoveryCreateStrategyRequest,
+    identity: Annotated[SessionIdentity, Depends(require_capability("asset_discovery.create_strategy"))],
+) -> dict[str, Any]:
+    del payload, identity
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "Creating a separate Strategy from Asset Discovery is disabled. "
+            "Use /api/asset-discovery/append-to-research-strategy to append only the explicitly selected "
+            "and certified assets to the current RESEARCH Strategy."
+        ),
+    )
 
 
 @router.get("/export")
