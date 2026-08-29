@@ -56,6 +56,8 @@ from .strategy_lab import (
     get_strategy,
     get_strategy_model_snapshot,
     get_trader_winner_context,
+    update_strategy,
+    StrategyLabConflict,
 )
 
 COLLECTION = ASSET_DISCOVERY_RESEARCH_COLLECTION
@@ -3071,6 +3073,153 @@ def _validated_creation_source(
     return source, config, validation
 
 
+
+def append_selected_assets_to_research_strategy(
+    db: Database,
+    *,
+    run_id: str | None,
+    symbols: list[str],
+    actor_email: str | None,
+) -> dict[str, Any]:
+    """Append only the explicitly selected, fully certified assets to the current RESEARCH Strategy.
+
+    Existing Strategy assets are preserved in their original order. Rejected/failed assets are never
+    persisted here. Market history is persisted only for selected assets after an exact-selection
+    final certification PASS.
+    """
+    current_document = _campaign(db) or {}
+    current_run_id = str(current_document.get("run_id") or "").strip()
+    normalized_run_id = str(run_id or "").strip()
+    if normalized_run_id and normalized_run_id != current_run_id:
+        raise AssetDiscoveryConflict("The selected Asset Discovery run is no longer the current campaign.")
+
+    requested_symbols = _selection_symbols(symbols)
+    if not requested_symbols:
+        raise AssetDiscoveryConflict("Select at least one discovered asset.")
+
+    discovery_metadata = _discovery_metadata_for_symbols(db, current_document, requested_symbols)
+    _require_persistent_candidate_selection(discovery_metadata, requested_symbols)
+    source_raw, source_config, validation = _validated_creation_source(db, current_document, requested_symbols)
+    source_id = str(source_raw.get("_id") or "")
+    source_assets = [str(item).strip().upper() for item in source_config.assets if str(item).strip()]
+    source_asset_set = set(source_assets)
+    added_symbols = [symbol for symbol in requested_symbols if symbol not in source_asset_set]
+    already_present = [symbol for symbol in requested_symbols if symbol in source_asset_set]
+    if not added_symbols:
+        raise AssetDiscoveryConflict("All selected assets are already present in the current Strategy Research source.")
+
+    snapshot_end = str(validation.get("snapshot_end") or "").strip()
+    if not snapshot_end:
+        snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+
+    source_baseline_frames = _baseline_frames(source_config, snapshot_end)
+    required_sessions = _baseline_required_sessions(source_baseline_frames, source_config, snapshot_end)
+    persisted_history_rows: dict[str, int] = {}
+    discarded_assets: list[dict[str, str]] = []
+    for symbol in added_symbols:
+        try:
+            persisted_history_rows[symbol] = _persist_selected_asset_history(
+                db, symbol, source_config, snapshot_end, required_sessions
+            )
+        except AssetDiscoveryConflict as exc:
+            discarded_assets.append({"symbol": symbol, "reason": str(exc)})
+            # If history cannot be persisted safely, the candidate no longer has promotion-quality evidence.
+            db[CATALOG_COLLECTION].delete_one({"_id": symbol})
+
+    if discarded_assets:
+        discarded = ", ".join(item["symbol"] for item in discarded_assets)
+        raise AssetDiscoveryConflict(
+            "The certified selection changed during market-history persistence. "
+            f"Discarded: {discarded}. Run final certification again."
+        )
+
+    combined_assets = list(dict.fromkeys([*source_assets, *added_symbols]))
+    updated_configuration = source_config.model_copy(update={"assets": combined_assets})
+    previous_revision = int(source_raw.get("revision") or 1)
+    note = "Added Asset Discovery certified assets without removing existing Strategy assets: " + ", ".join(added_symbols)
+    try:
+        updated_strategy = update_strategy(
+            db,
+            source_id,
+            configuration=updated_configuration,
+            name=str(source_raw.get("name") or ""),
+            description=str(source_raw.get("description") or ""),
+            note=note,
+            expected_revision=previous_revision,
+            actor_email=actor_email,
+        )
+    except StrategyLabConflict as exc:
+        raise AssetDiscoveryConflict(str(exc)) from exc
+
+    now = utc_now()
+    lightweight_lineage = {
+        "run_id": current_run_id or None,
+        "validation_id": validation.get("validation_id"),
+        "added_assets": added_symbols,
+        "previous_revision": previous_revision,
+        "new_revision": updated_strategy.get("revision"),
+        "updated_at": now,
+        "updated_by": (actor_email or "").strip().lower() or None,
+    }
+    db[STRATEGY_PROFILES_COLLECTION].update_one(
+        {"_id": source_id, "revision": int(updated_strategy.get("revision") or previous_revision + 1)},
+        {"$set": {"last_discovery_append": bson_value(lightweight_lineage)}},
+    )
+    updated_strategy = get_strategy(db, source_id)
+
+    for symbol in added_symbols:
+        db[CATALOG_COLLECTION].update_one(
+            {"_id": symbol},
+            {
+                "$set": {
+                    "status": "added_to_research_strategy",
+                    "last_strategy_id": source_id,
+                    "last_strategy_added_at": now,
+                    "updated_at": now,
+                },
+                "$inc": {"research_strategy_added_count": 1},
+            },
+        )
+
+    append_record = {
+        "run_id": current_run_id or None,
+        "validation_id": validation.get("validation_id"),
+        "decision": validation.get("decision"),
+        "strategy_id": source_id,
+        "strategy_sequence": updated_strategy.get("strategy_sequence"),
+        "previous_revision": previous_revision,
+        "new_revision": updated_strategy.get("revision"),
+        "selected_assets": requested_symbols,
+        "added_assets": added_symbols,
+        "already_present_assets": already_present,
+        "asset_count_before": len(source_assets),
+        "asset_count_after": len(combined_assets),
+        "persisted_history_rows": persisted_history_rows,
+        "updated_at": now,
+        "updated_by": (actor_email or "").strip().lower() or None,
+    }
+    db[COLLECTION].update_one(
+        {"_id": CURRENT_ID, "run_id": current_run_id},
+        {"$set": {"research_strategy_append": bson_value(append_record), "updated_at": now}},
+    )
+
+    return {
+        "research_strategy": updated_strategy,
+        "selected_assets": requested_symbols,
+        "added_assets": added_symbols,
+        "already_present_assets": already_present,
+        "asset_count_before": len(source_assets),
+        "asset_count_after": len(combined_assets),
+        "persisted_history_rows": persisted_history_rows,
+        "full_strategy_validation": {
+            "validation_id": validation.get("validation_id"),
+            "decision": validation.get("decision"),
+            "deltas": validation.get("deltas"),
+            "gates": validation.get("gates"),
+        },
+    }
+
+
 def create_research_strategy_from_discovery(
     db: Database,
     *,
@@ -3304,6 +3453,8 @@ def export_asset_discovery(db: Database, *, front_version: str | None = None) ->
             "scan_parallelism": _scan_worker_count(),
             "validation_parallelism": _replay_worker_count(),
             "rejected_candidate_details_persisted": False,
+            "research_strategy_update_mode": "append_explicitly_selected_certified_assets_only",
+            "existing_research_strategy_assets_preserved": True,
         },
         "campaign": payload,
     }
