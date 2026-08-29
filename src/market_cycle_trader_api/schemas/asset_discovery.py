@@ -4,16 +4,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class AssetDiscoveryStartRequest(BaseModel):
-    research_size: int = Field(default=24, ge=8, le=64)
-
-    @field_validator("research_size")
-    @classmethod
-    def validate_research_size(cls, value: int) -> int:
-        normalized = int(value)
-        if normalized % 8 != 0:
-            raise ValueError("Asset Discovery research_size must be a multiple of 8.")
-        return normalized
-
+    research_size: int = Field(default=64, ge=1)
 
 class AssetDiscoveryValidateSelectionRequest(BaseModel):
     run_id: str | None = Field(default=None, max_length=160)
