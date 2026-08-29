@@ -2321,12 +2321,23 @@ def _analysis_decision_dates(
         )
 
     execution_start = max(champion_oos_start, requested_execution_start)
-    if execution_start >= champion_oos_end:
+
+    requested_end_value = getattr(config, 'analysis_end_date', None)
+    execution_end = champion_oos_end
+    if requested_end_value:
+        requested_end = pd.Timestamp(requested_end_value)
+        requested_end = (
+            requested_end.tz_localize('UTC')
+            if requested_end.tzinfo is None
+            else requested_end.tz_convert('UTC')
+        )
+        requested_execution_end = int(common_dates.searchsorted(requested_end, side='right'))
+        execution_end = min(champion_oos_end, requested_execution_end)
+
+    if execution_start >= execution_end:
         raise ValueError('The requested analysis interval contains no executable session.')
 
-    
-    
-    return common_dates[execution_start - 1:champion_oos_end]
+    return common_dates[execution_start - 1:execution_end]
 
 def _scheduled_policy(policies: dict[int, Callable[[pd.Timestamp, int, int], tuple[int, float]]], decision_to_fold: dict[pd.Timestamp, int]) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
 
