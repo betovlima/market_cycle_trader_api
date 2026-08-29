@@ -496,6 +496,13 @@ def latest_feature_snapshot(frame: pd.DataFrame) -> tuple[pd.Series, pd.Timestam
 
 
 def market_quality(frame: pd.DataFrame) -> dict[str, float]:
+    """Return descriptive market metrics without filtering Discovery candidates.
+
+    Asset Discovery v10.3 does not reject candidates because of arbitrary price or
+    liquidity thresholds. Economic eligibility is decided by complete historical
+    coverage and the full-Strategy capital replay. These values remain useful only
+    as diagnostics/ranker features.
+    """
     source = _clean_frame(frame)
     if len(source) < MIN_FEATURE_SESSIONS:
         raise RuntimeError("insufficient_history")
@@ -505,12 +512,6 @@ def market_quality(frame: pd.DataFrame) -> dict[str, float]:
     latest_close = float(close.iloc[-1])
     median_dollar_volume = float((close * volume).median())
     nonzero_volume_ratio = float((volume > 0).mean())
-    if latest_close < 5.0:
-        raise RuntimeError("price_filter")
-    if median_dollar_volume < 10_000_000.0:
-        raise RuntimeError("liquidity_filter")
-    if nonzero_volume_ratio < 0.98:
-        raise RuntimeError("volume_quality_filter")
     return {
         "latest_close": latest_close,
         "median_dollar_volume": median_dollar_volume,
