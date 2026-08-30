@@ -1564,10 +1564,31 @@ def build_temporal_intelligence_export(
             statistical_export = bson_value(pipeline_statistical_ml_control)
             archive.writestr("strategy_research_statistical_ml_control.json", json.dumps(statistical_export, indent=2, ensure_ascii=False, default=str))
             archive.writestr("strategy_research_statistical_ml_control_predictions.csv", _csv_text([bson_value(dict(item)) for item in (statistical_export.get("predictions") or []) if isinstance(item, dict)]))
-            archive.writestr("strategy_research_statistical_ml_control_folds.csv", _csv_text([bson_value({key: value for key, value in dict(item).items() if key not in {"close_metrics", "open_metrics"}} | {
-                **{f"close_{key}": value for key, value in ((item.get("close_metrics") or {}).items()) if key != "roc"},
-                **{f"open_{key}": value for key, value in ((item.get("open_metrics") or {}).items()) if key != "roc"},
-            }) for item in (statistical_export.get("folds") or []) if isinstance(item, dict)]))
+            statistical_fold_rows = []
+            for item in (statistical_export.get("folds") or []):
+                if not isinstance(item, dict):
+                    continue
+                close_metrics = item.get("close_metrics") or {}
+                open_metrics = item.get("open_metrics") or {}
+                close_cash = close_metrics.get("cash") or {}
+                close_rotate = close_metrics.get("rotate") or {}
+                open_cash = open_metrics.get("cash") or {}
+                open_rotate = open_metrics.get("rotate") or {}
+                regime_context = item.get("regime_context") or {}
+                statistical_fold_rows.append(bson_value({
+                    **{key: value for key, value in dict(item).items() if key not in {"close_metrics", "open_metrics", "regime_context"}},
+                    "close_auc": close_metrics.get("auc"),
+                    "open_auc": open_metrics.get("auc"),
+                    "close_cash_auc": close_cash.get("auc"),
+                    "close_rotate_auc": close_rotate.get("auc"),
+                    "open_cash_auc": open_cash.get("auc"),
+                    "open_rotate_auc": open_rotate.get("auc"),
+                    "regime_context_enabled": regime_context.get("enabled"),
+                    "regime_cluster_count": regime_context.get("cluster_count"),
+                    "regime_silhouette_score": regime_context.get("silhouette_score"),
+                    "regime_window_sessions": regime_context.get("window_sessions"),
+                }))
+            archive.writestr("strategy_research_statistical_ml_control_folds.csv", _csv_text(statistical_fold_rows))
             archive.writestr("strategy_research_statistical_ml_control_monthly.csv", _csv_text([bson_value(dict(item)) for item in (statistical_export.get("monthly") or []) if isinstance(item, dict)]))
             archive.writestr("strategy_research_statistical_ml_control_extreme_sessions.csv", _csv_text([bson_value(dict(item)) for item in (statistical_export.get("extreme_sessions") or []) if isinstance(item, dict)]))
         if pipeline_roc_policy is not None:

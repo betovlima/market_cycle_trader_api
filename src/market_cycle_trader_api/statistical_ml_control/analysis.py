@@ -251,6 +251,28 @@ def _weighted_asset_utility(
     return float(weighted - penalty * downside), returns
 
 
+def _alternative_score(row: dict[str, Any]) -> float | None:
+    return _finite(row.get("risk_adjusted_entry_score")) or _finite(row.get("entry_rank_score"))
+
+
+def _best_alternative(
+    candidates: list[dict[str, Any]],
+    *,
+    current_symbol: str,
+) -> dict[str, Any] | None:
+    eligible = []
+    for row in candidates:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        score = _alternative_score(row)
+        if not symbol or symbol == current_symbol or symbol == "CASH" or score is None:
+            continue
+        eligible.append((float(score), str(symbol), row))
+    if not eligible:
+        return None
+    eligible.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return dict(eligible[0][2])
+
+
 def _prepare_rows(
     reference_rows: list[dict[str, Any]],
     observation_rows: list[dict[str, Any]],
@@ -318,6 +340,9 @@ def _prepare_rows(
     close_cross = {day: _cross_section_z(values) for day, values in close_returns_by_day.items()}
     gap_cross = {day: _cross_section_z(values) for day, values in open_gaps_by_exec_day.items()}
     open_series = _open_series(observations)
+    observations_by_day: dict[str, list[dict[str, Any]]] = {}
+    for (decision_day, _symbol), row in enriched.items():
+        observations_by_day.setdefault(decision_day, []).append(row)
 
     result: list[dict[str, Any]] = []
     for reference in reference_rows:
@@ -335,8 +360,27 @@ def _prepare_rows(
         utility, horizon_returns = _weighted_asset_utility(open_series.get(symbol), execution_at, settings)
         if utility is None:
             continue
+        alternative = _best_alternative(observations_by_day.get(decision_day, []), current_symbol=symbol)
+        alternative_symbol = str((alternative or {}).get("symbol") or "").upper() or None
+        alternative_utility = None
+        alternative_horizon_returns: dict[int, float | None] = {}
+        if alternative_symbol:
+            alternative_utility, alternative_horizon_returns = _weighted_asset_utility(
+                open_series.get(alternative_symbol), execution_at, settings
+            )
         minimum_cash_edge = float(settings.get("minimum_cash_edge") or 0.005)
-        target_cash = int(0.0 >= float(utility) + minimum_cash_edge)
+        minimum_rotation_edge = float(settings.get("minimum_rotation_edge") or 0.005)
+        target_rotate = int(bool(
+            alternative_symbol
+            and alternative_utility is not None
+            and float(alternative_utility) >= float(utility) + minimum_rotation_edge
+            and float(alternative_utility) >= 0.0 + minimum_rotation_edge
+        ))
+        target_cash = int(bool(
+            0.0 >= float(utility) + minimum_cash_edge
+            and (alternative_utility is None or 0.0 >= float(alternative_utility) + minimum_cash_edge)
+        ))
+        target_action = "ROTATE" if target_rotate else "CASH" if target_cash else "FOLLOW_BASE"
         finite_count = _finite(reference.get("finite_score_count"))
         positive_count = _finite(reference.get("positive_score_count"))
         positive_share = None if finite_count in {None, 0.0} or positive_count is None else float(positive_count / finite_count)
@@ -377,7 +421,28 @@ def _prepare_rows(
             "decision_reason": reference.get("decision_reason"),
             "strategy_equity": _finite(reference.get("strategy_equity")),
             "target_cash": target_cash,
+            "target_rotate": target_rotate,
+            "target_action": target_action,
             "asset_utility": utility,
+            "alternative_symbol": alternative_symbol,
+            "alternative_utility": alternative_utility,
+            "alternative_entry_rank_score": _finite((alternative or {}).get("entry_rank_score")),
+            "alternative_entry_rank_percentile": _finite((alternative or {}).get("entry_rank_percentile")),
+            "alternative_risk_adjusted_entry_score": _finite((alternative or {}).get("risk_adjusted_entry_score")),
+            "alternative_incumbent_risk_health": _finite((alternative or {}).get("incumbent_risk_health")),
+            "alternative_all_horizon_risk_safety": _finite((alternative or {}).get("all_horizon_risk_safety")),
+            "alternative_predicted_drawdown": _finite((alternative or {}).get("predicted_drawdown")),
+            "alternative_short_profit_consensus": _finite((alternative or {}).get("short_profit_consensus")),
+            "alternative_long_profit_confirmation": _finite((alternative or {}).get("long_profit_confirmation")),
+            "alternative_horizon_agreement": _finite((alternative or {}).get("horizon_agreement")),
+            "alternative_opening_gap": _finite((alternative or {}).get("opening_gap")),
+            "alternative_opening_gap_robust_z": _finite((alternative or {}).get("opening_gap_robust_z")),
+            "alternative_opening_gap_cross_section_robust_z": (gap_cross.get(execution_day) or {}).get(alternative_symbol) if alternative_symbol else None,
+            "alternative_opening_gap_abs_tail_percentile": _finite((alternative or {}).get("opening_gap_abs_tail_percentile")),
+            "alternative_vs_base_risk_adjusted_gap": (
+                None if _finite((alternative or {}).get("risk_adjusted_entry_score")) is None or _finite(observation.get("risk_adjusted_entry_score")) is None
+                else float(_finite((alternative or {}).get("risk_adjusted_entry_score")) - _finite(observation.get("risk_adjusted_entry_score")))
+            ),
             "close_return_1d": _finite(observation.get("close_return_1d")),
             "close_return_robust_z": close_z,
             "close_cross_section_robust_z": (close_cross.get(decision_day) or {}).get(symbol),
@@ -415,6 +480,8 @@ def _prepare_rows(
         }
         for horizon, value in horizon_returns.items():
             row[f"asset_return_{int(horizon)}d"] = value
+        for horizon, value in alternative_horizon_returns.items():
+            row[f"alternative_return_{int(horizon)}d"] = value
         result.append(row)
     result.sort(key=lambda row: _stamp(row.get("execution_at")) or pd.Timestamp.min.tz_localize("UTC"))
     return result
@@ -449,6 +516,16 @@ CLOSE_FEATURES = (
     "position_drawdown_from_peak",
     "decision_is_rotation",
     "min_hold_guard_applied",
+    "alternative_entry_rank_score",
+    "alternative_entry_rank_percentile",
+    "alternative_risk_adjusted_entry_score",
+    "alternative_incumbent_risk_health",
+    "alternative_all_horizon_risk_safety",
+    "alternative_predicted_drawdown",
+    "alternative_short_profit_consensus",
+    "alternative_long_profit_confirmation",
+    "alternative_horizon_agreement",
+    "alternative_vs_base_risk_adjusted_gap",
 )
 
 OPEN_FEATURES = CLOSE_FEATURES + (
@@ -458,7 +535,58 @@ OPEN_FEATURES = CLOSE_FEATURES + (
     "opening_gap_abs_tail_percentile",
     "shock_tail_score",
     "statistical_open_shock",
+    "alternative_opening_gap",
+    "alternative_opening_gap_robust_z",
+    "alternative_opening_gap_cross_section_robust_z",
+    "alternative_opening_gap_abs_tail_percentile",
 )
+
+
+def _mean_available(values: list[float | None]) -> float | None:
+    clean = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    return float(sum(clean) / len(clean)) if clean else None
+
+
+def _constant_binary_metrics(y_true: pd.Series, probability: float, threshold: float, *, origin: str) -> dict[str, Any]:
+    probabilities = np.full(len(y_true), float(probability), dtype=float)
+    return _binary_metrics(y_true, probabilities, threshold, origin=origin)
+
+
+def _binary_fold_model(
+    *,
+    train: pd.DataFrame,
+    fit: pd.DataFrame,
+    validation: pd.DataFrame,
+    test: pd.DataFrame,
+    features: tuple[str, ...],
+    target: str,
+    settings: dict[str, Any],
+    seed_offset: int,
+    default_threshold: float,
+    fit_on_full_train: bool,
+) -> tuple[np.ndarray, float, float | None, dict[str, Any]]:
+    source_fit = train if fit_on_full_train else fit
+    validation_source = validation
+    if source_fit[target].nunique() < 2:
+        probability = float(source_fit[target].mean()) if len(source_fit) else 0.0
+        threshold = float(default_threshold)
+        return (
+            np.full(len(test), probability, dtype=float),
+            threshold,
+            None,
+            _constant_binary_metrics(test[target], probability, threshold, origin="constant_training_class"),
+        )
+    model = _model(settings, seed_offset)
+    model.fit(source_fit[list(features)], source_fit[target].astype(int))
+    if not validation_source.empty and validation_source[target].nunique() >= 2:
+        validation_prob = _positive_probability(model, validation_source[list(features)])
+        threshold, validation_balanced = _select_threshold(validation_source[target], validation_prob, settings)
+    else:
+        source_prob = _positive_probability(model, source_fit[list(features)])
+        threshold, validation_balanced = _select_threshold(source_fit[target], source_prob, settings)
+    test_probability = _positive_probability(model, test[list(features)])
+    metrics = _binary_metrics(test[target], test_probability, threshold, origin="inner_validation")
+    return test_probability, float(threshold), validation_balanced, metrics
 
 
 def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -469,55 +597,83 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
     last_test_year = int(frame["year"].max())
     minimum_train = max(30, int(settings.get("min_train_rows") or 250))
     validation_share = min(max(float(settings.get("inner_validation_share") or 0.20), 0.10), 0.40)
+    default_cash_threshold = float(settings.get("default_probability_threshold") or 0.65)
+    default_rotation_threshold = float(settings.get("default_rotation_probability_threshold") or default_cash_threshold)
+    arbitration_margin = float(settings.get("action_probability_margin") or 0.05)
     predictions: list[dict[str, Any]] = []
     folds: list[dict[str, Any]] = []
 
     for test_year in range(first_test_year, last_test_year + 1):
         train = frame[frame["year"] < test_year].copy()
         test = frame[frame["year"] == test_year].copy()
-        if len(train) < minimum_train or test.empty or train["target_cash"].nunique() < 2:
+        if len(train) < minimum_train or test.empty:
             continue
         validation_rows = max(20, int(round(len(train) * validation_share)))
         validation_rows = min(validation_rows, max(1, len(train) // 3))
         fit = train.iloc[:-validation_rows].copy() if validation_rows < len(train) else train.copy()
         validation = train.iloc[-validation_rows:].copy() if validation_rows < len(train) else train.iloc[0:0].copy()
-        if len(fit) < max(20, minimum_train // 2) or fit["target_cash"].nunique() < 2:
+        if len(fit) < max(20, minimum_train // 2):
             fit = train.copy()
             validation = train.iloc[0:0].copy()
 
-        close_model = _model(settings, 11 + test_year)
-        close_model.fit(fit[list(CLOSE_FEATURES)], fit["target_cash"].astype(int))
-        close_validation_prob = _positive_probability(close_model, validation[list(CLOSE_FEATURES)]) if not validation.empty else np.asarray([], dtype=float)
-        close_threshold, close_validation_balanced = _select_threshold(validation["target_cash"] if not validation.empty else fit["target_cash"], close_validation_prob if len(close_validation_prob) else _positive_probability(close_model, fit[list(CLOSE_FEATURES)]), settings)
-
-        open_model = _model(settings, 29 + test_year)
-        open_model.fit(train[list(OPEN_FEATURES)], train["target_cash"].astype(int))
-        if not validation.empty:
-            validation_open = validation.copy()
-            open_validation_prob = _positive_probability(open_model, validation_open[list(OPEN_FEATURES)])
-            open_threshold, open_validation_balanced = _select_threshold(validation_open["target_cash"], open_validation_prob, settings)
-        else:
-            open_threshold = close_threshold
-            open_validation_balanced = None
-
-        close_test_probability = _positive_probability(close_model, test[list(CLOSE_FEATURES)])
-        test_open = test.copy()
-        open_test_probability = _positive_probability(open_model, test_open[list(OPEN_FEATURES)])
-        close_metrics = _binary_metrics(test["target_cash"], close_test_probability, close_threshold, origin="inner_validation")
-        open_metrics = _binary_metrics(test["target_cash"], open_test_probability, open_threshold, origin="inner_validation")
+        close_cash_prob, close_cash_threshold, close_cash_validation, close_cash_metrics = _binary_fold_model(
+            train=train, fit=fit, validation=validation, test=test,
+            features=CLOSE_FEATURES, target="target_cash", settings=settings,
+            seed_offset=11 + test_year, default_threshold=default_cash_threshold, fit_on_full_train=False,
+        )
+        close_rotate_prob, close_rotate_threshold, close_rotate_validation, close_rotate_metrics = _binary_fold_model(
+            train=train, fit=fit, validation=validation, test=test,
+            features=CLOSE_FEATURES, target="target_rotate", settings=settings,
+            seed_offset=17 + test_year, default_threshold=default_rotation_threshold, fit_on_full_train=False,
+        )
+        open_cash_prob, open_cash_threshold, open_cash_validation, open_cash_metrics = _binary_fold_model(
+            train=train, fit=fit, validation=validation, test=test,
+            features=OPEN_FEATURES, target="target_cash", settings=settings,
+            seed_offset=29 + test_year, default_threshold=default_cash_threshold, fit_on_full_train=True,
+        )
+        open_rotate_prob, open_rotate_threshold, open_rotate_validation, open_rotate_metrics = _binary_fold_model(
+            train=train, fit=fit, validation=validation, test=test,
+            features=OPEN_FEATURES, target="target_rotate", settings=settings,
+            seed_offset=37 + test_year, default_threshold=default_rotation_threshold, fit_on_full_train=True,
+        )
+        close_auc = _mean_available([_finite(close_cash_metrics.get("auc")), _finite(close_rotate_metrics.get("auc"))])
+        open_auc = _mean_available([_finite(open_cash_metrics.get("auc")), _finite(open_rotate_metrics.get("auc"))])
         folds.append({
             "test_year": int(test_year),
             "train_rows": int(len(train)),
             "test_rows": int(len(test)),
-            "close_threshold": close_threshold,
-            "open_threshold": open_threshold,
-            "close_validation_balanced_accuracy": close_validation_balanced,
-            "open_validation_balanced_accuracy": open_validation_balanced,
-            "close_metrics": close_metrics,
-            "open_metrics": open_metrics,
+            "close_threshold": close_cash_threshold,
+            "open_threshold": open_cash_threshold,
+            "close_cash_threshold": close_cash_threshold,
+            "close_rotate_threshold": close_rotate_threshold,
+            "open_cash_threshold": open_cash_threshold,
+            "open_rotate_threshold": open_rotate_threshold,
+            "close_validation_balanced_accuracy": close_cash_validation,
+            "open_validation_balanced_accuracy": open_cash_validation,
+            "close_rotate_validation_balanced_accuracy": close_rotate_validation,
+            "open_rotate_validation_balanced_accuracy": open_rotate_validation,
+            "close_metrics": {"auc": close_auc, "cash": close_cash_metrics, "rotate": close_rotate_metrics},
+            "open_metrics": {"auc": open_auc, "cash": open_cash_metrics, "rotate": open_rotate_metrics},
         })
-        for (_, source), close_probability, open_probability in zip(test_open.iterrows(), close_test_probability, open_test_probability):
-            action = "CASH" if float(open_probability) >= float(open_threshold) else "FOLLOW_BASE"
+        for position, ((_, source), close_cash, close_rotate, open_cash, open_rotate) in enumerate(zip(
+            test.iterrows(), close_cash_prob, close_rotate_prob, open_cash_prob, open_rotate_prob
+        )):
+            close_cash_signal = float(close_cash) >= float(close_cash_threshold)
+            close_rotate_signal = float(close_rotate) >= float(close_rotate_threshold)
+            if close_cash_signal and float(close_cash) >= float(close_rotate) + arbitration_margin:
+                close_action = "CASH"
+            elif close_rotate_signal and source.get("alternative_symbol") and float(close_rotate) >= float(close_cash) + arbitration_margin:
+                close_action = "ROTATE"
+            else:
+                close_action = "FOLLOW_BASE"
+            open_cash_signal = float(open_cash) >= float(open_cash_threshold)
+            open_rotate_signal = float(open_rotate) >= float(open_rotate_threshold)
+            if open_cash_signal and float(open_cash) >= float(open_rotate) + arbitration_margin:
+                action = "CASH"
+            elif open_rotate_signal and source.get("alternative_symbol") and float(open_rotate) >= float(open_cash) + arbitration_margin:
+                action = "ROTATE"
+            else:
+                action = "FOLLOW_BASE"
             predictions.append({
                 "execution_at": source["execution_at"],
                 "decision_at": source["decision_at"],
@@ -526,25 +682,40 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
                 "previous_asset": source.get("previous_asset"),
                 "base_action": source.get("base_action"),
                 "target_cash": int(source["target_cash"]),
+                "target_rotate": int(source["target_rotate"]),
+                "target_action": source.get("target_action"),
                 "policy_action": action,
-                "close_cash_probability": float(close_probability),
-                "open_cash_probability": float(open_probability),
-                "close_threshold": float(close_threshold),
-                "open_threshold": float(open_threshold),
-                "close_signal": bool(float(close_probability) >= float(close_threshold)),
-                "open_signal": bool(float(open_probability) >= float(open_threshold)),
-                "opening_changed_decision": bool((float(close_probability) >= float(close_threshold)) != (float(open_probability) >= float(open_threshold))),
+                "close_policy_action": close_action,
+                "alternative_symbol": source.get("alternative_symbol"),
                 "asset_utility": _finite(source.get("asset_utility")),
+                "alternative_utility": _finite(source.get("alternative_utility")),
+                "close_cash_probability": float(close_cash),
+                "close_rotate_probability": float(close_rotate),
+                "open_cash_probability": float(open_cash),
+                "open_rotate_probability": float(open_rotate),
+                "close_threshold": float(close_cash_threshold),
+                "open_threshold": float(open_cash_threshold),
+                "close_cash_threshold": float(close_cash_threshold),
+                "close_rotate_threshold": float(close_rotate_threshold),
+                "open_cash_threshold": float(open_cash_threshold),
+                "open_rotate_threshold": float(open_rotate_threshold),
+                "close_signal": bool(close_cash_signal or close_rotate_signal),
+                "open_signal": bool(open_cash_signal or open_rotate_signal),
+                "opening_changed_decision": bool(close_action != action),
                 "close_return_1d": _finite(source.get("close_return_1d")),
                 "close_return_robust_z": _finite(source.get("close_return_robust_z")),
                 "opening_gap": _finite(source.get("opening_gap")),
                 "opening_gap_robust_z": _finite(source.get("opening_gap_robust_z")),
+                "alternative_opening_gap": _finite(source.get("alternative_opening_gap")),
+                "alternative_opening_gap_robust_z": _finite(source.get("alternative_opening_gap_robust_z")),
                 "shock_tail_score": _finite(source.get("shock_tail_score")),
                 "statistical_close_shock": int(source.get("statistical_close_shock") or 0),
                 "statistical_open_shock": int(source.get("statistical_open_shock") or 0),
                 "opportunity_risk_conflict": int(source.get("opportunity_risk_conflict") or 0),
                 "entry_rank_percentile": _finite(source.get("entry_rank_percentile")),
                 "risk_adjusted_entry_score": _finite(source.get("risk_adjusted_entry_score")),
+                "alternative_risk_adjusted_entry_score": _finite(source.get("alternative_risk_adjusted_entry_score")),
+                "alternative_vs_base_risk_adjusted_gap": _finite(source.get("alternative_vs_base_risk_adjusted_gap")),
                 "incumbent_risk_health": _finite(source.get("incumbent_risk_health")),
                 "all_horizon_risk_safety": _finite(source.get("all_horizon_risk_safety")),
                 "predicted_drawdown": _finite(source.get("predicted_drawdown")),
@@ -554,27 +725,46 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
                     f"asset_return_{int(horizon)}d": _finite(source.get(f"asset_return_{int(horizon)}d"))
                     for horizon in [int(value) for value in (settings.get("horizons_sessions") or [1, 3, 5])]
                 },
+                **{
+                    f"alternative_return_{int(horizon)}d": _finite(source.get(f"alternative_return_{int(horizon)}d"))
+                    for horizon in [int(value) for value in (settings.get("horizons_sessions") or [1, 3, 5])]
+                },
             })
     return predictions, folds
-
 
 def _replay(reference_rows: list[dict[str, Any]], predictions: list[dict[str, Any]], settings: dict[str, Any]) -> dict[str, Any]:
     equity = _equity_path(reference_rows)
     if not equity:
         return {}
-    equity_by_day = {_day_key(row["stamp"]): row for row in equity}
-    prediction_by_day = {_day_key(row.get("execution_at")): row for row in predictions if row.get("policy_action") == "CASH"}
+    predictions_by_day = {
+        _day_key(row.get("execution_at")): row
+        for row in predictions
+        if str(row.get("policy_action") or "FOLLOW_BASE") in {"CASH", "ROTATE"}
+    }
     factors_by_day: dict[str, float] = {}
     interventions: list[dict[str, Any]] = []
-    for day, prediction in prediction_by_day.items():
-        one_day = _finite(prediction.get("asset_return_1d"))
-        if not day or one_day is None or 1.0 + one_day <= 1e-9:
+    for day, prediction in predictions_by_day.items():
+        base_return = _finite(prediction.get("asset_return_1d"))
+        if not day or base_return is None or 1.0 + base_return <= 1e-9:
             continue
-        factors_by_day[day] = float(1.0 / (1.0 + one_day))
-        interventions.append({**prediction, "capital_factor_vs_base": factors_by_day[day]})
+        action = str(prediction.get("policy_action") or "FOLLOW_BASE")
+        if action == "CASH":
+            candidate_return = 0.0
+        elif action == "ROTATE":
+            candidate_return = _finite(prediction.get("alternative_return_1d"))
+            if candidate_return is None or 1.0 + candidate_return <= 1e-9:
+                continue
+        else:
+            continue
+        factor = float((1.0 + float(candidate_return)) / (1.0 + float(base_return)))
+        factors_by_day[day] = factor
+        interventions.append({
+            **prediction,
+            "base_session_return": float(base_return),
+            "candidate_session_return": float(candidate_return),
+            "capital_factor_vs_base": factor,
+        })
 
-    if not equity:
-        return {}
     initial = float(equity[0]["starting_value"])
     base_path: list[dict[str, Any]] = []
     candidate_path: list[dict[str, Any]] = []
@@ -592,19 +782,24 @@ def _replay(reference_rows: list[dict[str, Any]], predictions: list[dict[str, An
     monthly_map_base = {row["month"]: row["return"] for row in (base.get("monthly_returns") or [])}
     monthly_map_candidate = {row["month"]: row["return"] for row in (candidate.get("monthly_returns") or [])}
     monthly: list[dict[str, Any]] = []
-    intervention_counts = Counter((_day_key(item.get("execution_at")) or "")[:7] for item in interventions)
+    action_counts_by_month: dict[str, Counter] = {}
+    for item in interventions:
+        month = (_day_key(item.get("execution_at")) or "")[:7]
+        action_counts_by_month.setdefault(month, Counter())[str(item.get("policy_action") or "FOLLOW_BASE")] += 1
     for month in sorted(set(monthly_map_base) | set(monthly_map_candidate)):
         base_return = monthly_map_base.get(month)
         candidate_return = monthly_map_candidate.get(month)
+        counts = action_counts_by_month.get(month, Counter())
         monthly.append({
             "month": month,
             "control_return": base_return,
             "candidate_return": candidate_return,
             "delta_return": None if base_return is None or candidate_return is None else float(candidate_return - base_return),
-            "cash_interventions": int(intervention_counts.get(month, 0)),
+            "cash_interventions": int(counts.get("CASH", 0)),
+            "rotation_interventions": int(counts.get("ROTATE", 0)),
         })
     return {
-        "method": "daily_market_open_cash_override_then_recheck_next_session",
+        "method": "daily_market_open_hold_rotate_cash_shadow_arbitration",
         "interventions": len(interventions),
         "intervention_rows": interventions,
         "control": base,
@@ -615,7 +810,6 @@ def _replay(reference_rows: list[dict[str, Any]], predictions: list[dict[str, An
         },
         "monthly": monthly,
     }
-
 
 def _gate(name: str, passed: bool, observed: Any, requirement: str) -> dict[str, Any]:
     return {"name": name, "passed": bool(passed), "observed": observed, "requirement": requirement}
@@ -646,8 +840,20 @@ def build_analysis(
     open_aucs = [value for value in open_aucs if value is not None]
     close_aucs = [_finite(((fold.get("close_metrics") or {}).get("auc"))) for fold in folds]
     close_aucs = [value for value in close_aucs if value is not None]
-    mean_open_auc = float(sum(open_aucs) / len(open_aucs)) if open_aucs else None
-    mean_close_auc = float(sum(close_aucs) / len(close_aucs)) if close_aucs else None
+    open_cash_aucs = [_finite((((fold.get("open_metrics") or {}).get("cash") or {}).get("auc"))) for fold in folds]
+    open_cash_aucs = [value for value in open_cash_aucs if value is not None]
+    open_rotate_aucs = [_finite((((fold.get("open_metrics") or {}).get("rotate") or {}).get("auc"))) for fold in folds]
+    open_rotate_aucs = [value for value in open_rotate_aucs if value is not None]
+    close_cash_aucs = [_finite((((fold.get("close_metrics") or {}).get("cash") or {}).get("auc"))) for fold in folds]
+    close_cash_aucs = [value for value in close_cash_aucs if value is not None]
+    close_rotate_aucs = [_finite((((fold.get("close_metrics") or {}).get("rotate") or {}).get("auc"))) for fold in folds]
+    close_rotate_aucs = [value for value in close_rotate_aucs if value is not None]
+    mean_open_auc = _mean_available(open_aucs)
+    mean_close_auc = _mean_available(close_aucs)
+    mean_open_cash_auc = _mean_available(open_cash_aucs)
+    mean_open_rotate_auc = _mean_available(open_rotate_aucs)
+    mean_close_cash_auc = _mean_available(close_cash_aucs)
+    mean_close_rotate_auc = _mean_available(close_rotate_aucs)
     control_dd = _finite(control.get("maximum_drawdown"))
     candidate_dd = _finite(candidate.get("maximum_drawdown"))
     control_worst = _finite(((control.get("worst_month") or {}).get("return")))
@@ -670,7 +876,8 @@ def build_analysis(
     gates = [
         _gate("capital_lift", capital_lift >= min_capital_lift, capital_lift, f">= {min_capital_lift:.2%}"),
         _gate("minimum_interventions", interventions >= min_interventions, interventions, f">= {min_interventions}"),
-        _gate("open_checkpoint_auc", mean_open_auc is not None and mean_open_auc >= min_mean_auc, mean_open_auc, f">= {min_mean_auc:.3f}"),
+        _gate("open_cash_auc", mean_open_cash_auc is not None and mean_open_cash_auc >= min_mean_auc, mean_open_cash_auc, f">= {min_mean_auc:.3f}"),
+        _gate("open_rotate_auc", mean_open_rotate_auc is not None and mean_open_rotate_auc >= min_mean_auc, mean_open_rotate_auc, f">= {min_mean_auc:.3f}"),
         _gate("positive_oos_years", positive_years >= min_positive_years, positive_years, f">= {min_positive_years}"),
         _gate(
             "drawdown_safety",
@@ -687,6 +894,8 @@ def build_analysis(
     ]
     approved = all(bool(item["passed"]) for item in gates)
     action_counts = Counter(str(item.get("policy_action") or "FOLLOW_BASE") for item in predictions)
+    cash_interventions = int(action_counts.get("CASH", 0))
+    rotation_interventions = int(action_counts.get("ROTATE", 0))
     opening_changes = sum(bool(item.get("opening_changed_decision")) for item in predictions)
     statistical_close_shocks = sum(bool(item.get("statistical_close_shock")) for item in predictions)
     statistical_open_shocks = sum(bool(item.get("statistical_open_shock")) for item in predictions)
@@ -705,10 +914,12 @@ def build_analysis(
         "period_start": str(period_start),
         "period_end": str(period_end),
         "protocol": {
-            "purpose": "causal close/open parity control before operational Strategy activation",
+            "purpose": "causal close/open HOLD-ROTATE-CASH arbitration before operational Strategy activation",
             "close_checkpoint": "uses information available at the completed decision close only",
             "open_checkpoint": "adds only the next regular-session opening price and gap before execution",
-            "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals"],
+            "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals", "best risk-adjusted alternative versus base asset"],
+            "candidate_actions": ["FOLLOW_BASE", "ROTATE", "CASH"],
+            "rotation_candidate_selection": "best causal risk-adjusted alternative at the completed close",
             "chronological_validation": "expanding walk-forward by test year",
             "threshold_selection": "inner chronological validation only",
             "future_information_in_features": False,
@@ -728,13 +939,19 @@ def build_analysis(
             "research_rows": len(rows),
             "oos_predictions": len(predictions),
             "actions": {action: int(action_counts.get(action, 0)) for action in ACTIONS},
-            "cash_interventions": interventions,
+            "cash_interventions": cash_interventions,
+            "rotation_interventions": rotation_interventions,
+            "total_interventions": interventions,
             "opening_changed_decision_count": int(opening_changes),
             "statistical_close_shock_count": int(statistical_close_shocks),
             "statistical_open_shock_count": int(statistical_open_shocks),
             "opportunity_risk_conflict_count": int(opportunity_risk_conflicts),
             "mean_close_auc": mean_close_auc,
             "mean_open_auc": mean_open_auc,
+            "mean_close_cash_auc": mean_close_cash_auc,
+            "mean_open_cash_auc": mean_open_cash_auc,
+            "mean_close_rotate_auc": mean_close_rotate_auc,
+            "mean_open_rotate_auc": mean_open_rotate_auc,
             "control_ending_capital": control.get("ending_capital"),
             "candidate_ending_capital": candidate.get("ending_capital"),
             "ending_capital_delta": candidate.get("ending_capital_delta"),
