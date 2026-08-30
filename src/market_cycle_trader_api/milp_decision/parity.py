@@ -5,6 +5,77 @@ from typing import Any
 from .utils import as_datetime, as_float
 
 
+_ROTATION_ALL_POSITION_CHANGES = "all_position_changes"
+_ROTATION_INVESTED_ASSET_CHANGES = "invested_asset_to_invested_asset"
+
+
+def _asset(value: Any) -> str:
+    return str(value or "CASH").strip().upper() or "CASH"
+
+
+def _rotation_increment(previous: Any, target: Any, *, count_cash_transitions: bool) -> int:
+    previous_asset = _asset(previous)
+    target_asset = _asset(target)
+    if previous_asset == target_asset:
+        return 0
+    if not count_cash_transitions and "CASH" in {previous_asset, target_asset}:
+        return 0
+    return 1
+
+
+def _reported_switches(reference: dict[str, Any]) -> int | None:
+    metrics = reference.get("metrics") if isinstance(reference.get("metrics"), dict) else {}
+    value = metrics.get("capital_rotations")
+    if value is None:
+        value = metrics.get("position_changes")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _rotation_semantics(reference: dict[str, Any]) -> str:
+    protocol = reference.get("protocol") if isinstance(reference.get("protocol"), dict) else {}
+    explicit = str(protocol.get("rotation_semantics") or reference.get("rotation_semantics") or "").strip().lower()
+    if explicit in {_ROTATION_ALL_POSITION_CHANGES, _ROTATION_INVESTED_ASSET_CHANGES}:
+        return explicit
+
+    expected_switches = _reported_switches(reference)
+    rotations = [row for row in (reference.get("rotations") or []) if isinstance(row, dict)]
+    if expected_switches is not None and rotations:
+        all_position_changes = sum(
+            _rotation_increment(row.get("from_asset"), row.get("to_asset"), count_cash_transitions=True)
+            for row in rotations
+        )
+        invested_asset_changes = sum(
+            _rotation_increment(row.get("from_asset"), row.get("to_asset"), count_cash_transitions=False)
+            for row in rotations
+        )
+        all_matches = all_position_changes == expected_switches
+        invested_matches = invested_asset_changes == expected_switches
+        if all_matches != invested_matches:
+            return _ROTATION_ALL_POSITION_CHANGES if all_matches else _ROTATION_INVESTED_ASSET_CHANGES
+
+    processing_kind = str(reference.get("processing_kind") or "").strip().lower()
+    if processing_kind in {
+        "strategy_research_temporal",
+        "strategy_research_stateful",
+        "strategy_research_decision_optimization",
+    }:
+        return _ROTATION_ALL_POSITION_CHANGES
+    return _ROTATION_INVESTED_ASSET_CHANGES
+
+
+def _path_switches(assets: list[str], initial_previous_asset: str, *, count_cash_transitions: bool) -> int:
+    previous = _asset(initial_previous_asset)
+    switches = 0
+    for target in assets:
+        target_asset = _asset(target)
+        switches += _rotation_increment(previous, target_asset, count_cash_transitions=count_cash_transitions)
+        previous = target_asset
+    return switches
+
+
 def reference_analytics(db: Any, processing_id: str) -> dict[str, Any]:
     from ..services.analytics import processing_analytics
 
@@ -19,18 +90,7 @@ def reference_analytics(db: Any, processing_id: str) -> dict[str, Any]:
 
 
 def counts_cash_transitions_as_rotations(reference: dict[str, Any]) -> bool:
-    protocol = reference.get("protocol") if isinstance(reference.get("protocol"), dict) else {}
-    semantics = str(protocol.get("rotation_semantics") or "").strip().lower()
-    if semantics == "all_position_changes":
-        return True
-    if semantics == "invested_asset_to_invested_asset":
-        return False
-    processing_kind = str(reference.get("processing_kind") or "").strip().lower()
-    return processing_kind in {
-        "strategy_research_temporal",
-        "strategy_research_stateful",
-        "strategy_research_decision_optimization",
-    }
+    return _rotation_semantics(reference) == _ROTATION_ALL_POSITION_CHANGES
 
 
 def reference_path(reference: dict[str, Any]) -> dict[str, Any]:
@@ -49,7 +109,7 @@ def reference_path(reference: dict[str, Any]) -> dict[str, Any]:
         (row for row in rotations if as_datetime(row.get("executed_at")) == first_timestamp),
         None,
     )
-    current = str((first_rotation or {}).get("from_asset") or equity[0].get("selected_asset") or "CASH").upper() or "CASH"
+    current = _asset((first_rotation or {}).get("from_asset") or equity[0].get("selected_asset") or "CASH")
     initial_previous = current
     rotation_index = 0
     assets: list[str] = []
@@ -64,7 +124,7 @@ def reference_path(reference: dict[str, Any]) -> dict[str, Any]:
             rotation_timestamp = as_datetime(rotations[rotation_index].get("executed_at"))
             if rotation_timestamp is None or rotation_timestamp > timestamp:
                 break
-            current = str(rotations[rotation_index].get("to_asset") or "CASH").upper() or "CASH"
+            current = _asset(rotations[rotation_index].get("to_asset"))
             rotation_index += 1
         explicit = str(row.get("selected_asset") or "").strip().upper()
         asset = explicit or current or "CASH"
@@ -75,12 +135,14 @@ def reference_path(reference: dict[str, Any]) -> dict[str, Any]:
 
     if not values or len(values) != len(assets):
         raise ValueError("Selected Strategy Research reference path is incomplete for MILP parity.")
+    semantics = _rotation_semantics(reference)
     return {
         "timestamps": timestamps,
         "equity": values,
         "assets": assets,
         "initial_previous_asset": initial_previous,
-        "count_cash_transitions_as_rotations": counts_cash_transitions_as_rotations(reference),
+        "rotation_semantics": semantics,
+        "count_cash_transitions_as_rotations": semantics == _ROTATION_ALL_POSITION_CHANGES,
     }
 
 
@@ -97,8 +159,11 @@ def compare(reference: dict[str, Any], replay_metrics: dict[str, Any]) -> dict[s
     replay_exposure = as_float(replay_metrics.get("market_exposure"))
     reference_cash = int(metrics.get("cash_days") or 0)
     replay_cash = int(replay_metrics.get("cash_days") or 0)
-    reference_switches = int(metrics.get("capital_rotations") or metrics.get("position_changes") or 0)
-    replay_switches = int(replay_metrics.get("capital_rotations") or 0)
+    reference_switches_reported = _reported_switches(reference)
+    try:
+        replay_switches_reported = int(replay_metrics.get("capital_rotations")) if replay_metrics.get("capital_rotations") is not None else None
+    except (TypeError, ValueError):
+        replay_switches_reported = None
     reference_sessions = len(reference_equity)
     replay_sessions = len(replay_equity)
 
@@ -116,10 +181,12 @@ def compare(reference: dict[str, Any], replay_metrics: dict[str, Any]) -> dict[s
     decision_path_match = reference_sessions == replay_sessions
     equity_curve_match = decision_path_match
     max_equity_delta_rate = 0.0
+    replay_assets: list[str] = []
     if decision_path_match:
         for index, replay in enumerate(replay_equity):
-            source_asset = str(reference_assets[index] or "CASH").upper()
-            replay_asset = str(replay.get("selected_asset") or "CASH").upper()
+            source_asset = _asset(reference_assets[index])
+            replay_asset = _asset(replay.get("selected_asset"))
+            replay_assets.append(replay_asset)
             if source_asset != replay_asset:
                 decision_path_match = False
             source_value = reference_equity[index]
@@ -131,6 +198,21 @@ def compare(reference: dict[str, Any], replay_metrics: dict[str, Any]) -> dict[s
             max_equity_delta_rate = max(max_equity_delta_rate, delta)
             if delta > 1e-10:
                 equity_curve_match = False
+    else:
+        replay_assets = [_asset(row.get("selected_asset")) for row in replay_equity]
+
+    count_cash_transitions = bool(normalized["count_cash_transitions_as_rotations"])
+    initial_previous = _asset(normalized["initial_previous_asset"])
+    reference_switches = _path_switches(
+        reference_assets,
+        initial_previous,
+        count_cash_transitions=count_cash_transitions,
+    )
+    replay_switches = _path_switches(
+        replay_assets,
+        initial_previous,
+        count_cash_transitions=count_cash_transitions,
+    )
 
     checks = {
         "ending_capital": capital_delta is not None and abs(capital_delta) <= 1e-10,
@@ -147,11 +229,13 @@ def compare(reference: dict[str, Any], replay_metrics: dict[str, Any]) -> dict[s
         "ending_capital_delta_rate": capital_delta,
         "market_exposure_delta": exposure_delta,
         "maximum_equity_delta_rate": max_equity_delta_rate,
+        "rotation_semantics": normalized["rotation_semantics"],
         "reference": {
             "ending_capital": reference_capital,
             "cash_days": reference_cash,
             "market_exposure": reference_exposure,
             "switches": reference_switches,
+            "reported_switches": reference_switches_reported,
             "equity_sessions": reference_sessions,
         },
         "replay": {
@@ -159,6 +243,7 @@ def compare(reference: dict[str, Any], replay_metrics: dict[str, Any]) -> dict[s
             "cash_days": replay_cash,
             "market_exposure": replay_exposure,
             "switches": replay_switches,
+            "reported_switches": replay_switches_reported,
             "equity_sessions": replay_sessions,
         },
     }

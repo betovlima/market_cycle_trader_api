@@ -118,6 +118,92 @@ def _build_execution_context(
     )
 
 
+
+
+def _tree_depth(node: dict[str, Any] | None) -> int:
+    if not isinstance(node, dict):
+        return 0
+    if "leaf_index" in node:
+        return 1
+    return 1 + max(
+        _tree_depth(node.get("left_child")),
+        _tree_depth(node.get("right_child")),
+    )
+
+
+def _public_tree_node(node: dict[str, Any] | None, feature_names: list[str]) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    if "leaf_index" in node:
+        return {
+            "kind": "leaf",
+            "leaf_index": int(node.get("leaf_index", -1)),
+            "value": float(node.get("leaf_value", 0.0)),
+            "count": int(node.get("leaf_count", 0) or 0),
+        }
+
+    feature_index = int(node.get("split_feature", -1))
+    feature_name = (
+        feature_names[feature_index]
+        if 0 <= feature_index < len(feature_names)
+        else f"feature_{feature_index}"
+    )
+    return {
+        "kind": "split",
+        "split_index": int(node.get("split_index", -1)),
+        "feature": str(feature_name),
+        "threshold": node.get("threshold"),
+        "decision_type": str(node.get("decision_type") or "<="),
+        "default_left": bool(node.get("default_left", False)),
+        "gain": float(node.get("split_gain", 0.0) or 0.0),
+        "value": float(node.get("internal_value", 0.0) or 0.0),
+        "count": int(node.get("internal_count", 0) or 0),
+        "left": _public_tree_node(node.get("left_child"), feature_names),
+        "right": _public_tree_node(node.get("right_child"), feature_names),
+    }
+
+
+def _lightgbm_last_tree_snapshot(
+    model: Any,
+    *,
+    symbol: str,
+    fold_id: int,
+    fold_position: int,
+    train_end: pd.Timestamp | None,
+) -> dict[str, Any] | None:
+    booster = getattr(model, "booster_", None)
+    if booster is None:
+        return None
+    try:
+        dump = booster.dump_model()
+    except Exception:
+        return None
+    trees = dump.get("tree_info") if isinstance(dump, dict) else None
+    if not isinstance(trees, list) or not trees:
+        return None
+    tree = trees[-1] if isinstance(trees[-1], dict) else {}
+    structure = tree.get("tree_structure") if isinstance(tree, dict) else None
+    feature_names = [str(item) for item in (dump.get("feature_names") or [])]
+    public_root = _public_tree_node(structure, feature_names)
+    if public_root is None:
+        return None
+    return {
+        "schema_version": 1,
+        "source": "latest_final_fold_selected_asset",
+        "asset": str(symbol).upper(),
+        "fold_id": int(fold_id),
+        "fold_position": int(fold_position),
+        "training_end": (pd.Timestamp(train_end).isoformat() if train_end is not None else None),
+        "tree_index": int(tree.get("tree_index", len(trees) - 1)),
+        "tree_count": int(len(trees)),
+        "num_leaves": int(tree.get("num_leaves", 0) or 0),
+        "depth": int(_tree_depth(structure)),
+        "shrinkage": float(tree.get("shrinkage", 0.0) or 0.0),
+        "feature_names": feature_names,
+        "root": public_root,
+    }
+
+
 def _lightgbm_fit_models(
     frames: dict[str, pd.DataFrame],
     symbols: list[str],
@@ -246,6 +332,10 @@ def _run_lightgbm(
         cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
+        latest_final_models: dict[str, Any] = {}
+        latest_final_fold_id: int | None = None
+        latest_final_fold_position: int | None = None
+        latest_final_train_end: pd.Timestamp | None = None
         run_base = repetition / repetitions
         run_span = 1.0 / repetitions
         fold_span = (run_span * 0.90) / max(1, total_folds)
@@ -379,6 +469,10 @@ def _run_lightgbm(
                 progress_callback=phase_progress("final training", 0.50, 0.90),
                 technical_log_callback=technical_log_callback,
             )
+            latest_final_models = final_models
+            latest_final_fold_id = fold_id
+            latest_final_fold_position = fold_position
+            latest_final_train_end = (pd.Timestamp(final_fit_dates[-1]) if len(final_fit_dates) else None)
             final_cash_edge_models = None
             if _risk_off_enabled(rep_config):
                 final_cash_edge_models = _lightgbm_fit_models(
@@ -556,6 +650,30 @@ def _run_lightgbm(
         )
         backend = "lightgbm_utility" if repetitions <= 1 else f"lightgbm_utility_seed_{seed}"
         result.backend = backend
+
+        latest_asset = None
+        if isinstance(result.predictions, pd.DataFrame) and not result.predictions.empty:
+            last_prediction = result.predictions.iloc[-1]
+            for key in ("selected_asset", "final_action_asset", "best_asset", "raw_best_asset"):
+                raw_candidate = last_prediction.get(key)
+                if raw_candidate is None or pd.isna(raw_candidate):
+                    continue
+                candidate = str(raw_candidate).strip().upper()
+                if candidate and candidate != "CASH":
+                    latest_asset = candidate
+                    break
+        if latest_asset is None and latest_final_models:
+            latest_asset = next(reversed(latest_final_models))
+        latest_tree = None
+        if latest_asset and latest_asset in latest_final_models and latest_final_fold_id is not None and latest_final_fold_position is not None:
+            latest_tree = _lightgbm_last_tree_snapshot(
+                latest_final_models[latest_asset],
+                symbol=latest_asset,
+                fold_id=latest_final_fold_id,
+                fold_position=latest_final_fold_position,
+                train_end=latest_final_train_end,
+            )
+
         result.metrics.update(
             {
                 "backend": backend,
@@ -585,6 +703,7 @@ def _run_lightgbm(
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
+                "latest_research_tree": latest_tree,
             }
         )
         margin_by_fold = {item["fold_id"]: item for item in margin_details}

@@ -696,3 +696,96 @@ def dashboard_tuning_candidate_detail(
         "started_at": candidate.get("started_at"),
         "finished_at": candidate.get("finished_at"),
     })
+
+
+def dashboard_latest_research_tree(db: Any) -> dict[str, Any]:
+    research_id, _ = _strategy_control_ids(db)
+    strategy = _strategy_profile_detail(db, research_id)
+    if not research_id or not isinstance(strategy, dict):
+        return {
+            "available": False,
+            "reason": "no_selected_research_strategy",
+            "strategy": None,
+            "job": None,
+            "tree": None,
+        }
+
+    query: dict[str, Any] = {
+        "status": "completed",
+        "strategy_profile_id": str(research_id),
+        "research_model_family": "lightgbm_utility",
+    }
+    revision = strategy.get("revision")
+    if revision is not None:
+        query["strategy_profile_revision"] = int(revision)
+    configuration_hash = str(strategy.get("configuration_hash") or "").strip()
+    if configuration_hash:
+        query["strategy_configuration_hash"] = configuration_hash
+
+    job = db[JOBS_COLLECTION].find_one(
+        query,
+        {
+            "_id": 0,
+            "id": 1,
+            "finished_at": 1,
+            "strategy_profile_id": 1,
+            "strategy_profile_name": 1,
+            "strategy_profile_revision": 1,
+            "research_model_family": 1,
+            "research_model_label": 1,
+        },
+        sort=[("finished_at", -1), ("created_at", -1)],
+    )
+    strategy_payload = {
+        "id": str(strategy.get("id") or research_id),
+        "name": str(strategy.get("name") or ""),
+        "revision": strategy.get("revision"),
+        "configuration_hash": strategy.get("configuration_hash"),
+    }
+    if job is None:
+        return {
+            "available": False,
+            "reason": "no_completed_backtest_for_selected_strategy",
+            "strategy": bson_value(strategy_payload),
+            "job": None,
+            "tree": None,
+        }
+
+    run = db[RUNS_COLLECTION].find_one(
+        {
+            "job_id": str(job.get("id") or ""),
+            "symbol": "PORTFOLIO",
+            "metrics.latest_research_tree": {"$ne": None},
+        },
+        {
+            "_id": 0,
+            "backend": 1,
+            "metrics.latest_research_tree": 1,
+            "metrics.repetition_index": 1,
+            "metrics.repetition_count": 1,
+        },
+        sort=[("metrics.repetition_index", -1), ("updated_at", -1)],
+    )
+    tree = (((run or {}).get("metrics") or {}).get("latest_research_tree")) if isinstance(run, dict) else None
+    job_payload = {
+        "id": str(job.get("id") or ""),
+        "finished_at": iso_value(job.get("finished_at")),
+        "model_label": str(job.get("research_model_label") or "Utility model"),
+        "repetition_index": (((run or {}).get("metrics") or {}).get("repetition_index")) if isinstance(run, dict) else None,
+        "repetition_count": (((run or {}).get("metrics") or {}).get("repetition_count")) if isinstance(run, dict) else None,
+    }
+    if not isinstance(tree, dict):
+        return {
+            "available": False,
+            "reason": "tree_snapshot_not_available",
+            "strategy": bson_value(strategy_payload),
+            "job": bson_value(job_payload),
+            "tree": None,
+        }
+    return {
+        "available": True,
+        "reason": None,
+        "strategy": bson_value(strategy_payload),
+        "job": bson_value(job_payload),
+        "tree": bson_value(tree),
+    }
