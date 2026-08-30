@@ -21,7 +21,7 @@ from ..schemas.temporal_research_settings import (
 )
 
 SETTINGS_ID = "winner-transition"
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 PARAMETERIZATION_FILE = "003_temporal_winner_transition_research.json"
 
 
@@ -68,9 +68,9 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
     if document is None:
         raise RuntimeError("Temporal research settings could not be initialized.")
     raw_settings = {
-        "risk": document.get("risk") or seed.get("risk"),
-        "confidence": document.get("confidence") or seed.get("confidence"),
-        "statistical_ml_control": document.get("statistical_ml_control") or seed.get("statistical_ml_control"),
+        "risk": {**(seed.get("risk") or {}), **(document.get("risk") or {})},
+        "confidence": {**(seed.get("confidence") or {}), **(document.get("confidence") or {})},
+        "statistical_ml_control": {**(seed.get("statistical_ml_control") or {}), **(document.get("statistical_ml_control") or {})},
     }
     settings = _validated_settings(raw_settings)
     expected_hash = _settings_hash(settings)

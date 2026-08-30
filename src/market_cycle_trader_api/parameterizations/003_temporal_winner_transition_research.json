@@ -60,6 +60,9 @@
     "extreme_tail_percentile": 0.98,
     "extreme_robust_z": 3.0,
     "opportunity_conflict_min_percentile": 0.75,
-    "risk_conflict_max_safety": 0.25
+    "risk_conflict_max_safety": 0.25,
+    "minimum_rotation_edge": 0.005,
+    "default_rotation_probability_threshold": 0.65,
+    "action_probability_margin": 0.05
   }
 }

@@ -56,6 +56,7 @@ class StatisticalMlControlSettings(BaseModel):
     horizon_weights: dict[str, float]
     downside_penalty: float = Field(ge=0.0, le=10.0)
     minimum_cash_edge: float = Field(ge=0.0, le=1.0)
+    minimum_rotation_edge: float = Field(ge=0.0, le=1.0)
     extreme_tail_percentile: float = Field(gt=0.5, lt=1.0)
     extreme_robust_z: float = Field(gt=0.0, le=20.0)
     opportunity_conflict_min_percentile: float = Field(ge=0.0, le=1.0)
@@ -64,6 +65,8 @@ class StatisticalMlControlSettings(BaseModel):
     inner_validation_share: float = Field(gt=0.0, lt=0.5)
     probability_threshold_candidates: list[float] = Field(min_length=1, max_length=30)
     default_probability_threshold: float = Field(gt=0.0, lt=1.0)
+    default_rotation_probability_threshold: float = Field(gt=0.0, lt=1.0)
+    action_probability_margin: float = Field(ge=0.0, le=1.0)
     n_estimators: int = Field(ge=50, le=5000)
     max_depth: int = Field(ge=2, le=30)
     min_samples_leaf: int = Field(ge=1, le=10_000)
@@ -97,6 +100,8 @@ class StatisticalMlControlSettings(BaseModel):
             raise ValueError("minimum_history_sessions cannot exceed lookback_sessions.")
         if self.default_probability_threshold not in self.probability_threshold_candidates:
             raise ValueError("default_probability_threshold must be included in probability_threshold_candidates.")
+        if self.default_rotation_probability_threshold not in self.probability_threshold_candidates:
+            raise ValueError("default_rotation_probability_threshold must be included in probability_threshold_candidates.")
         expected = {str(item) for item in self.horizons_sessions}
         supplied = {str(key) for key in self.horizon_weights}
         if expected != supplied:
