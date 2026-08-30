@@ -1580,6 +1580,10 @@ def build_temporal_intelligence_export(
                     row for row in (((statistical_export.get("daily_regime_trajectory") or {}).get("folds") or []))
                     if isinstance(row, dict) and int(row.get("test_year") or 0) == int(item.get("test_year") or 0)
                 ), {})
+                dynamic_year = next((
+                    row for row in (((statistical_export.get("daily_dynamic_regime") or {}).get("yearly") or []))
+                    if isinstance(row, dict) and int(row.get("test_year") or 0) == int(item.get("test_year") or 0)
+                ), {})
                 statistical_fold_rows.append(bson_value({
                     **{key: value for key, value in dict(item).items() if key not in {"close_metrics", "open_metrics", "regime_context"}},
                     "close_auc": close_metrics.get("auc"),
@@ -1598,6 +1602,12 @@ def build_temporal_intelligence_export(
                     "regime_trajectory_warning_precision": trajectory_fold.get("precision"),
                     "regime_trajectory_warning_recall": trajectory_fold.get("recall"),
                     "regime_trajectory_median_lead_sessions": trajectory_fold.get("median_trough_lead_sessions"),
+                    "daily_dynamic_pre_refit_auc": dynamic_year.get("pre_refit_auc"),
+                    "daily_dynamic_post_refit_auc": dynamic_year.get("post_refit_auc"),
+                    "daily_dynamic_geometry_shift_auc": dynamic_year.get("geometry_shift_auc"),
+                    "daily_dynamic_distance_absorption_auc": dynamic_year.get("distance_absorption_auc"),
+                    "daily_dynamic_pre_only_warnings": dynamic_year.get("pre_only_warnings"),
+                    "daily_dynamic_pre_only_severe_windows": dynamic_year.get("pre_only_severe_windows"),
                 }))
             archive.writestr("strategy_research_statistical_ml_control_folds.csv", _csv_text(statistical_fold_rows))
             archive.writestr("strategy_research_statistical_ml_control_monthly.csv", _csv_text([bson_value(dict(item)) for item in (statistical_export.get("monthly") or []) if isinstance(item, dict)]))
@@ -1625,6 +1635,7 @@ def build_temporal_intelligence_export(
                 if isinstance(row, dict)
             ]
             archive.writestr("strategy_research_daily_dynamic_regime.csv", _csv_text(dynamic_regime_rows))
+            archive.writestr("strategy_research_daily_pre_post_regime_innovation.csv", _csv_text(dynamic_regime_rows))
         if pipeline_roc_policy is not None:
             roc_export = pipeline_roc_policy_raw or pipeline_roc_policy
             archive.writestr("strategy_research_roc_decision_policy.json", json.dumps(roc_export, indent=2, ensure_ascii=False, default=str))

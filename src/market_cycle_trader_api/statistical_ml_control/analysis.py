@@ -995,10 +995,15 @@ def _match_dynamic_cluster_families(
     return mapping, new_families, int(next_family_id), match_distance
 
 
-def _dynamic_regime_binary_metrics(points: list[dict[str, Any]]) -> dict[str, Any]:
+def _dynamic_regime_binary_metrics(
+    points: list[dict[str, Any]],
+    *,
+    score_key: str = "dynamic_regime_pressure_score",
+    warning_key: str = "dynamic_regime_warning",
+) -> dict[str, Any]:
     usable = [
         item for item in points
-        if _finite(item.get("dynamic_regime_pressure_score")) is not None
+        if _finite(item.get(score_key)) is not None
         and item.get("trajectory_severe_event") in {0, 1}
     ]
     if not usable:
@@ -1013,8 +1018,8 @@ def _dynamic_regime_binary_metrics(points: list[dict[str, Any]]) -> dict[str, An
             "median_trough_lead_sessions": None,
         }
     truth = np.asarray([int(item.get("trajectory_severe_event") or 0) for item in usable], dtype=int)
-    score = np.asarray([float(item.get("dynamic_regime_pressure_score") or 0.0) for item in usable], dtype=float)
-    warning = np.asarray([int(item.get("dynamic_regime_warning") or 0) for item in usable], dtype=int)
+    score = np.asarray([float(item.get(score_key) or 0.0) for item in usable], dtype=float)
+    warning = np.asarray([int(item.get(warning_key) or 0) for item in usable], dtype=int)
     true_mask = (truth == 1) & (warning == 1)
     warning_count = int(warning.sum())
     severe_count = int(truth.sum())
@@ -1034,6 +1039,56 @@ def _dynamic_regime_binary_metrics(points: list[dict[str, Any]]) -> dict[str, An
         "recall": float(true_count / severe_count) if severe_count else None,
         "median_trough_lead_sessions": float(np.median(leads)) if leads else None,
     }
+
+
+def _dynamic_regime_score_auc(points: list[dict[str, Any]], key: str) -> float | None:
+    usable = [
+        item for item in points
+        if _finite(item.get(key)) is not None and item.get("trajectory_severe_event") in {0, 1}
+    ]
+    if not usable:
+        return None
+    truth = np.asarray([int(item.get("trajectory_severe_event") or 0) for item in usable], dtype=int)
+    values = np.asarray([float(item.get(key) or 0.0) for item in usable], dtype=float)
+    return _safe_auc(truth, values)
+
+
+def _pre_post_warning_comparison(points: list[dict[str, Any]]) -> dict[str, Any]:
+    pre_only = [item for item in points if int(item.get("dynamic_regime_pre_refit_warning") or 0) == 1 and int(item.get("dynamic_regime_warning") or 0) == 0]
+    post_only = [item for item in points if int(item.get("dynamic_regime_pre_refit_warning") or 0) == 0 and int(item.get("dynamic_regime_warning") or 0) == 1]
+    both = [item for item in points if int(item.get("dynamic_regime_pre_refit_warning") or 0) == 1 and int(item.get("dynamic_regime_warning") or 0) == 1]
+    neither = [item for item in points if int(item.get("dynamic_regime_pre_refit_warning") or 0) == 0 and int(item.get("dynamic_regime_warning") or 0) == 0]
+    severe = [item for item in points if int(item.get("trajectory_severe_event") or 0) == 1]
+    def severe_count(items: list[dict[str, Any]]) -> int:
+        return int(sum(int(item.get("trajectory_severe_event") or 0) == 1 for item in items))
+    return {
+        "pre_only_warnings": int(len(pre_only)),
+        "post_only_warnings": int(len(post_only)),
+        "both_warnings": int(len(both)),
+        "neither_warnings": int(len(neither)),
+        "pre_only_severe_windows": severe_count(pre_only),
+        "post_only_severe_windows": severe_count(post_only),
+        "both_severe_windows": severe_count(both),
+        "severe_windows": int(len(severe)),
+    }
+
+
+def _geometry_shift_score(
+    pre_raw_centroids: np.ndarray,
+    post_raw_centroids: np.ndarray,
+    reference_mean: np.ndarray,
+    reference_scale: np.ndarray,
+) -> float | None:
+    if len(pre_raw_centroids) == 0 or len(post_raw_centroids) == 0:
+        return None
+    scale = np.where(np.asarray(reference_scale, dtype=float) <= 1e-12, 1.0, np.asarray(reference_scale, dtype=float))
+    mean = np.asarray(reference_mean, dtype=float)
+    pre_scaled = (np.asarray(pre_raw_centroids, dtype=float) - mean) / scale
+    post_scaled = (np.asarray(post_raw_centroids, dtype=float) - mean) / scale
+    distances = np.linalg.norm(post_scaled[:, None, :] - pre_scaled[None, :, :], axis=2)
+    post_to_pre = np.min(distances, axis=1)
+    pre_to_post = np.min(distances, axis=0)
+    return float((np.mean(post_to_pre) + np.mean(pre_to_post)) / 2.0)
 
 
 def _dynamic_daily_regime_diagnostic(
@@ -1065,30 +1120,85 @@ def _dynamic_daily_regime_diagnostic(
     points: list[dict[str, Any]] = []
     opportunity_anchor, environment_anchor = _dynamic_semantic_anchors(columns)
 
-    for position in range(minimum_history - 1, len(source)):
+    # The first `minimum_history` observations are history. The new close is first
+    # measured against yesterday's geometry and only afterwards incorporated into
+    # a complete unsupervised refit. This separates detection from adaptation.
+    for position in range(minimum_history, len(source)):
         current_day = _day_key(source.iloc[position].get("execution_at"))
         if current_day not in target_days:
             continue
+
+        # PRE-REFIT: fit strictly on observations before the newly completed close.
+        history_raw = raw_matrix[:position]
+        pre_medians = np.nanmedian(history_raw, axis=0)
+        pre_medians = np.where(np.isfinite(pre_medians), pre_medians, 0.0)
+        pre_filled = np.where(np.isfinite(history_raw), history_raw, pre_medians)
+        pre_mean = np.mean(pre_filled, axis=0)
+        pre_scale = np.std(pre_filled, axis=0, ddof=0)
+        pre_scale = np.where(np.isfinite(pre_scale) & (pre_scale > 1e-12), pre_scale, 1.0)
+        pre_matrix = (pre_filled - pre_mean) / pre_scale
+        pre_labels, pre_centroids, pre_cluster_count, pre_silhouette = _dynamic_cluster_fit(pre_matrix, settings)
+        if pre_labels is None or pre_centroids is None:
+            continue
+        pre_labels = np.asarray(pre_labels, dtype=int)
+        pre_centroids = np.asarray(pre_centroids, dtype=float)
+        pre_raw_centroids = pre_centroids * pre_scale + pre_mean
+        pre_semantic_order = _canonical_cluster_order(pre_centroids, columns)
+        pre_original_to_semantic = {int(original): int(rank) for rank, original in enumerate(pre_semantic_order)}
+        pre_distances = np.linalg.norm(pre_matrix[:, None, :] - pre_centroids[None, :, :], axis=2)
+        pre_nearest = np.argmin(pre_distances, axis=1)
+        pre_nearest_distances = pre_distances[np.arange(len(pre_matrix)), pre_nearest]
+
+        current_raw = raw_matrix[position]
+        current_filled_pre = np.where(np.isfinite(current_raw), current_raw, pre_medians)
+        current_pre_scaled = (current_filled_pre - pre_mean) / pre_scale
+        current_pre_distances = np.linalg.norm(pre_centroids - current_pre_scaled[None, :], axis=1)
+        pre_current_original = int(np.argmin(current_pre_distances))
+        pre_current_semantic_rank = int(pre_original_to_semantic[pre_current_original])
+        pre_healthy_original = int(pre_semantic_order[0])
+        pre_defensive_original = int(pre_semantic_order[-1])
+        pre_current_nearest = float(current_pre_distances[pre_current_original])
+        pre_healthy_distance = float(current_pre_distances[pre_healthy_original])
+        pre_defensive_distance = float(current_pre_distances[pre_defensive_original])
+        pre_healthy_similarity = float(math.exp(-pre_healthy_distance / temperature))
+        pre_defensive_similarity = float(math.exp(-pre_defensive_distance / temperature))
+        pre_danger_balance = float(pre_defensive_similarity - pre_healthy_similarity)
+        pre_novelty_threshold = float(np.quantile(pre_nearest_distances, novelty_quantile)) if len(pre_nearest_distances) >= 20 else None
+        pre_novelty_ratio = None if pre_novelty_threshold in {None, 0.0} else float(pre_current_nearest / max(float(pre_novelty_threshold), 1e-9))
+        pre_is_novel = bool(pre_novelty_threshold is not None and pre_current_nearest > float(pre_novelty_threshold))
+        pre_opportunity = float(_semantic_projection(current_pre_scaled.reshape(1, -1), opportunity_anchor)[0])
+        pre_environment = float(_semantic_projection(current_pre_scaled.reshape(1, -1), environment_anchor)[0])
+        pre_environment_weakness = float(1.0 / (1.0 + math.exp(max(-30.0, min(30.0, pre_environment)))))
+        pre_pressure = float((pre_defensive_similarity + pre_environment_weakness) / 2.0)
+        pre_historical_defensive = np.exp(-pre_distances[:, pre_defensive_original] / temperature)
+        pre_historical_environment = _semantic_projection(pre_matrix, environment_anchor)
+        pre_historical_weakness = 1.0 / (1.0 + np.exp(np.clip(pre_historical_environment, -30.0, 30.0)))
+        pre_historical_pressure = (pre_historical_defensive + pre_historical_weakness) / 2.0
+        pre_warning_threshold = float(np.quantile(pre_historical_pressure, warning_quantile)) if len(pre_historical_pressure) >= 20 else None
+        pre_warning = bool(pre_is_novel or (pre_warning_threshold is not None and pre_pressure >= pre_warning_threshold))
+
+        # POST-REFIT: rebuild the full unsupervised geometry with today's completed
+        # close included. This is the adaptive state used as tomorrow's reference.
         prefix_raw = raw_matrix[: position + 1]
-        medians = np.nanmedian(prefix_raw, axis=0)
-        medians = np.where(np.isfinite(medians), medians, 0.0)
-        filled = np.where(np.isfinite(prefix_raw), prefix_raw, medians)
-        current_mean = np.mean(filled, axis=0)
-        current_scale = np.std(filled, axis=0, ddof=0)
-        current_scale = np.where(np.isfinite(current_scale) & (current_scale > 1e-12), current_scale, 1.0)
-        matrix = (filled - current_mean) / current_scale
+        post_medians = np.nanmedian(prefix_raw, axis=0)
+        post_medians = np.where(np.isfinite(post_medians), post_medians, 0.0)
+        post_filled = np.where(np.isfinite(prefix_raw), prefix_raw, post_medians)
+        post_mean = np.mean(post_filled, axis=0)
+        post_scale = np.std(post_filled, axis=0, ddof=0)
+        post_scale = np.where(np.isfinite(post_scale) & (post_scale > 1e-12), post_scale, 1.0)
+        matrix = (post_filled - post_mean) / post_scale
         labels, centroids, cluster_count, silhouette = _dynamic_cluster_fit(matrix, settings)
         if labels is None or centroids is None:
             continue
         labels = np.asarray(labels, dtype=int)
         centroids = np.asarray(centroids, dtype=float)
-        raw_centroids = centroids * current_scale + current_mean
+        raw_centroids = centroids * post_scale + post_mean
         semantic_order = _canonical_cluster_order(centroids, columns)
         original_to_semantic = {int(original): int(rank) for rank, original in enumerate(semantic_order)}
         family_mapping, previous_families, next_family_id, match_distances = _match_dynamic_cluster_families(
             raw_centroids,
-            current_mean,
-            current_scale,
+            post_mean,
+            post_scale,
             previous_families,
             next_family_id,
         )
@@ -1110,7 +1220,6 @@ def _dynamic_daily_regime_diagnostic(
         current_nearest = float(nearest_distances[-1])
         novelty_ratio = None if novelty_threshold in {None, 0.0} else float(current_nearest / max(float(novelty_threshold), 1e-9))
         is_novel = bool(novelty_threshold is not None and current_nearest > float(novelty_threshold))
-
         opportunity_values = _semantic_projection(matrix, opportunity_anchor)
         environment_values = _semantic_projection(matrix, environment_anchor)
         current_opportunity = float(opportunity_values[-1])
@@ -1124,6 +1233,10 @@ def _dynamic_daily_regime_diagnostic(
         warning_threshold = float(np.quantile(historical_pressure, warning_quantile)) if len(historical_pressure) >= 20 else None
         warning = bool(is_novel or (warning_threshold is not None and current_pressure >= warning_threshold))
 
+        geometry_shift = _geometry_shift_score(pre_raw_centroids, raw_centroids, pre_mean, pre_scale)
+        distance_absorption = float(pre_current_nearest - current_nearest)
+        distance_absorption_ratio = None if pre_current_nearest <= 1e-12 else float(current_nearest / pre_current_nearest)
+        pressure_shift = float(current_pressure - pre_pressure)
         center_x = float(_semantic_projection(centroids[[current_original]], opportunity_anchor)[0])
         center_y = float(_semantic_projection(centroids[[current_original]], environment_anchor)[0])
         transitioned = previous_family is not None and current_family != previous_family
@@ -1134,6 +1247,23 @@ def _dynamic_daily_regime_diagnostic(
             "test_year": int(prediction.get("test_year") or source.iloc[position]["execution_at"].year),
             "symbol": prediction.get("symbol") or source.iloc[position].get("symbol"),
             "policy_action": prediction.get("policy_action"),
+            "dynamic_regime_pre_refit_cluster_count": int(pre_cluster_count),
+            "dynamic_regime_pre_refit_silhouette": pre_silhouette,
+            "dynamic_regime_pre_refit_semantic_rank": pre_current_semantic_rank,
+            "dynamic_regime_pre_refit_opportunity_axis": pre_opportunity,
+            "dynamic_regime_pre_refit_environment_axis": pre_environment,
+            "dynamic_regime_pre_refit_nearest_distance": pre_current_nearest,
+            "dynamic_regime_pre_refit_healthy_distance": pre_healthy_distance,
+            "dynamic_regime_pre_refit_defensive_distance": pre_defensive_distance,
+            "dynamic_regime_pre_refit_healthy_similarity": pre_healthy_similarity,
+            "dynamic_regime_pre_refit_defensive_similarity": pre_defensive_similarity,
+            "dynamic_regime_pre_refit_danger_balance": pre_danger_balance,
+            "dynamic_regime_pre_refit_novelty_threshold": pre_novelty_threshold,
+            "dynamic_regime_pre_refit_novelty_ratio": pre_novelty_ratio,
+            "dynamic_regime_pre_refit_is_novel": int(pre_is_novel),
+            "dynamic_regime_pre_refit_pressure_score": pre_pressure,
+            "dynamic_regime_pre_refit_warning_threshold": pre_warning_threshold,
+            "dynamic_regime_pre_refit_warning": int(pre_warning),
             "dynamic_regime_cluster_count": int(cluster_count),
             "dynamic_regime_silhouette": silhouette,
             "dynamic_regime_family_id": current_family,
@@ -1158,6 +1288,13 @@ def _dynamic_daily_regime_diagnostic(
             "dynamic_regime_pressure_score": current_pressure,
             "dynamic_regime_warning_threshold": warning_threshold,
             "dynamic_regime_warning": int(warning),
+            "dynamic_regime_pre_only_warning": int(pre_warning and not warning),
+            "dynamic_regime_post_only_warning": int(warning and not pre_warning),
+            "dynamic_regime_warning_preserved": int(pre_warning and warning),
+            "dynamic_regime_geometry_shift": geometry_shift,
+            "dynamic_regime_distance_absorption": distance_absorption,
+            "dynamic_regime_distance_absorption_ratio": distance_absorption_ratio,
+            "dynamic_regime_pressure_shift_post_minus_pre": pressure_shift,
             "trajectory_severe_event": prediction.get("trajectory_severe_event"),
             "trajectory_forward_min_return": prediction.get("trajectory_forward_min_return"),
             "trajectory_trough_lead_sessions": prediction.get("trajectory_trough_lead_sessions"),
@@ -1165,18 +1302,38 @@ def _dynamic_daily_regime_diagnostic(
         previous_family = current_family
         previous_semantic_rank = current_semantic_rank
 
-    overall = _dynamic_regime_binary_metrics(points)
+    post_overall = _dynamic_regime_binary_metrics(points)
+    pre_overall = _dynamic_regime_binary_metrics(
+        points,
+        score_key="dynamic_regime_pre_refit_pressure_score",
+        warning_key="dynamic_regime_pre_refit_warning",
+    )
+    warning_comparison = _pre_post_warning_comparison(points)
     yearly: list[dict[str, Any]] = []
     for year in sorted({int(item.get("test_year") or 0) for item in points if int(item.get("test_year") or 0) > 0}):
         year_points = [item for item in points if int(item.get("test_year") or 0) == year]
-        metrics = _dynamic_regime_binary_metrics(year_points)
+        post_metrics = _dynamic_regime_binary_metrics(year_points)
+        pre_metrics = _dynamic_regime_binary_metrics(
+            year_points,
+            score_key="dynamic_regime_pre_refit_pressure_score",
+            warning_key="dynamic_regime_pre_refit_warning",
+        )
         silhouettes = [_finite(item.get("dynamic_regime_silhouette")) for item in year_points]
         silhouettes = [value for value in silhouettes if value is not None]
         yearly.append({
             "test_year": int(year),
-            **metrics,
+            **post_metrics,
+            "post_refit_auc": post_metrics.get("auc"),
+            "pre_refit_auc": pre_metrics.get("auc"),
+            "pre_refit_warnings": pre_metrics.get("warnings"),
+            "pre_refit_precision": pre_metrics.get("precision"),
+            "pre_refit_recall": pre_metrics.get("recall"),
+            "geometry_shift_auc": _dynamic_regime_score_auc(year_points, "dynamic_regime_geometry_shift"),
+            "distance_absorption_auc": _dynamic_regime_score_auc(year_points, "dynamic_regime_distance_absorption"),
+            **_pre_post_warning_comparison(year_points),
             "mean_silhouette": _mean_available(silhouettes),
             "novel_states": int(sum(int(item.get("dynamic_regime_is_novel") or 0) for item in year_points)),
+            "pre_refit_novel_states": int(sum(int(item.get("dynamic_regime_pre_refit_is_novel") or 0) for item in year_points)),
             "cluster_transitions": int(sum(int(item.get("dynamic_regime_transition") or 0) for item in year_points)),
             "more_defensive_transitions": int(sum(int(item.get("dynamic_regime_more_defensive_transition") or 0) for item in year_points)),
         })
@@ -1188,13 +1345,17 @@ def _dynamic_daily_regime_diagnostic(
         "enabled": True,
         "decision_feature": False,
         "refit_each_close": True,
-        "fit_scope": "expanding causal history through each completed close; scaler and clustering are rebuilt from scratch for every OOS session",
-        "current_observation_in_refit": True,
+        "pre_refit_detection_enabled": True,
+        "fit_scope": "each completed close is first evaluated against the previous causal geometry and then incorporated into a full expanding unsupervised refit",
+        "pre_refit_scope": "strict causal history ending at the previous completed close",
+        "post_refit_scope": "expanding causal history through the newly completed close",
+        "current_observation_in_pre_refit": False,
+        "current_observation_in_post_refit": True,
         "future_information_in_clustering": False,
         "algorithm": "Ward hierarchical clustering rebuilt from scratch at every completed close; k selected from the same causal hierarchy by sampled silhouette",
         "axis_definition": {
-            "x": "standardized opportunity composite rebuilt at each close",
-            "y": "standardized market/risk-health composite rebuilt at each close",
+            "x": "standardized opportunity composite",
+            "y": "standardized market/risk-health composite",
         },
         "novelty_quantile": novelty_quantile,
         "warning_quantile": warning_quantile,
@@ -1202,9 +1363,15 @@ def _dynamic_daily_regime_diagnostic(
         "cluster_count_distribution": {str(key): int(value) for key, value in sorted(cluster_distribution.items())},
         "stable_family_distribution": {str(key): int(value) for key, value in sorted(family_distribution.items())},
         "novel_state_count": int(sum(int(item.get("dynamic_regime_is_novel") or 0) for item in points)),
+        "pre_refit_novel_state_count": int(sum(int(item.get("dynamic_regime_pre_refit_is_novel") or 0) for item in points)),
         "cluster_transition_count": int(sum(int(item.get("dynamic_regime_transition") or 0) for item in points)),
         "more_defensive_transition_count": int(sum(int(item.get("dynamic_regime_more_defensive_transition") or 0) for item in points)),
-        "overall": overall,
+        "overall": post_overall,
+        "post_refit_overall": post_overall,
+        "pre_refit_overall": pre_overall,
+        "warning_comparison": warning_comparison,
+        "geometry_shift_auc": _dynamic_regime_score_auc(points, "dynamic_regime_geometry_shift"),
+        "distance_absorption_auc": _dynamic_regime_score_auc(points, "dynamic_regime_distance_absorption"),
         "yearly": yearly,
         "points": points,
     }
@@ -1774,8 +1941,9 @@ def build_analysis(
             "open_checkpoint": "adds only the next regular-session opening price and gap before execution",
             "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals", "best risk-adjusted alternative versus base asset", "causal rolling regime distances and PCA quadrant context"],
             "regime_context": "frozen fold-level regime context retained for the HOLD/ROTATE/CASH ablation",
-            "daily_dynamic_regime": "shadow-only unsupervised state map; scaler and clustering are rebuilt from scratch after every completed close using all causal observations available through that close",
+            "daily_dynamic_regime": "shadow-only unsupervised pre/post refit state map; each new close is first measured against the previous geometry and then incorporated into a complete expanding refit",
             "daily_regime_trajectory": "shadow diagnostic of regime direction, speed and persistence; not used by HOLD/ROTATE/CASH models in this release",
+            "pre_post_refit_regime_innovation": "separates detection from adaptation by preserving pre-refit surprise/pressure before the current close is absorbed into the rebuilt geometry",
             "daily_dynamic_regime_used_as_decision_feature": False,
             "daily_regime_trajectory_used_as_decision_feature": False,
             "monthly_diagnostic_cluster_used_as_feature": False,
@@ -1823,6 +1991,16 @@ def build_analysis(
             "daily_dynamic_regime_warning_precision": ((daily_dynamic_regime.get("overall") or {}).get("precision")),
             "daily_dynamic_regime_warning_recall": ((daily_dynamic_regime.get("overall") or {}).get("recall")),
             "daily_dynamic_regime_median_lead_sessions": ((daily_dynamic_regime.get("overall") or {}).get("median_trough_lead_sessions")),
+            "daily_dynamic_pre_refit_auc": ((daily_dynamic_regime.get("pre_refit_overall") or {}).get("auc")),
+            "daily_dynamic_pre_refit_warning_count": int(((daily_dynamic_regime.get("pre_refit_overall") or {}).get("warnings") or 0)),
+            "daily_dynamic_pre_refit_warning_precision": ((daily_dynamic_regime.get("pre_refit_overall") or {}).get("precision")),
+            "daily_dynamic_pre_refit_warning_recall": ((daily_dynamic_regime.get("pre_refit_overall") or {}).get("recall")),
+            "daily_dynamic_geometry_shift_auc": daily_dynamic_regime.get("geometry_shift_auc"),
+            "daily_dynamic_distance_absorption_auc": daily_dynamic_regime.get("distance_absorption_auc"),
+            "daily_dynamic_pre_only_warning_count": int(((daily_dynamic_regime.get("warning_comparison") or {}).get("pre_only_warnings") or 0)),
+            "daily_dynamic_pre_only_severe_window_count": int(((daily_dynamic_regime.get("warning_comparison") or {}).get("pre_only_severe_windows") or 0)),
+            "daily_dynamic_post_only_warning_count": int(((daily_dynamic_regime.get("warning_comparison") or {}).get("post_only_warnings") or 0)),
+            "daily_dynamic_warning_preserved_count": int(((daily_dynamic_regime.get("warning_comparison") or {}).get("both_warnings") or 0)),
             "daily_regime_trajectory_auc": ((daily_regime_trajectory.get("overall") or {}).get("auc")),
             "daily_regime_warning_count": int(((daily_regime_trajectory.get("overall") or {}).get("warnings") or 0)),
             "daily_regime_severe_window_count": int(((daily_regime_trajectory.get("overall") or {}).get("severe_windows") or 0)),
