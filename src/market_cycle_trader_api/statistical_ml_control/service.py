@@ -116,6 +116,31 @@ def public_summary(document: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(document, dict):
         return None
     payload = dict(document)
+    predictions = [dict(item) for item in (payload.get("predictions") or []) if isinstance(item, dict)]
+    trajectory = dict(payload.get("daily_regime_trajectory") or {})
+    trajectory["points"] = [
+        bson_value({
+            "execution_at": item.get("execution_at"),
+            "test_year": item.get("test_year"),
+            "symbol": item.get("symbol"),
+            "policy_action": item.get("policy_action"),
+            "regime_cluster_id": item.get("regime_cluster_id"),
+            "regime_quadrant": item.get("regime_quadrant"),
+            "regime_pca_x": item.get("regime_pca_x"),
+            "regime_pca_y": item.get("regime_pca_y"),
+            "regime_is_defensive_cluster": item.get("regime_is_defensive_cluster"),
+            "regime_danger_similarity": item.get("regime_danger_similarity"),
+            "regime_danger_balance": item.get("regime_danger_balance"),
+            "regime_trajectory_score": item.get("regime_trajectory_score"),
+            "regime_trajectory_warning": item.get("regime_trajectory_warning"),
+            "trajectory_severe_event": item.get("trajectory_severe_event"),
+            "trajectory_forward_min_return": item.get("trajectory_forward_min_return"),
+            "trajectory_trough_lead_sessions": item.get("trajectory_trough_lead_sessions"),
+        })
+        for item in predictions
+        if item.get("regime_pca_x") is not None and item.get("regime_pca_y") is not None
+    ]
+    payload["daily_regime_trajectory"] = trajectory
     payload.pop("_id", None)
     payload.pop("predictions", None)
     return bson_value(payload)
