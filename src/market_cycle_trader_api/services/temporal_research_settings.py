@@ -21,7 +21,7 @@ from ..schemas.temporal_research_settings import (
 )
 
 SETTINGS_ID = "winner-transition"
-SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_SCHEMA_VERSION = 2
 PARAMETERIZATION_FILE = "003_temporal_winner_transition_research.json"
 
 
@@ -67,13 +67,17 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
     document = db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].find_one({"_id": SETTINGS_ID})
     if document is None:
         raise RuntimeError("Temporal research settings could not be initialized.")
-    raw_settings = {"risk": document.get("risk"), "confidence": document.get("confidence")}
+    raw_settings = {
+        "risk": document.get("risk") or seed.get("risk"),
+        "confidence": document.get("confidence") or seed.get("confidence"),
+        "statistical_ml_control": document.get("statistical_ml_control") or seed.get("statistical_ml_control"),
+    }
     settings = _validated_settings(raw_settings)
     expected_hash = _settings_hash(settings)
     if raw_settings != settings or document.get("settings_hash") != expected_hash:
         db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].update_one(
             {"_id": SETTINGS_ID},
-            {"$set": {**settings, "settings_hash": expected_hash, "updated_at": now}},
+            {"$set": {**settings, "schema_version": SETTINGS_SCHEMA_VERSION, "settings_hash": expected_hash, "updated_at": now}},
         )
         document = {**document, **settings, "settings_hash": expected_hash, "updated_at": now}
     return document
@@ -81,7 +85,7 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
 
 def temporal_research_settings_snapshot(db: Any) -> dict[str, Any]:
     document = ensure_temporal_research_settings(db)
-    settings = _validated_settings({"risk": document.get("risk"), "confidence": document.get("confidence")})
+    settings = _validated_settings({"risk": document.get("risk"), "confidence": document.get("confidence"), "statistical_ml_control": document.get("statistical_ml_control")})
     return {
         "settings_id": SETTINGS_ID,
         "schema_version": int(document.get("schema_version") or SETTINGS_SCHEMA_VERSION),
@@ -113,7 +117,7 @@ def update_temporal_research_settings(
         raise TemporalResearchSettingsConflict(
             f"Expected revision {payload.expected_revision}, current revision {revision}."
         )
-    settings = _validated_settings({"risk": previous.get("risk"), "confidence": previous.get("confidence")})
+    settings = _validated_settings({"risk": previous.get("risk"), "confidence": previous.get("confidence"), "statistical_ml_control": previous.get("statistical_ml_control")})
     patch = payload.settings.model_dump(exclude_none=True, mode="python")
     for group, values in patch.items():
         settings[group] = deepcopy(values)

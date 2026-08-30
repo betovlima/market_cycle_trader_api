@@ -1,14 +1,65 @@
 {
   "risk": {
     "severe_threshold": -0.05,
-    "risk_quantiles": [0.70, 0.75, 0.80, 0.85, 0.90],
+    "risk_quantiles": [
+      0.7,
+      0.75,
+      0.8,
+      0.85,
+      0.9
+    ],
     "default_risk_quantile": 0.75,
     "min_outer_train_rows": 50,
     "min_inner_train_rows": 24,
     "min_train_severe": 3
   },
   "confidence": {
-    "margin_quantiles": [0.0, 0.25, 0.5, 0.75],
+    "margin_quantiles": [
+      0.0,
+      0.25,
+      0.5,
+      0.75
+    ],
     "min_alerts": 4
+  },
+  "statistical_ml_control": {
+    "lookback_sessions": 60,
+    "minimum_history_sessions": 30,
+    "horizons_sessions": [
+      1,
+      3,
+      5
+    ],
+    "horizon_weights": {
+      "1": 0.45,
+      "3": 0.35,
+      "5": 0.2
+    },
+    "downside_penalty": 0.5,
+    "minimum_cash_edge": 0.005,
+    "min_train_rows": 250,
+    "inner_validation_share": 0.2,
+    "probability_threshold_candidates": [
+      0.55,
+      0.6,
+      0.65,
+      0.7,
+      0.75
+    ],
+    "default_probability_threshold": 0.65,
+    "n_estimators": 320,
+    "max_depth": 5,
+    "min_samples_leaf": 8,
+    "random_state": 42,
+    "min_interventions": 5,
+    "min_capital_lift": 0.02,
+    "min_mean_open_auc": 0.55,
+    "min_positive_oos_years": 2,
+    "max_drawdown_degradation": 0.01,
+    "max_worst_month_degradation": 0.01,
+    "extreme_tail_percentile": 0.98,
+    "extreme_robust_z": 3.0,
+    "opportunity_conflict_min_percentile": 0.75,
+    "risk_conflict_max_safety": 0.25
   }
 }
