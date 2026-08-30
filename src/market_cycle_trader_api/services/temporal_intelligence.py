@@ -1575,6 +1575,11 @@ def build_temporal_intelligence_export(
                 open_cash = open_metrics.get("cash") or {}
                 open_rotate = open_metrics.get("rotate") or {}
                 regime_context = item.get("regime_context") or {}
+                trajectory_context = regime_context.get("trajectory") or {}
+                trajectory_fold = next((
+                    row for row in (((statistical_export.get("daily_regime_trajectory") or {}).get("folds") or []))
+                    if isinstance(row, dict) and int(row.get("test_year") or 0) == int(item.get("test_year") or 0)
+                ), {})
                 statistical_fold_rows.append(bson_value({
                     **{key: value for key, value in dict(item).items() if key not in {"close_metrics", "open_metrics", "regime_context"}},
                     "close_auc": close_metrics.get("auc"),
@@ -1587,10 +1592,34 @@ def build_temporal_intelligence_export(
                     "regime_cluster_count": regime_context.get("cluster_count"),
                     "regime_silhouette_score": regime_context.get("silhouette_score"),
                     "regime_window_sessions": regime_context.get("window_sessions"),
+                    "regime_trajectory_enabled": trajectory_context.get("enabled"),
+                    "regime_trajectory_warning_threshold": trajectory_context.get("warning_threshold"),
+                    "regime_trajectory_auc": trajectory_fold.get("auc"),
+                    "regime_trajectory_warning_precision": trajectory_fold.get("precision"),
+                    "regime_trajectory_warning_recall": trajectory_fold.get("recall"),
+                    "regime_trajectory_median_lead_sessions": trajectory_fold.get("median_trough_lead_sessions"),
                 }))
             archive.writestr("strategy_research_statistical_ml_control_folds.csv", _csv_text(statistical_fold_rows))
             archive.writestr("strategy_research_statistical_ml_control_monthly.csv", _csv_text([bson_value(dict(item)) for item in (statistical_export.get("monthly") or []) if isinstance(item, dict)]))
             archive.writestr("strategy_research_statistical_ml_control_extreme_sessions.csv", _csv_text([bson_value(dict(item)) for item in (statistical_export.get("extreme_sessions") or []) if isinstance(item, dict)]))
+            trajectory_export_rows = []
+            for item in (statistical_export.get("predictions") or []):
+                if not isinstance(item, dict):
+                    continue
+                trajectory_export_rows.append(bson_value({
+                    key: item.get(key)
+                    for key in (
+                        "execution_at", "test_year", "symbol", "regime_cluster_id", "regime_quadrant",
+                        "regime_pca_x", "regime_pca_y", "regime_healthy_distance", "regime_danger_distance",
+                        "regime_healthy_similarity", "regime_danger_similarity", "regime_danger_balance",
+                        "regime_danger_approach_1d", "regime_danger_approach_3d", "regime_danger_approach_window",
+                        "regime_environment_deterioration_window", "regime_q4_persistence",
+                        "regime_defensive_persistence", "regime_path_speed", "regime_trajectory_score",
+                        "regime_trajectory_warning", "trajectory_forward_min_return", "trajectory_forward_return",
+                        "trajectory_severe_event", "trajectory_trough_lead_sessions",
+                    )
+                }))
+            archive.writestr("strategy_research_daily_regime_trajectory.csv", _csv_text(trajectory_export_rows))
         if pipeline_roc_policy is not None:
             roc_export = pipeline_roc_policy_raw or pipeline_roc_policy
             archive.writestr("strategy_research_roc_decision_policy.json", json.dumps(roc_export, indent=2, ensure_ascii=False, default=str))
