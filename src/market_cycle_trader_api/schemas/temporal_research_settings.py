@@ -131,12 +131,48 @@ class StatisticalMlControlSettings(BaseModel):
         return self
 
 
+class AssetStateClusteringSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    feature_names: list[str] = Field(min_length=4, max_length=40)
+    min_history_rows: int = Field(ge=30, le=5000)
+    min_clusters: int = Field(ge=2, le=10)
+    max_clusters: int = Field(ge=2, le=10)
+    silhouette_sample_rows: int = Field(ge=40, le=5000)
+    map_sample_rows: int = Field(ge=40, le=1000)
+    novelty_quantile: float = Field(gt=0.5, lt=1.0)
+    profile_horizon_sessions: int = Field(ge=1, le=20)
+    severe_loss_threshold: float = Field(gt=-1.0, lt=0.0)
+    kmeans_n_init: int = Field(ge=1, le=50)
+    random_state: int = Field(ge=0, le=2_147_483_647)
+
+    @field_validator("feature_names")
+    @classmethod
+    def validate_feature_names(cls, value: list[str]) -> list[str]:
+        normalized = []
+        for item in value:
+            name = str(item).strip()
+            if name and name not in normalized:
+                normalized.append(name)
+        if len(normalized) < 4:
+            raise ValueError("feature_names must contain at least four unique names.")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_cluster_range(self) -> "AssetStateClusteringSettings":
+        if self.min_clusters > self.max_clusters:
+            raise ValueError("min_clusters cannot exceed max_clusters.")
+        return self
+
+
 class TemporalWinnerTransitionResearchSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     risk: WinnerTransitionRiskSettings
     confidence: WinnerTransitionConfidenceSettings
     statistical_ml_control: StatisticalMlControlSettings
+    asset_state_clustering: AssetStateClusteringSettings
 
 
 class TemporalResearchSettingsPatch(BaseModel):
@@ -145,10 +181,11 @@ class TemporalResearchSettingsPatch(BaseModel):
     risk: WinnerTransitionRiskSettings | None = None
     confidence: WinnerTransitionConfidenceSettings | None = None
     statistical_ml_control: StatisticalMlControlSettings | None = None
+    asset_state_clustering: AssetStateClusteringSettings | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> "TemporalResearchSettingsPatch":
-        if self.risk is None and self.confidence is None and self.statistical_ml_control is None:
+        if self.risk is None and self.confidence is None and self.statistical_ml_control is None and self.asset_state_clustering is None:
             raise ValueError("At least one temporal research settings group is required.")
         return self
 
