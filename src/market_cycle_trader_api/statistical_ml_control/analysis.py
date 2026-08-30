@@ -6,10 +6,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import balanced_accuracy_score, brier_score_loss, roc_auc_score
+from sklearn.metrics import balanced_accuracy_score, brier_score_loss, roc_auc_score, silhouette_score
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from ..classification_evaluation import roc_curve_payload
 from .config import ACTIONS, ANALYSIS_VERSION, SCHEMA_VERSION
@@ -542,6 +545,196 @@ OPEN_FEATURES = CLOSE_FEATURES + (
 )
 
 
+REGIME_SOURCE_FEATURES = (
+    "positive_score_share",
+    "universe_breadth_20",
+    "spy_return_5",
+    "spy_return_20",
+    "spy_realized_volatility_20",
+    "incumbent_risk_health",
+    "all_horizon_risk_safety",
+    "predicted_drawdown",
+    "short_profit_consensus",
+    "long_profit_confirmation",
+    "horizon_agreement",
+    "position_return_since_entry",
+    "position_drawdown_from_peak",
+    "best_score_zscore",
+    "opportunity_risk_divergence",
+)
+REGIME_MAX_FEATURE_CLUSTERS = 6
+REGIME_CONTEXT_FEATURES = (
+    "regime_nearest_distance",
+    "regime_second_distance",
+    "regime_distance_margin",
+    "regime_pca_x",
+    "regime_pca_y",
+    "regime_q1",
+    "regime_q2",
+    "regime_q3",
+    "regime_q4",
+) + tuple(f"regime_similarity_{idx}" for idx in range(REGIME_MAX_FEATURE_CLUSTERS))
+
+
+def _rolling_regime_source(frame: pd.DataFrame, settings: dict[str, Any]) -> pd.DataFrame:
+    result = frame.copy().sort_values("execution_at").reset_index(drop=True)
+    window = max(5, int(settings.get("regime_window_sessions") or 20))
+    min_periods = max(3, min(window, window // 3))
+    for feature in REGIME_SOURCE_FEATURES:
+        values = pd.to_numeric(result.get(feature), errors="coerce")
+        result[f"regime_source_{feature}"] = values.rolling(window=window, min_periods=min_periods).mean()
+    return result
+
+
+def _regime_matrix_columns() -> list[str]:
+    return [f"regime_source_{feature}" for feature in REGIME_SOURCE_FEATURES]
+
+
+def _select_regime_cluster_count(matrix: np.ndarray, settings: dict[str, Any]) -> tuple[int, float | None]:
+    minimum = max(2, int(settings.get("regime_min_clusters") or 2))
+    maximum = min(REGIME_MAX_FEATURE_CLUSTERS, int(settings.get("regime_max_clusters") or 6), max(2, len(matrix) - 1))
+    candidates: list[tuple[float, int]] = []
+    for count in range(minimum, maximum + 1):
+        if len(matrix) <= count:
+            continue
+        labels = AgglomerativeClustering(n_clusters=count, linkage="ward").fit_predict(matrix)
+        if len(set(labels)) < 2:
+            continue
+        try:
+            score = float(silhouette_score(matrix, labels))
+        except Exception:
+            continue
+        candidates.append((score, count))
+    if not candidates:
+        return minimum, None
+    score, count = max(candidates, key=lambda item: (item[0], -item[1]))
+    return int(count), float(score)
+
+
+def _canonical_cluster_order(centroids: np.ndarray, columns: list[str]) -> list[int]:
+    index = {name: position for position, name in enumerate(columns)}
+    def value(row: np.ndarray, feature: str) -> float:
+        pos = index.get(f"regime_source_{feature}")
+        return 0.0 if pos is None else float(row[pos])
+    scored = []
+    for original, row in enumerate(centroids):
+        defensive = (
+            -value(row, "universe_breadth_20")
+            -value(row, "spy_return_5")
+            -value(row, "spy_return_20")
+            -value(row, "incumbent_risk_health")
+            -value(row, "all_horizon_risk_safety")
+            +value(row, "spy_realized_volatility_20")
+            +value(row, "predicted_drawdown")
+            +value(row, "opportunity_risk_divergence")
+        )
+        scored.append((float(defensive), int(original)))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [original for _score, original in scored]
+
+
+def _regime_context_frames(
+    train: pd.DataFrame,
+    fit: pd.DataFrame,
+    validation: pd.DataFrame,
+    test: pd.DataFrame,
+    settings: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    if not bool(settings.get("regime_context_enabled", True)):
+        return train, fit, validation, test, {"enabled": False}
+    columns = _regime_matrix_columns()
+    minimum_train = max(30, int(settings.get("regime_min_train_rows") or 120))
+    if len(train) < minimum_train:
+        return train, fit, validation, test, {"enabled": False, "reason": "insufficient_train_rows"}
+    train_matrix_frame = train.reindex(columns=columns).apply(pd.to_numeric, errors="coerce")
+    medians = train_matrix_frame.median(numeric_only=True).fillna(0.0)
+    train_matrix_frame = train_matrix_frame.fillna(medians).fillna(0.0)
+    scaler = StandardScaler()
+    train_matrix = scaler.fit_transform(train_matrix_frame.to_numpy(dtype=float))
+    cluster_count, silhouette = _select_regime_cluster_count(train_matrix, settings)
+    labels = AgglomerativeClustering(n_clusters=cluster_count, linkage="ward").fit_predict(train_matrix)
+    raw_centroids = np.vstack([train_matrix[labels == cluster].mean(axis=0) for cluster in range(cluster_count)])
+    order = _canonical_cluster_order(raw_centroids, columns)
+    centroids = raw_centroids[order]
+    original_to_canonical = {original: canonical for canonical, original in enumerate(order)}
+
+    pca = PCA(n_components=2, random_state=int(settings.get("random_state") or 42))
+    pca.fit(train_matrix)
+    opportunity_anchor = np.zeros(len(columns), dtype=float)
+    environment_anchor = np.zeros(len(columns), dtype=float)
+    for feature in ("short_profit_consensus", "long_profit_confirmation", "best_score_zscore", "positive_score_share"):
+        if f"regime_source_{feature}" in columns:
+            opportunity_anchor[columns.index(f"regime_source_{feature}")] = 1.0
+    for feature in ("universe_breadth_20", "spy_return_5", "spy_return_20", "incumbent_risk_health", "all_horizon_risk_safety"):
+        if f"regime_source_{feature}" in columns:
+            environment_anchor[columns.index(f"regime_source_{feature}")] = 1.0
+    for feature in ("spy_realized_volatility_20", "predicted_drawdown", "opportunity_risk_divergence"):
+        if f"regime_source_{feature}" in columns:
+            environment_anchor[columns.index(f"regime_source_{feature}")] = -1.0
+    component_scores = [abs(float(np.dot(component, opportunity_anchor))) for component in pca.components_]
+    x_component = int(np.argmax(component_scores))
+    y_component = 1 - x_component
+    x_sign = 1.0 if float(np.dot(pca.components_[x_component], opportunity_anchor)) >= 0.0 else -1.0
+    y_sign = 1.0 if float(np.dot(pca.components_[y_component], environment_anchor)) >= 0.0 else -1.0
+    temperature = float(settings.get("regime_distance_temperature") or 1.0)
+
+    def transform(source: pd.DataFrame) -> pd.DataFrame:
+        result = source.copy()
+        matrix_frame = result.reindex(columns=columns).apply(pd.to_numeric, errors="coerce").fillna(medians).fillna(0.0)
+        matrix = scaler.transform(matrix_frame.to_numpy(dtype=float))
+        distances = np.linalg.norm(matrix[:, None, :] - centroids[None, :, :], axis=2)
+        nearest = np.argsort(distances, axis=1)
+        pca_raw = pca.transform(matrix)
+        pca_x = pca_raw[:, x_component] * x_sign
+        pca_y = pca_raw[:, y_component] * y_sign
+        for idx in range(REGIME_MAX_FEATURE_CLUSTERS):
+            if idx < cluster_count:
+                result[f"regime_similarity_{idx}"] = np.exp(-distances[:, idx] / max(temperature, 1e-9))
+            else:
+                result[f"regime_similarity_{idx}"] = 0.0
+        result["regime_cluster_id"] = nearest[:, 0].astype(int)
+        result["regime_nearest_distance"] = distances[np.arange(len(result)), nearest[:, 0]]
+        if cluster_count > 1:
+            result["regime_second_distance"] = distances[np.arange(len(result)), nearest[:, 1]]
+            result["regime_distance_margin"] = result["regime_second_distance"] - result["regime_nearest_distance"]
+        else:
+            result["regime_second_distance"] = result["regime_nearest_distance"]
+            result["regime_distance_margin"] = 0.0
+        result["regime_pca_x"] = pca_x
+        result["regime_pca_y"] = pca_y
+        result["regime_q1"] = ((pca_x >= 0.0) & (pca_y >= 0.0)).astype(int)
+        result["regime_q2"] = ((pca_x < 0.0) & (pca_y >= 0.0)).astype(int)
+        result["regime_q3"] = ((pca_x < 0.0) & (pca_y < 0.0)).astype(int)
+        result["regime_q4"] = ((pca_x >= 0.0) & (pca_y < 0.0)).astype(int)
+        result["regime_quadrant"] = np.select(
+            [result["regime_q1"] == 1, result["regime_q2"] == 1, result["regime_q3"] == 1, result["regime_q4"] == 1],
+            ["Q1", "Q2", "Q3", "Q4"],
+            default="Q0",
+        )
+        return result
+
+    train_out = transform(train)
+    fit_out = transform(fit)
+    validation_out = transform(validation) if not validation.empty else validation.copy()
+    test_out = transform(test)
+    cluster_counts = Counter(int(original_to_canonical.get(int(label), int(label))) for label in labels)
+    return train_out, fit_out, validation_out, test_out, {
+        "enabled": True,
+        "cluster_count": int(cluster_count),
+        "silhouette_score": silhouette,
+        "train_rows": int(len(train)),
+        "window_sessions": int(settings.get("regime_window_sessions") or 20),
+        "cluster_counts": {str(key): int(value) for key, value in sorted(cluster_counts.items())},
+        "pca_explained_variance_ratio": [float(value) for value in pca.explained_variance_ratio_.tolist()],
+        "quadrant_definition": {"x": "opportunity-oriented PCA axis", "y": "market/risk-health-oriented PCA axis"},
+        "fit_scope": "outer-fold training years only",
+    }
+
+
+CLOSE_MODEL_FEATURES = CLOSE_FEATURES + REGIME_CONTEXT_FEATURES
+OPEN_MODEL_FEATURES = OPEN_FEATURES + REGIME_CONTEXT_FEATURES
+
+
 def _mean_available(values: list[float | None]) -> float | None:
     clean = [float(value) for value in values if value is not None and math.isfinite(float(value))]
     return float(sum(clean) / len(clean)) if clean else None
@@ -593,6 +786,7 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
     frame = pd.DataFrame(rows)
     if frame.empty:
         return [], []
+    frame = _rolling_regime_source(frame, settings)
     first_test_year = int(settings.get("first_test_year") or max(int(frame["year"].min()) + 2, 2022))
     last_test_year = int(frame["year"].max())
     minimum_train = max(30, int(settings.get("min_train_rows") or 250))
@@ -616,24 +810,30 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
             fit = train.copy()
             validation = train.iloc[0:0].copy()
 
+        train, fit, validation, test, regime_context = _regime_context_frames(
+            train, fit, validation, test, settings
+        )
+        close_features = CLOSE_MODEL_FEATURES if regime_context.get("enabled") else CLOSE_FEATURES
+        open_features = OPEN_MODEL_FEATURES if regime_context.get("enabled") else OPEN_FEATURES
+
         close_cash_prob, close_cash_threshold, close_cash_validation, close_cash_metrics = _binary_fold_model(
             train=train, fit=fit, validation=validation, test=test,
-            features=CLOSE_FEATURES, target="target_cash", settings=settings,
+            features=close_features, target="target_cash", settings=settings,
             seed_offset=11 + test_year, default_threshold=default_cash_threshold, fit_on_full_train=False,
         )
         close_rotate_prob, close_rotate_threshold, close_rotate_validation, close_rotate_metrics = _binary_fold_model(
             train=train, fit=fit, validation=validation, test=test,
-            features=CLOSE_FEATURES, target="target_rotate", settings=settings,
+            features=close_features, target="target_rotate", settings=settings,
             seed_offset=17 + test_year, default_threshold=default_rotation_threshold, fit_on_full_train=False,
         )
         open_cash_prob, open_cash_threshold, open_cash_validation, open_cash_metrics = _binary_fold_model(
             train=train, fit=fit, validation=validation, test=test,
-            features=OPEN_FEATURES, target="target_cash", settings=settings,
+            features=open_features, target="target_cash", settings=settings,
             seed_offset=29 + test_year, default_threshold=default_cash_threshold, fit_on_full_train=True,
         )
         open_rotate_prob, open_rotate_threshold, open_rotate_validation, open_rotate_metrics = _binary_fold_model(
             train=train, fit=fit, validation=validation, test=test,
-            features=OPEN_FEATURES, target="target_rotate", settings=settings,
+            features=open_features, target="target_rotate", settings=settings,
             seed_offset=37 + test_year, default_threshold=default_rotation_threshold, fit_on_full_train=True,
         )
         close_auc = _mean_available([_finite(close_cash_metrics.get("auc")), _finite(close_rotate_metrics.get("auc"))])
@@ -654,6 +854,7 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
             "open_rotate_validation_balanced_accuracy": open_rotate_validation,
             "close_metrics": {"auc": close_auc, "cash": close_cash_metrics, "rotate": close_rotate_metrics},
             "open_metrics": {"auc": open_auc, "cash": open_cash_metrics, "rotate": open_rotate_metrics},
+            "regime_context": regime_context,
         })
         for position, ((_, source), close_cash, close_rotate, open_cash, open_rotate) in enumerate(zip(
             test.iterrows(), close_cash_prob, close_rotate_prob, open_cash_prob, open_rotate_prob
@@ -721,6 +922,14 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
                 "predicted_drawdown": _finite(source.get("predicted_drawdown")),
                 "opportunity_risk_divergence": _finite(source.get("opportunity_risk_divergence")),
                 "universe_breadth_20": _finite(source.get("universe_breadth_20")),
+                "regime_cluster_id": None if source.get("regime_cluster_id") is None else int(source.get("regime_cluster_id")),
+                "regime_quadrant": source.get("regime_quadrant"),
+                "regime_pca_x": _finite(source.get("regime_pca_x")),
+                "regime_pca_y": _finite(source.get("regime_pca_y")),
+                "regime_nearest_distance": _finite(source.get("regime_nearest_distance")),
+                "regime_second_distance": _finite(source.get("regime_second_distance")),
+                "regime_distance_margin": _finite(source.get("regime_distance_margin")),
+                **{f"regime_similarity_{idx}": _finite(source.get(f"regime_similarity_{idx}")) for idx in range(REGIME_MAX_FEATURE_CLUSTERS)},
                 **{
                     f"asset_return_{int(horizon)}d": _finite(source.get(f"asset_return_{int(horizon)}d"))
                     for horizon in [int(value) for value in (settings.get("horizons_sessions") or [1, 3, 5])]
@@ -900,6 +1109,17 @@ def build_analysis(
     statistical_close_shocks = sum(bool(item.get("statistical_close_shock")) for item in predictions)
     statistical_open_shocks = sum(bool(item.get("statistical_open_shock")) for item in predictions)
     opportunity_risk_conflicts = sum(bool(item.get("opportunity_risk_conflict")) for item in predictions)
+    regime_silhouettes = [
+        _finite(((fold.get("regime_context") or {}).get("silhouette_score"))) for fold in folds
+        if (fold.get("regime_context") or {}).get("enabled")
+    ]
+    regime_silhouettes = [value for value in regime_silhouettes if value is not None]
+    mean_regime_silhouette = _mean_available(regime_silhouettes)
+    regime_quadrant_counts = Counter(str(item.get("regime_quadrant") or "Q0") for item in predictions)
+    regime_action_counts: dict[str, Counter] = {}
+    for item in predictions:
+        quadrant = str(item.get("regime_quadrant") or "Q0")
+        regime_action_counts.setdefault(quadrant, Counter())[str(item.get("policy_action") or "FOLLOW_BASE")] += 1
     extreme_rows = sorted(
         [row for row in predictions if _finite(row.get("shock_tail_score")) is not None],
         key=lambda row: float(row.get("shock_tail_score") or 0.0),
@@ -917,7 +1137,9 @@ def build_analysis(
             "purpose": "causal close/open HOLD-ROTATE-CASH arbitration before operational Strategy activation",
             "close_checkpoint": "uses information available at the completed decision close only",
             "open_checkpoint": "adds only the next regular-session opening price and gap before execution",
-            "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals", "best risk-adjusted alternative versus base asset"],
+            "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals", "best risk-adjusted alternative versus base asset", "causal rolling regime distances and PCA quadrant context"],
+            "regime_context": "rolling state; clustering/scaler/PCA fitted only on years before each outer test year",
+            "monthly_diagnostic_cluster_used_as_feature": False,
             "candidate_actions": ["FOLLOW_BASE", "ROTATE", "CASH"],
             "rotation_candidate_selection": "best causal risk-adjusted alternative at the completed close",
             "chronological_validation": "expanding walk-forward by test year",
@@ -946,6 +1168,13 @@ def build_analysis(
             "statistical_close_shock_count": int(statistical_close_shocks),
             "statistical_open_shock_count": int(statistical_open_shocks),
             "opportunity_risk_conflict_count": int(opportunity_risk_conflicts),
+            "regime_context_enabled": bool(settings.get("regime_context_enabled", True)),
+            "mean_regime_silhouette": mean_regime_silhouette,
+            "regime_quadrant_counts": {key: int(value) for key, value in sorted(regime_quadrant_counts.items())},
+            "actions_by_regime_quadrant": {
+                quadrant: {action: int(counts.get(action, 0)) for action in ACTIONS}
+                for quadrant, counts in sorted(regime_action_counts.items())
+            },
             "mean_close_auc": mean_close_auc,
             "mean_open_auc": mean_open_auc,
             "mean_close_cash_auc": mean_close_cash_auc,
