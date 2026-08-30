@@ -108,6 +108,27 @@ def build_and_persist(
         "updated_at": now,
     })
     _ensure_indexes(db)
+    from ..asset_state_clustering.service import build_and_persist as build_asset_state_clustering
+    asset_state = build_asset_state_clustering(
+        db,
+        run_id,
+        processing_id=processing_id,
+        start_month=start_month,
+        end_month=end_month,
+    )
+    result["asset_state_clustering"] = {
+        "id": asset_state.get("id"),
+        "status": asset_state.get("status"),
+        "analysis_version": asset_state.get("analysis_version"),
+        "schema_version": asset_state.get("schema_version"),
+        "shadow_only": asset_state.get("shadow_only", True),
+        "decision_effect": asset_state.get("decision_effect", "none"),
+        "method": asset_state.get("method") or {},
+        "feature_names": asset_state.get("feature_names") or [],
+        "summary": asset_state.get("summary") or {},
+        "asset_summaries": asset_state.get("asset_summaries") or [],
+        "latest_maps": asset_state.get("latest_maps") or [],
+    }
     db[TEMPORAL_STATISTICAL_ML_CONTROL_COLLECTION].insert_one(bson_value(dict(result)))
     return bson_value(result)
 

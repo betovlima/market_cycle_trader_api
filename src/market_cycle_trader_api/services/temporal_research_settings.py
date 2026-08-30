@@ -21,7 +21,7 @@ from ..schemas.temporal_research_settings import (
 )
 
 SETTINGS_ID = "winner-transition"
-SETTINGS_SCHEMA_VERSION = 6
+SETTINGS_SCHEMA_VERSION = 7
 PARAMETERIZATION_FILE = "003_temporal_winner_transition_research.json"
 
 
@@ -71,6 +71,7 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
         "risk": {**(seed.get("risk") or {}), **(document.get("risk") or {})},
         "confidence": {**(seed.get("confidence") or {}), **(document.get("confidence") or {})},
         "statistical_ml_control": {**(seed.get("statistical_ml_control") or {}), **(document.get("statistical_ml_control") or {})},
+        "asset_state_clustering": {**(seed.get("asset_state_clustering") or {}), **(document.get("asset_state_clustering") or {})},
     }
     settings = _validated_settings(raw_settings)
     expected_hash = _settings_hash(settings)
@@ -85,7 +86,7 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
 
 def temporal_research_settings_snapshot(db: Any) -> dict[str, Any]:
     document = ensure_temporal_research_settings(db)
-    settings = _validated_settings({"risk": document.get("risk"), "confidence": document.get("confidence"), "statistical_ml_control": document.get("statistical_ml_control")})
+    settings = _validated_settings({"risk": document.get("risk"), "confidence": document.get("confidence"), "statistical_ml_control": document.get("statistical_ml_control"), "asset_state_clustering": document.get("asset_state_clustering")})
     return {
         "settings_id": SETTINGS_ID,
         "schema_version": int(document.get("schema_version") or SETTINGS_SCHEMA_VERSION),
@@ -117,7 +118,7 @@ def update_temporal_research_settings(
         raise TemporalResearchSettingsConflict(
             f"Expected revision {payload.expected_revision}, current revision {revision}."
         )
-    settings = _validated_settings({"risk": previous.get("risk"), "confidence": previous.get("confidence"), "statistical_ml_control": previous.get("statistical_ml_control")})
+    settings = _validated_settings({"risk": previous.get("risk"), "confidence": previous.get("confidence"), "statistical_ml_control": previous.get("statistical_ml_control"), "asset_state_clustering": previous.get("asset_state_clustering")})
     patch = payload.settings.model_dump(exclude_none=True, mode="python")
     for group, values in patch.items():
         settings[group] = deepcopy(values)
