@@ -4,10 +4,11 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
 
-from ...auth.security import SessionIdentity, require_portfolio_session
+from ...auth.security import SessionIdentity, require_capability, require_portfolio_session
 from ...core.runtime import database
 from ...services.dashboard import (
     dashboard_job_detail,
+    dashboard_latest_research_tree,
     dashboard_strategy_intelligence,
     dashboard_summary,
     dashboard_tuning_candidate_detail,
@@ -23,6 +24,13 @@ def get_dashboard_summary(
     
 
     return dashboard_summary(database(), limit=limit)
+
+
+@router.get("/research-tree")
+def get_dashboard_research_tree(
+    _identity: Annotated[SessionIdentity, Depends(require_capability("backtest.view"))],
+) -> dict[str, Any]:
+    return dashboard_latest_research_tree(database())
 
 
 @router.get("/jobs/{job_id}")
