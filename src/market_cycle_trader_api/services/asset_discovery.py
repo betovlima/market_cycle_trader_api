@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -69,6 +70,20 @@ SUPPORTED_EXCHANGES = frozenset({"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE"})
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.\-]+$")
 ACTIVE_STATUSES = frozenset({"queued", "running", "stopping"})
 TICKER_IDENTITY_GAP_SESSIONS = 20
+IDENTITY_CORPORATE_ACTION_TYPES = (
+    "name_change",
+    "cash_merger",
+    "stock_merger",
+    "stock_and_cash_merger",
+    "redemption",
+    "worthless_removal",
+    "reorganization",
+    "reverse_split",
+)
+IDENTITY_HARD_EVENT_TYPES = frozenset({
+    "cash_merger", "stock_merger", "stock_and_cash_merger", "redemption", "worthless_removal", "reorganization"
+})
+IDENTITY_SYMBOL_BATCH_SIZE = 40
 MIN_PERSISTENT_MARGINAL_CAPITAL_DELTA_RATE = 0.0
 DEFAULT_SEVERE_MONTH_THRESHOLD = -0.05
 WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
@@ -395,9 +410,172 @@ def _discover_asset_metadata(db: Database) -> dict[str, dict[str, str | None]]:
             "symbol": symbol,
             "company_name": company_name,
             "exchange": exchange or None,
+            "asset_id": str(item.get("id") or "").strip() or None,
+            "cusip": str(item.get("cusip") or "").strip() or None,
+            "asset_status": str(item.get("status") or "").strip().lower() or None,
         }
     return result
 
+
+
+def _corporate_actions_endpoint() -> str:
+    return "https://data.alpaca.markets/v1/corporate-actions"
+
+
+def _event_type_from_bucket(bucket: str) -> str:
+    value = str(bucket or "").strip().lower()
+    aliases = {
+        "name_changes": "name_change",
+        "cash_mergers": "cash_merger",
+        "stock_mergers": "stock_merger",
+        "stock_and_cash_mergers": "stock_and_cash_merger",
+        "redemptions": "redemption",
+        "worthless_removals": "worthless_removal",
+        "reorganizations": "reorganization",
+        "reverse_splits": "reverse_split",
+    }
+    return aliases.get(value, value[:-1] if value.endswith("s") else value)
+
+
+def _corporate_action_symbol_aliases(event: dict[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    for key in ("symbol", "old_symbol", "new_symbol", "source_symbol", "target_symbol", "alternate_symbol"):
+        value = str(event.get(key) or "").strip().upper()
+        if value:
+            aliases.add(value)
+    return aliases
+
+
+def _corporate_action_cusip_aliases(event: dict[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    for key in ("cusip", "old_cusip", "new_cusip", "source_cusip", "target_cusip"):
+        value = str(event.get(key) or "").strip().upper()
+        if value:
+            aliases.add(value)
+    return aliases
+
+
+def _identity_event_summary(event_type: str, event: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "id", "process_date", "effective_date", "ex_date", "record_date", "payable_date",
+        "symbol", "old_symbol", "new_symbol", "source_symbol", "target_symbol",
+        "old_cusip", "new_cusip", "source_cusip", "target_cusip", "cusip", "isin",
+    )
+    return {"type": event_type, **{key: event.get(key) for key in keys if event.get(key) not in {None, ""}}}
+
+
+def _identity_event_breaks_comparability(event_type: str, event: dict[str, Any]) -> bool:
+    if event_type in IDENTITY_HARD_EVENT_TYPES:
+        return True
+    old_symbol = str(event.get("old_symbol") or "").strip().upper()
+    new_symbol = str(event.get("new_symbol") or "").strip().upper()
+    old_cusip = str(event.get("old_cusip") or "").strip().upper()
+    new_cusip = str(event.get("new_cusip") or "").strip().upper()
+    if event_type == "name_change":
+        return bool((old_symbol and new_symbol and old_symbol != new_symbol) or (old_cusip and new_cusip and old_cusip != new_cusip))
+    if event_type == "reverse_split":
+        return bool(old_symbol and new_symbol and old_symbol != new_symbol)
+    return False
+
+
+def _identity_integrity_for_symbols(
+    db: Database,
+    symbols: list[str],
+    *,
+    start_date: str,
+    end_date: str,
+    asset_metadata: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    normalized = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
+    if not normalized:
+        return {}
+    credentials = get_alpaca_credentials(db)
+    headers = _alpaca_headers(credentials)
+    metadata = asset_metadata if isinstance(asset_metadata, dict) else {}
+    current_cusip_by_symbol = {
+        symbol: str((metadata.get(symbol) or {}).get("cusip") or "").strip().upper()
+        for symbol in normalized
+    }
+    events_by_symbol: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in normalized}
+    event_keys_by_symbol: dict[str, set[str]] = {symbol: set() for symbol in normalized}
+    for offset in range(0, len(normalized), IDENTITY_SYMBOL_BATCH_SIZE):
+        batch = normalized[offset: offset + IDENTITY_SYMBOL_BATCH_SIZE]
+        batch_cusips = sorted({current_cusip_by_symbol.get(symbol) for symbol in batch if current_cusip_by_symbol.get(symbol)})
+        query_filters: list[dict[str, str]] = [{"symbols": ",".join(batch)}]
+        if batch_cusips:
+            query_filters.append({"cusips": ",".join(batch_cusips)})
+        for identity_filter in query_filters:
+            page_token: str | None = None
+            while True:
+                params: dict[str, Any] = {
+                    **identity_filter,
+                    "types": ",".join(IDENTITY_CORPORATE_ACTION_TYPES),
+                    "start": str(start_date)[:10],
+                    "end": str(end_date)[:10],
+                    "region": "us",
+                    "data_quality": "complete",
+                    "limit": 1000,
+                    "sort": "asc",
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                response = requests.get(_corporate_actions_endpoint(), params=params, headers=headers, timeout=30)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Alpaca returned an unexpected corporate-actions payload.")
+                for bucket, raw_events in payload.items():
+                    if bucket == "next_page_token" or not isinstance(raw_events, list):
+                        continue
+                    event_type = _event_type_from_bucket(bucket)
+                    for raw_event in raw_events:
+                        if not isinstance(raw_event, dict):
+                            continue
+                        symbol_aliases = _corporate_action_symbol_aliases(raw_event)
+                        cusip_aliases = _corporate_action_cusip_aliases(raw_event)
+                        matched = set(symbol_aliases.intersection(batch))
+                        for symbol in batch:
+                            current_cusip = current_cusip_by_symbol.get(symbol)
+                            if current_cusip and current_cusip in cusip_aliases:
+                                matched.add(symbol)
+                        if not matched and len(batch) == 1 and not symbol_aliases and not cusip_aliases:
+                            matched = {batch[0]}
+                        event_key = str(raw_event.get("id") or "") or json.dumps(
+                            _identity_event_summary(event_type, raw_event), sort_keys=True, default=str
+                        )
+                        for symbol in matched:
+                            key = f"{event_type}:{event_key}"
+                            if key in event_keys_by_symbol[symbol]:
+                                continue
+                            event_keys_by_symbol[symbol].add(key)
+                            events_by_symbol[symbol].append({"event_type": event_type, "event": dict(raw_event)})
+                page_token = str(payload.get("next_page_token") or "").strip() or None
+                if not page_token:
+                    break
+    result: dict[str, dict[str, Any]] = {}
+    for symbol in normalized:
+        summaries: list[dict[str, Any]] = []
+        hard: list[dict[str, Any]] = []
+        for item in events_by_symbol.get(symbol) or []:
+            event_type = str(item.get("event_type") or "")
+            event = item.get("event") if isinstance(item.get("event"), dict) else {}
+            summary = _identity_event_summary(event_type, event)
+            summaries.append(summary)
+            if _identity_event_breaks_comparability(event_type, event):
+                hard.append(summary)
+        result[symbol] = {
+            "status": "rejected" if hard else "passed",
+            "checked": True,
+            "source": "alpaca_corporate_actions_v1",
+            "window_start": str(start_date)[:10],
+            "window_end": str(end_date)[:10],
+            "event_count": len(summaries),
+            "comparability_break_count": len(hard),
+            "events": summaries,
+            "comparability_breaks": hard,
+            "reason": "economic_identity_discontinuity" if hard else "no_identity_break_detected",
+        }
+    return result
 
 def _discover_symbols(db: Database) -> list[str]:
     return sorted(_discover_asset_metadata(db))
@@ -1500,6 +1678,8 @@ def _catalog_metrics(item: dict[str, Any]) -> dict[str, Any]:
         metrics["discovery_selection"] = dict(item.get("discovery_selection") or {})
     if isinstance(item.get("current_snapshot"), dict):
         metrics["current_snapshot"] = dict(item.get("current_snapshot") or {})
+    if isinstance(item.get("identity_integrity"), dict):
+        metrics["identity_integrity"] = dict(item.get("identity_integrity") or {})
     marginal = item.get("marginal_replay") if isinstance(item.get("marginal_replay"), dict) else None
     if marginal is not None:
         candidate = marginal.get("candidate") if isinstance(marginal.get("candidate"), dict) else {}
@@ -1566,6 +1746,7 @@ def _persist_shortlist_to_catalog(db: Database, document: dict[str, Any], result
             "latest_model_score": raw_score,
             "latest_snapshot_end": baseline.get("market_snapshot_end"),
             "latest_metrics": _catalog_metrics(item),
+            "identity_integrity": bson_value(item.get("identity_integrity") or {}),
             "history_window_complete": True,
             "history_required_start": item.get("history_required_start"),
             "history_start_tolerance_days": item.get("history_start_tolerance_days"),
@@ -1827,8 +2008,26 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         )
         scan_budget = min(len(external), requested)
         selected = external[:scan_budget]
+        identity_integrity = _identity_integrity_for_symbols(
+            db,
+            selected,
+            start_date=str(config.start_date),
+            end_date=end_session,
+            asset_metadata=universe_metadata,
+        )
+        identity_rejected = [
+            symbol for symbol in selected
+            if str((identity_integrity.get(symbol) or {}).get("status") or "").lower() != "passed"
+        ]
+        for symbol in identity_rejected:
+            _increment(db, run_id, {"attempted_count": 1})
+            _reject(db, run_id, "economic_identity_discontinuity")
+        selected = [symbol for symbol in selected if symbol not in set(identity_rejected)]
         research_window["external_universe_count"] = len(external)
         research_window["selected_sample_size"] = scan_budget
+        research_window["identity_integrity_checked_count"] = scan_budget
+        research_window["identity_integrity_rejected_count"] = len(identity_rejected)
+        research_window["identity_integrity_passed_count"] = len(selected)
         research_window["selected_sample_hash"] = hashlib.sha256("|".join(selected).encode("utf-8")).hexdigest()
         db[COLLECTION].update_one(
             {"_id": CURRENT_ID, "run_id": run_id},
@@ -1837,11 +2036,13 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
         _event(
             db,
             run_id,
-            f"Scanning the deterministic external sample of {scan_budget} symbols for the current Strategy snapshot.",
+            f"Scanning {len(selected)} identity-qualified symbols from the deterministic external sample of {scan_budget}.",
             changes={
                 "universe_size": len(universe),
                 "external_universe_size": len(external),
                 "scan_budget": scan_budget,
+                "identity_qualified_scan_size": len(selected),
+                "identity_rejected_count": len(identity_rejected),
                 "research_window": research_window,
             },
         )
@@ -1900,6 +2101,9 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                         asset_metadata = universe_metadata.get(symbol) or {}
                         result["company_name"] = asset_metadata.get("company_name")
                         result["exchange"] = asset_metadata.get("exchange")
+                        result["asset_id"] = asset_metadata.get("asset_id")
+                        result["cusip"] = asset_metadata.get("cusip")
+                        result["identity_integrity"] = identity_integrity.get(symbol) or {"status": "unknown", "checked": False}
                         evaluated.append(result)
                         _increment(db, run_id, {"attempted_count": 1, "evaluated_count": 1})
                     except RuntimeError as exc:
@@ -1917,10 +2121,10 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                             db,
                             run_id,
                             step="external_scan",
-                            percent=(100.0 * scan_completed / max(1, scan_budget)),
+                            percent=(100.0 * scan_completed / max(1, len(selected))),
                             label="Scanning external assets",
                             current=scan_completed,
-                            total=scan_budget,
+                            total=len(selected),
                         )
 
             if _should_stop_after_batch(db, run_id):
@@ -2461,6 +2665,16 @@ def _discovery_metadata_for_symbols(
     return metadata
 
 def _require_persistent_candidate_selection(metadata: dict[str, dict[str, Any]], symbols: list[str]) -> None:
+    identity_invalid = [
+        symbol for symbol in symbols
+        if str((((metadata.get(symbol) or {}).get("identity_integrity") or {}).get("status") or "")).lower() != "passed"
+    ]
+    if identity_invalid:
+        raise AssetDiscoveryConflict(
+            "Assets without a passed economic-identity integrity check cannot advance to selected-universe validation: "
+            + ", ".join(identity_invalid)
+            + ". Run a new Asset Discovery campaign so corporate-action identity history can be validated."
+        )
     low_adherence = [symbol for symbol in symbols if not _item_is_persistent_candidate(metadata.get(symbol))]
     if low_adherence:
         raise AssetDiscoveryConflict(
