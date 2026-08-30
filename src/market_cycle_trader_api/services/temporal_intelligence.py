@@ -1620,6 +1620,11 @@ def build_temporal_intelligence_export(
                     )
                 }))
             archive.writestr("strategy_research_daily_regime_trajectory.csv", _csv_text(trajectory_export_rows))
+            dynamic_regime_rows = [
+                dict(row) for row in (((statistical_export.get("daily_dynamic_regime") or {}).get("points") or []))
+                if isinstance(row, dict)
+            ]
+            archive.writestr("strategy_research_daily_dynamic_regime.csv", _csv_text(dynamic_regime_rows))
         if pipeline_roc_policy is not None:
             roc_export = pipeline_roc_policy_raw or pipeline_roc_policy
             archive.writestr("strategy_research_roc_decision_policy.json", json.dumps(roc_export, indent=2, ensure_ascii=False, default=str))

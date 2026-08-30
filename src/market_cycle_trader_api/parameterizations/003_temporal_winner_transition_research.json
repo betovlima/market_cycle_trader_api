@@ -74,6 +74,13 @@
     "regime_trajectory_window_sessions": 5,
     "regime_trajectory_warning_quantile": 0.9,
     "regime_trajectory_target_horizon_sessions": 5,
-    "regime_trajectory_severe_loss_threshold": -0.05
+    "regime_trajectory_severe_loss_threshold": -0.05,
+    "daily_dynamic_regime_enabled": true,
+    "daily_dynamic_regime_min_history_rows": 120,
+    "daily_dynamic_regime_min_clusters": 2,
+    "daily_dynamic_regime_max_clusters": 6,
+    "daily_dynamic_regime_silhouette_sample_rows": 80,
+    "daily_dynamic_regime_novelty_quantile": 0.99,
+    "daily_dynamic_regime_warning_quantile": 0.9
   }
 }

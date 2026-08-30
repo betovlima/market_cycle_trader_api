@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.cluster.hierarchy import fcluster, linkage
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
@@ -862,6 +863,353 @@ def _regime_context_frames(
     }
 
 
+DYNAMIC_REGIME_OPPORTUNITY_FEATURES = (
+    "short_profit_consensus",
+    "long_profit_confirmation",
+    "best_score_zscore",
+    "positive_score_share",
+)
+DYNAMIC_REGIME_ENVIRONMENT_POSITIVE_FEATURES = (
+    "universe_breadth_20",
+    "spy_return_5",
+    "spy_return_20",
+    "incumbent_risk_health",
+    "all_horizon_risk_safety",
+)
+DYNAMIC_REGIME_ENVIRONMENT_NEGATIVE_FEATURES = (
+    "spy_realized_volatility_20",
+    "predicted_drawdown",
+    "opportunity_risk_divergence",
+)
+
+
+def _dynamic_semantic_anchors(columns: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    opportunity = np.zeros(len(columns), dtype=float)
+    environment = np.zeros(len(columns), dtype=float)
+    for feature in DYNAMIC_REGIME_OPPORTUNITY_FEATURES:
+        key = f"regime_source_{feature}"
+        if key in columns:
+            opportunity[columns.index(key)] = 1.0
+    for feature in DYNAMIC_REGIME_ENVIRONMENT_POSITIVE_FEATURES:
+        key = f"regime_source_{feature}"
+        if key in columns:
+            environment[columns.index(key)] = 1.0
+    for feature in DYNAMIC_REGIME_ENVIRONMENT_NEGATIVE_FEATURES:
+        key = f"regime_source_{feature}"
+        if key in columns:
+            environment[columns.index(key)] = -1.0
+    return opportunity, environment
+
+
+def _semantic_projection(matrix: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    denominator = float(np.sum(np.abs(anchor)))
+    if denominator <= 1e-12:
+        return np.zeros(len(matrix), dtype=float)
+    return np.asarray(matrix @ anchor / denominator, dtype=float)
+
+
+def _dynamic_cluster_fit(
+    matrix: np.ndarray,
+    settings: dict[str, Any],
+) -> tuple[np.ndarray | None, np.ndarray | None, int, float | None]:
+    minimum = max(2, int(settings.get("daily_dynamic_regime_min_clusters") or settings.get("regime_min_clusters") or 2))
+    maximum = min(
+        REGIME_MAX_FEATURE_CLUSTERS,
+        int(settings.get("daily_dynamic_regime_max_clusters") or settings.get("regime_max_clusters") or 6),
+        max(2, len(matrix) - 1),
+    )
+    sample_rows = max(40, int(settings.get("daily_dynamic_regime_silhouette_sample_rows") or 80))
+    if len(matrix) <= sample_rows:
+        sample_index = np.arange(len(matrix), dtype=int)
+    else:
+        sample_index = np.unique(np.linspace(0, len(matrix) - 1, sample_rows, dtype=int))
+    try:
+        hierarchy = linkage(matrix, method="ward", optimal_ordering=False)
+    except Exception:
+        return None, None, minimum, None
+    candidates: list[tuple[float, int, np.ndarray]] = []
+    for count in range(minimum, maximum + 1):
+        labels = np.asarray(fcluster(hierarchy, t=count, criterion="maxclust"), dtype=int) - 1
+        if len(set(labels.tolist())) != count:
+            continue
+        sample_labels = labels[sample_index]
+        if len(set(sample_labels.tolist())) < 2:
+            continue
+        try:
+            score = float(silhouette_score(matrix[sample_index], sample_labels))
+        except Exception:
+            continue
+        candidates.append((score, count, labels))
+    if not candidates:
+        return None, None, minimum, None
+    score, count, labels = max(candidates, key=lambda item: (item[0], -item[1]))
+    centroids = np.vstack([matrix[labels == cluster].mean(axis=0) for cluster in range(int(count))])
+    return labels, centroids, int(count), float(score)
+
+
+def _match_dynamic_cluster_families(
+    current_centroids_raw: np.ndarray,
+    current_mean: np.ndarray,
+    current_scale: np.ndarray,
+    previous_families: dict[int, np.ndarray],
+    next_family_id: int,
+) -> tuple[dict[int, int], dict[int, np.ndarray], int, dict[int, float]]:
+    if len(current_centroids_raw) == 0:
+        return {}, {}, next_family_id, {}
+    mapping: dict[int, int] = {}
+    match_distance: dict[int, float] = {}
+    scale = np.where(np.asarray(current_scale, dtype=float) <= 1e-12, 1.0, np.asarray(current_scale, dtype=float))
+    mean = np.asarray(current_mean, dtype=float)
+    if previous_families:
+        previous_ids = sorted(previous_families)
+        previous_raw = np.vstack([previous_families[family_id] for family_id in previous_ids])
+        previous_scaled = (previous_raw - mean) / scale
+        current_scaled = (np.asarray(current_centroids_raw, dtype=float) - mean) / scale
+        distances = np.linalg.norm(current_scaled[:, None, :] - previous_scaled[None, :, :], axis=2)
+        pairs = sorted(
+            (float(distances[current, previous]), int(current), int(previous))
+            for current in range(distances.shape[0])
+            for previous in range(distances.shape[1])
+        )
+        used_current: set[int] = set()
+        used_previous: set[int] = set()
+        for distance, current, previous in pairs:
+            if current in used_current or previous in used_previous:
+                continue
+            family_id = int(previous_ids[previous])
+            mapping[current] = family_id
+            match_distance[current] = distance
+            used_current.add(current)
+            used_previous.add(previous)
+            if len(used_current) >= min(len(current_centroids_raw), len(previous_ids)):
+                break
+    for current in range(len(current_centroids_raw)):
+        if current in mapping:
+            continue
+        mapping[current] = int(next_family_id)
+        match_distance[current] = float("nan")
+        next_family_id += 1
+    new_families = {int(key): np.asarray(value, dtype=float).copy() for key, value in previous_families.items()}
+    for current in range(len(current_centroids_raw)):
+        new_families[int(mapping[current])] = np.asarray(current_centroids_raw[current], dtype=float).copy()
+    return mapping, new_families, int(next_family_id), match_distance
+
+
+def _dynamic_regime_binary_metrics(points: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        item for item in points
+        if _finite(item.get("dynamic_regime_pressure_score")) is not None
+        and item.get("trajectory_severe_event") in {0, 1}
+    ]
+    if not usable:
+        return {
+            "rows": 0,
+            "auc": None,
+            "warnings": 0,
+            "severe_windows": 0,
+            "true_warnings": 0,
+            "precision": None,
+            "recall": None,
+            "median_trough_lead_sessions": None,
+        }
+    truth = np.asarray([int(item.get("trajectory_severe_event") or 0) for item in usable], dtype=int)
+    score = np.asarray([float(item.get("dynamic_regime_pressure_score") or 0.0) for item in usable], dtype=float)
+    warning = np.asarray([int(item.get("dynamic_regime_warning") or 0) for item in usable], dtype=int)
+    true_mask = (truth == 1) & (warning == 1)
+    warning_count = int(warning.sum())
+    severe_count = int(truth.sum())
+    true_count = int(true_mask.sum())
+    leads = [
+        int(usable[index].get("trajectory_trough_lead_sessions") or 0)
+        for index, matched in enumerate(true_mask.tolist())
+        if matched and int(usable[index].get("trajectory_trough_lead_sessions") or 0) > 0
+    ]
+    return {
+        "rows": int(len(usable)),
+        "auc": _safe_auc(truth, score),
+        "warnings": warning_count,
+        "severe_windows": severe_count,
+        "true_warnings": true_count,
+        "precision": float(true_count / warning_count) if warning_count else None,
+        "recall": float(true_count / severe_count) if severe_count else None,
+        "median_trough_lead_sessions": float(np.median(leads)) if leads else None,
+    }
+
+
+def _dynamic_daily_regime_diagnostic(
+    rows: list[dict[str, Any]],
+    predictions: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    if not bool(settings.get("daily_dynamic_regime_enabled", True)):
+        return {"enabled": False, "decision_feature": False, "refit_each_close": False, "points": []}
+    source = pd.DataFrame(rows).copy()
+    if source.empty:
+        return {"enabled": False, "decision_feature": False, "refit_each_close": False, "reason": "no_rows", "points": []}
+    source["execution_at"] = pd.to_datetime(source.get("execution_at"), utc=True, errors="coerce")
+    source = source.dropna(subset=["execution_at"]).sort_values("execution_at").drop_duplicates("execution_at", keep="last").reset_index(drop=True)
+    source = _rolling_regime_source(source, settings)
+    columns = _regime_matrix_columns()
+    numeric_frame = source.reindex(columns=columns).apply(pd.to_numeric, errors="coerce")
+    raw_matrix = numeric_frame.to_numpy(dtype=float)
+    minimum_history = max(30, int(settings.get("daily_dynamic_regime_min_history_rows") or settings.get("regime_min_train_rows") or 120))
+    novelty_quantile = min(max(float(settings.get("daily_dynamic_regime_novelty_quantile") or 0.99), 0.80), 0.999)
+    warning_quantile = min(max(float(settings.get("daily_dynamic_regime_warning_quantile") or 0.90), 0.55), 0.995)
+    temperature = max(float(settings.get("regime_distance_temperature") or 1.0), 1e-9)
+    prediction_by_day = {_day_key(item.get("execution_at")): item for item in predictions}
+    target_days = set(prediction_by_day)
+    previous_families: dict[int, np.ndarray] = {}
+    next_family_id = 0
+    previous_family: int | None = None
+    previous_semantic_rank: int | None = None
+    points: list[dict[str, Any]] = []
+    opportunity_anchor, environment_anchor = _dynamic_semantic_anchors(columns)
+
+    for position in range(minimum_history - 1, len(source)):
+        current_day = _day_key(source.iloc[position].get("execution_at"))
+        if current_day not in target_days:
+            continue
+        prefix_raw = raw_matrix[: position + 1]
+        medians = np.nanmedian(prefix_raw, axis=0)
+        medians = np.where(np.isfinite(medians), medians, 0.0)
+        filled = np.where(np.isfinite(prefix_raw), prefix_raw, medians)
+        current_mean = np.mean(filled, axis=0)
+        current_scale = np.std(filled, axis=0, ddof=0)
+        current_scale = np.where(np.isfinite(current_scale) & (current_scale > 1e-12), current_scale, 1.0)
+        matrix = (filled - current_mean) / current_scale
+        labels, centroids, cluster_count, silhouette = _dynamic_cluster_fit(matrix, settings)
+        if labels is None or centroids is None:
+            continue
+        labels = np.asarray(labels, dtype=int)
+        centroids = np.asarray(centroids, dtype=float)
+        raw_centroids = centroids * current_scale + current_mean
+        semantic_order = _canonical_cluster_order(centroids, columns)
+        original_to_semantic = {int(original): int(rank) for rank, original in enumerate(semantic_order)}
+        family_mapping, previous_families, next_family_id, match_distances = _match_dynamic_cluster_families(
+            raw_centroids,
+            current_mean,
+            current_scale,
+            previous_families,
+            next_family_id,
+        )
+        distances = np.linalg.norm(matrix[:, None, :] - centroids[None, :, :], axis=2)
+        nearest = np.argmin(distances, axis=1)
+        nearest_distances = distances[np.arange(len(matrix)), nearest]
+        current_original = int(labels[-1])
+        current_family = int(family_mapping[current_original])
+        current_semantic_rank = int(original_to_semantic[current_original])
+        healthy_original = int(semantic_order[0])
+        defensive_original = int(semantic_order[-1])
+        current_healthy_distance = float(distances[-1, healthy_original])
+        current_defensive_distance = float(distances[-1, defensive_original])
+        healthy_similarity = float(math.exp(-current_healthy_distance / temperature))
+        defensive_similarity = float(math.exp(-current_defensive_distance / temperature))
+        danger_balance = float(defensive_similarity - healthy_similarity)
+        historical_distances = nearest_distances[:-1]
+        novelty_threshold = float(np.quantile(historical_distances, novelty_quantile)) if len(historical_distances) >= 20 else None
+        current_nearest = float(nearest_distances[-1])
+        novelty_ratio = None if novelty_threshold in {None, 0.0} else float(current_nearest / max(float(novelty_threshold), 1e-9))
+        is_novel = bool(novelty_threshold is not None and current_nearest > float(novelty_threshold))
+
+        opportunity_values = _semantic_projection(matrix, opportunity_anchor)
+        environment_values = _semantic_projection(matrix, environment_anchor)
+        current_opportunity = float(opportunity_values[-1])
+        current_environment = float(environment_values[-1])
+        environment_weakness = float(1.0 / (1.0 + math.exp(max(-30.0, min(30.0, current_environment)))))
+        current_pressure = float((defensive_similarity + environment_weakness) / 2.0)
+        historical_defensive = np.exp(-distances[:-1, defensive_original] / temperature) if len(matrix) > 1 else np.asarray([], dtype=float)
+        historical_environment = environment_values[:-1]
+        historical_weakness = 1.0 / (1.0 + np.exp(np.clip(historical_environment, -30.0, 30.0)))
+        historical_pressure = (historical_defensive + historical_weakness) / 2.0 if len(historical_defensive) else np.asarray([], dtype=float)
+        warning_threshold = float(np.quantile(historical_pressure, warning_quantile)) if len(historical_pressure) >= 20 else None
+        warning = bool(is_novel or (warning_threshold is not None and current_pressure >= warning_threshold))
+
+        center_x = float(_semantic_projection(centroids[[current_original]], opportunity_anchor)[0])
+        center_y = float(_semantic_projection(centroids[[current_original]], environment_anchor)[0])
+        transitioned = previous_family is not None and current_family != previous_family
+        moved_more_defensive = previous_semantic_rank is not None and current_semantic_rank > previous_semantic_rank
+        prediction = prediction_by_day.get(current_day) or {}
+        points.append({
+            "execution_at": source.iloc[position]["execution_at"].isoformat(),
+            "test_year": int(prediction.get("test_year") or source.iloc[position]["execution_at"].year),
+            "symbol": prediction.get("symbol") or source.iloc[position].get("symbol"),
+            "policy_action": prediction.get("policy_action"),
+            "dynamic_regime_cluster_count": int(cluster_count),
+            "dynamic_regime_silhouette": silhouette,
+            "dynamic_regime_family_id": current_family,
+            "dynamic_regime_semantic_rank": current_semantic_rank,
+            "dynamic_regime_is_most_defensive": int(current_semantic_rank == cluster_count - 1),
+            "dynamic_regime_transition": int(bool(transitioned)),
+            "dynamic_regime_more_defensive_transition": int(bool(moved_more_defensive)),
+            "dynamic_regime_family_match_distance": _finite(match_distances.get(current_original)),
+            "dynamic_regime_opportunity_axis": current_opportunity,
+            "dynamic_regime_environment_axis": current_environment,
+            "dynamic_regime_cluster_center_opportunity": center_x,
+            "dynamic_regime_cluster_center_environment": center_y,
+            "dynamic_regime_nearest_distance": current_nearest,
+            "dynamic_regime_healthy_distance": current_healthy_distance,
+            "dynamic_regime_defensive_distance": current_defensive_distance,
+            "dynamic_regime_healthy_similarity": healthy_similarity,
+            "dynamic_regime_defensive_similarity": defensive_similarity,
+            "dynamic_regime_danger_balance": danger_balance,
+            "dynamic_regime_novelty_threshold": novelty_threshold,
+            "dynamic_regime_novelty_ratio": novelty_ratio,
+            "dynamic_regime_is_novel": int(is_novel),
+            "dynamic_regime_pressure_score": current_pressure,
+            "dynamic_regime_warning_threshold": warning_threshold,
+            "dynamic_regime_warning": int(warning),
+            "trajectory_severe_event": prediction.get("trajectory_severe_event"),
+            "trajectory_forward_min_return": prediction.get("trajectory_forward_min_return"),
+            "trajectory_trough_lead_sessions": prediction.get("trajectory_trough_lead_sessions"),
+        })
+        previous_family = current_family
+        previous_semantic_rank = current_semantic_rank
+
+    overall = _dynamic_regime_binary_metrics(points)
+    yearly: list[dict[str, Any]] = []
+    for year in sorted({int(item.get("test_year") or 0) for item in points if int(item.get("test_year") or 0) > 0}):
+        year_points = [item for item in points if int(item.get("test_year") or 0) == year]
+        metrics = _dynamic_regime_binary_metrics(year_points)
+        silhouettes = [_finite(item.get("dynamic_regime_silhouette")) for item in year_points]
+        silhouettes = [value for value in silhouettes if value is not None]
+        yearly.append({
+            "test_year": int(year),
+            **metrics,
+            "mean_silhouette": _mean_available(silhouettes),
+            "novel_states": int(sum(int(item.get("dynamic_regime_is_novel") or 0) for item in year_points)),
+            "cluster_transitions": int(sum(int(item.get("dynamic_regime_transition") or 0) for item in year_points)),
+            "more_defensive_transitions": int(sum(int(item.get("dynamic_regime_more_defensive_transition") or 0) for item in year_points)),
+        })
+    silhouettes = [_finite(item.get("dynamic_regime_silhouette")) for item in points]
+    silhouettes = [value for value in silhouettes if value is not None]
+    cluster_distribution = Counter(int(item.get("dynamic_regime_cluster_count") or 0) for item in points)
+    family_distribution = Counter(int(item.get("dynamic_regime_family_id") or 0) for item in points)
+    return {
+        "enabled": True,
+        "decision_feature": False,
+        "refit_each_close": True,
+        "fit_scope": "expanding causal history through each completed close; scaler and clustering are rebuilt from scratch for every OOS session",
+        "current_observation_in_refit": True,
+        "future_information_in_clustering": False,
+        "algorithm": "Ward hierarchical clustering rebuilt from scratch at every completed close; k selected from the same causal hierarchy by sampled silhouette",
+        "axis_definition": {
+            "x": "standardized opportunity composite rebuilt at each close",
+            "y": "standardized market/risk-health composite rebuilt at each close",
+        },
+        "novelty_quantile": novelty_quantile,
+        "warning_quantile": warning_quantile,
+        "mean_silhouette": _mean_available(silhouettes),
+        "cluster_count_distribution": {str(key): int(value) for key, value in sorted(cluster_distribution.items())},
+        "stable_family_distribution": {str(key): int(value) for key, value in sorted(family_distribution.items())},
+        "novel_state_count": int(sum(int(item.get("dynamic_regime_is_novel") or 0) for item in points)),
+        "cluster_transition_count": int(sum(int(item.get("dynamic_regime_transition") or 0) for item in points)),
+        "more_defensive_transition_count": int(sum(int(item.get("dynamic_regime_more_defensive_transition") or 0) for item in points)),
+        "overall": overall,
+        "yearly": yearly,
+        "points": points,
+    }
+
+
 CLOSE_MODEL_FEATURES = CLOSE_FEATURES + REGIME_CONTEXT_FEATURES
 OPEN_MODEL_FEATURES = OPEN_FEATURES + REGIME_CONTEXT_FEATURES
 
@@ -1325,6 +1673,7 @@ def build_analysis(
     if not predictions:
         raise ValueError("Statistical & Predictive Controls could not produce chronological out-of-sample predictions.")
     predictions = _attach_forward_strategy_risk_labels(reference_rows, predictions, settings)
+    daily_dynamic_regime = _dynamic_daily_regime_diagnostic(rows, predictions, settings)
     daily_regime_trajectory = _daily_regime_trajectory_diagnostic(predictions, folds, settings)
     replay = _replay(reference_rows, predictions, settings)
     control = replay.get("control") if isinstance(replay.get("control"), dict) else {}
@@ -1424,8 +1773,10 @@ def build_analysis(
             "close_checkpoint": "uses information available at the completed decision close only",
             "open_checkpoint": "adds only the next regular-session opening price and gap before execution",
             "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals", "best risk-adjusted alternative versus base asset", "causal rolling regime distances and PCA quadrant context"],
-            "regime_context": "rolling state; clustering/scaler/PCA fitted only on years before each outer test year",
+            "regime_context": "frozen fold-level regime context retained for the HOLD/ROTATE/CASH ablation",
+            "daily_dynamic_regime": "shadow-only unsupervised state map; scaler and clustering are rebuilt from scratch after every completed close using all causal observations available through that close",
             "daily_regime_trajectory": "shadow diagnostic of regime direction, speed and persistence; not used by HOLD/ROTATE/CASH models in this release",
+            "daily_dynamic_regime_used_as_decision_feature": False,
             "daily_regime_trajectory_used_as_decision_feature": False,
             "monthly_diagnostic_cluster_used_as_feature": False,
             "candidate_actions": ["FOLLOW_BASE", "ROTATE", "CASH"],
@@ -1463,6 +1814,15 @@ def build_analysis(
                 quadrant: {action: int(counts.get(action, 0)) for action in ACTIONS}
                 for quadrant, counts in sorted(regime_action_counts.items())
             },
+            "daily_dynamic_regime_mean_silhouette": daily_dynamic_regime.get("mean_silhouette"),
+            "daily_dynamic_regime_novel_state_count": int(daily_dynamic_regime.get("novel_state_count") or 0),
+            "daily_dynamic_regime_transition_count": int(daily_dynamic_regime.get("cluster_transition_count") or 0),
+            "daily_dynamic_regime_more_defensive_transition_count": int(daily_dynamic_regime.get("more_defensive_transition_count") or 0),
+            "daily_dynamic_regime_auc": ((daily_dynamic_regime.get("overall") or {}).get("auc")),
+            "daily_dynamic_regime_warning_count": int(((daily_dynamic_regime.get("overall") or {}).get("warnings") or 0)),
+            "daily_dynamic_regime_warning_precision": ((daily_dynamic_regime.get("overall") or {}).get("precision")),
+            "daily_dynamic_regime_warning_recall": ((daily_dynamic_regime.get("overall") or {}).get("recall")),
+            "daily_dynamic_regime_median_lead_sessions": ((daily_dynamic_regime.get("overall") or {}).get("median_trough_lead_sessions")),
             "daily_regime_trajectory_auc": ((daily_regime_trajectory.get("overall") or {}).get("auc")),
             "daily_regime_warning_count": int(((daily_regime_trajectory.get("overall") or {}).get("warnings") or 0)),
             "daily_regime_severe_window_count": int(((daily_regime_trajectory.get("overall") or {}).get("severe_windows") or 0)),
@@ -1490,6 +1850,7 @@ def build_analysis(
         "monthly": replay.get("monthly") or [],
         "extreme_sessions": extreme_rows,
         "daily_regime_trajectory": daily_regime_trajectory,
+        "daily_dynamic_regime": daily_dynamic_regime,
         "predictions": predictions,
         "replay": {
             "method": replay.get("method"),
