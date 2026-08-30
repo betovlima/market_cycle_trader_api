@@ -67,6 +67,12 @@ class StatisticalMlControlSettings(BaseModel):
     default_probability_threshold: float = Field(gt=0.0, lt=1.0)
     default_rotation_probability_threshold: float = Field(gt=0.0, lt=1.0)
     action_probability_margin: float = Field(ge=0.0, le=1.0)
+    regime_context_enabled: bool
+    regime_window_sessions: int = Field(ge=5, le=252)
+    regime_min_clusters: int = Field(ge=2, le=10)
+    regime_max_clusters: int = Field(ge=2, le=10)
+    regime_min_train_rows: int = Field(ge=30, le=100_000)
+    regime_distance_temperature: float = Field(gt=0.0, le=100.0)
     n_estimators: int = Field(ge=50, le=5000)
     max_depth: int = Field(ge=2, le=30)
     min_samples_leaf: int = Field(ge=1, le=10_000)
@@ -102,6 +108,8 @@ class StatisticalMlControlSettings(BaseModel):
             raise ValueError("default_probability_threshold must be included in probability_threshold_candidates.")
         if self.default_rotation_probability_threshold not in self.probability_threshold_candidates:
             raise ValueError("default_rotation_probability_threshold must be included in probability_threshold_candidates.")
+        if self.regime_min_clusters > self.regime_max_clusters:
+            raise ValueError("regime_min_clusters cannot exceed regime_max_clusters.")
         expected = {str(item) for item in self.horizons_sessions}
         supplied = {str(key) for key in self.horizon_weights}
         if expected != supplied:
