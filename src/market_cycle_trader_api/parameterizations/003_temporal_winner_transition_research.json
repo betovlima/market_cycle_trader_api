@@ -69,6 +69,11 @@
     "regime_min_clusters": 2,
     "regime_max_clusters": 6,
     "regime_min_train_rows": 120,
-    "regime_distance_temperature": 1.0
+    "regime_distance_temperature": 1.0,
+    "regime_trajectory_enabled": true,
+    "regime_trajectory_window_sessions": 5,
+    "regime_trajectory_warning_quantile": 0.9,
+    "regime_trajectory_target_horizon_sessions": 5,
+    "regime_trajectory_severe_loss_threshold": -0.05
   }
 }

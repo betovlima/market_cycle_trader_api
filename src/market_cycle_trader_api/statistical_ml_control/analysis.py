@@ -575,6 +575,16 @@ REGIME_CONTEXT_FEATURES = (
     "regime_q4",
 ) + tuple(f"regime_similarity_{idx}" for idx in range(REGIME_MAX_FEATURE_CLUSTERS))
 
+REGIME_TRAJECTORY_COMPONENTS = (
+    "regime_danger_similarity",
+    "regime_danger_balance",
+    "regime_danger_approach_3d",
+    "regime_danger_approach_window",
+    "regime_environment_deterioration_window",
+    "regime_q4_persistence",
+    "regime_defensive_persistence",
+)
+
 
 def _rolling_regime_source(frame: pd.DataFrame, settings: dict[str, Any]) -> pd.DataFrame:
     result = frame.copy().sort_values("execution_at").reset_index(drop=True)
@@ -631,6 +641,90 @@ def _canonical_cluster_order(centroids: np.ndarray, columns: list[str]) -> list[
         scored.append((float(defensive), int(original)))
     scored.sort(key=lambda item: (item[0], item[1]))
     return [original for _score, original in scored]
+
+
+def _attach_regime_trajectory_raw(
+    source: pd.DataFrame,
+    *,
+    settings: dict[str, Any],
+) -> pd.DataFrame:
+    if source.empty:
+        return source.copy()
+    result = source.copy().sort_values("execution_at").reset_index(drop=True)
+    window = max(3, int(settings.get("regime_trajectory_window_sessions") or 5))
+    danger_distance = pd.to_numeric(result.get("regime_danger_distance"), errors="coerce")
+    danger_balance = pd.to_numeric(result.get("regime_danger_balance"), errors="coerce")
+    pca_x = pd.to_numeric(result.get("regime_pca_x"), errors="coerce")
+    pca_y = pd.to_numeric(result.get("regime_pca_y"), errors="coerce")
+    q4 = pd.to_numeric(result.get("regime_q4"), errors="coerce").fillna(0.0)
+    defensive = pd.to_numeric(result.get("regime_is_defensive_cluster"), errors="coerce").fillna(0.0)
+
+    result["regime_danger_approach_1d"] = danger_distance.shift(1) - danger_distance
+    result["regime_danger_approach_3d"] = danger_distance.shift(3) - danger_distance
+    result["regime_danger_approach_window"] = danger_distance.shift(window) - danger_distance
+    result["regime_danger_balance_delta_1d"] = danger_balance - danger_balance.shift(1)
+    result["regime_danger_balance_delta_3d"] = danger_balance - danger_balance.shift(3)
+    result["regime_environment_deterioration_window"] = -(pca_y - pca_y.shift(window)) / float(window)
+    result["regime_q4_persistence"] = q4.rolling(window=window, min_periods=1).mean()
+    result["regime_defensive_persistence"] = defensive.rolling(window=window, min_periods=1).mean()
+    step = np.sqrt((pca_x - pca_x.shift(1)) ** 2 + (pca_y - pca_y.shift(1)) ** 2)
+    result["regime_path_speed"] = step.rolling(window=window, min_periods=1).mean()
+    return result
+
+
+def _trajectory_score_contract(train: pd.DataFrame, settings: dict[str, Any]) -> dict[str, Any]:
+    centers: dict[str, float] = {}
+    scales: dict[str, float] = {}
+    for feature in REGIME_TRAJECTORY_COMPONENTS:
+        values = pd.to_numeric(train.get(feature), errors="coerce").dropna().tolist()
+        center, scale = _robust_scale(values)
+        centers[feature] = float(center)
+        scales[feature] = float(scale)
+    scored = _apply_trajectory_score(train, centers=centers, scales=scales)
+    valid = pd.to_numeric(scored.get("regime_trajectory_score"), errors="coerce").dropna()
+    quantile = min(max(float(settings.get("regime_trajectory_warning_quantile") or 0.90), 0.51), 0.99)
+    threshold = float(valid.quantile(quantile)) if not valid.empty else 0.0
+    return {"centers": centers, "scales": scales, "warning_quantile": quantile, "warning_threshold": threshold}
+
+
+def _apply_trajectory_score(
+    source: pd.DataFrame,
+    *,
+    centers: dict[str, float],
+    scales: dict[str, float],
+) -> pd.DataFrame:
+    result = source.copy()
+    components: list[np.ndarray] = []
+    for feature in REGIME_TRAJECTORY_COMPONENTS:
+        values = pd.to_numeric(result.get(feature), errors="coerce").to_numpy(dtype=float)
+        center = float(centers.get(feature, 0.0))
+        scale = max(float(scales.get(feature, 1.0)), 1e-9)
+        z = np.clip((values - center) / scale, -5.0, 5.0)
+        components.append(z)
+    matrix = np.vstack(components).T if components else np.zeros((len(result), 0), dtype=float)
+    with np.errstate(invalid="ignore"):
+        score = np.nanmean(matrix, axis=1) if matrix.size else np.zeros(len(result), dtype=float)
+    result["regime_trajectory_score"] = score
+    return result
+
+
+def _trajectory_with_history(
+    history: pd.DataFrame,
+    source: pd.DataFrame,
+    *,
+    settings: dict[str, Any],
+) -> pd.DataFrame:
+    if source.empty:
+        return source.copy()
+    window = max(3, int(settings.get("regime_trajectory_window_sessions") or 5))
+    history_tail = history.tail(max(window, 5)).copy() if not history.empty else history.copy()
+    history_tail["__trajectory_keep"] = 0
+    current = source.copy()
+    current["__trajectory_keep"] = 1
+    combined = pd.concat([history_tail, current], ignore_index=True)
+    combined = _attach_regime_trajectory_raw(combined, settings=settings)
+    result = combined[combined["__trajectory_keep"] == 1].drop(columns=["__trajectory_keep"]).reset_index(drop=True)
+    return result
 
 
 def _regime_context_frames(
@@ -693,6 +787,12 @@ def _regime_context_frames(
             else:
                 result[f"regime_similarity_{idx}"] = 0.0
         result["regime_cluster_id"] = nearest[:, 0].astype(int)
+        result["regime_is_defensive_cluster"] = (nearest[:, 0] == (cluster_count - 1)).astype(int)
+        result["regime_healthy_distance"] = distances[:, 0]
+        result["regime_danger_distance"] = distances[:, cluster_count - 1]
+        result["regime_healthy_similarity"] = np.exp(-distances[:, 0] / max(temperature, 1e-9))
+        result["regime_danger_similarity"] = np.exp(-distances[:, cluster_count - 1] / max(temperature, 1e-9))
+        result["regime_danger_balance"] = result["regime_danger_similarity"] - result["regime_healthy_similarity"]
         result["regime_nearest_distance"] = distances[np.arange(len(result)), nearest[:, 0]]
         if cluster_count > 1:
             result["regime_second_distance"] = distances[np.arange(len(result)), nearest[:, 1]]
@@ -713,10 +813,40 @@ def _regime_context_frames(
         )
         return result
 
-    train_out = transform(train)
-    fit_out = transform(fit)
-    validation_out = transform(validation) if not validation.empty else validation.copy()
-    test_out = transform(test)
+    train_base = transform(train)
+    fit_base = transform(fit)
+    validation_base = transform(validation) if not validation.empty else validation.copy()
+    test_base = transform(test)
+
+    trajectory_enabled = bool(settings.get("regime_trajectory_enabled", True))
+    trajectory_contract: dict[str, Any] = {"enabled": False}
+    if trajectory_enabled:
+        train_out = _attach_regime_trajectory_raw(train_base, settings=settings)
+        fit_out = _trajectory_with_history(train_base.iloc[0:0], fit_base, settings=settings)
+        validation_out = _trajectory_with_history(fit_base, validation_base, settings=settings) if not validation_base.empty else validation_base.copy()
+        test_out = _trajectory_with_history(train_base, test_base, settings=settings)
+        trajectory_contract = _trajectory_score_contract(train_out, settings)
+        train_out = _apply_trajectory_score(train_out, centers=trajectory_contract["centers"], scales=trajectory_contract["scales"])
+        fit_out = _apply_trajectory_score(fit_out, centers=trajectory_contract["centers"], scales=trajectory_contract["scales"])
+        if not validation_out.empty:
+            validation_out = _apply_trajectory_score(validation_out, centers=trajectory_contract["centers"], scales=trajectory_contract["scales"])
+        test_out = _apply_trajectory_score(test_out, centers=trajectory_contract["centers"], scales=trajectory_contract["scales"])
+        threshold = float(trajectory_contract["warning_threshold"])
+        for target_frame in (train_out, fit_out, validation_out, test_out):
+            if not target_frame.empty:
+                target_frame["regime_trajectory_warning"] = (pd.to_numeric(target_frame["regime_trajectory_score"], errors="coerce") >= threshold).astype(int)
+        trajectory_contract = {
+            "enabled": True,
+            "window_sessions": int(settings.get("regime_trajectory_window_sessions") or 5),
+            "warning_quantile": float(trajectory_contract["warning_quantile"]),
+            "warning_threshold": threshold,
+            "components": list(REGIME_TRAJECTORY_COMPONENTS),
+            "fit_scope": "outer-fold training years only",
+            "decision_feature": False,
+        }
+    else:
+        train_out, fit_out, validation_out, test_out = train_base, fit_base, validation_base, test_base
+
     cluster_counts = Counter(int(original_to_canonical.get(int(label), int(label))) for label in labels)
     return train_out, fit_out, validation_out, test_out, {
         "enabled": True,
@@ -728,6 +858,7 @@ def _regime_context_frames(
         "pca_explained_variance_ratio": [float(value) for value in pca.explained_variance_ratio_.tolist()],
         "quadrant_definition": {"x": "opportunity-oriented PCA axis", "y": "market/risk-health-oriented PCA axis"},
         "fit_scope": "outer-fold training years only",
+        "trajectory": trajectory_contract,
     }
 
 
@@ -929,6 +1060,23 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
                 "regime_nearest_distance": _finite(source.get("regime_nearest_distance")),
                 "regime_second_distance": _finite(source.get("regime_second_distance")),
                 "regime_distance_margin": _finite(source.get("regime_distance_margin")),
+                "regime_healthy_distance": _finite(source.get("regime_healthy_distance")),
+                "regime_danger_distance": _finite(source.get("regime_danger_distance")),
+                "regime_healthy_similarity": _finite(source.get("regime_healthy_similarity")),
+                "regime_danger_similarity": _finite(source.get("regime_danger_similarity")),
+                "regime_danger_balance": _finite(source.get("regime_danger_balance")),
+                "regime_is_defensive_cluster": int(source.get("regime_is_defensive_cluster") or 0),
+                "regime_danger_approach_1d": _finite(source.get("regime_danger_approach_1d")),
+                "regime_danger_approach_3d": _finite(source.get("regime_danger_approach_3d")),
+                "regime_danger_approach_window": _finite(source.get("regime_danger_approach_window")),
+                "regime_danger_balance_delta_1d": _finite(source.get("regime_danger_balance_delta_1d")),
+                "regime_danger_balance_delta_3d": _finite(source.get("regime_danger_balance_delta_3d")),
+                "regime_environment_deterioration_window": _finite(source.get("regime_environment_deterioration_window")),
+                "regime_q4_persistence": _finite(source.get("regime_q4_persistence")),
+                "regime_defensive_persistence": _finite(source.get("regime_defensive_persistence")),
+                "regime_path_speed": _finite(source.get("regime_path_speed")),
+                "regime_trajectory_score": _finite(source.get("regime_trajectory_score")),
+                "regime_trajectory_warning": int(source.get("regime_trajectory_warning") or 0),
                 **{f"regime_similarity_{idx}": _finite(source.get(f"regime_similarity_{idx}")) for idx in range(REGIME_MAX_FEATURE_CLUSTERS)},
                 **{
                     f"asset_return_{int(horizon)}d": _finite(source.get(f"asset_return_{int(horizon)}d"))
@@ -940,6 +1088,142 @@ def _walk_forward(rows: list[dict[str, Any]], settings: dict[str, Any]) -> tuple
                 },
             })
     return predictions, folds
+
+def _attach_forward_strategy_risk_labels(
+    reference_rows: list[dict[str, Any]],
+    predictions: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not bool(settings.get("regime_trajectory_enabled", True)):
+        return [dict(item) for item in predictions]
+    horizon = max(1, int(settings.get("regime_trajectory_target_horizon_sessions") or 5))
+    severe_threshold = float(settings.get("regime_trajectory_severe_loss_threshold") or -0.05)
+    equity = _equity_path(reference_rows)
+    by_day = {_day_key(row.get("stamp")): index for index, row in enumerate(equity)}
+    output: list[dict[str, Any]] = []
+    for item in predictions:
+        row = dict(item)
+        index = by_day.get(_day_key(row.get("execution_at")))
+        if index is None or index + 1 >= len(equity):
+            output.append(row)
+            continue
+        current = float(equity[index]["value"])
+        future = equity[index + 1:min(len(equity), index + horizon + 1)]
+        if current <= 0.0 or not future:
+            output.append(row)
+            continue
+        future_returns = [float(point["value"]) / current - 1.0 for point in future]
+        trough_offset = int(np.argmin(np.asarray(future_returns, dtype=float))) + 1
+        minimum_return = float(min(future_returns))
+        row["trajectory_forward_min_return"] = minimum_return
+        row["trajectory_forward_return"] = float(future_returns[-1])
+        row["trajectory_severe_event"] = int(minimum_return <= severe_threshold)
+        row["trajectory_trough_lead_sessions"] = trough_offset
+        output.append(row)
+    return output
+
+
+def _trajectory_binary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        item for item in rows
+        if _finite(item.get("regime_trajectory_score")) is not None and item.get("trajectory_severe_event") in {0, 1}
+    ]
+    if not usable:
+        return {"rows": 0, "auc": None, "warnings": 0, "severe_windows": 0, "true_warnings": 0, "precision": None, "recall": None, "balanced_accuracy": None, "median_trough_lead_sessions": None, "mean_trough_lead_sessions": None}
+    y_true = np.asarray([int(item["trajectory_severe_event"]) for item in usable], dtype=int)
+    scores = np.asarray([float(item["regime_trajectory_score"]) for item in usable], dtype=float)
+    warnings = np.asarray([int(item.get("regime_trajectory_warning") or 0) for item in usable], dtype=int)
+    auc = _safe_auc(y_true, scores)
+    warning_count = int(warnings.sum())
+    severe_count = int(y_true.sum())
+    true_warning_mask = (warnings == 1) & (y_true == 1)
+    true_warnings = int(true_warning_mask.sum())
+    precision = float(true_warnings / warning_count) if warning_count else None
+    recall = float(true_warnings / severe_count) if severe_count else None
+    balanced = float(balanced_accuracy_score(y_true, warnings)) if len(set(y_true.tolist())) > 1 else None
+    leads = [
+        int(usable[index].get("trajectory_trough_lead_sessions") or 0)
+        for index, matched in enumerate(true_warning_mask.tolist())
+        if matched and int(usable[index].get("trajectory_trough_lead_sessions") or 0) > 0
+    ]
+    return {
+        "rows": int(len(usable)),
+        "auc": auc,
+        "warnings": warning_count,
+        "severe_windows": severe_count,
+        "true_warnings": true_warnings,
+        "precision": precision,
+        "recall": recall,
+        "balanced_accuracy": balanced,
+        "median_trough_lead_sessions": float(np.median(leads)) if leads else None,
+        "mean_trough_lead_sessions": float(np.mean(leads)) if leads else None,
+    }
+
+
+def _daily_regime_trajectory_diagnostic(
+    predictions: list[dict[str, Any]],
+    folds: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    if not bool(settings.get("regime_trajectory_enabled", True)):
+        return {"enabled": False, "decision_feature": False}
+    overall = _trajectory_binary_metrics(predictions)
+    fold_rows: list[dict[str, Any]] = []
+    for fold in folds:
+        year = int(fold.get("test_year") or 0)
+        year_rows = [item for item in predictions if int(item.get("test_year") or 0) == year]
+        metrics = _trajectory_binary_metrics(year_rows)
+        trajectory_contract = ((fold.get("regime_context") or {}).get("trajectory") or {})
+        fold_rows.append({
+            "test_year": year,
+            **metrics,
+            "warning_threshold": _finite(trajectory_contract.get("warning_threshold")),
+            "warning_quantile": _finite(trajectory_contract.get("warning_quantile")),
+        })
+
+    quadrant_rows: list[dict[str, Any]] = []
+    for quadrant in ("Q1", "Q2", "Q3", "Q4"):
+        subset = [item for item in predictions if str(item.get("regime_quadrant") or "Q0") == quadrant]
+        metrics = _trajectory_binary_metrics(subset)
+        quadrant_rows.append({"quadrant": quadrant, **metrics})
+
+    top_warnings = sorted(
+        [item for item in predictions if int(item.get("regime_trajectory_warning") or 0) == 1],
+        key=lambda item: float(item.get("regime_trajectory_score") or 0.0),
+        reverse=True,
+    )[:40]
+    warning_rows = [{
+        "execution_at": item.get("execution_at"),
+        "test_year": item.get("test_year"),
+        "symbol": item.get("symbol"),
+        "regime_cluster_id": item.get("regime_cluster_id"),
+        "regime_quadrant": item.get("regime_quadrant"),
+        "trajectory_score": item.get("regime_trajectory_score"),
+        "danger_similarity": item.get("regime_danger_similarity"),
+        "danger_approach_3d": item.get("regime_danger_approach_3d"),
+        "danger_approach_window": item.get("regime_danger_approach_window"),
+        "q4_persistence": item.get("regime_q4_persistence"),
+        "defensive_persistence": item.get("regime_defensive_persistence"),
+        "forward_min_return": item.get("trajectory_forward_min_return"),
+        "severe_event": item.get("trajectory_severe_event"),
+        "trough_lead_sessions": item.get("trajectory_trough_lead_sessions"),
+    } for item in top_warnings]
+    return {
+        "enabled": True,
+        "shadow_only": True,
+        "decision_feature": False,
+        "decision_policy_changed": False,
+        "method": "daily causal regime trajectory from training-only fold centroids and rolling session state",
+        "trajectory_window_sessions": int(settings.get("regime_trajectory_window_sessions") or 5),
+        "target_horizon_sessions": int(settings.get("regime_trajectory_target_horizon_sessions") or 5),
+        "severe_loss_threshold": float(settings.get("regime_trajectory_severe_loss_threshold") or -0.05),
+        "warning_quantile": float(settings.get("regime_trajectory_warning_quantile") or 0.90),
+        "overall": overall,
+        "folds": fold_rows,
+        "quadrants": quadrant_rows,
+        "top_warnings": warning_rows,
+    }
+
 
 def _replay(reference_rows: list[dict[str, Any]], predictions: list[dict[str, Any]], settings: dict[str, Any]) -> dict[str, Any]:
     equity = _equity_path(reference_rows)
@@ -1040,6 +1324,8 @@ def build_analysis(
     predictions, folds = _walk_forward(rows, settings)
     if not predictions:
         raise ValueError("Statistical & Predictive Controls could not produce chronological out-of-sample predictions.")
+    predictions = _attach_forward_strategy_risk_labels(reference_rows, predictions, settings)
+    daily_regime_trajectory = _daily_regime_trajectory_diagnostic(predictions, folds, settings)
     replay = _replay(reference_rows, predictions, settings)
     control = replay.get("control") if isinstance(replay.get("control"), dict) else {}
     candidate = replay.get("candidate") if isinstance(replay.get("candidate"), dict) else {}
@@ -1139,6 +1425,8 @@ def build_analysis(
             "open_checkpoint": "adds only the next regular-session opening price and gap before execution",
             "features_include": ["robust time-series shocks", "cross-sectional shocks", "opportunity-risk divergence", "existing Temporal risk/quality signals", "best risk-adjusted alternative versus base asset", "causal rolling regime distances and PCA quadrant context"],
             "regime_context": "rolling state; clustering/scaler/PCA fitted only on years before each outer test year",
+            "daily_regime_trajectory": "shadow diagnostic of regime direction, speed and persistence; not used by HOLD/ROTATE/CASH models in this release",
+            "daily_regime_trajectory_used_as_decision_feature": False,
             "monthly_diagnostic_cluster_used_as_feature": False,
             "candidate_actions": ["FOLLOW_BASE", "ROTATE", "CASH"],
             "rotation_candidate_selection": "best causal risk-adjusted alternative at the completed close",
@@ -1175,6 +1463,13 @@ def build_analysis(
                 quadrant: {action: int(counts.get(action, 0)) for action in ACTIONS}
                 for quadrant, counts in sorted(regime_action_counts.items())
             },
+            "daily_regime_trajectory_auc": ((daily_regime_trajectory.get("overall") or {}).get("auc")),
+            "daily_regime_warning_count": int(((daily_regime_trajectory.get("overall") or {}).get("warnings") or 0)),
+            "daily_regime_severe_window_count": int(((daily_regime_trajectory.get("overall") or {}).get("severe_windows") or 0)),
+            "daily_regime_true_warning_count": int(((daily_regime_trajectory.get("overall") or {}).get("true_warnings") or 0)),
+            "daily_regime_warning_precision": ((daily_regime_trajectory.get("overall") or {}).get("precision")),
+            "daily_regime_warning_recall": ((daily_regime_trajectory.get("overall") or {}).get("recall")),
+            "daily_regime_median_lead_sessions": ((daily_regime_trajectory.get("overall") or {}).get("median_trough_lead_sessions")),
             "mean_close_auc": mean_close_auc,
             "mean_open_auc": mean_open_auc,
             "mean_close_cash_auc": mean_close_cash_auc,
@@ -1194,6 +1489,7 @@ def build_analysis(
         "folds": folds,
         "monthly": replay.get("monthly") or [],
         "extreme_sessions": extreme_rows,
+        "daily_regime_trajectory": daily_regime_trajectory,
         "predictions": predictions,
         "replay": {
             "method": replay.get("method"),

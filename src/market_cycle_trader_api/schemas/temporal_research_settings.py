@@ -73,6 +73,11 @@ class StatisticalMlControlSettings(BaseModel):
     regime_max_clusters: int = Field(ge=2, le=10)
     regime_min_train_rows: int = Field(ge=30, le=100_000)
     regime_distance_temperature: float = Field(gt=0.0, le=100.0)
+    regime_trajectory_enabled: bool
+    regime_trajectory_window_sessions: int = Field(ge=3, le=60)
+    regime_trajectory_warning_quantile: float = Field(gt=0.5, lt=1.0)
+    regime_trajectory_target_horizon_sessions: int = Field(ge=1, le=20)
+    regime_trajectory_severe_loss_threshold: float = Field(gt=-1.0, lt=0.0)
     n_estimators: int = Field(ge=50, le=5000)
     max_depth: int = Field(ge=2, le=30)
     min_samples_leaf: int = Field(ge=1, le=10_000)

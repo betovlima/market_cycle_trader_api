@@ -21,7 +21,7 @@ from ..schemas.temporal_research_settings import (
 )
 
 SETTINGS_ID = "winner-transition"
-SETTINGS_SCHEMA_VERSION = 4
+SETTINGS_SCHEMA_VERSION = 5
 PARAMETERIZATION_FILE = "003_temporal_winner_transition_research.json"
 
 
