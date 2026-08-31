@@ -1720,10 +1720,16 @@ def _strategy_research_pipeline_state(document: dict[str, Any] | None) -> dict[s
         stage_states["fragile_incumbent"] = "skipped"
     if status_value == "completed" and "emerging_trend" not in stored_stage_states:
         stage_states["emerging_trend"] = "skipped"
+    stage_progress = {
+        stage: bson_value(value)
+        for stage, value in dict(stored.get("stage_progress") or {}).items()
+        if stage in stage_states and isinstance(value, dict)
+    }
     return {
         "status": status_value,
         "current_stage": stored.get("current_stage") if stored.get("current_stage") in STRATEGY_RESEARCH_PIPELINE_STAGES else None,
         "stage_states": stage_states,
+        "stage_progress": stage_progress,
         "start_month": stored.get("start_month"),
         "end_month": stored.get("end_month"),
         "failure_message": stored.get("failure_message"),
@@ -1741,6 +1747,7 @@ def _persist_strategy_research_pipeline_state(
         "status": state.get("status") or "idle",
         "current_stage": state.get("current_stage"),
         "stage_states": dict(state.get("stage_states") or _default_strategy_research_stage_states()),
+        "stage_progress": dict(state.get("stage_progress") or {}),
         "start_month": state.get("start_month"),
         "end_month": state.get("end_month"),
         "failure_message": state.get("failure_message"),
@@ -1881,6 +1888,42 @@ def _pipeline_stage_start(db: Any, run_id: str, stage: str) -> dict[str, Any]:
 
 def _pipeline_stage_complete(db: Any, run_id: str, stage: str) -> dict[str, Any]:
     return control_strategy_research_pipeline(db, run_id, action="stage_complete", stage=stage)
+
+
+def _pipeline_stage_progress(
+    db: Any,
+    run_id: str,
+    stage: str,
+    progress: dict[str, Any],
+) -> None:
+    if stage not in STRATEGY_RESEARCH_PIPELINE_STAGES:
+        return
+    now = utc_now()
+    payload = {
+        "percent": round(
+            max(0.0, min(100.0, float(progress.get("percent") or 0.0))), 1
+        ),
+        "completed_units": int(progress.get("completed_assets") or 0),
+        "total_units": int(progress.get("total_assets") or 0),
+        "last_completed_unit": progress.get("last_completed_symbol"),
+        "unit_label": "assets",
+        "heartbeat_at": bson_value(progress.get("heartbeat_at") or now),
+        "updated_at": now,
+    }
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_one(
+        {
+            "id": str(run_id),
+            "strategy_research_pipeline.current_stage": stage,
+            "strategy_research_pipeline.status": "running",
+        },
+        {
+            "$set": {
+                f"strategy_research_pipeline.stage_progress.{stage}": bson_value(payload),
+                "strategy_research_pipeline.updated_at": now,
+                "updated_at": now,
+            }
+        },
+    )
 
 
 def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
@@ -2440,6 +2483,7 @@ def control_strategy_research_pipeline(
     now = utc_now()
     next_status = current["status"]
     current_stage = current.get("current_stage")
+    stage_progress = dict(current.get("stage_progress") or {})
     failure_message = current.get("failure_message")
     start_worker = False
 
@@ -2449,6 +2493,7 @@ def control_strategy_research_pipeline(
         if str(end_month) < str(start_month):
             raise TemporalIntelligenceConflict("Strategy Research end_month must be greater than or equal to start_month.")
         stage_states = _default_strategy_research_stage_states()
+        stage_progress = {}
         stage_states["reference"] = "completed"
         temporal_status = str(document.get("status") or "").lower()
         if temporal_status == "completed":
@@ -2479,11 +2524,24 @@ def control_strategy_research_pipeline(
         next_status = "running"
         current_stage = stage
         stage_states[stage] = "running"
+        stage_progress[stage] = {
+            "percent": 0.0,
+            "completed_units": 0,
+            "total_units": 0,
+            "heartbeat_at": now,
+            "updated_at": now,
+        }
         failure_message = None
     elif action == "stage_complete":
         if stage not in STRATEGY_RESEARCH_PIPELINE_STAGES:
             raise TemporalIntelligenceConflict("Unknown Strategy Research stage.")
         stage_states[stage] = "completed"
+        stage_progress[stage] = {
+            **dict(stage_progress.get(stage) or {}),
+            "percent": 100.0,
+            "heartbeat_at": now,
+            "updated_at": now,
+        }
         current_stage = None
         if next_status in {"stop_requested", "stopped"}:
             next_status = "stopped"
@@ -2505,6 +2563,11 @@ def control_strategy_research_pipeline(
         next_status = "failed"
         current_stage = stage
         stage_states[stage] = "failed"
+        stage_progress[stage] = {
+            **dict(stage_progress.get(stage) or {}),
+            "heartbeat_at": now,
+            "updated_at": now,
+        }
         failure_message = str(message or "Strategy Research stage failed.")
     else:
         raise TemporalIntelligenceConflict("Unsupported Strategy Research pipeline action.")
@@ -2513,6 +2576,7 @@ def control_strategy_research_pipeline(
         "status": next_status,
         "current_stage": current_stage,
         "stage_states": stage_states,
+        "stage_progress": stage_progress,
         "start_month": start_month or current.get("start_month"),
         "end_month": end_month or current.get("end_month"),
         "failure_message": failure_message,
@@ -2550,7 +2614,7 @@ def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, A
         if stage_states.get("reference") == "waiting":
             stage_states["reference"] = "completed"
         stage_states["temporal"] = "running"
-        for stage in ("roc_policy", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation"):
+        for stage in ("asset_state_clustering", "statistical_ml_control", "roc_policy", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation"):
             stage_states[stage] = "waiting"
         repaired = _persist_strategy_research_pipeline_state(
             db,

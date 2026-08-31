@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import perf_counter
 from typing import Any, Callable
 
@@ -15,6 +16,10 @@ from .config import ANALYSIS_VERSION, SCHEMA_VERSION
 
 
 DERIVED_FEATURES = ("asset_return_1d", "asset_return_5d", "asset_volatility_10d")
+
+
+class AssetStateClusteringCancelled(RuntimeError):
+    pass
 
 
 def _number(value: Any) -> float | None:
@@ -284,6 +289,128 @@ def _latest_map(
     }
 
 
+def _ensure_not_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and bool(cancel_check()):
+        raise AssetStateClusteringCancelled(
+            "Daily Asset State Clustering was stopped by the user."
+        )
+
+
+def _analyze_symbol(
+    *,
+    symbol: str,
+    rows: list[dict[str, Any]],
+    feature_names: list[str],
+    settings: dict[str, Any],
+    min_history: int,
+    profile_horizon: int,
+    severe_threshold: float,
+    cancel_check: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    asset_started = perf_counter()
+    _ensure_not_cancelled(cancel_check)
+    frame = _prepare_symbol_frame(rows, feature_names)
+    if frame.empty or len(frame) < min_history:
+        return {
+            "symbol": symbol,
+            "states": [],
+            "latest_map": None,
+            "asset_summary": {
+                "symbol": symbol,
+                "status": "insufficient_history",
+                "rows": int(len(frame)),
+                "minimum_history_rows": min_history,
+                "duration_seconds": float(perf_counter() - asset_started),
+            },
+        }
+
+    returns = pd.to_numeric(
+        frame["open_to_open_return"], errors="coerce"
+    ).to_numpy(dtype=float)
+    forward_returns = _forward_returns(returns, profile_horizon)
+    feature_matrix_all = (
+        frame[feature_names]
+        .apply(pd.to_numeric, errors="coerce")
+        .to_numpy(dtype=float)
+    )
+    states: list[dict[str, Any]] = []
+    silhouettes: list[float] = []
+    novel_count = 0
+    latest_fit: dict[str, Any] | None = None
+    latest_profile: dict[str, Any] | None = None
+
+    for idx in range(min_history - 1, len(frame)):
+        if (idx - min_history + 1) % 8 == 0:
+            _ensure_not_cancelled(cancel_check)
+        fitted = _fit_state(feature_matrix_all, idx, feature_names, settings)
+        if not fitted:
+            continue
+        profile = _cluster_profile_vectorized(
+            forward_returns,
+            fitted["labels"],
+            idx,
+            fitted["current_cluster"],
+            horizon=profile_horizon,
+            severe_threshold=severe_threshold,
+        )
+        if fitted["silhouette"] is not None:
+            silhouettes.append(float(fitted["silhouette"]))
+        novel_count += int(fitted["is_novel"])
+        states.append({
+            "timestamp": frame.iloc[idx]["timestamp"].isoformat(),
+            "symbol": symbol,
+            "cluster_id": fitted["current_cluster"],
+            "cluster_count": fitted["cluster_count"],
+            "silhouette_score": fitted["silhouette"],
+            "nearest_distance": fitted["current_distance"],
+            "novelty_threshold": fitted["novelty_threshold"],
+            "is_novel": fitted["is_novel"],
+            "profile_samples": profile["samples"],
+            "profile_mean_forward_return": profile["mean_forward_return"],
+            "profile_median_forward_return": profile["median_forward_return"],
+            "profile_positive_rate": profile["positive_rate"],
+            "profile_severe_loss_rate": profile["severe_loss_rate"],
+        })
+        latest_fit = fitted
+        latest_profile = profile
+
+    _ensure_not_cancelled(cancel_check)
+    latest_map: dict[str, Any] | None = None
+    if latest_fit is not None:
+        latest_map = _latest_map(frame, latest_fit, settings)
+        latest_map["symbol"] = symbol
+        latest_map["current_profile"] = latest_profile or {}
+        if states:
+            current_point = next(
+                (point for point in latest_map["points"] if point.get("is_current")),
+                None,
+            )
+            if current_point:
+                states[-1]["pca_x"] = current_point.get("x")
+                states[-1]["pca_y"] = current_point.get("y")
+
+    asset_duration = float(perf_counter() - asset_started)
+    return {
+        "symbol": symbol,
+        "states": states,
+        "latest_map": latest_map,
+        "asset_summary": {
+            "symbol": symbol,
+            "status": "completed",
+            "rows": int(len(frame)),
+            "states": int(len(states)),
+            "mean_silhouette": _safe_mean(silhouettes),
+            "median_silhouette": _safe_median(silhouettes),
+            "novel_states": int(novel_count),
+            "latest_cluster_id": (states[-1]["cluster_id"] if states else None),
+            "latest_cluster_count": (states[-1]["cluster_count"] if states else None),
+            "latest_is_novel": (states[-1]["is_novel"] if states else None),
+            "latest_profile": latest_profile or {},
+            "duration_seconds": asset_duration,
+        },
+    }
+
+
 def build_analysis(
     *,
     observation_rows: list[dict[str, Any]],
@@ -293,6 +420,9 @@ def build_analysis(
     period_start: str,
     period_end: str,
     progress_callback: Callable[[float], None] | None = None,
+    checkpoint_callback: Callable[[dict[str, Any], int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    completed_asset_results: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     enabled = bool(settings.get("enabled", True))
@@ -327,103 +457,76 @@ def build_analysis(
     min_history = max(30, int(settings.get("min_history_rows") or 120))
     profile_horizon = max(1, int(settings.get("profile_horizon_sessions") or 5))
     severe_threshold = float(settings.get("severe_loss_threshold") or -0.05)
-    daily_states_by_symbol: dict[str, list[dict[str, Any]]] = {}
-    latest_maps: list[dict[str, Any]] = []
-    asset_summaries: list[dict[str, Any]] = []
     symbols = sorted(grouped)
-    total_work = max(1, len(symbols))
-    completed_durations: list[float] = []
+    total_work = len(symbols)
+    asset_results = {
+        symbol: dict(result)
+        for symbol, result in dict(completed_asset_results or {}).items()
+        if symbol in grouped and isinstance(result, dict)
+    }
+    completed_count = len(asset_results)
+    if progress_callback:
+        progress_callback(1.0 if total_work == 0 else completed_count / total_work)
 
-    for symbol_index, symbol in enumerate(symbols):
-        asset_started = perf_counter()
-        frame = _prepare_symbol_frame(grouped[symbol], feature_names)
-        if frame.empty or len(frame) < min_history:
-            asset_summaries.append({
-                "symbol": symbol,
-                "status": "insufficient_history",
-                "rows": int(len(frame)),
-                "minimum_history_rows": min_history,
-                "duration_seconds": float(perf_counter() - asset_started),
-            })
-            if progress_callback:
-                progress_callback((symbol_index + 1) / total_work)
-            continue
+    pending_symbols = [symbol for symbol in symbols if symbol not in asset_results]
+    configured_workers = max(1, min(8, int(settings.get("parallel_workers") or 2)))
+    worker_count = min(configured_workers, len(pending_symbols))
+    if worker_count:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="asset-state-clustering",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    _analyze_symbol,
+                    symbol=symbol,
+                    rows=grouped[symbol],
+                    feature_names=feature_names,
+                    settings=settings,
+                    min_history=min_history,
+                    profile_horizon=profile_horizon,
+                    severe_threshold=severe_threshold,
+                    cancel_check=cancel_check,
+                ): symbol
+                for symbol in pending_symbols
+            }
+            try:
+                for future in as_completed(futures):
+                    _ensure_not_cancelled(cancel_check)
+                    result = future.result()
+                    symbol = str(result.get("symbol") or futures[future])
+                    asset_results[symbol] = result
+                    completed_count += 1
+                    if checkpoint_callback:
+                        checkpoint_callback(result, completed_count, total_work)
+                    if progress_callback:
+                        progress_callback(completed_count / max(1, total_work))
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                raise
 
-        returns = pd.to_numeric(frame["open_to_open_return"], errors="coerce").to_numpy(dtype=float)
-        forward_returns = _forward_returns(returns, profile_horizon)
-        feature_matrix_all = frame[feature_names].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-        states: list[dict[str, Any]] = []
-        silhouettes: list[float] = []
-        novel_count = 0
-        latest_fit: dict[str, Any] | None = None
-        latest_profile: dict[str, Any] | None = None
-
-        for idx in range(min_history - 1, len(frame)):
-            fitted = _fit_state(feature_matrix_all, idx, feature_names, settings)
-            if not fitted:
-                continue
-            profile = _cluster_profile_vectorized(
-                forward_returns,
-                fitted["labels"],
-                idx,
-                fitted["current_cluster"],
-                horizon=profile_horizon,
-                severe_threshold=severe_threshold,
-            )
-            if fitted["silhouette"] is not None:
-                silhouettes.append(float(fitted["silhouette"]))
-            novel_count += int(fitted["is_novel"])
-            states.append({
-                "timestamp": frame.iloc[idx]["timestamp"].isoformat(),
-                "symbol": symbol,
-                "cluster_id": fitted["current_cluster"],
-                "cluster_count": fitted["cluster_count"],
-                "silhouette_score": fitted["silhouette"],
-                "nearest_distance": fitted["current_distance"],
-                "novelty_threshold": fitted["novelty_threshold"],
-                "is_novel": fitted["is_novel"],
-                "profile_samples": profile["samples"],
-                "profile_mean_forward_return": profile["mean_forward_return"],
-                "profile_median_forward_return": profile["median_forward_return"],
-                "profile_positive_rate": profile["positive_rate"],
-                "profile_severe_loss_rate": profile["severe_loss_rate"],
-            })
-            latest_fit = fitted
-            latest_profile = profile
-
-        daily_states_by_symbol[symbol] = states
-        if latest_fit is not None:
-            latest_map = _latest_map(frame, latest_fit, settings)
-            latest_map["symbol"] = symbol
-            latest_map["current_profile"] = latest_profile or {}
-            latest_maps.append(latest_map)
-            if states:
-                current_point = next(
-                    (point for point in latest_map["points"] if point.get("is_current")),
-                    None,
-                )
-                if current_point:
-                    states[-1]["pca_x"] = current_point.get("x")
-                    states[-1]["pca_y"] = current_point.get("y")
-
-        asset_duration = float(perf_counter() - asset_started)
-        completed_durations.append(asset_duration)
-        asset_summaries.append({
-            "symbol": symbol,
-            "status": "completed",
-            "rows": int(len(frame)),
-            "states": int(len(states)),
-            "mean_silhouette": _safe_mean(silhouettes),
-            "median_silhouette": _safe_median(silhouettes),
-            "novel_states": int(novel_count),
-            "latest_cluster_id": (states[-1]["cluster_id"] if states else None),
-            "latest_cluster_count": (states[-1]["cluster_count"] if states else None),
-            "latest_is_novel": (states[-1]["is_novel"] if states else None),
-            "latest_profile": latest_profile or {},
-            "duration_seconds": asset_duration,
-        })
-        if progress_callback:
-            progress_callback((symbol_index + 1) / total_work)
+    _ensure_not_cancelled(cancel_check)
+    ordered_results = [asset_results[symbol] for symbol in symbols if symbol in asset_results]
+    daily_states_by_symbol = {
+        str(result.get("symbol") or ""): list(result.get("states") or [])
+        for result in ordered_results
+        if result.get("symbol")
+    }
+    latest_maps = [
+        dict(result["latest_map"])
+        for result in ordered_results
+        if isinstance(result.get("latest_map"), dict)
+    ]
+    asset_summaries = [
+        dict(result.get("asset_summary") or {}) for result in ordered_results
+    ]
+    completed_durations = [
+        float(item["duration_seconds"])
+        for item in asset_summaries
+        if item.get("status") == "completed"
+        and item.get("duration_seconds") is not None
+    ]
 
     completed_assets = [item for item in asset_summaries if item.get("status") == "completed"]
     all_states = [state for states in daily_states_by_symbol.values() for state in states]
@@ -449,12 +552,16 @@ def build_analysis(
         "decision_effect": "none",
         "duration_seconds": total_duration,
         "mean_completed_asset_duration_seconds": _safe_mean(completed_durations),
-        "performance_revision": "10.5.1",
+        "parallel_workers": worker_count or configured_workers,
+        "checkpointed_asset_count": int(len(asset_results)),
+        "performance_revision": "10.5.2",
         "performance_optimizations": [
             "PCA computed only for the latest visualization geometry",
             "matured forward returns precomputed once per asset",
             "cluster profile aggregation vectorized per daily refit",
             "numeric feature matrix prepared once per asset",
+            "assets processed with bounded parallel workers",
+            "completed assets checkpointed for restart recovery",
         ],
     }
     return {
@@ -475,7 +582,7 @@ def build_analysis(
             "cluster_selection": "training-only silhouette",
             "future_outcomes_used_for_clustering": False,
             "profile_outcome_rule": "only matured historical forward returns are used after clustering to describe the current cluster",
-            "implementation_revision": "10.5.1-performance",
+            "implementation_revision": "10.5.2-resumable-parallel",
         },
         "feature_names": feature_names,
         "summary": summary,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..asset_state_clustering.analysis import AssetStateClusteringCancelled
+
 
 ASSET_STATE_STAGE = "asset_state_clustering"
 _INSTALLED = False
@@ -57,19 +59,26 @@ def install_strategy_research_asset_state_stage() -> None:
                     processing_id=processing_id,
                     start_month=start_month,
                     end_month=end_month,
+                    progress_callback=lambda progress: temporal._pipeline_stage_progress(
+                        db, run_id, ASSET_STATE_STAGE, progress
+                    ),
+                    cancel_check=lambda: temporal._pipeline_stop_requested(db, run_id),
                 )
                 if str((result or {}).get("status") or "").lower() != "completed":
                     raise temporal.TemporalIntelligenceConflict(
                         "Daily Asset State Clustering did not produce a completed result."
                     )
+            except AssetStateClusteringCancelled as exc:
+                raise temporal.TemporalIntelligenceConflict(str(exc)) from exc
             except Exception as exc:
-                temporal.control_strategy_research_pipeline(
-                    db,
-                    run_id,
-                    action="stage_failed",
-                    stage=ASSET_STATE_STAGE,
-                    message=str(exc),
-                )
+                if not temporal._pipeline_stop_requested(db, run_id):
+                    temporal.control_strategy_research_pipeline(
+                        db,
+                        run_id,
+                        action="stage_failed",
+                        stage=ASSET_STATE_STAGE,
+                        message=str(exc),
+                    )
                 raise
 
             temporal._pipeline_stage_complete(db, run_id, ASSET_STATE_STAGE)

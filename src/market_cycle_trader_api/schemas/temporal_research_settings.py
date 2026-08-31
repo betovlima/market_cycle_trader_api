@@ -145,6 +145,7 @@ class AssetStateClusteringSettings(BaseModel):
     profile_horizon_sessions: int = Field(ge=1, le=20)
     severe_loss_threshold: float = Field(gt=-1.0, lt=0.0)
     kmeans_n_init: int = Field(ge=1, le=50)
+    parallel_workers: int = Field(ge=1, le=8)
     random_state: int = Field(ge=0, le=2_147_483_647)
 
     @field_validator("feature_names")

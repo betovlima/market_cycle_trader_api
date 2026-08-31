@@ -118,6 +118,7 @@
     "profile_horizon_sessions": 5,
     "severe_loss_threshold": -0.05,
     "kmeans_n_init": 5,
+    "parallel_workers": 2,
     "random_state": 42
   }
 }
