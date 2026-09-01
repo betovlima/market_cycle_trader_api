@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from market_cycle_trader_api.auth.access_service import get_access_service
 from market_cycle_trader_api.auth.capabilities import capabilities_for_role
+from market_cycle_trader_api.auth.reviewer_access_service import get_reviewer_access_service
 from market_cycle_trader_api.auth.security import (
     SESSION_COOKIE_NAME,
     get_session_manager,
@@ -35,6 +36,23 @@ def _session_response(identity, idle_expires_at=None) -> SessionResponse:
         email=identity.email,
         capabilities=capabilities_for_role(identity.role),
     )
+
+
+def _validate_bound_session(identity):
+    if not identity.session_id:
+        return None
+    if identity.role == "reviewer" or str(identity.session_id).startswith("reviewer-session-"):
+        return get_reviewer_access_service().validate_session(identity.session_id)
+    return get_access_service().validate_access_session(identity.session_id)
+
+
+def _revoke_bound_session(identity) -> None:
+    if not identity.session_id:
+        return
+    if identity.role == "reviewer" or str(identity.session_id).startswith("reviewer-session-"):
+        get_reviewer_access_service().revoke_session(identity.session_id)
+        return
+    get_access_service().revoke_access_session(identity.session_id)
 
 
 @router.post("/admin/login", response_model=SessionResponse)
@@ -101,12 +119,10 @@ def session(request: Request) -> SessionResponse:
         return SessionResponse(authenticated=False, expires_in_seconds=0)
     try:
         identity = manager.decode_session_token(token)
+        current = _validate_bound_session(identity)
     except HTTPException:
         return SessionResponse(authenticated=False, expires_in_seconds=0)
-    idle_expires_at = None
-    if identity.session_id:
-        current = get_access_service().validate_access_session(identity.session_id)
-        idle_expires_at = current.get("idle_expires_at")
+    idle_expires_at = current.get("idle_expires_at") if current else None
     return _session_response(identity, idle_expires_at)
 
 
@@ -117,8 +133,7 @@ def logout(request: Request, response: Response) -> SessionResponse:
     if token:
         try:
             identity = manager.decode_session_token(token)
-            if identity.session_id:
-                get_access_service().revoke_access_session(identity.session_id)
+            _revoke_bound_session(identity)
         except HTTPException:
             pass
     manager.clear_cookie(response)
