@@ -52,7 +52,6 @@ class SessionManager:
         return bool(expected) and hmac.compare_digest(expected, submitted)
 
     def create_admin_identity(self) -> SessionIdentity:
-        
         return SessionIdentity(
             subject="trader-admin",
             role="admin",
@@ -66,14 +65,17 @@ class SessionManager:
         role = str(session.get("role") or "viewer")
         scope_by_role = {
             "viewer": "trader:read",
+            "reviewer": "trader:read",
             "trader": "trader:read portfolio:read",
             "admin": "trader:read portfolio:read admin:manage",
         }
         if role not in scope_by_role:
             raise HTTPException(status_code=401, detail="Invalid access role.")
         identity_subject = str(session.get("identity_subject") or "")
+        access_method = str(session.get("access_method") or "google")
+        subject = identity_subject if access_method == "reviewer_code" else f"google:{identity_subject}"
         return SessionIdentity(
-            subject=f"google:{identity_subject}",
+            subject=subject,
             role=role,
             scope=scope_by_role[role],
             expires_at=session["expires_at"],
@@ -118,7 +120,7 @@ class SessionManager:
 
         role = str(payload.get("role") or "")
         scope = str(payload.get("scope") or "")
-        if role not in {"admin", "viewer", "trader"} or "trader:read" not in scope.split():
+        if role not in {"admin", "viewer", "reviewer", "trader"} or "trader:read" not in scope.split():
             raise HTTPException(status_code=401, detail="Invalid session.")
         identity = SessionIdentity(
             subject=str(payload.get("subject") or ""),
@@ -131,9 +133,14 @@ class SessionManager:
         )
 
         if identity.session_id:
-            from market_cycle_trader_api.auth.access_service import get_access_service
+            if role == "reviewer" or str(identity.session_id).startswith("reviewer-session-"):
+                from market_cycle_trader_api.auth.reviewer_access_service import get_reviewer_access_service
 
-            current = get_access_service().validate_access_session(identity.session_id)
+                current = get_reviewer_access_service().validate_session(identity.session_id)
+            else:
+                from market_cycle_trader_api.auth.access_service import get_access_service
+
+                current = get_access_service().validate_access_session(identity.session_id)
             if str(current.get("role") or "viewer") != role:
                 raise HTTPException(status_code=401, detail="Invalid identity-bound session.")
             return self.create_access_identity(current)
