@@ -1,0 +1,109 @@
+name: Apply Temporal v10.8 Engine Patch
+
+on:
+  push:
+    branches:
+      - feat/10.8.0-temporal-research-simplification
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    if: ${{ !contains(github.event.head_commit.message, '[v10.8 generated]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/10.8.0-temporal-research-simplification
+          fetch-depth: 0
+
+      - name: Apply source changes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              if new in text:
+                  return
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"Expected one anchor in {path}, found {count}: {old[:100]!r}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          service = Path("src/market_cycle_trader_api/services/temporal_intelligence.py")
+          replace_once(
+              service,
+              "from .system_settings import apply_training_runtime_settings, get_system_settings\n",
+              "from .system_settings import apply_training_runtime_settings, get_system_settings\nfrom .temporal_research_settings import temporal_research_settings_snapshot\n",
+          )
+          replace_once(
+              service,
+              '    runtime_settings = get_system_settings(db)\n    if not bool(runtime_settings["training"]["enabled"]):\n',
+              '    runtime_settings = get_system_settings(db)\n    temporal_research_snapshot = temporal_research_settings_snapshot(db)\n    if not bool(runtime_settings["training"]["enabled"]):\n',
+          )
+          replace_once(
+              service,
+              '        "system_settings_revision": int(runtime_settings["revision"]),\n        "training_timeout_seconds": int(runtime_settings["training"]["timeout_seconds"]),\n',
+              '        "system_settings_revision": int(runtime_settings["revision"]),\n        "temporal_research_settings_revision": int(temporal_research_snapshot["revision"]),\n        "temporal_research_settings_hash": str(temporal_research_snapshot["settings_hash"]),\n        "temporal_research_settings": bson_value(temporal_research_snapshot["settings"]),\n        "training_timeout_seconds": int(runtime_settings["training"]["timeout_seconds"]),\n',
+          )
+          replace_once(
+              service,
+              '    request_payload = run.get("request") if isinstance(run.get("request"), dict) else {}\n    numeric_environment: dict[str, str] = {}\n',
+              '    request_payload = run.get("request") if isinstance(run.get("request"), dict) else {}\n    temporal_research_settings = run.get("temporal_research_settings") if isinstance(run.get("temporal_research_settings"), dict) else {}\n    temporal_timing_settings = temporal_research_settings.get("temporal_timing") if isinstance(temporal_research_settings.get("temporal_timing"), dict) else {}\n    timing_overrides_enabled = bool(temporal_timing_settings.get("overrides_enabled", True))\n    numeric_environment: dict[str, str] = {\n        "MCT_TEMPORAL_TIMING_OVERRIDES_ENABLED": "1" if timing_overrides_enabled else "0",\n    }\n',
+          )
+          replace_once(
+              service,
+              '        numeric_environment = {key: str(numeric_threads) for key in _NUMERIC_THREAD_ENVIRONMENT_KEYS}\n',
+              '        numeric_environment.update({key: str(numeric_threads) for key in _NUMERIC_THREAD_ENVIRONMENT_KEYS})\n',
+          )
+
+          engine = Path("src/market_cycle_trader_api/engine/temporal_intelligence.py")
+          replace_once(
+              engine,
+              'def _model_kwargs(config: Any) -> dict[str, Any]:\n',
+              'def _temporal_timing_overrides_enabled() -> bool:\n    value = str(os.getenv("MCT_TEMPORAL_TIMING_OVERRIDES_ENABLED") or "1").strip().lower()\n    return value not in {"0", "false", "no", "off"}\n\n\ndef _model_kwargs(config: Any) -> dict[str, Any]:\n',
+          )
+          engine_text = engine.read_text(encoding="utf-8")
+          old_call = "enable_timing_override=True"
+          new_call = "enable_timing_override=_temporal_timing_overrides_enabled()"
+          if new_call not in engine_text:
+              count = engine_text.count(old_call)
+              if count != 4:
+                  raise RuntimeError(f"Expected four Temporal timing call sites, found {count}")
+              engine_text = engine_text.replace(old_call, new_call)
+              engine.write_text(engine_text, encoding="utf-8")
+          replace_once(
+              engine,
+              '        "decision_policy": "strategy_research_temporal_timing" if enable_timing_override else "strategy_research_reference_replay",\n',
+              '        "decision_policy": "strategy_research_temporal_timing" if enable_timing_override else "strategy_research_reference_replay",\n        "timing_overrides_enabled": bool(enable_timing_override),\n',
+          )
+          replace_once(
+              engine,
+              '        "decision_policy": "winner_anchored_temporal_timing" if enable_timing_override else "winner_anchor_replay",\n',
+              '        "decision_policy": "winner_anchored_temporal_timing" if enable_timing_override else "winner_anchor_replay",\n        "timing_overrides_enabled": bool(enable_timing_override),\n',
+          )
+          replace_once(
+              engine,
+              '        "latest_as_of": common_dates[-1],\n        "horizon_metrics": horizon_summaries,\n',
+              '        "latest_as_of": common_dates[-1],\n        "timing_overrides_enabled": _temporal_timing_overrides_enabled(),\n        "horizon_metrics": horizon_summaries,\n',
+          )
+
+          config = Path("src/market_cycle_trader_api/core/config.py")
+          replace_once(config, 'API_VERSION = "10.7.0"', 'API_VERSION = "10.8.0"')
+          pyproject = Path("pyproject.toml")
+          replace_once(pyproject, 'version = "10.7.0"', 'version = "10.8.0"')
+
+          Path(".github/workflows/apply-v10-8-temporal-patch.yml").unlink()
+
+      - name: Validate Python syntax
+        run: python -m compileall -q src/market_cycle_trader_api
+
+      - name: Commit generated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: wire temporal timing ablation [v10.8 generated]"
+          git push origin HEAD:feat/10.8.0-temporal-research-simplification
