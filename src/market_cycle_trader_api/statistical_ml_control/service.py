@@ -17,6 +17,7 @@ from ..infrastructure.persistence.mongo_repository import (
 from ..services.temporal_research_settings import temporal_research_settings_snapshot
 from .analysis import build_analysis
 from .config import SCHEMA_VERSION
+from .edge_calibration import build_edge_calibration
 
 
 _ZERO_PRESERVING_SETTINGS = frozenset({
@@ -161,15 +162,30 @@ def build_and_persist(
     settings_snapshot = temporal_research_settings_snapshot(db)
     persisted_settings = ((settings_snapshot.get("settings") or {}).get("statistical_ml_control") or {})
     settings = _runtime_settings(persisted_settings)
+    reference_rows = _winner_reference_rows(db, run_id)
+    observation_rows = _observation_rows(db, run_id)
     result = build_analysis(
-        reference_rows=_winner_reference_rows(db, run_id),
-        observation_rows=_observation_rows(db, run_id),
+        reference_rows=reference_rows,
+        observation_rows=observation_rows,
         settings=settings,
         run_id=run_id,
         processing_id=processing_id,
         period_start=start_month,
         period_end=end_month,
     )
+    try:
+        result["edge_calibration"] = build_edge_calibration(
+            reference_rows=reference_rows,
+            observation_rows=observation_rows,
+            settings=settings,
+        )
+    except (ValueError, RuntimeError) as exc:
+        result["edge_calibration"] = {
+            "status": "failed",
+            "shadow_only": True,
+            "decision_effect": "none",
+            "error": str(exc),
+        }
     now = datetime.now(timezone.utc)
     result.update({
         "id": str(uuid.uuid4()),
