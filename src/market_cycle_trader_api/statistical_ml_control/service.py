@@ -115,26 +115,6 @@ def get_persisted(
     return bson_value(row) if row is not None else None
 
 
-def _asset_state_summary(
-    db: Any,
-    run_id: str,
-    *,
-    processing_id: str,
-    start_month: str,
-    end_month: str,
-) -> dict[str, Any] | None:
-    from ..asset_state_clustering.service import get_persisted, public_summary
-
-    document = get_persisted(
-        db,
-        run_id,
-        processing_id=processing_id,
-        start_month=start_month,
-        end_month=end_month,
-    )
-    return public_summary(document)
-
-
 def build_and_persist(
     db: Any,
     run_id: str,
@@ -146,18 +126,6 @@ def build_and_persist(
     existing = get_persisted(db, run_id, processing_id=processing_id, start_month=start_month, end_month=end_month)
     if existing and str(existing.get("status") or "").lower() == "completed":
         return existing
-
-    asset_state = _asset_state_summary(
-        db,
-        run_id,
-        processing_id=processing_id,
-        start_month=start_month,
-        end_month=end_month,
-    )
-    if asset_state is None or str(asset_state.get("status") or "").lower() != "completed":
-        raise RuntimeError(
-            "Statistical & Predictive Controls require a completed Daily Asset State Clustering stage."
-        )
 
     settings_snapshot = temporal_research_settings_snapshot(db)
     persisted_settings = ((settings_snapshot.get("settings") or {}).get("statistical_ml_control") or {})
@@ -193,19 +161,6 @@ def build_and_persist(
         "created_at": now,
         "updated_at": now,
     })
-    result["asset_state_clustering"] = {
-        "id": asset_state.get("id"),
-        "status": asset_state.get("status"),
-        "analysis_version": asset_state.get("analysis_version"),
-        "schema_version": asset_state.get("schema_version"),
-        "shadow_only": asset_state.get("shadow_only", True),
-        "decision_effect": asset_state.get("decision_effect", "none"),
-        "method": asset_state.get("method") or {},
-        "feature_names": asset_state.get("feature_names") or [],
-        "summary": asset_state.get("summary") or {},
-        "asset_summaries": asset_state.get("asset_summaries") or [],
-        "latest_maps": asset_state.get("latest_maps") or [],
-    }
     _ensure_indexes(db)
     db[TEMPORAL_STATISTICAL_ML_CONTROL_COLLECTION].insert_one(bson_value(dict(result)))
     return bson_value(result)
