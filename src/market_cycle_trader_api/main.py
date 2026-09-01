@@ -32,6 +32,7 @@ from .api.routers import (
     paper_market,
     public_paper_portfolio,
     parameter_bootstrap,
+    reviewer_access,
     strategy_configuration,
     strategy_lab,
     system_settings,
@@ -44,8 +45,9 @@ from .milp_decision.router import router as milp_decision_router
 from .decision_science.router import router as decision_science_router
 from .roc_decision_policy.router import router as roc_decision_policy_router
 from .auth.config import get_auth_settings
-from .auth.security import require_admin_session, require_backtest_access, require_portfolio_session, require_trader_access, require_trader_session
+from .auth.security import require_admin_session, require_backtest_access, require_capability, require_portfolio_session, require_trader_access, require_trader_session
 from .auth.access_service import get_access_service
+from .auth.reviewer_access_service import get_reviewer_access_service
 from .core.runtime import MONGO_STATUS, close_mongo, database, initialize_mongo
 from .services.paper_market_scheduler import (
     start_paper_market_scheduler,
@@ -69,6 +71,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         recover_temporal_intelligence_runs(database())
     get_auth_settings().validate_runtime()
     get_access_service().ensure_storage()
+    get_reviewer_access_service().ensure_storage()
     start_paper_market_scheduler()
     try:
         yield
@@ -98,9 +101,12 @@ def create_app() -> FastAPI:
 
     application.include_router(health.router)
     application.include_router(auth.router)
+    application.include_router(reviewer_access.public_router)
+    application.include_router(reviewer_access.admin_router)
     application.include_router(access_admin.router)
     viewer_required = [Depends(require_trader_session)]
     backtest_access = [Depends(require_backtest_access)]
+    backtest_export_access = [Depends(require_capability("backtest.export"))]
     admin_required = [Depends(require_admin_session)]
     research_access = [Depends(require_trader_access)]
     portfolio_required = [Depends(require_portfolio_session)]
@@ -113,7 +119,7 @@ def create_app() -> FastAPI:
     application.include_router(decision_science_router)
     application.include_router(roc_decision_policy_router)
     application.include_router(temporal_rotation_quality.router)
-    application.include_router(exports.router, dependencies=admin_required)
+    application.include_router(exports.router, dependencies=backtest_export_access)
     application.include_router(analytics.router)
     application.include_router(asset_discovery.router)
     application.include_router(paper_market.router, dependencies=admin_required)
