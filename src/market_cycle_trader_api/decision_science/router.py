@@ -9,9 +9,9 @@ from ..core.runtime import database
 from .service import build_export, history, latest, run_analysis
 
 router = APIRouter(prefix="/api/decision-science", tags=["decision-science"])
-require_view = require_capability("temporal_intelligence.view")
+require_view = require_capability("decision_science.view")
 require_run = require_capability("temporal_intelligence.start")
-require_export = require_capability("temporal_intelligence.export")
+require_export = require_capability("decision_science.export")
 
 
 @router.get("/history")
@@ -40,6 +40,7 @@ def analyze_decision_science(
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
+
 @router.get("/{analysis_id}/export.zip")
 def export_decision_science(
     analysis_id: str,
@@ -54,4 +55,3 @@ def export_decision_science(
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="decision_science_{analysis_id}.zip"'},
     )
-
