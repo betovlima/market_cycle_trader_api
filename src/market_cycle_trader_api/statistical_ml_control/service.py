@@ -19,6 +19,42 @@ from .analysis import build_analysis
 from .config import SCHEMA_VERSION
 
 
+_ZERO_PRESERVING_SETTINGS = frozenset({
+    "downside_penalty",
+    "minimum_cash_edge",
+    "minimum_rotation_edge",
+    "opportunity_conflict_min_percentile",
+    "risk_conflict_max_safety",
+    "action_probability_margin",
+    "random_state",
+    "min_capital_lift",
+    "max_drawdown_degradation",
+    "max_worst_month_degradation",
+})
+
+
+class _ExplicitZero(float):
+    def __new__(cls) -> "_ExplicitZero":
+        return super().__new__(cls, 0.0)
+
+    def __bool__(self) -> bool:
+        return True
+
+
+def _runtime_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    runtime = dict(settings)
+    for name in _ZERO_PRESERVING_SETTINGS:
+        if name not in runtime or runtime[name] is None:
+            continue
+        try:
+            value = float(runtime[name])
+        except (TypeError, ValueError):
+            continue
+        if value == 0.0:
+            runtime[name] = _ExplicitZero()
+    return runtime
+
+
 def _ensure_indexes(db: Any) -> None:
     collection = db[TEMPORAL_STATISTICAL_ML_CONTROL_COLLECTION]
     collection.create_index([("id", ASCENDING)], unique=True, name="uq_statistical_ml_control_id")
@@ -123,7 +159,8 @@ def build_and_persist(
         )
 
     settings_snapshot = temporal_research_settings_snapshot(db)
-    settings = ((settings_snapshot.get("settings") or {}).get("statistical_ml_control") or {})
+    persisted_settings = ((settings_snapshot.get("settings") or {}).get("statistical_ml_control") or {})
+    settings = _runtime_settings(persisted_settings)
     result = build_analysis(
         reference_rows=_winner_reference_rows(db, run_id),
         observation_rows=_observation_rows(db, run_id),
