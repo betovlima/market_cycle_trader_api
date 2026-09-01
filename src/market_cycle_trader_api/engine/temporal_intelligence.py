@@ -111,6 +111,11 @@ def _effective_n_jobs(configured: int) -> int:
     return 1 if int(configured) == 0 else int(configured)
 
 
+def _temporal_timing_overrides_enabled() -> bool:
+    value = str(os.getenv("MCT_TEMPORAL_TIMING_OVERRIDES_ENABLED") or "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def _model_kwargs(config: Any) -> dict[str, Any]:
     settings = _lightgbm_settings(config)
     n_jobs = _effective_n_jobs(int(settings["n_jobs"]))
@@ -2838,6 +2843,7 @@ def _strategy_research_reference_study(
         "action_counts": action_counts,
         "one_side_cost_rate": float(one_side_cost),
         "decision_policy": "strategy_research_temporal_timing" if enable_timing_override else "strategy_research_reference_replay",
+        "timing_overrides_enabled": bool(enable_timing_override),
         "winner_anchor_days": int(anchor_days),
         "winner_anchor_top1_days": int(anchor_top1_days),
         "timing_override_count": int(timing_override_count),
@@ -3127,6 +3133,7 @@ def _winner_anchored_temporal_study(
         "action_counts": action_counts,
         "one_side_cost_rate": float(one_side_cost),
         "decision_policy": "winner_anchored_temporal_timing" if enable_timing_override else "winner_anchor_replay",
+        "timing_overrides_enabled": bool(enable_timing_override),
         "winner_anchor_days": int(anchor_days),
         "winner_anchor_top1_days": int(anchor_top1_days),
         "timing_override_count": int(timing_override_count),
@@ -4085,7 +4092,7 @@ def run_temporal_intelligence(
         multi_horizon_shadow = _strategy_research_reference_study(
             multi_horizon_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
             open_prices, config, include_diagnostics=True, include_economic_curve=True,
-            enable_timing_override=True,
+            enable_timing_override=_temporal_timing_overrides_enabled(),
         ) if not multi_horizon_frame.empty else {}
     else:
         winner_anchor_replay = _winner_anchored_temporal_study(
@@ -4094,7 +4101,7 @@ def run_temporal_intelligence(
         ) if not multi_horizon_frame.empty else {}
         multi_horizon_shadow = _winner_anchored_temporal_study(
             multi_horizon_frame, winner_reference_daily_rows, open_prices, common_dates, config,
-            include_diagnostics=True, include_economic_curve=True, enable_timing_override=True,
+            include_diagnostics=True, include_economic_curve=True, enable_timing_override=_temporal_timing_overrides_enabled(),
         ) if not multi_horizon_frame.empty else {}
 
     reference_parity = None
@@ -4127,7 +4134,7 @@ def run_temporal_intelligence(
         if strategy_research_reference_analytics:
             fold_capital = _strategy_research_reference_study(
                 fold_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
-                open_prices, config, enable_timing_override=True
+                open_prices, config, enable_timing_override=_temporal_timing_overrides_enabled()
             ) if not fold_frame.empty else {}
             fold_anchor = _strategy_research_reference_study(
                 fold_frame, winner_reference_daily_rows, strategy_research_reference_analytics,
@@ -4135,7 +4142,7 @@ def run_temporal_intelligence(
             ) if not fold_frame.empty else {}
         else:
             fold_capital = _winner_anchored_temporal_study(
-                fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=True
+                fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=_temporal_timing_overrides_enabled()
             ) if not fold_frame.empty else {}
             fold_anchor = _winner_anchored_temporal_study(
                 fold_frame, winner_reference_daily_rows, open_prices, common_dates, config, enable_timing_override=False
@@ -4270,6 +4277,7 @@ def run_temporal_intelligence(
         "oos_start": folds[0]["test_start"],
         "oos_end": folds[-1]["test_end"],
         "latest_as_of": common_dates[-1],
+        "timing_overrides_enabled": _temporal_timing_overrides_enabled(),
         "horizon_metrics": horizon_summaries,
         "fold_metrics": fold_summaries,
         "latest_forecasts": latest_forecasts,

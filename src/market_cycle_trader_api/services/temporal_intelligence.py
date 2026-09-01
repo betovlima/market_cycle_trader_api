@@ -53,6 +53,7 @@ from .strategy_lab import (
     update_trader_live_market_cutoff,
 )
 from .system_settings import apply_training_runtime_settings, get_system_settings
+from .temporal_research_settings import temporal_research_settings_snapshot
 
 TEMPORAL_ENGINE_MODULE = "market_cycle_trader_api.engine.temporal_intelligence"
 TEMPORAL_EXPERIMENT = "temporal_decision_intelligence_v8_winner_anchored_timing"
@@ -395,6 +396,7 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         raise TemporalIntelligenceConflict("Wait for the active Model Tuning campaign to finish before starting Temporal Intelligence.")
 
     runtime_settings = get_system_settings(db)
+    temporal_research_snapshot = temporal_research_settings_snapshot(db)
     if not bool(runtime_settings["training"]["enabled"]):
         raise TemporalIntelligenceConflict("Model training is disabled in System Settings.")
 
@@ -473,6 +475,9 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
         "technical_error": None,
         "shadow_only": True,
         "system_settings_revision": int(runtime_settings["revision"]),
+        "temporal_research_settings_revision": int(temporal_research_snapshot["revision"]),
+        "temporal_research_settings_hash": str(temporal_research_snapshot["settings_hash"]),
+        "temporal_research_settings": bson_value(temporal_research_snapshot["settings"]),
         "training_timeout_seconds": int(runtime_settings["training"]["timeout_seconds"]),
     }
     db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].insert_one(deepcopy(document))
@@ -490,10 +495,15 @@ def _run_temporal_process(db: Any, run_id: str) -> None:
     if existing_python_path:
         python_path = python_path + os.pathsep + existing_python_path
     request_payload = run.get("request") if isinstance(run.get("request"), dict) else {}
-    numeric_environment: dict[str, str] = {}
+    temporal_research_settings = run.get("temporal_research_settings") if isinstance(run.get("temporal_research_settings"), dict) else {}
+    temporal_timing_settings = temporal_research_settings.get("temporal_timing") if isinstance(temporal_research_settings.get("temporal_timing"), dict) else {}
+    timing_overrides_enabled = bool(temporal_timing_settings.get("overrides_enabled", True))
+    numeric_environment: dict[str, str] = {
+        "MCT_TEMPORAL_TIMING_OVERRIDES_ENABLED": "1" if timing_overrides_enabled else "0",
+    }
     if bool(request_payload.get("deterministic_execution")):
         numeric_threads = max(1, int(request_payload.get("numeric_thread_limit") or 1))
-        numeric_environment = {key: str(numeric_threads) for key in _NUMERIC_THREAD_ENVIRONMENT_KEYS}
+        numeric_environment.update({key: str(numeric_threads) for key in _NUMERIC_THREAD_ENVIRONMENT_KEYS})
         numeric_environment["MCT_MODEL_THREADS_OVERRIDE"] = str(numeric_threads)
     environment = build_subprocess_environment({
         "PYTHONPATH": python_path,
