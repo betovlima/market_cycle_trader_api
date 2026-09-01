@@ -233,6 +233,8 @@ def build_edge_calibration(
 
         train, fit, validation, test, regime_context = _regime_context_frames(train, fit, validation, test, settings)
         features = OPEN_MODEL_FEATURES if regime_context.get("enabled") else OPEN_FEATURES
+        cash_candidate_seed = 101_000 + test_year
+        rotation_candidate_seed = 201_000 + test_year
 
         cash_grid = [
             _inner_candidate(
@@ -242,10 +244,10 @@ def build_edge_calibration(
                 target="target_cash",
                 edge=edge,
                 settings=settings,
-                seed_offset=101_000 + test_year * 100 + index,
+                seed_offset=cash_candidate_seed,
                 default_threshold=default_cash_threshold,
             )
-            for index, edge in enumerate(cash_candidates)
+            for edge in cash_candidates
         ]
         rotation_grid = [
             _inner_candidate(
@@ -255,10 +257,10 @@ def build_edge_calibration(
                 target="target_rotate",
                 edge=edge,
                 settings=settings,
-                seed_offset=201_000 + test_year * 100 + index,
+                seed_offset=rotation_candidate_seed,
                 default_threshold=default_rotation_threshold,
             )
-            for index, edge in enumerate(rotation_candidates)
+            for edge in rotation_candidates
         ]
         selected_cash = _select_edge(cash_grid, configured_cash_edge)
         selected_rotation = _select_edge(rotation_grid, configured_rotation_edge)
@@ -362,6 +364,7 @@ def build_edge_calibration(
             "selection_scope": "inner chronological validation only",
             "outer_scope": "calendar-year OOS evaluation only",
             "selection_metric_order": ["balanced_accuracy", "auc", "lower_brier", "configured_edge_proximity"],
+            "candidate_seed_policy": "same random seed for every competing edge inside the same target and fold",
             "cash_candidates": cash_candidates,
             "rotation_candidates": rotation_candidates,
             "regime_context_enabled": bool(settings.get("regime_context_enabled", True)),
