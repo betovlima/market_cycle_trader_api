@@ -1,0 +1,31 @@
+name: Clean API validation artifacts
+
+on:
+  push:
+    branches:
+      - feat/10.8.0-temporal-research-simplification
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: ${{ !contains(github.event.head_commit.message, '[validation artifacts cleaned]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/10.8.0-temporal-research-simplification
+          fetch-depth: 0
+      - name: Remove generated Python bytecode
+        run: |
+          find src -type d -name __pycache__ -prune -exec rm -rf {} +
+          find src -type f -name '*.pyc' -delete
+          rm .github/workflows/cleanup-v10-8-validation.yml
+      - name: Commit cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: remove validation bytecode [validation artifacts cleaned]"
+          git push origin HEAD:feat/10.8.0-temporal-research-simplification
