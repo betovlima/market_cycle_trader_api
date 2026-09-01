@@ -301,15 +301,38 @@ def _selected_backend(db: Any, job_id: str) -> str | None:
         {"_id": 0, "results": 1},
     )
     selected = _selected_internal_row(comparison)
-    backend = str((selected or {}).get("backend") or "").strip()
-    if backend:
-        return backend
+    preferred = str((selected or {}).get("backend") or "").strip()
     run = db[RUNS_COLLECTION].find_one(
         {"job_id": job_id, "symbol": "PORTFOLIO"},
         {"_id": 0, "backend": 1},
     )
     fallback = str((run or {}).get("backend") or "").strip()
-    return fallback or None
+
+    candidates: list[str] = []
+    for candidate in (preferred, fallback):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in db[PREDICTIONS_COLLECTION].distinct(
+        "backend", {"job_id": job_id, "symbol": "PORTFOLIO"}
+    ):
+        value = str(candidate or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    for candidate in candidates:
+        valid_sessions = db[PREDICTIONS_COLLECTION].count_documents(
+            {
+                "job_id": job_id,
+                "symbol": "PORTFOLIO",
+                "backend": candidate,
+                "timestamp": {"$exists": True, "$ne": None},
+                "strategy_equity": {"$type": "number"},
+            },
+            limit=2,
+        )
+        if int(valid_sessions or 0) >= 2:
+            return candidate
+    return preferred or fallback or (candidates[0] if candidates else None)
 
 
 def _sorted_rows(rows: Iterable[dict[str, Any]], key: str) -> list[dict[str, Any]]:

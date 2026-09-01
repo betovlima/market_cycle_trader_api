@@ -303,6 +303,105 @@ def _research_processing_context(db: Any, strategy: dict[str, Any]) -> tuple[str
     return processing_id, ("backtest" if processing_id else None), ("Simulation Backtest" if processing_id else None), None
 
 
+def _valid_reference_equity_session(row: Any) -> bool:
+    if not isinstance(row, dict) or not str(row.get("timestamp") or "").strip():
+        return False
+    try:
+        value = float(row.get("simulation_equity"))
+    except (TypeError, ValueError):
+        return False
+    return value == value and value not in {float("inf"), float("-inf")}
+
+
+def _validate_strategy_research_reference_replay(
+    db: Any,
+    *,
+    strategy: dict[str, Any],
+    processing_id: str | None,
+    processing_kind: str | None,
+) -> dict[str, Any]:
+    processing_key = str(processing_id or "").strip()
+    kind = str(processing_kind or "").strip()
+    strategy_kind = str(strategy.get("strategy_kind") or "standard").strip() or "standard"
+    strategy_name = str(strategy.get("name") or strategy.get("strategy_profile_name") or strategy.get("id") or "Strategy Research")
+    expected_strategy_id = str(strategy.get("id") or strategy.get("strategy_profile_id") or "").strip()
+    expected_revision = int(strategy.get("revision") or strategy.get("strategy_profile_revision") or 1)
+    expected_hash = str(strategy.get("configuration_hash") or strategy.get("strategy_configuration_hash") or "").strip()
+
+    if not processing_key:
+        if strategy_kind == "standard":
+            raise TemporalIntelligenceConflict(
+                f"Reference Replay is unavailable for {strategy_name} revision {expected_revision}. "
+                "Run a completed Simulation Backtest for this exact Strategy revision before starting Temporal Intelligence."
+            )
+        raise TemporalIntelligenceConflict(
+            f"Reference Replay binding is unavailable for {strategy_name} revision {expected_revision}."
+        )
+
+    from .analytics import processing_analytics
+    try:
+        analytics = processing_analytics(db, processing_key)
+    except HTTPException as exc:
+        detail = str(getattr(exc, "detail", None) or exc)
+        raise TemporalIntelligenceConflict(f"Reference Replay {processing_key} is unavailable: {detail}") from exc
+    except Exception as exc:
+        raise TemporalIntelligenceConflict(f"Reference Replay {processing_key} could not be loaded: {exc}") from exc
+
+    actual_strategy_id = str(analytics.get("strategy_profile_id") or "").strip()
+    actual_revision = int(analytics.get("strategy_profile_revision") or 1)
+    actual_hash = str(analytics.get("strategy_configuration_hash") or "").strip()
+
+    if kind == "backtest":
+        source = db[JOBS_COLLECTION].find_one(
+            {"id": processing_key},
+            {
+                "_id": 0,
+                "status": 1,
+                "strategy_profile_id": 1,
+                "strategy_profile_revision": 1,
+                "strategy_configuration_hash": 1,
+            },
+        )
+        if source is None:
+            raise TemporalIntelligenceConflict(f"Reference Replay {processing_key} Simulation Backtest was not found.")
+        if str(source.get("status") or "").lower() != "completed":
+            raise TemporalIntelligenceConflict(f"Reference Replay {processing_key} Simulation Backtest is not completed.")
+        actual_strategy_id = str(source.get("strategy_profile_id") or "").strip()
+        actual_revision = int(source.get("strategy_profile_revision") or 1)
+        actual_hash = str(source.get("strategy_configuration_hash") or "").strip()
+
+    if expected_strategy_id and actual_strategy_id != expected_strategy_id:
+        raise TemporalIntelligenceConflict(
+            f"Reference Replay {processing_key} belongs to Strategy {actual_strategy_id or 'unknown'}, "
+            f"but {expected_strategy_id} was requested."
+        )
+    if actual_revision != expected_revision:
+        raise TemporalIntelligenceConflict(
+            f"Reference Replay {processing_key} belongs to Strategy revision {actual_revision}, "
+            f"but revision {expected_revision} was requested."
+        )
+    if expected_hash and actual_hash != expected_hash:
+        raise TemporalIntelligenceConflict(
+            f"Reference Replay {processing_key} does not match the frozen Strategy configuration hash."
+        )
+
+    valid_equity_sessions = sum(
+        1 for row in (analytics.get("equity") or []) if _valid_reference_equity_session(row)
+    )
+    if valid_equity_sessions < 2:
+        raise TemporalIntelligenceConflict(
+            f"Reference Replay {processing_key} is incomplete for {strategy_name} revision {expected_revision}: "
+            f"found {valid_equity_sessions} valid equity sessions; at least 2 are required. "
+            "Run a new Simulation Backtest for this exact Strategy revision before starting Temporal Intelligence."
+        )
+
+    return {
+        "processing_id": processing_key,
+        "processing_kind": kind or str(analytics.get("processing_kind") or ""),
+        "valid_equity_sessions": valid_equity_sessions,
+    }
+
+
 def _strategy_research_run_is_protected(db: Any, run_id: str) -> bool:
     return db[STRATEGY_PROFILES_COLLECTION].find_one(
         {"source_temporal_run_id": str(run_id)},
@@ -403,6 +502,12 @@ def start_temporal_intelligence(db: Any, *, actor_email: str | None, start_threa
     try:
         request, strategy, model_snapshot, market_context = _build_execution_request(db)
         research_processing_id, research_processing_kind, research_processing_label, stateful_reference_bundle = _research_processing_context(db, strategy)
+        _validate_strategy_research_reference_replay(
+            db,
+            strategy=strategy,
+            processing_id=research_processing_id,
+            processing_kind=research_processing_kind,
+        )
         snapshot_id, source_run_id = _stable_temporal_market_snapshot(
             db,
             strategy_configuration_hash=str(strategy.get("configuration_hash") or ""),
@@ -2504,6 +2609,18 @@ def control_strategy_research_pipeline(
             raise TemporalIntelligenceConflict("Strategy Research end_month must be greater than or equal to start_month.")
         stage_states = _default_strategy_research_stage_states()
         stage_progress = {}
+        _validate_strategy_research_reference_replay(
+            db,
+            strategy={
+                "id": document.get("strategy_profile_id"),
+                "name": document.get("strategy_profile_name"),
+                "revision": document.get("strategy_profile_revision"),
+                "configuration_hash": document.get("strategy_configuration_hash"),
+                "strategy_kind": document.get("strategy_kind") or "standard",
+            },
+            processing_id=document.get("research_processing_id"),
+            processing_kind=document.get("research_processing_kind"),
+        )
         stage_states["reference"] = "completed"
         temporal_status = str(document.get("status") or "").lower()
         if temporal_status == "completed":
