@@ -21,8 +21,12 @@ from ..schemas.temporal_research_settings import (
 )
 
 SETTINGS_ID = "winner-transition"
-SETTINGS_SCHEMA_VERSION = 8
+SETTINGS_SCHEMA_VERSION = 9
 PARAMETERIZATION_FILE = "003_temporal_winner_transition_research.json"
+_DEPRECATED_ASSET_STATE_CLUSTERING_FIELDS = frozenset({
+    "refit_interval_sessions",
+    "cluster_selection_interval_sessions",
+})
 
 
 class TemporalResearchSettingsConflict(RuntimeError):
@@ -42,6 +46,34 @@ def _validated_settings(raw: Any) -> dict[str, Any]:
 def _settings_hash(settings: dict[str, Any]) -> str:
     payload = json.dumps(settings, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _migrate_legacy_settings_document(db: Any, document: dict[str, Any], *, now: Any) -> dict[str, Any]:
+    asset_state = dict(document.get("asset_state_clustering") or {})
+    deprecated = sorted(
+        name for name in _DEPRECATED_ASSET_STATE_CLUSTERING_FIELDS if name in asset_state
+    )
+    if not deprecated:
+        return document
+
+    for name in deprecated:
+        asset_state.pop(name, None)
+    db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].update_one(
+        {"_id": SETTINGS_ID},
+        {
+            "$unset": {f"asset_state_clustering.{name}": "" for name in deprecated},
+            "$set": {
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "updated_at": now,
+            },
+        },
+    )
+    return {
+        **document,
+        "asset_state_clustering": asset_state,
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "updated_at": now,
+    }
 
 
 def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
@@ -67,6 +99,7 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
     document = db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].find_one({"_id": SETTINGS_ID})
     if document is None:
         raise RuntimeError("Temporal research settings could not be initialized.")
+    document = _migrate_legacy_settings_document(db, document, now=now)
     raw_settings = {
         "risk": {**(seed.get("risk") or {}), **(document.get("risk") or {})},
         "confidence": {**(seed.get("confidence") or {}), **(document.get("confidence") or {})},
@@ -75,12 +108,18 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
     }
     settings = _validated_settings(raw_settings)
     expected_hash = _settings_hash(settings)
-    if raw_settings != settings or document.get("settings_hash") != expected_hash:
+    if raw_settings != settings or document.get("settings_hash") != expected_hash or int(document.get("schema_version") or 0) != SETTINGS_SCHEMA_VERSION:
         db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].update_one(
             {"_id": SETTINGS_ID},
             {"$set": {**settings, "schema_version": SETTINGS_SCHEMA_VERSION, "settings_hash": expected_hash, "updated_at": now}},
         )
-        document = {**document, **settings, "settings_hash": expected_hash, "updated_at": now}
+        document = {
+            **document,
+            **settings,
+            "schema_version": SETTINGS_SCHEMA_VERSION,
+            "settings_hash": expected_hash,
+            "updated_at": now,
+        }
     return document
 
 
@@ -130,6 +169,7 @@ def update_temporal_research_settings(
         {
             "$set": {
                 **settings,
+                "schema_version": SETTINGS_SCHEMA_VERSION,
                 "settings_hash": _settings_hash(settings),
                 "updated_at": now,
                 "updated_by": actor,
