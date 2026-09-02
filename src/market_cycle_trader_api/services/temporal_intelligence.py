@@ -2378,12 +2378,8 @@ def _run_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
 
 
 def _start_strategy_research_pipeline_worker(db: Any, run_id: str) -> None:
-    run_key = str(run_id)
-    with _ACTIVE_PIPELINE_LOCK:
-        if run_key in _ACTIVE_PIPELINE_WORKERS:
-            return
-        _ACTIVE_PIPELINE_WORKERS.add(run_key)
-    threading.Thread(target=_run_strategy_research_pipeline_worker, args=(db, run_key), daemon=True).start()
+    del db, run_id
+    return
 
 
 def _reconcile_detached_strategy_research_pipeline(
@@ -2688,6 +2684,8 @@ def control_strategy_research_pipeline(
     end_month: str | None = None,
     message: str | None = None,
 ) -> dict[str, Any]:
+    if action in {"start", "resume"}:
+        raise TemporalIntelligenceConflict("Strategy Research pipeline has been retired.")
     document = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find_one({"id": str(run_id)})
     if document is None:
         raise TemporalIntelligenceNotFound("Temporal Intelligence run not found.")
@@ -2992,15 +2990,20 @@ def recover_temporal_intelligence_runs(db: Any) -> int:
             }
         },
     )
-    resumable = db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].find(
+    db[TEMPORAL_INTELLIGENCE_RUNS_COLLECTION].update_many(
         {
-            "status": "completed",
-            "strategy_research_pipeline.status": "running",
+            "strategy_research_pipeline.status": {
+                "$in": ["running", "pause_requested", "paused", "stop_requested"]
+            },
         },
-        {"_id": 0, "id": 1},
+        {
+            "$set": {
+                "strategy_research_pipeline.status": "stopped",
+                "strategy_research_pipeline.current_stage": None,
+                "strategy_research_pipeline.failure_message": None,
+                "strategy_research_pipeline.updated_at": now,
+                "updated_at": now,
+            }
+        },
     )
-    for item in resumable:
-        run_id = str(item.get("id") or "").strip()
-        if run_id:
-            _start_strategy_research_pipeline_worker(db, run_id)
     return int(getattr(result, "modified_count", 0) or 0)
