@@ -21,7 +21,7 @@ from ..schemas.temporal_research_settings import (
 )
 
 SETTINGS_ID = "winner-transition"
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 10
 PARAMETERIZATION_FILE = "003_temporal_winner_transition_research.json"
 
 
@@ -54,10 +54,6 @@ def _settings_from_document(document: dict[str, Any], seed: dict[str, Any] | Non
             **(document.get("statistical_ml_control") or {}),
         },
         "temporal_timing": {**(defaults.get("temporal_timing") or {}), **(document.get("temporal_timing") or {})},
-        "asset_state_clustering": {
-            **(defaults.get("asset_state_clustering") or {}),
-            **(document.get("asset_state_clustering") or {}),
-        },
     })
 
 
@@ -89,14 +85,19 @@ def ensure_temporal_research_settings(db: Any) -> dict[str, Any]:
     needs_upgrade = (
         int(document.get("schema_version") or 0) != SETTINGS_SCHEMA_VERSION
         or document.get("settings_hash") != expected_hash
+        or "asset_state_clustering" in document
         or any(document.get(group) != settings[group] for group in settings)
     )
     if needs_upgrade:
         db[TEMPORAL_RESEARCH_SETTINGS_COLLECTION].update_one(
             {"_id": SETTINGS_ID},
-            {"$set": {**settings, "schema_version": SETTINGS_SCHEMA_VERSION, "settings_hash": expected_hash, "updated_at": now}},
+            {
+                "$set": {**settings, "schema_version": SETTINGS_SCHEMA_VERSION, "settings_hash": expected_hash, "updated_at": now},
+                "$unset": {"asset_state_clustering": ""},
+            },
         )
         document = {**document, **settings, "schema_version": SETTINGS_SCHEMA_VERSION, "settings_hash": expected_hash, "updated_at": now}
+        document.pop("asset_state_clustering", None)
     return document
 
 
