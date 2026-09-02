@@ -2396,6 +2396,35 @@ def _reconcile_detached_strategy_research_pipeline(
     current_stage = state.get("current_stage")
     temporal_status = str(document.get("status") or "").lower()
 
+    failure_message = str(state.get("failure_message") or "").strip()
+    obsolete_asset_state_failure = (
+        pipeline_status == "failed"
+        and temporal_status == "completed"
+        and "asset state clustering" in failure_message.lower()
+    )
+    if obsolete_asset_state_failure:
+        stage_states = dict(state.get("stage_states") or _default_strategy_research_stage_states())
+        stage_progress = dict(state.get("stage_progress") or {})
+        stage_states["reference"] = "completed"
+        stage_states["temporal"] = "completed"
+        if stage_states.get("statistical_ml_control") == "failed":
+            stage_states["statistical_ml_control"] = "waiting"
+            stage_progress.pop("statistical_ml_control", None)
+        repaired = _persist_strategy_research_pipeline_state(
+            db,
+            run_id,
+            {
+                **state,
+                "status": "running",
+                "current_stage": None,
+                "stage_states": stage_states,
+                "stage_progress": stage_progress,
+                "failure_message": None,
+            },
+        )
+        _start_strategy_research_pipeline_worker(db, run_id)
+        return repaired
+
     if pipeline_status == "paused" and temporal_status == "completed":
         stage_states = dict(state.get("stage_states") or _default_strategy_research_stage_states())
         if stage_states.get("reference") == "waiting":
