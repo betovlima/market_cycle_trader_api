@@ -8,10 +8,6 @@ from .core.environment import load_project_environment
 
 load_project_environment()
 
-from .services.strategy_research_asset_state_stage import install_strategy_research_asset_state_stage
-
-install_strategy_research_asset_state_stage()
-
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
