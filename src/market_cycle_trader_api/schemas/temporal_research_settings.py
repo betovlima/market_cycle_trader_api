@@ -180,7 +180,6 @@ class TemporalWinnerTransitionResearchSettings(BaseModel):
     confidence: WinnerTransitionConfidenceSettings
     statistical_ml_control: StatisticalMlControlSettings
     temporal_timing: TemporalTimingSettings
-    asset_state_clustering: AssetStateClusteringSettings
 
 
 class TemporalResearchSettingsPatch(BaseModel):
@@ -190,7 +189,6 @@ class TemporalResearchSettingsPatch(BaseModel):
     confidence: WinnerTransitionConfidenceSettings | None = None
     statistical_ml_control: StatisticalMlControlSettings | None = None
     temporal_timing: TemporalTimingSettings | None = None
-    asset_state_clustering: AssetStateClusteringSettings | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> "TemporalResearchSettingsPatch":
@@ -199,7 +197,6 @@ class TemporalResearchSettingsPatch(BaseModel):
             and self.confidence is None
             and self.statistical_ml_control is None
             and self.temporal_timing is None
-            and self.asset_state_clustering is None
         ):
             raise ValueError("At least one temporal research settings group is required.")
         return self

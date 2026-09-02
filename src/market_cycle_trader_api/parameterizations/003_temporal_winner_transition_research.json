@@ -1,26 +1,51 @@
 {
   "risk": {
     "severe_threshold": -0.05,
-    "risk_quantiles": [0.7, 0.75, 0.8, 0.85, 0.9],
+    "risk_quantiles": [
+      0.7,
+      0.75,
+      0.8,
+      0.85,
+      0.9
+    ],
     "default_risk_quantile": 0.75,
     "min_outer_train_rows": 50,
     "min_inner_train_rows": 24,
     "min_train_severe": 3
   },
   "confidence": {
-    "margin_quantiles": [0.0, 0.25, 0.5, 0.75],
+    "margin_quantiles": [
+      0.0,
+      0.25,
+      0.5,
+      0.75
+    ],
     "min_alerts": 4
   },
   "statistical_ml_control": {
     "lookback_sessions": 60,
     "minimum_history_sessions": 30,
-    "horizons_sessions": [1, 3, 5],
-    "horizon_weights": {"1": 0.45, "3": 0.35, "5": 0.2},
+    "horizons_sessions": [
+      1,
+      3,
+      5
+    ],
+    "horizon_weights": {
+      "1": 0.45,
+      "3": 0.35,
+      "5": 0.2
+    },
     "downside_penalty": 0.5,
     "minimum_cash_edge": 0.005,
     "min_train_rows": 250,
     "inner_validation_share": 0.2,
-    "probability_threshold_candidates": [0.55, 0.6, 0.65, 0.7, 0.75],
+    "probability_threshold_candidates": [
+      0.55,
+      0.6,
+      0.65,
+      0.7,
+      0.75
+    ],
     "default_probability_threshold": 0.65,
     "n_estimators": 320,
     "max_depth": 5,
@@ -60,43 +85,5 @@
   },
   "temporal_timing": {
     "overrides_enabled": true
-  },
-  "asset_state_clustering": {
-    "enabled": false,
-    "feature_names": [
-      "entry_rank_score",
-      "risk_adjusted_asset_rank_score",
-      "entry_rank_percentile",
-      "opportunity_gate_score",
-      "risk_adjusted_entry_score",
-      "entry_risk_multiplier",
-      "hold_score",
-      "incumbent_persistence_score",
-      "incumbent_risk_health",
-      "short_profit_consensus",
-      "short_risk_safety",
-      "short_horizon_agreement",
-      "long_profit_confirmation",
-      "long_risk_safety",
-      "cross_horizon_agreement",
-      "all_horizon_risk_safety",
-      "predicted_drawdown",
-      "entry_separation_strength",
-      "entry_top_gap_strength",
-      "asset_return_1d",
-      "asset_return_5d",
-      "asset_volatility_10d"
-    ],
-    "min_history_rows": 120,
-    "min_clusters": 2,
-    "max_clusters": 6,
-    "silhouette_sample_rows": 120,
-    "map_sample_rows": 120,
-    "novelty_quantile": 0.99,
-    "profile_horizon_sessions": 5,
-    "severe_loss_threshold": -0.05,
-    "kmeans_n_init": 5,
-    "parallel_workers": 2,
-    "random_state": 42
   }
 }

@@ -159,7 +159,7 @@ def public_temporal_run(document: dict[str, Any] | None, *, include_result: bool
         "materialized_strategy_name": document.get("materialized_strategy_name"),
         "materialized_strategy_at": bson_value(document.get("materialized_strategy_at")),
         "shadow_only": True,
-        "strategy_research_pipeline": bson_value(document.get("strategy_research_pipeline")) if isinstance(document.get("strategy_research_pipeline"), dict) else None,
+        "strategy_research_pipeline": bson_value(_strategy_research_pipeline_state(document)) if isinstance(document.get("strategy_research_pipeline"), dict) else None,
         **({"result": bson_value(_public_temporal_result(result)) if result is not None else None} if include_result else {}),
     }
 
@@ -1858,11 +1858,21 @@ def _persist_strategy_research_pipeline_state(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     now = utc_now()
+    normalized_stage_states = _default_strategy_research_stage_states()
+    for stage, value in dict(state.get("stage_states") or {}).items():
+        if stage in normalized_stage_states and str(value) in STRATEGY_RESEARCH_PIPELINE_STAGE_STATES:
+            normalized_stage_states[stage] = str(value)
+    normalized_stage_progress = {
+        stage: value
+        for stage, value in dict(state.get("stage_progress") or {}).items()
+        if stage in normalized_stage_states
+    }
+    requested_stage = str(state.get("current_stage") or "").strip() or None
     update = {
         "status": state.get("status") or "idle",
-        "current_stage": state.get("current_stage"),
-        "stage_states": dict(state.get("stage_states") or _default_strategy_research_stage_states()),
-        "stage_progress": dict(state.get("stage_progress") or {}),
+        "current_stage": requested_stage if requested_stage in normalized_stage_states else None,
+        "stage_states": normalized_stage_states,
+        "stage_progress": normalized_stage_progress,
         "start_month": state.get("start_month"),
         "end_month": state.get("end_month"),
         "failure_message": state.get("failure_message"),
@@ -2741,7 +2751,7 @@ def request_strategy_research_pipeline_stop(db: Any, run_id: str) -> dict[str, A
         if stage_states.get("reference") == "waiting":
             stage_states["reference"] = "completed"
         stage_states["temporal"] = "running"
-        for stage in ("asset_state_clustering", "statistical_ml_control", "roc_policy", "clustering", "fragile_incumbent", "emerging_trend", "risk", "confidence", "stateful", "milp", "validation"):
+        for stage in STRATEGY_RESEARCH_PIPELINE_STAGES[2:]:
             stage_states[stage] = "waiting"
         repaired = _persist_strategy_research_pipeline_state(
             db,
