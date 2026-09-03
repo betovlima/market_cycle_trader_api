@@ -1,100 +1,10 @@
-name: Apply API v10.9.1 backtest mark-to-market
+name: API v10.9.1 patch workflow disabled
 
 on:
-  push:
-    branches:
-      - fix/10.9.1-backtest-mark-to-market
-
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
-  apply:
-    if: github.actor != 'github-actions[bot]'
+  disabled:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Remove forced final liquidation and bump version
-        shell: python
-        run: |
-          from pathlib import Path
-          import re
-
-          path = Path('src/market_cycle_trader_api/engine/capital_rotation.py')
-          text = path.read_text(encoding='utf-8')
-
-          allocation_pattern = re.compile(
-              r'\n    final_date = pd\.Timestamp\(execution_dates\[-1\]\)\n'
-              r'    if any\(float\(shares\[symbol\]\) > 0 for symbol in symbols\):\n'
-              r'.*?'
-              r'\n    predictions = pd\.DataFrame\(prediction_rows\)\.set_index\("timestamp"\)',
-              re.S,
-          )
-          text, allocation_count = allocation_pattern.subn(
-              '\n    predictions = pd.DataFrame(prediction_rows).set_index("timestamp")',
-              text,
-              count=1,
-          )
-
-          single_position_pattern = re.compile(
-              r'\n    if position > 0 and prediction_rows:\n'
-              r'.*?'
-              r'\n    records = enrich_trade_diagnostics\(records, frames, symbols\)',
-              re.S,
-          )
-          text, single_count = single_position_pattern.subn(
-              '\n    records = enrich_trade_diagnostics(records, frames, symbols)',
-              text,
-              count=1,
-          )
-
-          if allocation_count != 1 or single_count != 1:
-              raise SystemExit(
-                  f'Expected one final-liquidation block in each backtest path; '
-                  f'found allocation={allocation_count}, single={single_count}.'
-              )
-
-          text = text.replace("f'Sells including final liquidation: {sells}'", "f'Sells: {sells}'")
-          text = text.replace(
-              "'- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'",
-              "'- Open positions remain open at the end of the backtest and are marked to market.'",
-          )
-          if 'FINAL_LIQUIDATION' in text:
-              raise SystemExit('FINAL_LIQUIDATION still exists in capital_rotation.py after patch.')
-
-          path.write_text(text, encoding='utf-8')
-
-          pyproject = Path('pyproject.toml')
-          pyproject_text = pyproject.read_text(encoding='utf-8')
-          if 'version = "10.9.0"' not in pyproject_text:
-              raise SystemExit('Expected pyproject version 10.9.0.')
-          pyproject.write_text(pyproject_text.replace('version = "10.9.0"', 'version = "10.9.1"', 1), encoding='utf-8')
-
-          config = Path('src/market_cycle_trader_api/core/config.py')
-          config_text = config.read_text(encoding='utf-8')
-          if 'API_VERSION = "10.9.0"' not in config_text:
-              raise SystemExit('Expected API_VERSION 10.9.0.')
-          config.write_text(config_text.replace('API_VERSION = "10.9.0"', 'API_VERSION = "10.9.1"', 1), encoding='utf-8')
-      - name: Validate source
-        run: |
-          python -m compileall -q src
-          python - <<'PY'
-          from pathlib import Path
-          source = Path('src/market_cycle_trader_api/engine/capital_rotation.py').read_text(encoding='utf-8')
-          assert 'FINAL_LIQUIDATION' not in source
-          assert 'Open positions remain open at the end of the backtest and are marked to market.' in source
-          assert 'API_VERSION = "10.9.1"' in Path('src/market_cycle_trader_api/core/config.py').read_text(encoding='utf-8')
-          assert 'version = "10.9.1"' in Path('pyproject.toml').read_text(encoding='utf-8')
-          PY
-      - name: Commit API v10.9.1
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml src/market_cycle_trader_api/core/config.py src/market_cycle_trader_api/engine/capital_rotation.py
-          git commit -m "fix: keep open positions marked to market at backtest end [API v10.9.1]"
-          git push
+      - run: echo "One-shot patch already applied; workflow intentionally disabled."
