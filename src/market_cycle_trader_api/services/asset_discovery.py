@@ -2137,7 +2137,11 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 )
                 return
 
-        ranked = _rank_all_results(evaluated)
+        ranked = [
+            item
+            for item in _rank_all_results(evaluated)
+            if str(item.get("symbol") or "").strip().upper() not in baseline_symbols
+        ]
         for item in ranked:
             selection = dict(item.get("discovery_selection") or {})
             selection["rank"] = item.get("rank")
@@ -2284,6 +2288,42 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
         }
     except Exception:
         selected_baseline = None
+
+    campaign_public = _public(document)
+    if isinstance(campaign_public, dict):
+        excluded_assets = {
+            str(item).strip().upper()
+            for item in ((selected_baseline or {}).get("assets") or [])
+            if str(item).strip()
+        }
+        campaign_baseline = campaign_public.get("baseline") if isinstance(campaign_public.get("baseline"), dict) else {}
+        excluded_assets.update(
+            str(item).strip().upper()
+            for item in (campaign_baseline.get("assets") or [])
+            if str(item).strip()
+        )
+
+        def external_candidate(item: Any) -> bool:
+            if not isinstance(item, dict):
+                return False
+            symbol = str(item.get("symbol") or "").strip().upper()
+            return bool(symbol) and symbol not in excluded_assets
+
+        campaign_public["results"] = [
+            item for item in (campaign_public.get("results") or []) if external_candidate(item)
+        ]
+        campaign_public["shortlisted_count"] = len(campaign_public["results"])
+        marginal = campaign_public.get("marginal_replay") if isinstance(campaign_public.get("marginal_replay"), dict) else None
+        if marginal is not None:
+            marginal = dict(marginal)
+            marginal["results"] = [
+                item for item in (marginal.get("results") or []) if external_candidate(item)
+            ]
+            marginal["persistent_candidate_count"] = sum(
+                1 for item in marginal["results"] if _marginal_replay_is_persistent_candidate(item)
+            )
+            campaign_public["marginal_replay"] = marginal
+
     return {
         "api_version": API_VERSION,
         "mode": "manual",
@@ -2311,7 +2351,7 @@ def get_asset_discovery_status(db: Database) -> dict[str, Any]:
             "continuous_history_required": True,
             "rejected_candidate_details_persisted": False,
         },
-        "campaign": _public(document),
+        "campaign": campaign_public,
     }
 
 
@@ -2817,9 +2857,14 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
         source_config = BacktestRequest.model_validate(source_raw.get("configuration") or {})
         source_assets = [str(item).strip().upper() for item in source_config.assets]
         source_asset_set = set(source_assets)
+        already_present = [symbol for symbol in selected_symbols if symbol in source_asset_set]
+        if already_present:
+            raise AssetDiscoveryConflict(
+                "Assets already present in the current Strategy Research source cannot be selected again: "
+                + ", ".join(already_present)
+                + "."
+            )
         added_symbols = [symbol for symbol in selected_symbols if symbol not in source_asset_set]
-        if not added_symbols:
-            raise AssetDiscoveryConflict("The selected assets are already present in the current Strategy Research source.")
 
         snapshot_end = str(validation.get("snapshot_end") or "").strip()
         if not snapshot_end:
@@ -3026,9 +3071,15 @@ def start_full_strategy_validation(
         source_raw, source_config = _current_research_source(db)
         source_id = str(source_raw.get("_id") or "")
         source_assets = [str(item).strip().upper() for item in source_config.assets]
-        added_symbols = [symbol for symbol in requested_symbols if symbol not in set(source_assets)]
-        if not added_symbols:
-            raise AssetDiscoveryConflict("The selected assets are already present in the current Strategy Research source.")
+        source_asset_set = set(source_assets)
+        already_present = [symbol for symbol in requested_symbols if symbol in source_asset_set]
+        if already_present:
+            raise AssetDiscoveryConflict(
+                "Assets already present in the current Strategy Research source cannot be selected again: "
+                + ", ".join(already_present)
+                + "."
+            )
+        added_symbols = [symbol for symbol in requested_symbols if symbol not in source_asset_set]
 
         source_model_snapshot = get_strategy_model_snapshot(db, source_id)
         baseline = document.get("baseline") if isinstance(document.get("baseline"), dict) else {}
