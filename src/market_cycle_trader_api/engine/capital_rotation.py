@@ -408,17 +408,6 @@ def _model_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], sy
             values.append(float('-inf'))
             continue
 
-        location = frame.index.get_loc(timestamp)
-        if not isinstance(location, (int, np.integer)) or location + 1 >= len(frame.index):
-            values.append(float('-inf'))
-            continue
-        next_row = frame.iloc[int(location) + 1]
-        next_open = float(next_row.get('open', float('nan')))
-        next_close = float(next_row.get('close', float('nan')))
-        if not (np.isfinite(next_open) and next_open > 0 and np.isfinite(next_close) and next_close > 0):
-            values.append(float('-inf'))
-            continue
-
         prediction = float(model.predict(row)[0])
         values.append(prediction)
     return np.asarray(values, dtype=np.float64)
