@@ -1,0 +1,68 @@
+name: Apply API v10.9.2 remove next-session lookahead
+
+on:
+  push:
+    branches:
+      - fix/10.9.2-remove-next-session-availability-lookahead
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Remove next-session availability lookahead and bump version
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('src/market_cycle_trader_api/engine/capital_rotation.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        location = frame.index.get_loc(timestamp)\n        if not isinstance(location, (int, np.integer)) or location + 1 >= len(frame.index):\n            values.append(float('-inf'))\n            continue\n        next_row = frame.iloc[int(location) + 1]\n        next_open = float(next_row.get('open', float('nan')))\n        next_close = float(next_row.get('close', float('nan')))\n        if not (np.isfinite(next_open) and next_open > 0 and np.isfinite(next_close) and next_close > 0):\n            values.append(float('-inf'))\n            continue\n\n'''
+          if old not in text:
+              raise SystemExit('Expected next-session availability block was not found in _model_utilities.')
+          text = text.replace(old, '', 1)
+          path.write_text(text, encoding='utf-8')
+
+          pyproject = Path('pyproject.toml')
+          pyproject_text = pyproject.read_text(encoding='utf-8')
+          if 'version = "10.9.1"' not in pyproject_text:
+              raise SystemExit('Expected pyproject version 10.9.1.')
+          pyproject.write_text(pyproject_text.replace('version = "10.9.1"', 'version = "10.9.2"', 1), encoding='utf-8')
+
+          config = Path('src/market_cycle_trader_api/core/config.py')
+          config_text = config.read_text(encoding='utf-8')
+          if 'API_VERSION = "10.9.1"' not in config_text:
+              raise SystemExit('Expected API_VERSION 10.9.1.')
+          config.write_text(config_text.replace('API_VERSION = "10.9.1"', 'API_VERSION = "10.9.2"', 1), encoding='utf-8')
+      - name: Validate source
+        run: |
+          python -m compileall -q src
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('src/market_cycle_trader_api/engine/capital_rotation.py').read_text(encoding='utf-8')
+          start = source.index('def _model_utilities(')
+          end = source.index('\ndef _utility_policy(', start)
+          block = source[start:end]
+          assert "next_row = frame.iloc[int(location) + 1]" not in block
+          assert "next_open" not in block
+          assert "next_close" not in block
+          assert 'model.predict(row)' in block
+          assert 'API_VERSION = "10.9.2"' in Path('src/market_cycle_trader_api/core/config.py').read_text(encoding='utf-8')
+          assert 'version = "10.9.2"' in Path('pyproject.toml').read_text(encoding='utf-8')
+          PY
+      - name: Commit API v10.9.2
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml src/market_cycle_trader_api/core/config.py src/market_cycle_trader_api/engine/capital_rotation.py
+          git commit -m "fix: remove next-session availability lookahead from backtest policy [API v10.9.2]"
+          git push
