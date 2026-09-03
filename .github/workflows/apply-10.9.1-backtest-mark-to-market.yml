@@ -58,6 +58,12 @@ jobs:
                   f'Expected one final-liquidation block in each backtest path; '
                   f'found allocation={allocation_count}, single={single_count}.'
               )
+
+          text = text.replace("f'Sells including final liquidation: {sells}'", "f'Sells: {sells}'")
+          text = text.replace(
+              "'- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'",
+              "'- Open positions remain open at the end of the backtest and are marked to market.'",
+          )
           if 'FINAL_LIQUIDATION' in text:
               raise SystemExit('FINAL_LIQUIDATION still exists in capital_rotation.py after patch.')
 
@@ -81,7 +87,7 @@ jobs:
           from pathlib import Path
           source = Path('src/market_cycle_trader_api/engine/capital_rotation.py').read_text(encoding='utf-8')
           assert 'FINAL_LIQUIDATION' not in source
-          assert 'FINAL_SELL' in source  # historical/export compatibility remains supported
+          assert 'Open positions remain open at the end of the backtest and are marked to market.' in source
           assert 'API_VERSION = "10.9.1"' in Path('src/market_cycle_trader_api/core/config.py').read_text(encoding='utf-8')
           assert 'version = "10.9.1"' in Path('pyproject.toml').read_text(encoding='utf-8')
           PY
