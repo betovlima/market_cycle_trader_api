@@ -1,0 +1,87 @@
+name: Apply API v10.9.3 Asset Discovery base exclusion
+
+on:
+  push:
+    branches:
+      - fix/10.9.3-asset-discovery-exclude-base-assets
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Exclude base Strategy assets from Discovery candidates
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('src/market_cycle_trader_api/services/asset_discovery.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_rank = """        ranked = _rank_all_results(evaluated)\n"""
+          new_rank = """        ranked = [\n            item\n            for item in _rank_all_results(evaluated)\n            if str(item.get(\"symbol\") or \"\").strip().upper() not in baseline_symbols\n        ]\n"""
+          if text.count(old_rank) != 1:
+              raise SystemExit(f'Expected one ranking assignment, found {text.count(old_rank)}.')
+          text = text.replace(old_rank, new_rank, 1)
+
+          old_validation = """        source_assets = [str(item).strip().upper() for item in source_config.assets]\n        source_asset_set = set(source_assets)\n        added_symbols = [symbol for symbol in selected_symbols if symbol not in source_asset_set]\n        if not added_symbols:\n            raise AssetDiscoveryConflict(\"The selected assets are already present in the current Strategy Research source.\")\n"""
+          new_validation = """        source_assets = [str(item).strip().upper() for item in source_config.assets]\n        source_asset_set = set(source_assets)\n        already_present = [symbol for symbol in selected_symbols if symbol in source_asset_set]\n        if already_present:\n            raise AssetDiscoveryConflict(\n                \"Assets already present in the current Strategy Research source cannot be selected again: \"\n                + \", \".join(already_present)\n                + \".\"\n            )\n        added_symbols = [symbol for symbol in selected_symbols if symbol not in source_asset_set]\n"""
+          if text.count(old_validation) != 1:
+              raise SystemExit(f'Expected one validation worker source block, found {text.count(old_validation)}.')
+          text = text.replace(old_validation, new_validation, 1)
+
+          old_start_validation = """        source_assets = [str(item).strip().upper() for item in source_config.assets]\n        added_symbols = [symbol for symbol in requested_symbols if symbol not in set(source_assets)]\n        if not added_symbols:\n            raise AssetDiscoveryConflict(\"The selected assets are already present in the current Strategy Research source.\")\n\n        source_model_snapshot = get_strategy_model_snapshot(db, source_id)\n"""
+          new_start_validation = """        source_assets = [str(item).strip().upper() for item in source_config.assets]\n        source_asset_set = set(source_assets)\n        already_present = [symbol for symbol in requested_symbols if symbol in source_asset_set]\n        if already_present:\n            raise AssetDiscoveryConflict(\n                \"Assets already present in the current Strategy Research source cannot be selected again: \"\n                + \", \".join(already_present)\n                + \".\"\n            )\n        added_symbols = [symbol for symbol in requested_symbols if symbol not in source_asset_set]\n\n        source_model_snapshot = get_strategy_model_snapshot(db, source_id)\n"""
+          if text.count(old_start_validation) != 1:
+              raise SystemExit(f'Expected one validation start source block, found {text.count(old_start_validation)}.')
+          text = text.replace(old_start_validation, new_start_validation, 1)
+
+          old_status = """    except Exception:\n        selected_baseline = None\n    return {\n        \"api_version\": API_VERSION,\n"""
+          new_status = """    except Exception:\n        selected_baseline = None\n\n    campaign_public = _public(document)\n    if isinstance(campaign_public, dict):\n        excluded_assets = {\n            str(item).strip().upper()\n            for item in ((selected_baseline or {}).get(\"assets\") or [])\n            if str(item).strip()\n        }\n        campaign_baseline = campaign_public.get(\"baseline\") if isinstance(campaign_public.get(\"baseline\"), dict) else {}\n        excluded_assets.update(\n            str(item).strip().upper()\n            for item in (campaign_baseline.get(\"assets\") or [])\n            if str(item).strip()\n        )\n\n        def external_candidate(item: Any) -> bool:\n            if not isinstance(item, dict):\n                return False\n            symbol = str(item.get(\"symbol\") or \"\").strip().upper()\n            return bool(symbol) and symbol not in excluded_assets\n\n        campaign_public[\"results\"] = [\n            item for item in (campaign_public.get(\"results\") or []) if external_candidate(item)\n        ]\n        campaign_public[\"shortlisted_count\"] = len(campaign_public[\"results\"])\n        marginal = campaign_public.get(\"marginal_replay\") if isinstance(campaign_public.get(\"marginal_replay\"), dict) else None\n        if marginal is not None:\n            marginal = dict(marginal)\n            marginal[\"results\"] = [\n                item for item in (marginal.get(\"results\") or []) if external_candidate(item)\n            ]\n            marginal[\"persistent_candidate_count\"] = sum(\n                1 for item in marginal[\"results\"] if _marginal_replay_is_persistent_candidate(item)\n            )\n            campaign_public[\"marginal_replay\"] = marginal\n\n    return {\n        \"api_version\": API_VERSION,\n"""
+          if text.count(old_status) != 1:
+              raise SystemExit(f'Expected one status return block, found {text.count(old_status)}.')
+          text = text.replace(old_status, new_status, 1)
+          text = text.replace('        \"campaign\": _public(document),\n', '        \"campaign\": campaign_public,\n', 1)
+
+          path.write_text(text, encoding='utf-8')
+
+          pyproject = Path('pyproject.toml')
+          ptext = pyproject.read_text(encoding='utf-8')
+          if 'version = "10.9.2"' not in ptext:
+              raise SystemExit('Expected pyproject version 10.9.2.')
+          pyproject.write_text(ptext.replace('version = "10.9.2"', 'version = "10.9.3"', 1), encoding='utf-8')
+
+          config = Path('src/market_cycle_trader_api/core/config.py')
+          ctext = config.read_text(encoding='utf-8')
+          if 'API_VERSION = "10.9.2"' not in ctext:
+              raise SystemExit('Expected API_VERSION 10.9.2.')
+          config.write_text(ctext.replace('API_VERSION = "10.9.2"', 'API_VERSION = "10.9.3"', 1), encoding='utf-8')
+      - name: Validate source
+        run: |
+          python -m compileall -q src
+          python - <<'PY'
+          from pathlib import Path
+          source = Path('src/market_cycle_trader_api/services/asset_discovery.py').read_text(encoding='utf-8')
+          assert 'campaign_public["results"]' in source
+          assert 'Assets already present in the current Strategy Research source cannot be selected again' in source
+          assert 'not in baseline_symbols' in source
+          assert 'API_VERSION = "10.9.3"' in Path('src/market_cycle_trader_api/core/config.py').read_text(encoding='utf-8')
+          assert 'version = "10.9.3"' in Path('pyproject.toml').read_text(encoding='utf-8')
+          PY
+      - name: Commit API v10.9.3
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-10.9.3-asset-discovery-base-exclusion.yml
+          git add pyproject.toml src/market_cycle_trader_api/core/config.py src/market_cycle_trader_api/services/asset_discovery.py
+          git commit -m "fix: exclude base Strategy assets from Asset Discovery candidates [API v10.9.3]"
+          git push
