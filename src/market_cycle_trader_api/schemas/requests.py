@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from .model_research import ResearchModelFamily
 
@@ -38,13 +38,6 @@ def normalize_assets(value: list[str]) -> list[str]:
 
 
 def normalize_assets_input(value: str) -> list[str]:
-    
-
-
-
-
-
-
     text = str(value or "").strip()
     if not text:
         raise ValueError("At least two asset symbols are required.")
@@ -69,12 +62,6 @@ def normalize_iso_date(value: str, *, field_name: str) -> str:
 
 
 class BacktestRequest(BaseModel):
-    
-
-
-
-
-
     model_config = ConfigDict(extra="forbid")
 
     assets: list[str]
@@ -160,6 +147,20 @@ class BacktestRequest(BaseModel):
     def fractional_shares(self) -> bool:
         return not self.whole_shares
 
+    @field_validator("strategy_mode", mode="before")
+    @classmethod
+    def normalize_strategy_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if normalized == "COMPOUND_ROTATION_SWING_LIGHTGBM":
+            return "COMPOUND_ROTATION_SWING_XGBOOST"
+        return normalized
+
+    @field_serializer("strategy_mode")
+    def serialize_strategy_mode(self, value: str) -> str:
+        if value == "COMPOUND_ROTATION_SWING_XGBOOST":
+            return "COMPOUND_ROTATION_SWING_LIGHTGBM"
+        return value
+
     @field_validator("assets")
     @classmethod
     def validate_assets(cls, value: list[str]) -> list[str]:
@@ -177,14 +178,30 @@ class BacktestRequest(BaseModel):
             return None
         return normalize_iso_date(value, field_name="end_date")
 
+    @field_validator("rotation_models", mode="before")
+    @classmethod
+    def normalize_rotation_models(cls, value: list[str]) -> list[str]:
+        if not isinstance(value, list):
+            return value
+        return [
+            "xgboost_utility" if str(item).strip().lower() == "lightgbm_utility" else item
+            for item in value
+        ]
+
     @field_validator("rotation_models")
     @classmethod
     def validate_rotation_models(cls, value: list[str]) -> list[str]:
         cleaned = list(dict.fromkeys(str(item).strip().lower() for item in value if str(item).strip()))
         if cleaned != ["xgboost_utility"]:
-            raise ValueError("This version supports only rotation_models=['xgboost_utility'].")
+            raise ValueError("This version supports only LightGBM Utility rotation.")
         return cleaned
 
+    @field_serializer("rotation_models")
+    def serialize_rotation_models(self, value: list[str]) -> list[str]:
+        return [
+            "lightgbm_utility" if item == "xgboost_utility" else item
+            for item in value
+        ]
 
     @field_validator("rotation_target_horizons")
     @classmethod
@@ -224,11 +241,11 @@ class BacktestRequest(BaseModel):
                 raise ValueError("End date cannot be earlier than start date.")
 
         if self.xgb_n_jobs == 0:
-            raise ValueError("xgb_n_jobs must be -1 or a positive integer.")
+            raise ValueError("Model worker count must be -1 or a positive integer.")
         if self.deterministic_execution:
             if self.xgb_n_jobs != 1:
                 raise ValueError(
-                    "Deterministic execution requires xgb_n_jobs=1 in MongoDB."
+                    "Deterministic execution requires model worker count = 1 in MongoDB."
                 )
             if self.numeric_thread_limit != 1:
                 raise ValueError(
@@ -253,8 +270,6 @@ class BacktestRequest(BaseModel):
 
 
 class BacktestExecutionRequest(BacktestRequest):
-    
-
     analysis_start_date: str
     analysis_end_date: str | None
     calendar_anchor_assets: list[str]
@@ -382,7 +397,6 @@ class BacktestExecutionRequest(BacktestRequest):
 LOCKED_CONFIGURATION_FIELDS = frozenset(BacktestRequest.model_fields)
 
 
-
 class TemporalPolicySearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -428,7 +442,6 @@ class WinnerTransitionInterventionSearchRequest(BaseModel):
         return self
 
 
-
 class WinnerTransitionConfidenceCalibrationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -441,8 +454,6 @@ class WinnerTransitionConfidenceCalibrationRequest(BaseModel):
         if self.end_month < self.start_month:
             raise ValueError("end_month must be greater than or equal to start_month.")
         return self
-
-
 
 
 class StrategyResearchPipelineControlRequest(BaseModel):
