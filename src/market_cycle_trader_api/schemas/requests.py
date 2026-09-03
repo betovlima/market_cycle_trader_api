@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .model_research import ResearchModelFamily
 
@@ -155,12 +155,6 @@ class BacktestRequest(BaseModel):
             return "COMPOUND_ROTATION_SWING_XGBOOST"
         return normalized
 
-    @field_serializer("strategy_mode")
-    def serialize_strategy_mode(self, value: str) -> str:
-        if value == "COMPOUND_ROTATION_SWING_XGBOOST":
-            return "COMPOUND_ROTATION_SWING_LIGHTGBM"
-        return value
-
     @field_validator("assets")
     @classmethod
     def validate_assets(cls, value: list[str]) -> list[str]:
@@ -195,13 +189,6 @@ class BacktestRequest(BaseModel):
         if cleaned != ["xgboost_utility"]:
             raise ValueError("This version supports only LightGBM Utility rotation.")
         return cleaned
-
-    @field_serializer("rotation_models")
-    def serialize_rotation_models(self, value: list[str]) -> list[str]:
-        return [
-            "lightgbm_utility" if item == "xgboost_utility" else item
-            for item in value
-        ]
 
     @field_validator("rotation_target_horizons")
     @classmethod
