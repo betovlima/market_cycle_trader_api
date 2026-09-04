@@ -1,0 +1,3 @@
+from .asset_discovery_replay_cache import install_asset_discovery_replay_model_cache
+
+install_asset_discovery_replay_model_cache()
