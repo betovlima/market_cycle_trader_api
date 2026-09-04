@@ -114,6 +114,15 @@ def _state_novelty(service: Any, bundle: Any, frame: pd.DataFrame) -> dict[str, 
     }
 
 
+def _configured_symbols(payload: dict[str, Any]) -> set[str]:
+    baseline = payload.get("baseline") if isinstance(payload.get("baseline"), dict) else {}
+    return {
+        str(symbol or "").strip().upper()
+        for symbol in list(baseline.get("assets") or [])
+        if str(symbol or "").strip()
+    }
+
+
 def install_asset_discovery_predictive_policy() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -295,6 +304,17 @@ def install_asset_discovery_predictive_policy() -> None:
 
     def predictive_get_status(db: Any) -> dict[str, Any]:
         payload = dict(original_get_status(db))
+        configured = _configured_symbols(payload)
+        campaign = payload.get("campaign") if isinstance(payload.get("campaign"), dict) else None
+        if campaign is not None and configured:
+            campaign = dict(campaign)
+            campaign_results = [
+                item for item in list(campaign.get("results") or [])
+                if str((item or {}).get("symbol") or "").strip().upper() not in configured
+            ]
+            campaign["results"] = campaign_results
+            campaign["shortlisted_count"] = len(campaign_results)
+            payload["campaign"] = campaign
         policy = dict(payload.get("persistence_policy") or {})
         policy.update({
             "marginal_replay": "manual_only_after_predictive_discovery",
@@ -308,12 +328,31 @@ def install_asset_discovery_predictive_policy() -> None:
         return payload
 
     def predictive_get_catalog(db: Any) -> dict[str, Any]:
+        try:
+            current_config, _current_strategy = service.get_research_strategy_context(db)
+            configured = {
+                str(symbol or "").strip().upper()
+                for symbol in list(current_config.assets or [])
+                if str(symbol or "").strip()
+            }
+        except Exception:
+            configured = set()
+        if configured:
+            db[service.CATALOG_COLLECTION].delete_many({"_id": {"$in": sorted(configured)}})
         payload = dict(original_get_catalog(db))
+        if configured:
+            assets = [
+                item for item in list(payload.get("assets") or [])
+                if str((item or {}).get("symbol") or "").strip().upper() not in configured
+            ]
+            payload["assets"] = assets
+            payload["count"] = len(assets)
         policy = dict(payload.get("persistence_policy") or {})
         policy.update({
             "validation_method": _PREDICTIVE_VALIDATION_METHOD,
             "full_history_capital_lift_required": False,
             "economic_contribution_replay_automatic": False,
+            "configured_strategy_assets_excluded": True,
         })
         payload["persistence_policy"] = policy
         return payload
