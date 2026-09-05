@@ -17,6 +17,18 @@ def _uses_predictive_selection_validation(document: dict[str, Any]) -> bool:
     return status in _ECONOMIC_REPLAY_NOT_RUN
 
 
+def _coverage_from_metadata(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(item, dict) or item.get("history_window_complete") is not True:
+        return None
+    coverage = {
+        key: value
+        for key, value in item.items()
+        if key == "history_window_complete" or str(key).startswith("history_")
+    }
+    coverage["history_window_complete"] = True
+    return coverage
+
+
 def install_asset_discovery_predictive_selection_validation() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -82,48 +94,67 @@ def install_asset_discovery_predictive_selection_validation() -> None:
         if not snapshot_end:
             raise service.AssetDiscoveryConflict("The Predictive Asset Discovery snapshot is unavailable. Run a new Discovery campaign.")
 
-        identity_ok = all(
-            str((((metadata.get(symbol) or {}).get("identity_integrity") or {}).get("status") or "")).lower() == "passed"
-            for symbol in requested_symbols
-        )
-        predictive_ok = all(service._item_is_persistent_candidate(metadata.get(symbol)) for symbol in requested_symbols)
-        adherence_ok = all(
-            str((((metadata.get(symbol) or {}).get("market_adherence") or {}).get("status") or "")).lower() == "passed"
-            for symbol in requested_symbols
-        )
+        identity_failed = [
+            symbol for symbol in requested_symbols
+            if str((((metadata.get(symbol) or {}).get("identity_integrity") or {}).get("status") or "")).lower() != "passed"
+        ]
+        adherence_failed = [
+            symbol for symbol in requested_symbols
+            if str((((metadata.get(symbol) or {}).get("market_adherence") or {}).get("status") or "")).lower() != "passed"
+        ]
+        predictive_failed = [
+            symbol for symbol in requested_symbols
+            if not service._item_is_persistent_candidate(metadata.get(symbol))
+        ]
         source_ok = bool(source_id) and (not campaign_source_id or campaign_source_id == source_id)
 
-        baseline_frames = service._baseline_frames(source_config, snapshot_end)
-        required_sessions = service._baseline_required_sessions(baseline_frames, source_config, snapshot_end)
         coverage_by_symbol: dict[str, Any] = {}
+        needs_history_download: list[str] = []
         for symbol in added_symbols:
-            try:
-                _frame, coverage = service._candidate_history_coverage(
-                    db,
-                    symbol,
-                    source_config,
-                    snapshot_end,
-                    required_sessions,
-                )
-                coverage_by_symbol[symbol] = coverage
-            except Exception as exc:
-                coverage_by_symbol[symbol] = {
-                    "history_window_complete": False,
-                    "reason": str(exc)[:300],
-                }
-        history_ok = all(
-            bool((coverage_by_symbol.get(symbol) or {}).get("history_window_complete"))
-            for symbol in added_symbols
-        )
+            cached_coverage = _coverage_from_metadata(metadata.get(symbol) or {})
+            if cached_coverage is not None:
+                coverage_by_symbol[symbol] = cached_coverage
+            else:
+                needs_history_download.append(symbol)
+
+        if needs_history_download:
+            baseline_frames = service._baseline_frames(source_config, snapshot_end)
+            required_sessions = service._baseline_required_sessions(baseline_frames, source_config, snapshot_end)
+            for symbol in needs_history_download:
+                try:
+                    _frame, coverage = service._candidate_history_coverage(
+                        db,
+                        symbol,
+                        source_config,
+                        snapshot_end,
+                        required_sessions,
+                    )
+                    coverage_by_symbol[symbol] = coverage
+                except Exception as exc:
+                    coverage_by_symbol[symbol] = {
+                        "history_window_complete": False,
+                        "reason": str(exc)[:300],
+                    }
+
+        history_failed = [
+            symbol for symbol in added_symbols
+            if not bool((coverage_by_symbol.get(symbol) or {}).get("history_window_complete"))
+        ]
 
         gates = {
-            "predictive_candidate_selection": bool(predictive_ok),
-            "market_adherence": bool(adherence_ok),
-            "identity_integrity": bool(identity_ok),
-            "full_history_integrity": bool(history_ok),
+            "predictive_candidate_selection": not predictive_failed,
+            "market_adherence": not adherence_failed,
+            "identity_integrity": not identity_failed,
+            "full_history_integrity": not history_failed,
             "source_snapshot_integrity": bool(source_ok),
         }
         decision = "PASS" if all(gates.values()) else "FAIL"
+        failed_assets = {
+            "predictive_candidate_selection": predictive_failed,
+            "market_adherence": adherence_failed,
+            "identity_integrity": identity_failed,
+            "full_history_integrity": history_failed,
+        }
         now = service.utc_now()
         validation = {
             "validation_id": f"asset-predictive-{uuid4().hex[:12]}",
@@ -153,12 +184,23 @@ def install_asset_discovery_predictive_selection_validation() -> None:
                 "economic_replay_required_for_research_append": False,
             },
             "history_coverage": coverage_by_symbol,
+            "failed_assets": failed_assets,
             "deltas": {},
             "gates": gates,
             "decision": decision,
             "created_at": now,
             "completed_at": now,
         }
+        failed_labels = [name for name, passed in gates.items() if not passed]
+        message = (
+            f"Predictive selection integrity {decision} for {', '.join(added_symbols)}. "
+            "Market adherence and complete historical coverage were checked; no economic replay was executed."
+        )
+        if failed_labels:
+            message += " Failed gates: " + ", ".join(failed_labels) + "."
+        if history_failed:
+            message += " Incomplete Strategy history: " + ", ".join(history_failed) + "."
+
         db[service.COLLECTION].update_one(
             {"_id": service.CURRENT_ID, "run_id": current_run_id},
             {"$set": {
@@ -167,10 +209,7 @@ def install_asset_discovery_predictive_selection_validation() -> None:
                 "cancel_requested": False,
                 "completed_at": document.get("completed_at") or now,
                 "updated_at": now,
-                "message": (
-                    f"Predictive selection integrity {decision} for {', '.join(added_symbols)}. "
-                    "Market adherence and complete historical coverage were checked; no economic replay was executed."
-                ),
+                "message": message,
                 "full_strategy_validation": service.bson_value(validation),
             }},
         )
