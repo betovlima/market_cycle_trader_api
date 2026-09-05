@@ -40,8 +40,7 @@ def _normalized_assets(values: Any) -> set[str]:
 
 def _cacheable_reference_asset(config: Any, symbol: str) -> bool:
     reference_assets = _normalized_assets(getattr(config, "research_reference_assets", None))
-    candidate_assets = _normalized_assets(getattr(config, "research_candidate_assets", None))
-    return bool(reference_assets and candidate_assets and str(symbol).upper() in reference_assets)
+    return bool(reference_assets and str(symbol).upper() in reference_assets)
 
 
 def _series_signature(frame: pd.DataFrame, column: str) -> dict[str, Any] | None:
