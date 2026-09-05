@@ -9,6 +9,11 @@ _INSTALLED = False
 _PRIVATE_FAILURE_FIELD = "_technical_failure_diagnostics"
 _PUBLIC_FAILURE_FIELD = "technical_failure_summary"
 _MAX_PUBLIC_FAILURE_GROUPS = 12
+_EXPECTED_REJECTION_REASONS = frozenset({
+    "insufficient_history",
+    "discontinuous_history",
+    "ticker_identity_discontinuity",
+})
 
 
 def _sanitize_message(symbol: str, error: Exception) -> str:
@@ -24,12 +29,18 @@ def _sanitize_message(symbol: str, error: Exception) -> str:
     return message[:300]
 
 
+def _is_expected_rejection(error: Exception) -> bool:
+    return str(error or "").strip().lower() in _EXPECTED_REJECTION_REASONS
+
+
 def _failure_signature(stage: str, error_type: str, message: str) -> str:
     payload = f"{stage}|{error_type}|{message}".encode("utf-8", errors="replace")
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def _record_failure(service: Any, db: Any, symbol: str, stage: str, error: Exception) -> None:
+    if _is_expected_rejection(error):
+        return
     try:
         document = service._campaign(db) or {}
         run_id = str(document.get("run_id") or "").strip()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import threading
 import time
 from typing import Any
 
@@ -9,19 +10,32 @@ import pandas as pd
 
 SUPPORTED_FEEDS = {"iex", "sip"}
 SUPPORTED_ADJUSTMENTS = {"raw", "split", "dividend", "all"}
+_ALPACA_IMPORT_LOCK = threading.Lock()
+_ALPACA_TYPES: tuple[Any, Any, Any, Any, Any, Any] | None = None
 
 
 def _require_alpaca():
-    try:
-        from alpaca.data.enums import Adjustment, DataFeed
-        from alpaca.data.historical import StockHistoricalDataClient
-        from alpaca.data.requests import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-    except ImportError as exc:
-        raise RuntimeError(
-            "alpaca-py is not installed. Run: python -m pip install -r requirements.txt"
-        ) from exc
-    return Adjustment, DataFeed, StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit
+    global _ALPACA_TYPES
+    cached = _ALPACA_TYPES
+    if cached is not None:
+        return cached
+
+    with _ALPACA_IMPORT_LOCK:
+        cached = _ALPACA_TYPES
+        if cached is not None:
+            return cached
+        try:
+            from alpaca.data.enums import Adjustment, DataFeed
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        except ImportError as exc:
+            raise RuntimeError(
+                "alpaca-py is not installed. Run: python -m pip install -r requirements.txt"
+            ) from exc
+        cached = (Adjustment, DataFeed, StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit)
+        _ALPACA_TYPES = cached
+        return cached
 
 
 def _feed_value(feed: str):
@@ -146,7 +160,7 @@ def download_stock_bars(
         try:
             bars = client.get_stock_bars(request)
             return normalize_alpaca_frame(bars.df, symbol)
-        except Exception as exc:  
+        except Exception as exc:
             last_error = exc
             if attempt < 2:
                 time.sleep(2**attempt)
