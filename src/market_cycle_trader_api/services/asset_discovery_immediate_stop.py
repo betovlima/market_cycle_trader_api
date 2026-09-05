@@ -17,6 +17,10 @@ def _status(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _predictive_optional_replay(document: dict[str, Any]) -> bool:
+    return str(document.get("discovery_mode") or "").strip().lower() == "predictive_only"
+
+
 def _stop_with_immediate_marginal_termination(db: Database) -> dict[str, Any]:
     original = _ORIGINAL_STOP
     if original is None:
@@ -31,6 +35,7 @@ def _stop_with_immediate_marginal_termination(db: Database) -> dict[str, Any]:
         return original(db)
 
     run_id = str(document.get("run_id") or "").strip()
+    predictive_optional = _predictive_optional_replay(document)
     now = discovery.utc_now()
     db[discovery.COLLECTION].update_one(
         {"_id": discovery.CURRENT_ID, "run_id": run_id},
@@ -40,14 +45,14 @@ def _stop_with_immediate_marginal_termination(db: Database) -> dict[str, Any]:
                 "status": "stopping",
                 "phase": "marginal_replay",
                 "marginal_replay.status": "stopping",
-                "marginal_replay.current_stage": "Stopping Marginal Capital Replay now",
+                "marginal_replay.current_stage": "Stopping optional Marginal Capital Replay now" if predictive_optional else "Stopping Marginal Capital Replay now",
                 "stop_requested_at": now,
                 "updated_at": now,
-                "message": "Stopping Marginal Capital Replay now.",
+                "message": "Stopping optional Marginal Capital Replay now." if predictive_optional else "Stopping Marginal Capital Replay now.",
             },
             "$push": {
                 "events": {
-                    "$each": [{"at": now, "message": "Immediate stop requested for Marginal Capital Replay."}],
+                    "$each": [{"at": now, "message": "Immediate stop requested for optional Marginal Capital Replay." if predictive_optional else "Immediate stop requested for Marginal Capital Replay."}],
                     "$slice": -24,
                 }
             },
@@ -60,24 +65,39 @@ def _stop_with_immediate_marginal_termination(db: Database) -> dict[str, Any]:
         worker.join(timeout=2.0)
 
     finished_at = discovery.utc_now()
+    campaign_status = "completed" if predictive_optional else "stopped"
+    campaign_phase = "completed" if predictive_optional else "stopped"
+    message = (
+        "Optional Marginal Capital Replay stopped; predictive candidates were preserved."
+        if predictive_optional
+        else "Marginal Capital Replay stopped. A new Asset Discovery run can be started."
+    )
+    update_set: dict[str, Any] = {
+        "cancel_requested": False if predictive_optional else True,
+        "status": campaign_status,
+        "phase": campaign_phase,
+        "marginal_replay.status": "stopped",
+        "marginal_replay.current_stage": "Optional Marginal Capital Replay stopped" if predictive_optional else "Stopped by user",
+        "worker_active": False,
+        "worker_finished_at": finished_at,
+        "updated_at": finished_at,
+        "message": message,
+    }
+    if predictive_optional:
+        update_set.update({
+            "progress_step": "completed",
+            "stage_progress_percent": 100.0,
+            "current_stage": "Predictive Asset Discovery completed",
+        })
+
     db[discovery.COLLECTION].update_one(
         {"_id": discovery.CURRENT_ID, "run_id": run_id},
         {
-            "$set": {
-                "cancel_requested": True,
-                "status": "stopped",
-                "phase": "stopped",
-                "marginal_replay.status": "stopped",
-                "marginal_replay.current_stage": "Stopped by user",
-                "worker_active": False,
-                "worker_finished_at": finished_at,
-                "updated_at": finished_at,
-                "message": "Marginal Capital Replay stopped. A new Asset Discovery run can be started.",
-            },
+            "$set": update_set,
             "$unset": {"worker_process_id": ""},
             "$push": {
                 "events": {
-                    "$each": [{"at": finished_at, "message": "Marginal Capital Replay stopped immediately by user request."}],
+                    "$each": [{"at": finished_at, "message": message}],
                     "$slice": -24,
                 }
             },
