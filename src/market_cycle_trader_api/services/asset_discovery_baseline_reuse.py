@@ -48,6 +48,18 @@ def _normalized_assets(values: Any) -> list[str]:
     return [str(value or "").strip().upper() for value in list(values or []) if str(value or "").strip()]
 
 
+def _iso_date(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        stamp = pd.Timestamp(value)
+        if pd.isna(stamp):
+            return ""
+        return stamp.date().isoformat()
+    except Exception:
+        return str(value).strip()
+
+
 def _eligible_baseline(service: Any, db: Any, document: dict[str, Any]) -> dict[str, Any] | None:
     if str(document.get("discovery_mode") or "").strip().lower() != "predictive_only":
         return None
@@ -93,14 +105,14 @@ def _eligible_baseline(service: Any, db: Any, document: dict[str, Any]) -> dict[
         return None
 
     baseline = document.get("baseline") if isinstance(document.get("baseline"), dict) else {}
-    snapshot_end = str(baseline.get("market_snapshot_end") or "").strip()
+    snapshot_end = _iso_date(baseline.get("market_snapshot_end"))
     if not snapshot_end:
-        snapshot_end = str((document.get("discovery_selection_model") or {}).get("snapshot_end") or "").strip()
+        snapshot_end = _iso_date((document.get("discovery_selection_model") or {}).get("snapshot_end"))
     if not snapshot_end:
         return None
-    if str(request.get("analysis_end_date") or "").strip() != snapshot_end:
+    if _iso_date(request.get("analysis_end_date")) != snapshot_end:
         return None
-    if str(request.get("analysis_start_date") or "").strip() != str(source_config.start_date):
+    if _iso_date(request.get("analysis_start_date")) != _iso_date(source_config.start_date):
         return None
 
     comparison = db[COMPARISONS_COLLECTION].find_one({"job_id": last_backtest_id}) or {}
@@ -138,6 +150,7 @@ def _eligible_baseline(service: Any, db: Any, document: dict[str, Any]) -> dict[
         "reused_backtest_id": last_backtest_id,
     }
     return {
+        "db": db,
         "run_id": str(document.get("run_id") or ""),
         "source_strategy_id": source_id,
         "source_strategy_revision": source_revision,
@@ -188,6 +201,17 @@ def install_asset_discovery_baseline_reuse() -> None:
                 if state is not None and not state.get("consumed") and not candidate_assets:
                     state["consumed"] = True
                     metrics = dict(state.get("metrics") or {})
+                    try:
+                        state["db"][service.COLLECTION].update_one(
+                            {"_id": service.CURRENT_ID, "run_id": state.get("run_id")},
+                            {"$set": {
+                                "full_strategy_validation.current_stage": "Certified Strategy backtest reused as baseline",
+                                "full_strategy_validation.progress_percent": 50.0,
+                                "updated_at": service.utc_now(),
+                            }},
+                        )
+                    except Exception:
+                        pass
                     return metrics, pd.DatetimeIndex([])
         return original_run_replay(*args, **kwargs)
 
