@@ -4,8 +4,8 @@ from __future__ import annotations
 
 This launcher preserves the complete experiment implemented by
 ``research_asset_signature_rank_then_backtest.py`` but makes candidate discovery
-robust for local research databases.  The primary source remains the latest
-Asset Discovery result.  If that result contains no symbol outside the selected
+robust for local research databases. The primary source remains the latest
+Asset Discovery result. If that result contains no symbol outside the selected
 Strategy, the launcher falls back to every symbol currently cached in
 ``alpaca_market_bars`` and lets the main pipeline apply the Full Strategy History
 integrity gate before ranking.
@@ -28,6 +28,11 @@ import research_asset_signature_rank_then_backtest as pipeline
 import research_asset_signature_leave_one_out as calibration
 from research_asset_signature_pipeline_ranking import canonical_hash
 
+# Keep an immutable reference before monkey-patching the pipeline module.
+# Without this, the fallback function calls pipeline.candidate_source after that
+# name has been replaced by itself, producing infinite recursion.
+_ORIGINAL_CANDIDATE_SOURCE = pipeline.candidate_source
+
 
 def _candidate_source_with_local_mongo_fallback(
     db: Any,
@@ -41,16 +46,16 @@ def _candidate_source_with_local_mongo_fallback(
     2. Latest Asset Discovery result, exactly as the original pipeline does.
     3. Local MongoDB market-bar cache, excluding only the selected Strategy assets.
 
-    The third mode does *not* declare every cached symbol eligible.  The main
+    The third mode does *not* declare every cached symbol eligible. The main
     pipeline immediately validates each symbol against the complete XNYS Strategy
     window and only complete histories proceed to the mathematical ranking.
     """
 
     if explicit:
-        return pipeline.candidate_source(db, baseline_assets, explicit)
+        return _ORIGINAL_CANDIDATE_SOURCE(db, baseline_assets, explicit)
 
     try:
-        return pipeline.candidate_source(db, baseline_assets, None)
+        return _ORIGINAL_CANDIDATE_SOURCE(db, baseline_assets, None)
     except RuntimeError as exc:
         if "No new candidate symbols were found outside the selected Strategy" not in str(exc):
             raise
