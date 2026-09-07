@@ -17,7 +17,6 @@ import pandas as pd
 from pymongo import MongoClient
 from pymongo.uri_parser import parse_uri
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -34,7 +33,6 @@ from market_cycle_trader_api.services.asset_discovery_ranker import (
     _new_ranker,
     feature_frame,
 )
-
 
 STRATEGY_PROFILES_COLLECTION = "strategy_profiles"
 STRATEGY_CONTROL_COLLECTION = "strategy_control"
@@ -70,16 +68,14 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(rows)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.to_csv(temporary, index=False)
+    pd.DataFrame(rows).to_csv(temporary, index=False)
     temporary.replace(path)
 
 
 def _stable_seed(symbol: str, base_seed: int) -> int:
-    digest = hashlib.sha256(str(symbol).upper().encode("utf-8")).hexdigest()
-    offset = int(digest[:8], 16) % 1_000_000
-    return int(base_seed) + offset
+    digest = hashlib.sha256(symbol.upper().encode("utf-8")).hexdigest()
+    return int(base_seed) + (int(digest[:8], 16) % 1_000_000)
 
 
 def _normalize_date(value: Any) -> pd.Timestamp:
@@ -95,23 +91,27 @@ def _assert_local_mongo(uri: str, allow_remote: bool) -> None:
     if allow_remote:
         return
     parsed = parse_uri(uri)
-    hosts = {str(host).strip().lower() for host, _port in parsed.get("nodelist") or []}
+    hosts = {str(host).strip().lower() for host, _ in parsed.get("nodelist") or []}
     if hosts and hosts.issubset(LOCAL_MONGO_HOSTS):
         return
     raise RuntimeError(
-        "This research script is intentionally local-MongoDB only. "
-        f"Resolved MongoDB hosts={sorted(hosts) or ['unknown']}. "
+        "This experiment is local-MongoDB only. "
+        f"Resolved hosts={sorted(hosts) or ['unknown']}. "
         "Use a local URI or pass --allow-remote-mongo explicitly."
     )
 
 
-def _strategy_document(db: Any, strategy_sequence: int, strategy_id: str | None) -> dict[str, Any]:
-    query = {"_id": strategy_id} if strategy_id else {"strategy_sequence": int(strategy_sequence)}
+def _strategy_document(db: Any, sequence: int, strategy_id: str | None) -> dict[str, Any]:
+    query = {"_id": strategy_id} if strategy_id else {"strategy_sequence": int(sequence)}
     document = db[STRATEGY_PROFILES_COLLECTION].find_one(query)
     if document is None:
-        reference = strategy_id or f"Strategy #{strategy_sequence}"
-        raise RuntimeError(f"Strategy not found in local MongoDB: {reference}.")
+        raise RuntimeError(f"Strategy not found: {strategy_id or f'Strategy #{sequence}' }.")
     return document
+
+
+def _configuration(document: dict[str, Any]) -> dict[str, Any]:
+    value = document.get("configuration")
+    return dict(value) if isinstance(value, dict) else dict(document)
 
 
 def _winner_assets(db: Any) -> set[str]:
@@ -120,7 +120,7 @@ def _winner_assets(db: Any) -> set[str]:
     if not winner_id:
         return set()
     winner = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": winner_id}) or {}
-    configuration = winner.get("configuration") if isinstance(winner.get("configuration"), dict) else winner
+    configuration = _configuration(winner)
     return {
         str(symbol).strip().upper()
         for symbol in list(configuration.get("assets") or [])
@@ -128,14 +128,7 @@ def _winner_assets(db: Any) -> set[str]:
     }
 
 
-def _strategy_configuration(document: dict[str, Any]) -> dict[str, Any]:
-    configuration = document.get("configuration")
-    if isinstance(configuration, dict):
-        return dict(configuration)
-    return dict(document)
-
-
-def _identity(configuration: dict[str, Any]) -> dict[str, str]:
+def _market_identity(configuration: dict[str, Any]) -> dict[str, str]:
     return {
         "interval": str(configuration.get("timeframe") or "1Day"),
         "feed": str(configuration.get("alpaca_historical_feed") or "sip"),
@@ -143,29 +136,21 @@ def _identity(configuration: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _latest_common_session(
-    collection: Any,
-    assets: list[str],
-    identity: dict[str, str],
-) -> pd.Timestamp:
+def _latest_common_session(collection: Any, assets: list[str], identity: dict[str, str]) -> pd.Timestamp:
     latest: list[pd.Timestamp] = []
     missing: list[str] = []
     for symbol in assets:
-        document = collection.find_one(
+        row = collection.find_one(
             {"symbol": symbol, **identity},
             {"_id": 0, "timestamp": 1},
             sort=[("timestamp", -1)],
         )
-        if not document or document.get("timestamp") is None:
+        if not row or row.get("timestamp") is None:
             missing.append(symbol)
-            continue
-        latest.append(_normalize_date(document["timestamp"]))
+        else:
+            latest.append(_normalize_date(row["timestamp"]))
     if missing:
-        raise RuntimeError(
-            "Local MongoDB is missing cached market bars for: " + ", ".join(missing)
-        )
-    if not latest:
-        raise RuntimeError("No market history was found for the selected Strategy.")
+        raise RuntimeError("Local MongoDB has no cached bars for: " + ", ".join(missing))
     return min(latest)
 
 
@@ -177,11 +162,11 @@ def _load_frames_once(
     snapshot_end: pd.Timestamp,
 ) -> dict[str, pd.DataFrame]:
     start = start_date.tz_localize("UTC").to_pydatetime()
-    end_exclusive = (snapshot_end + pd.Timedelta(days=1)).tz_localize("UTC").to_pydatetime()
+    end = (snapshot_end + pd.Timedelta(days=1)).tz_localize("UTC").to_pydatetime()
     query = {
         "symbol": {"$in": assets},
         **identity,
-        "timestamp": {"$gte": start, "$lt": end_exclusive},
+        "timestamp": {"$gte": start, "$lt": end},
     }
     projection = {
         "_id": 0,
@@ -197,7 +182,7 @@ def _load_frames_once(
     }
     rows = list(collection.find(query, projection).sort([("symbol", 1), ("timestamp", 1)]))
     if not rows:
-        raise RuntimeError("The local MongoDB query returned no bars for the Strategy universe.")
+        raise RuntimeError("Local MongoDB returned no market bars for the selected Strategy.")
 
     raw = pd.DataFrame(rows)
     raw["symbol"] = raw["symbol"].astype(str).str.upper()
@@ -205,12 +190,11 @@ def _load_frames_once(
     frames: dict[str, pd.DataFrame] = {}
     for symbol, group in raw.groupby("symbol", sort=False):
         frame = group.drop(columns=["symbol"]).set_index("timestamp").sort_index()
-        frame = frame[~frame.index.duplicated(keep="last")]
-        frames[str(symbol)] = frame
+        frames[str(symbol)] = frame[~frame.index.duplicated(keep="last")]
 
     absent = [symbol for symbol in assets if symbol not in frames]
     if absent:
-        raise RuntimeError("No in-window rows were loaded for: " + ", ".join(absent))
+        raise RuntimeError("No in-window bars were loaded for: " + ", ".join(absent))
     return frames
 
 
@@ -218,8 +202,7 @@ def _expected_sessions(start_date: pd.Timestamp, snapshot_end: pd.Timestamp) -> 
     calendar = xcals.get_calendar("XNYS")
     first = pd.Timestamp(calendar.date_to_session(start_date, direction="next"))
     last = pd.Timestamp(calendar.date_to_session(snapshot_end, direction="previous"))
-    sessions = calendar.sessions_in_range(first, last)
-    sessions = pd.DatetimeIndex(sessions)
+    sessions = pd.DatetimeIndex(calendar.sessions_in_range(first, last))
     if sessions.tz is not None:
         sessions = sessions.tz_localize(None)
     return sessions.normalize()
@@ -234,65 +217,62 @@ def _validate_complete_history(
     failures: list[str] = []
     for symbol in assets:
         frame = frames[symbol]
-        observed = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True).normalize().tz_localize(None)).unique()
+        observed = pd.DatetimeIndex(
+            pd.to_datetime(frame.index, utc=True).normalize().tz_localize(None)
+        ).unique()
         missing = expected.difference(observed)
-        extra = observed.difference(expected)
-        row = {
-            "symbol": symbol,
-            "observed_rows": int(len(frame)),
-            "expected_sessions": int(len(expected)),
-            "missing_sessions": int(len(missing)),
-            "extra_sessions": int(len(extra)),
-            "actual_start": observed.min().date().isoformat() if len(observed) else None,
-            "actual_end": observed.max().date().isoformat() if len(observed) else None,
-            "history_complete": bool(len(missing) == 0),
-        }
-        diagnostics.append(row)
+        diagnostics.append(
+            {
+                "symbol": symbol,
+                "observed_rows": int(len(frame)),
+                "expected_sessions": int(len(expected)),
+                "missing_sessions": int(len(missing)),
+                "actual_start": observed.min().date().isoformat() if len(observed) else None,
+                "actual_end": observed.max().date().isoformat() if len(observed) else None,
+                "history_complete": bool(len(missing) == 0),
+            }
+        )
         if len(missing):
             sample = ",".join(item.date().isoformat() for item in missing[:5])
-            failures.append(f"{symbol} missing={len(missing)} sample={sample}")
+            failures.append(f"{symbol}: missing={len(missing)} sample={sample}")
     if failures:
         raise RuntimeError(
-            "Full Strategy History validation failed before the experiment:\n- "
-            + "\n- ".join(failures)
+            "Full Strategy History failed before the experiment:\n- " + "\n- ".join(failures)
         )
     return diagnostics
 
 
-def _feature_and_training_panels(
+def _build_panels(
     frames: dict[str, pd.DataFrame],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     feature_rows: list[pd.DataFrame] = []
     training_rows: list[pd.DataFrame] = []
-    features_by_symbol: dict[str, pd.DataFrame] = {}
 
     for symbol, frame in frames.items():
         features = feature_frame(frame).replace([np.inf, -np.inf], np.nan)
-        features_by_symbol[symbol] = features
+        dates = pd.DatetimeIndex(pd.to_datetime(features.index, utc=True)).normalize().tz_localize(None)
 
         feature_part = features.copy()
         feature_part["symbol"] = symbol
-        feature_part["date"] = pd.to_datetime(feature_part.index, utc=True).normalize().tz_localize(None)
+        feature_part["date"] = dates
         feature_rows.append(feature_part.reset_index(drop=True))
 
-        utility = _future_utility(frame).reindex(features.index)
         training_part = features.copy()
-        training_part["utility"] = utility
+        training_part["utility"] = _future_utility(frame).reindex(features.index)
         training_part["symbol"] = symbol
-        training_part["date"] = pd.to_datetime(training_part.index, utc=True).normalize().tz_localize(None)
+        training_part["date"] = dates
         training_rows.append(training_part.reset_index(drop=True))
 
     feature_panel = pd.concat(feature_rows, ignore_index=True)
-    feature_panel = feature_panel.dropna(subset=[*FEATURE_COLUMNS, "date"]).copy()
+    feature_panel = feature_panel.dropna(subset=[*FEATURE_COLUMNS, "date"])
     feature_panel = feature_panel.sort_values(["date", "symbol"]).reset_index(drop=True)
 
     training_panel = pd.concat(training_rows, ignore_index=True)
-    training_panel = training_panel.dropna(subset=[*FEATURE_COLUMNS, "utility", "date"]).copy()
-    training_panel = training_panel.sort_values(["date", "symbol"]).reset_index(drop=True)
-
+    training_panel = training_panel.dropna(subset=[*FEATURE_COLUMNS, "utility", "date"])
     counts = training_panel.groupby("date")["symbol"].transform("count")
-    training_panel = training_panel.loc[counts >= 3].reset_index(drop=True)
-    return feature_panel, training_panel, features_by_symbol
+    training_panel = training_panel.loc[counts >= 3]
+    training_panel = training_panel.sort_values(["date", "symbol"]).reset_index(drop=True)
+    return feature_panel, training_panel
 
 
 def _relevance_for_reference(dataset: pd.DataFrame) -> pd.DataFrame:
@@ -302,9 +282,7 @@ def _relevance_for_reference(dataset: pd.DataFrame) -> pd.DataFrame:
     return result.sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
-def _fit_reference_model(dataset: pd.DataFrame, random_state: int) -> Any:
-    if dataset.empty:
-        raise RuntimeError("Cannot fit a leave-one-out ranker with an empty reference dataset.")
+def _fit_model(dataset: pd.DataFrame, random_state: int) -> Any:
     model = _new_ranker(int(random_state))
     model.fit(
         dataset[list(FEATURE_COLUMNS)],
@@ -314,109 +292,30 @@ def _fit_reference_model(dataset: pd.DataFrame, random_state: int) -> Any:
     return model
 
 
-def _fold_boundaries(unique_dates: list[pd.Timestamp]) -> list[tuple[list[pd.Timestamp], list[pd.Timestamp]]]:
-    if len(unique_dates) < 360:
-        raise RuntimeError("Leave-one-out analysis requires at least 360 labelled sessions.")
-    initial_train_sessions = max(180, int(len(unique_dates) * INITIAL_TRAIN_FRACTION))
-    remaining = len(unique_dates) - initial_train_sessions
+def _fold_specs(unique_dates: list[pd.Timestamp]) -> list[tuple[list[pd.Timestamp], list[pd.Timestamp]]]:
+    dates = [pd.Timestamp(value) for value in unique_dates]
+    if len(dates) < 360:
+        raise RuntimeError("At least 360 labelled sessions are required.")
+    initial = max(180, int(len(dates) * INITIAL_TRAIN_FRACTION))
+    remaining = len(dates) - initial
     if remaining < VALIDATION_FOLDS * 20:
-        raise RuntimeError("Not enough labelled sessions for the four chronological validation folds.")
-    boundaries = np.linspace(initial_train_sessions, len(unique_dates), VALIDATION_FOLDS + 1, dtype=int)
-    folds: list[tuple[list[pd.Timestamp], list[pd.Timestamp]]] = []
+        raise RuntimeError("Not enough sessions for four chronological validation folds.")
+    boundaries = np.linspace(initial, len(dates), VALIDATION_FOLDS + 1, dtype=int)
+
+    result: list[tuple[list[pd.Timestamp], list[pd.Timestamp]]] = []
     for fold_index in range(VALIDATION_FOLDS):
         validation_start = int(boundaries[fold_index])
         validation_end = int(boundaries[fold_index + 1])
-        validation_dates = list(unique_dates[validation_start:validation_end])
+        validation_dates = dates[validation_start:validation_end]
         purge_end = max(0, validation_start - TARGET_HORIZON)
-        train_dates = list(unique_dates[:purge_end])
+        train_dates = dates[:purge_end]
         if len(train_dates) < 180 or len(validation_dates) < 20:
-            raise RuntimeError(f"Fold {fold_index + 1} is too short for the locked ranker policy.")
-        folds.append((train_dates, validation_dates))
-    return folds
+            raise RuntimeError(f"Fold {fold_index + 1} is too short.")
+        result.append((train_dates, validation_dates))
+    return result
 
 
-def _rank_metrics_for_dates(
-    scored: pd.DataFrame,
-    training_truth: pd.DataFrame,
-    held_out: str,
-    weak_threshold: float,
-) -> dict[str, Any]:
-    ranks: list[int] = []
-    percentiles: list[float] = []
-    relative_iqrs: list[float] = []
-    leader_gaps: list[float] = []
-    weak_flags: list[bool] = []
-    weak_wins: list[bool] = []
-    oracle_ranks: list[int] = []
-    oracle_percentiles: list[float] = []
-
-    truth_by_date = {
-        date: group.set_index("symbol")["utility"]
-        for date, group in training_truth.groupby("date", sort=False)
-    }
-
-    for date, group in scored.groupby("date", sort=False):
-        candidate = group[group["symbol"] == held_out]
-        reference = group[group["symbol"] != held_out]
-        if candidate.empty or reference.empty:
-            continue
-        candidate_score = float(candidate["score"].iloc[0])
-        reference_scores = reference["score"].to_numpy(dtype=float)
-        all_scores = np.concatenate([reference_scores, np.asarray([candidate_score])])
-        rank = 1 + int(np.sum(reference_scores > candidate_score))
-        percentile = float(np.mean(all_scores <= candidate_score))
-        median = float(np.median(reference_scores))
-        q25, q75 = np.quantile(reference_scores, [0.25, 0.75])
-        iqr = float(q75 - q25)
-        relative_iqr = float((candidate_score - median) / iqr) if abs(iqr) > 1e-12 else 0.0
-        leader_gap = float(candidate_score - float(np.max(reference_scores)))
-        weak = bool(float(np.max(reference_scores)) <= weak_threshold)
-
-        ranks.append(rank)
-        percentiles.append(percentile)
-        relative_iqrs.append(relative_iqr)
-        leader_gaps.append(leader_gap)
-        weak_flags.append(weak)
-        weak_wins.append(bool(weak and rank == 1))
-
-        truth = truth_by_date.get(date)
-        if truth is not None and held_out in truth.index:
-            reference_truth = truth.drop(labels=[held_out], errors="ignore").dropna().to_numpy(dtype=float)
-            held_truth = float(truth.loc[held_out])
-            if len(reference_truth):
-                all_truth = np.concatenate([reference_truth, np.asarray([held_truth])])
-                oracle_ranks.append(1 + int(np.sum(reference_truth > held_truth)))
-                oracle_percentiles.append(float(np.mean(all_truth <= held_truth)))
-
-    count = len(ranks)
-    weak_count = int(sum(weak_flags))
-    positive_gaps = [value for value in leader_gaps if value > 0]
-    return {
-        "session_count": count,
-        "rank_mean": float(np.mean(ranks)) if ranks else None,
-        "rank_median": float(np.median(ranks)) if ranks else None,
-        "rank_percentile_mean": float(np.mean(percentiles)) if percentiles else None,
-        "rank_percentile_median": float(np.median(percentiles)) if percentiles else None,
-        "relative_score_iqr_median": float(np.median(relative_iqrs)) if relative_iqrs else None,
-        "top1_frequency": float(np.mean(np.asarray(ranks) <= 1)) if ranks else None,
-        "top3_frequency": float(np.mean(np.asarray(ranks) <= 3)) if ranks else None,
-        "top5_frequency": float(np.mean(np.asarray(ranks) <= 5)) if ranks else None,
-        "leader_gap_mean": float(np.mean(leader_gaps)) if leader_gaps else None,
-        "leader_positive_gap_mean": float(np.mean(positive_gaps)) if positive_gaps else None,
-        "weak_reference_session_count": weak_count,
-        "weak_period_coverage": float(sum(weak_wins) / weak_count) if weak_count else None,
-        "oracle_rank_percentile_mean": float(np.mean(oracle_percentiles)) if oracle_percentiles else None,
-        "oracle_top1_frequency": float(np.mean(np.asarray(oracle_ranks) <= 1)) if oracle_ranks else None,
-        "oracle_top3_frequency": float(np.mean(np.asarray(oracle_ranks) <= 3)) if oracle_ranks else None,
-        "oracle_top5_frequency": float(np.mean(np.asarray(oracle_ranks) <= 5)) if oracle_ranks else None,
-    }
-
-
-def _leaf_similarity(
-    model: Any,
-    snapshot: pd.DataFrame,
-    held_out: str,
-) -> dict[str, Any]:
+def _leaf_similarity(model: Any, snapshot: pd.DataFrame, held_out: str) -> dict[str, Any]:
     if snapshot.empty or held_out not in set(snapshot["symbol"]):
         return {
             "state_similarity": None,
@@ -428,211 +327,237 @@ def _leaf_similarity(
     leaves = np.asarray(model.predict(ordered[list(FEATURE_COLUMNS)], pred_leaf=True))
     if leaves.ndim == 1:
         leaves = leaves.reshape(-1, 1)
+
     candidate_index = int(ordered.index[ordered["symbol"] == held_out][0])
-    candidate_leaves = leaves[candidate_index]
-    reference_mask = ordered["symbol"].to_numpy() != held_out
-    reference_leaves = leaves[reference_mask]
-    reference_symbols = ordered.loc[reference_mask, "symbol"].astype(str).tolist()
-    if not len(reference_symbols):
-        return {
-            "state_similarity": None,
-            "state_novelty": None,
-            "state_nearest_symbol": None,
-            "state_tree_count": int(leaves.shape[1]),
-        }
-    similarities = np.mean(reference_leaves == candidate_leaves, axis=1)
+    candidate = leaves[candidate_index]
+    mask = ordered["symbol"].to_numpy() != held_out
+    reference = leaves[mask]
+    symbols = ordered.loc[mask, "symbol"].astype(str).tolist()
+    similarities = np.mean(reference == candidate, axis=1)
     best = int(np.argmax(similarities))
     similarity = float(similarities[best])
     return {
         "state_similarity": similarity,
         "state_novelty": float(1.0 - similarity),
-        "state_nearest_symbol": reference_symbols[best],
+        "state_nearest_symbol": symbols[best],
         "state_tree_count": int(leaves.shape[1]),
     }
 
 
-def _score_snapshot(model: Any, snapshot: pd.DataFrame, held_out: str) -> dict[str, Any]:
+def _score_rank_snapshot(model: Any, snapshot: pd.DataFrame, held_out: str) -> dict[str, Any]:
     if snapshot.empty or held_out not in set(snapshot["symbol"]):
-        return {
-            "latest_rank": None,
-            "latest_rank_percentile": None,
-            "latest_relative_score_iqr": None,
-            **_leaf_similarity(model, snapshot, held_out),
-        }
+        return {"latest_rank": None, "latest_rank_percentile": None, **_leaf_similarity(model, snapshot, held_out)}
     scored = snapshot.copy()
     scored["score"] = model.predict(scored[list(FEATURE_COLUMNS)])
-    candidate = scored[scored["symbol"] == held_out]
-    reference = scored[scored["symbol"] != held_out]
-    candidate_score = float(candidate["score"].iloc[0])
-    reference_scores = reference["score"].to_numpy(dtype=float)
-    all_scores = np.concatenate([reference_scores, np.asarray([candidate_score])])
-    rank = 1 + int(np.sum(reference_scores > candidate_score))
-    median = float(np.median(reference_scores))
-    q25, q75 = np.quantile(reference_scores, [0.25, 0.75])
-    iqr = float(q75 - q25)
+    candidate_score = float(scored.loc[scored["symbol"] == held_out, "score"].iloc[0])
+    reference_scores = scored.loc[scored["symbol"] != held_out, "score"].to_numpy(dtype=float)
+    all_scores = np.append(reference_scores, candidate_score)
     return {
-        "latest_rank": rank,
+        "latest_rank": 1 + int(np.sum(reference_scores > candidate_score)),
         "latest_rank_percentile": float(np.mean(all_scores <= candidate_score)),
-        "latest_relative_score_iqr": float((candidate_score - median) / iqr) if abs(iqr) > 1e-12 else 0.0,
         **_leaf_similarity(model, snapshot, held_out),
     }
 
 
-def _correlation_metrics(
+def _rank_metrics(
+    scored: pd.DataFrame,
+    truth: pd.DataFrame,
     held_out: str,
-    full_corr: pd.DataFrame,
-    latest_60_corr: pd.DataFrame,
+    weak_threshold: float,
 ) -> dict[str, Any]:
-    def summarize(matrix: pd.DataFrame, prefix: str) -> dict[str, Any]:
-        if held_out not in matrix.columns:
-            return {}
-        values = matrix[held_out].drop(labels=[held_out], errors="ignore").dropna()
-        if values.empty:
-            return {}
+    truth_lookup = {
+        date: group.set_index("symbol")["utility"]
+        for date, group in truth.groupby("date", sort=False)
+    }
+    ranks: list[int] = []
+    percentiles: list[float] = []
+    relative_iqrs: list[float] = []
+    leader_gaps: list[float] = []
+    weak_count = 0
+    weak_wins = 0
+    oracle_ranks: list[int] = []
+    oracle_percentiles: list[float] = []
+
+    for date, group in scored.groupby("date", sort=False):
+        candidate = group[group["symbol"] == held_out]
+        reference = group[group["symbol"] != held_out]
+        if candidate.empty or reference.empty:
+            continue
+        candidate_score = float(candidate["score"].iloc[0])
+        reference_scores = reference["score"].to_numpy(dtype=float)
+        all_scores = np.append(reference_scores, candidate_score)
+        rank = 1 + int(np.sum(reference_scores > candidate_score))
+        ranks.append(rank)
+        percentiles.append(float(np.mean(all_scores <= candidate_score)))
+
+        q25, median, q75 = np.quantile(reference_scores, [0.25, 0.50, 0.75])
+        iqr = float(q75 - q25)
+        relative_iqrs.append(float((candidate_score - median) / iqr) if abs(iqr) > 1e-12 else 0.0)
+        leader_gap = float(candidate_score - float(np.max(reference_scores)))
+        leader_gaps.append(leader_gap)
+
+        weak = bool(float(np.max(reference_scores)) <= weak_threshold)
+        weak_count += int(weak)
+        weak_wins += int(weak and rank == 1)
+
+        truth_series = truth_lookup.get(date)
+        if truth_series is not None and held_out in truth_series.index:
+            held_truth = float(truth_series.loc[held_out])
+            reference_truth = truth_series.drop(labels=[held_out], errors="ignore").dropna().to_numpy(dtype=float)
+            if len(reference_truth):
+                all_truth = np.append(reference_truth, held_truth)
+                oracle_ranks.append(1 + int(np.sum(reference_truth > held_truth)))
+                oracle_percentiles.append(float(np.mean(all_truth <= held_truth)))
+
+    rank_array = np.asarray(ranks, dtype=float)
+    oracle_rank_array = np.asarray(oracle_ranks, dtype=float)
+    positive_gaps = [value for value in leader_gaps if value > 0]
+    return {
+        "session_count": len(ranks),
+        "rank_percentile_mean": float(np.mean(percentiles)) if percentiles else None,
+        "rank_percentile_median": float(np.median(percentiles)) if percentiles else None,
+        "top1_frequency": float(np.mean(rank_array <= 1)) if len(rank_array) else None,
+        "top3_frequency": float(np.mean(rank_array <= 3)) if len(rank_array) else None,
+        "top5_frequency": float(np.mean(rank_array <= 5)) if len(rank_array) else None,
+        "relative_score_iqr_median": float(np.median(relative_iqrs)) if relative_iqrs else None,
+        "leader_gap_mean": float(np.mean(leader_gaps)) if leader_gaps else None,
+        "leader_positive_gap_mean": float(np.mean(positive_gaps)) if positive_gaps else None,
+        "weak_reference_session_count": weak_count,
+        "weak_period_coverage": float(weak_wins / weak_count) if weak_count else None,
+        "oracle_rank_percentile_mean": float(np.mean(oracle_percentiles)) if oracle_percentiles else None,
+        "oracle_top1_frequency": float(np.mean(oracle_rank_array <= 1)) if len(oracle_rank_array) else None,
+        "oracle_top3_frequency": float(np.mean(oracle_rank_array <= 3)) if len(oracle_rank_array) else None,
+        "oracle_top5_frequency": float(np.mean(oracle_rank_array <= 5)) if len(oracle_rank_array) else None,
+    }
+
+
+def _corr_metrics(symbol: str, full_corr: pd.DataFrame, corr_60: pd.DataFrame) -> dict[str, Any]:
+    def one(matrix: pd.DataFrame, prefix: str) -> dict[str, Any]:
+        values = matrix[symbol].drop(labels=[symbol], errors="ignore").dropna()
         abs_values = values.abs()
-        nearest_abs = str(abs_values.idxmax())
+        nearest = str(abs_values.idxmax())
         return {
             f"{prefix}_max": float(values.max()),
             f"{prefix}_min": float(values.min()),
             f"{prefix}_median": float(values.median()),
             f"{prefix}_median_abs": float(abs_values.median()),
             f"{prefix}_max_abs": float(abs_values.max()),
-            f"{prefix}_nearest_abs_symbol": nearest_abs,
-            f"{prefix}_nearest_abs_signed": float(values.loc[nearest_abs]),
+            f"{prefix}_nearest_abs_symbol": nearest,
+            f"{prefix}_nearest_abs_signed": float(values.loc[nearest]),
         }
-
-    return {
-        **summarize(full_corr, "return_corr_full"),
-        **summarize(latest_60_corr, "return_corr_60_latest"),
-    }
+    return {**one(full_corr, "return_corr_full"), **one(corr_60, "return_corr_60_latest")}
 
 
-def _analyse_one_asset(
+def _analyse_asset(
     held_out: str,
     assets: list[str],
     feature_panel: pd.DataFrame,
     training_panel: pd.DataFrame,
-    fold_specs: list[tuple[list[pd.Timestamp], list[pd.Timestamp]]],
+    folds: list[tuple[list[pd.Timestamp], list[pd.Timestamp]]],
     latest_date: pd.Timestamp,
     full_corr: pd.DataFrame,
-    latest_60_corr: pd.DataFrame,
+    corr_60: pd.DataFrame,
     winner_assets: set[str],
-    base_seed: int,
+    random_state: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     started = time.perf_counter()
-    symbol_seed = _stable_seed(held_out, base_seed)
-    reference_base = training_panel[training_panel["symbol"] != held_out].copy()
-    reference_base = _relevance_for_reference(reference_base)
+    seed = _stable_seed(held_out, random_state)
+    reference = _relevance_for_reference(training_panel[training_panel["symbol"] != held_out])
     fold_rows: list[dict[str, Any]] = []
-    fold_metrics: list[dict[str, Any]] = []
-    fold_state_similarities: list[float] = []
-    fold_state_nearest: list[str] = []
 
-    for fold_number, (train_dates, validation_dates) in enumerate(fold_specs, start=1):
-        train_set = set(train_dates)
+    for fold_number, (train_dates, validation_dates) in enumerate(folds, start=1):
+        train = reference[reference["date"].isin(set(train_dates))].copy()
+        model = _fit_model(train, seed + fold_number)
+
+        training_scores = train[["date", "symbol", *FEATURE_COLUMNS]].copy()
+        training_scores["score"] = model.predict(training_scores[list(FEATURE_COLUMNS)])
+        weak_threshold = float(training_scores.groupby("date")["score"].max().quantile(0.25))
+
         validation_set = set(validation_dates)
-        train = reference_base[reference_base["date"].isin(train_set)].copy()
-        model = _fit_reference_model(train, symbol_seed + fold_number)
-
-        train_scores = train[["date", "symbol", *FEATURE_COLUMNS]].copy()
-        train_scores["score"] = model.predict(train_scores[list(FEATURE_COLUMNS)])
-        daily_reference_max = train_scores.groupby("date")["score"].max()
-        weak_threshold = float(daily_reference_max.quantile(0.25))
-
-        validation_features = feature_panel[
+        validation = feature_panel[
             feature_panel["date"].isin(validation_set)
             & feature_panel["symbol"].isin(assets)
         ].copy()
-        validation_features["score"] = model.predict(validation_features[list(FEATURE_COLUMNS)])
-        validation_truth = training_panel[
+        validation["score"] = model.predict(validation[list(FEATURE_COLUMNS)])
+        truth = training_panel[
             training_panel["date"].isin(validation_set)
             & training_panel["symbol"].isin(assets)
-        ][["date", "symbol", "utility"]].copy()
-        metrics = _rank_metrics_for_dates(
-            validation_features[["date", "symbol", "score"]],
-            validation_truth,
+        ][["date", "symbol", "utility"]]
+
+        metrics = _rank_metrics(
+            validation[["date", "symbol", "score"]],
+            truth,
             held_out,
             weak_threshold,
         )
 
-        fold_end = max(validation_dates)
-        fold_snapshot = feature_panel[
+        fold_end = pd.Timestamp(max(validation_dates))
+        snapshot = feature_panel[
             (feature_panel["date"] == fold_end)
             & feature_panel["symbol"].isin(assets)
         ].copy()
-        state = _leaf_similarity(model, fold_snapshot, held_out)
-        if state.get("state_similarity") is not None:
-            fold_state_similarities.append(float(state["state_similarity"]))
-        if state.get("state_nearest_symbol"):
-            fold_state_nearest.append(str(state["state_nearest_symbol"]))
+        fold_rows.append(
+            {
+                "symbol": held_out,
+                "fold": fold_number,
+                "train_start": pd.Timestamp(min(train_dates)).date().isoformat(),
+                "train_end": pd.Timestamp(max(train_dates)).date().isoformat(),
+                "validation_start": pd.Timestamp(min(validation_dates)).date().isoformat(),
+                "validation_end": fold_end.date().isoformat(),
+                "weak_reference_threshold": weak_threshold,
+                **metrics,
+                **_leaf_similarity(model, snapshot, held_out),
+            }
+        )
 
-        fold_row = {
-            "symbol": held_out,
-            "fold": fold_number,
-            "train_start": min(train_dates).date().isoformat(),
-            "train_end": max(train_dates).date().isoformat(),
-            "validation_start": min(validation_dates).date().isoformat(),
-            "validation_end": max(validation_dates).date().isoformat(),
-            "train_sessions": len(train_dates),
-            "validation_sessions": len(validation_dates),
-            "weak_reference_threshold": weak_threshold,
-            **metrics,
-            **state,
-        }
-        fold_rows.append(fold_row)
-        fold_metrics.append(metrics)
-
-    all_labelled_dates = sorted(pd.unique(reference_base["date"]))
-    final = reference_base[reference_base["date"].isin(set(all_labelled_dates))].copy()
-    final_model = _fit_reference_model(final, symbol_seed + 10_000)
+    final_model = _fit_model(reference, seed + 10_000)
     latest_snapshot = feature_panel[
         (feature_panel["date"] == latest_date)
         & feature_panel["symbol"].isin(assets)
     ].copy()
-    latest = _score_snapshot(final_model, latest_snapshot, held_out)
+    latest = _score_rank_snapshot(final_model, latest_snapshot, held_out)
 
-    def mean_metric(name: str) -> float | None:
-        values = [float(row[name]) for row in fold_metrics if row.get(name) is not None]
-        return float(np.mean(values)) if values else None
+    def values(name: str) -> list[float]:
+        return [float(row[name]) for row in fold_rows if row.get(name) is not None]
 
-    def median_metric(name: str) -> float | None:
-        values = [float(row[name]) for row in fold_metrics if row.get(name) is not None]
-        return float(np.median(values)) if values else None
+    def mean(name: str) -> float | None:
+        data = values(name)
+        return float(np.mean(data)) if data else None
 
-    fold_rank_percentiles = [
-        float(row["rank_percentile_mean"])
-        for row in fold_metrics
-        if row.get("rank_percentile_mean") is not None
-    ]
-    fold_top3 = [float(row["top3_frequency"]) for row in fold_metrics if row.get("top3_frequency") is not None]
-    nearest_mode = Counter(fold_state_nearest).most_common(1)[0][0] if fold_state_nearest else None
+    def median(name: str) -> float | None:
+        data = values(name)
+        return float(np.median(data)) if data else None
+
+    rank_fold_values = values("rank_percentile_mean")
+    top3_fold_values = values("top3_frequency")
+    state_values = values("state_similarity")
+    nearest_values = [str(row["state_nearest_symbol"]) for row in fold_rows if row.get("state_nearest_symbol")]
+    nearest_mode = Counter(nearest_values).most_common(1)[0][0] if nearest_values else None
 
     result = {
         "symbol": held_out,
-        "is_in_current_winner": bool(held_out in winner_assets),
-        "reference_asset_count": int(len(assets) - 1),
-        "oos_session_count": int(sum(int(row.get("session_count") or 0) for row in fold_metrics)),
-        "oos_rank_percentile_mean": mean_metric("rank_percentile_mean"),
-        "oos_rank_percentile_median_of_folds": median_metric("rank_percentile_median"),
-        "oos_rank_percentile_fold_std": float(np.std(fold_rank_percentiles, ddof=0)) if fold_rank_percentiles else None,
-        "oos_top1_frequency": mean_metric("top1_frequency"),
-        "oos_top3_frequency": mean_metric("top3_frequency"),
-        "oos_top5_frequency": mean_metric("top5_frequency"),
-        "oos_top3_fold_std": float(np.std(fold_top3, ddof=0)) if fold_top3 else None,
-        "oos_relative_score_iqr_median": median_metric("relative_score_iqr_median"),
-        "oos_leader_gap_mean": mean_metric("leader_gap_mean"),
-        "oos_leader_positive_gap_mean": mean_metric("leader_positive_gap_mean"),
-        "oos_weak_period_coverage": mean_metric("weak_period_coverage"),
-        "oracle_rank_percentile_mean": mean_metric("oracle_rank_percentile_mean"),
-        "oracle_top1_frequency": mean_metric("oracle_top1_frequency"),
-        "oracle_top3_frequency": mean_metric("oracle_top3_frequency"),
-        "oracle_top5_frequency": mean_metric("oracle_top5_frequency"),
-        "state_similarity_fold_median": float(np.median(fold_state_similarities)) if fold_state_similarities else None,
-        "state_similarity_fold_max": float(np.max(fold_state_similarities)) if fold_state_similarities else None,
-        "state_novelty_fold_median": float(1.0 - np.median(fold_state_similarities)) if fold_state_similarities else None,
+        "is_in_current_winner": held_out in winner_assets,
+        "reference_asset_count": len(assets) - 1,
+        "oos_session_count": int(sum(int(row.get("session_count") or 0) for row in fold_rows)),
+        "oos_rank_percentile_mean": mean("rank_percentile_mean"),
+        "oos_rank_percentile_fold_std": float(np.std(rank_fold_values, ddof=0)) if rank_fold_values else None,
+        "oos_top1_frequency": mean("top1_frequency"),
+        "oos_top3_frequency": mean("top3_frequency"),
+        "oos_top5_frequency": mean("top5_frequency"),
+        "oos_top3_fold_std": float(np.std(top3_fold_values, ddof=0)) if top3_fold_values else None,
+        "oos_relative_score_iqr_median": median("relative_score_iqr_median"),
+        "oos_leader_gap_mean": mean("leader_gap_mean"),
+        "oos_leader_positive_gap_mean": mean("leader_positive_gap_mean"),
+        "oos_weak_period_coverage": mean("weak_period_coverage"),
+        "oracle_rank_percentile_mean": mean("oracle_rank_percentile_mean"),
+        "oracle_top1_frequency": mean("oracle_top1_frequency"),
+        "oracle_top3_frequency": mean("oracle_top3_frequency"),
+        "oracle_top5_frequency": mean("oracle_top5_frequency"),
+        "state_similarity_fold_median": float(np.median(state_values)) if state_values else None,
+        "state_novelty_fold_median": float(1.0 - np.median(state_values)) if state_values else None,
         "state_nearest_symbol_fold_mode": nearest_mode,
         **latest,
-        **_correlation_metrics(held_out, full_corr, latest_60_corr),
+        **_corr_metrics(held_out, full_corr, corr_60),
         "elapsed_seconds": float(time.perf_counter() - started),
     }
     return result, fold_rows
@@ -657,14 +582,14 @@ def _distribution_summary(frame: pd.DataFrame) -> dict[str, Any]:
         "return_corr_60_latest_max_abs",
         "latest_rank_percentile",
     ]
-    summary: dict[str, Any] = {}
+    result: dict[str, Any] = {}
     for metric in metrics:
         if metric not in frame.columns:
             continue
         series = pd.to_numeric(frame[metric], errors="coerce").dropna()
         if series.empty:
             continue
-        summary[metric] = {
+        result[metric] = {
             "count": int(len(series)),
             "mean": float(series.mean()),
             "std": float(series.std(ddof=0)),
@@ -676,21 +601,21 @@ def _distribution_summary(frame: pd.DataFrame) -> dict[str, Any]:
             "min": float(series.min()),
             "max": float(series.max()),
         }
-    return summary
+    return result
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Read the selected Strategy's complete market history from local MongoDB once, "
-            "then run a backtest-free leave-one-out signature analysis entirely in memory."
+            "Load the selected Strategy's complete market history once from local MongoDB, "
+            "then run a backtest-free leave-one-out asset-signature experiment in RAM."
         )
     )
     parser.add_argument("--strategy-sequence", type=int, default=DEFAULT_STRATEGY_SEQUENCE)
     parser.add_argument("--strategy-id", default=None)
-    parser.add_argument("--snapshot-end", default=None, help="YYYY-MM-DD. Defaults to the latest common cached session.")
-    parser.add_argument("--mongo-uri", default=None, help="Defaults to MONGO_URL/MONGO_URI or mongodb://localhost:27017.")
-    parser.add_argument("--database", default=None, help="Defaults to MONGO_DATABASE from .env.")
+    parser.add_argument("--snapshot-end", default=None)
+    parser.add_argument("--mongo-uri", default=None)
+    parser.add_argument("--database", default=None)
     parser.add_argument("--env-file", default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--random-state", type=int, default=DEFAULT_RANDOM_STATE)
@@ -720,7 +645,7 @@ def main() -> int:
         int(
             args.workers
             if args.workers is not None
-            else os.getenv("ASSET_DISCOVERY_REPLAY_WORKERS") or DEFAULT_WORKERS
+            else (os.getenv("ASSET_DISCOVERY_REPLAY_WORKERS") or DEFAULT_WORKERS)
         ),
     )
 
@@ -735,7 +660,7 @@ def main() -> int:
     db = client[database_name]
 
     strategy = _strategy_document(db, args.strategy_sequence, args.strategy_id)
-    configuration = _strategy_configuration(strategy)
+    configuration = _configuration(strategy)
     assets = [
         str(symbol).strip().upper()
         for symbol in list(configuration.get("assets") or [])
@@ -743,21 +668,19 @@ def main() -> int:
     ]
     assets = list(dict.fromkeys(assets))
     if len(assets) < 3:
-        raise RuntimeError("The selected Strategy needs at least three assets for this experiment.")
+        raise RuntimeError("The selected Strategy must contain at least three assets.")
 
     strategy_sequence = int(strategy.get("strategy_sequence") or args.strategy_sequence)
     strategy_name = str(strategy.get("name") or f"Strategy #{strategy_sequence}")
     strategy_id = str(strategy.get("_id") or "")
     start_date = _normalize_date(configuration.get("start_date") or "2016-01-01")
-    identity = _identity(configuration)
+    identity = _market_identity(configuration)
     collection = db[ALPACA_MARKET_BARS_COLLECTION]
     snapshot_end = (
         _normalize_date(args.snapshot_end)
         if args.snapshot_end
         else _latest_common_session(collection, assets, identity)
     )
-    if snapshot_end < start_date:
-        raise RuntimeError("snapshot_end is earlier than the Strategy start_date.")
 
     output_dir = Path(
         args.output_dir
@@ -768,34 +691,30 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _log(
-        f"Experiment start: {strategy_name} ({strategy_id}), assets={len(assets)}, "
+        f"Start: {strategy_name} ({strategy_id}), assets={len(assets)}, "
         f"window={start_date.date().isoformat()} -> {snapshot_end.date().isoformat()}, workers={workers}."
     )
-    _log("MongoDB is read-only for this script. No Alpaca call and no Backtest will be executed.")
+    _log("MongoDB is read-only. No Alpaca call and no Backtest will be executed.")
 
     expected = _expected_sessions(start_date, snapshot_end)
-    _log(f"Step 1/6 - Loading all {len(assets)} Strategy series from local MongoDB in one query...")
-    load_started = time.perf_counter()
-    frames = _load_frames_once(collection, assets, identity, start_date, snapshot_end)
-    _log(f"Loaded {sum(len(frame) for frame in frames.values()):,} OHLCV rows in {time.perf_counter() - load_started:.1f}s.")
 
-    _log("Step 2/6 - Validating Full Strategy History for every asset...")
+    _log(f"Step 1/6 - Loading all {len(assets)} series from local MongoDB in one query...")
+    started = time.perf_counter()
+    frames = _load_frames_once(collection, assets, identity, start_date, snapshot_end)
+    _log(f"Loaded {sum(len(frame) for frame in frames.values()):,} OHLCV rows in {time.perf_counter() - started:.1f}s.")
+
+    _log("Step 2/6 - Validating Full Strategy History...")
     history = _validate_complete_history(frames, assets, expected)
     _write_csv(output_dir / "history_integrity.csv", history)
-    _log(f"All {len(assets)} assets cover the complete {len(expected)}-session XNYS Strategy window.")
+    _log(f"All {len(assets)} assets cover the complete {len(expected)}-session XNYS window.")
 
     _log("Step 3/6 - Building features and 20-session utility labels once in memory...")
-    feature_panel, training_panel, _features_by_symbol = _feature_and_training_panels(frames)
-    unique_dates = sorted(pd.unique(training_panel["date"]))
-    fold_specs = _fold_boundaries(unique_dates)
-    latest_date = max(pd.unique(feature_panel["date"]))
-    if latest_date < snapshot_end:
-        _log(
-            f"Note: latest complete feature date is {latest_date.date().isoformat()}, "
-            f"earlier than snapshot {snapshot_end.date().isoformat()}."
-        )
+    feature_panel, training_panel = _build_panels(frames)
+    unique_dates = [pd.Timestamp(value) for value in sorted(pd.unique(training_panel["date"]))]
+    folds = _fold_specs(unique_dates)
+    latest_date = pd.Timestamp(max(pd.unique(feature_panel["date"])))
 
-    _log("Step 4/6 - Computing pairwise return correlations without any model/backtest...")
+    _log("Step 4/6 - Computing pairwise return correlations...")
     close = pd.concat(
         {symbol: pd.to_numeric(frame["close"], errors="coerce") for symbol, frame in frames.items()},
         axis=1,
@@ -803,13 +722,13 @@ def main() -> int:
     ).sort_index()
     returns = close.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how="all")
     full_corr = returns.corr()
-    latest_60_corr = returns.tail(60).corr()
+    corr_60 = returns.tail(60).corr()
     full_corr.to_csv(output_dir / "return_correlation_full.csv")
-    latest_60_corr.to_csv(output_dir / "return_correlation_latest_60.csv")
+    corr_60.to_csv(output_dir / "return_correlation_latest_60.csv")
 
     winner_assets = _winner_assets(db)
     client.close()
-    _log("MongoDB connection closed. Steps 5-6 are now entirely in RAM/CPU.")
+    _log("MongoDB connection closed. Remaining work is entirely in RAM/CPU.")
 
     manifest = {
         "schema_version": 1,
@@ -836,59 +755,52 @@ def main() -> int:
         "backtest_used": False,
         "alpaca_network_used": False,
         "mongo_writes": False,
-        "notes": {
-            "oracle_metrics": "Evaluation-only realized future utility. Never used as a ranking input.",
-            "weak_period": "Reference daily max ranker score is below the 25th percentile of the fold's training-period daily maxima.",
-            "state_similarity": "LightGBM leaf agreement against the 55 remaining Strategy assets.",
-        },
+        "oracle_metrics_note": "Evaluation-only future utility; never used as ranking input.",
+        "weak_period_definition": (
+            "Reference daily max ranker score <= training-period Q25 of daily max scores."
+        ),
+        "state_similarity_definition": "LightGBM leaf agreement against the 55 remaining assets.",
     }
     _write_json(output_dir / "manifest.json", manifest)
 
     result_path = output_dir / "asset_signatures.csv"
     fold_path = output_dir / "asset_signature_folds.csv"
-    existing_results: list[dict[str, Any]] = []
-    existing_folds: list[dict[str, Any]] = []
-    completed_symbols: set[str] = set()
+    results: list[dict[str, Any]] = []
+    fold_rows: list[dict[str, Any]] = []
+    completed: set[str] = set()
+
     if not args.no_resume and result_path.exists():
-        existing_frame = pd.read_csv(result_path)
-        existing_results = existing_frame.to_dict(orient="records")
-        completed_symbols = {
-            str(symbol).upper()
-            for symbol in existing_frame.get("symbol", pd.Series(dtype=str)).dropna().astype(str)
-        }
+        existing = pd.read_csv(result_path)
+        results = existing.to_dict(orient="records")
+        completed = set(existing["symbol"].dropna().astype(str).str.upper()) if "symbol" in existing else set()
         if fold_path.exists():
-            existing_folds = pd.read_csv(fold_path).to_dict(orient="records")
-        if completed_symbols:
-            _log(f"Resume enabled: {len(completed_symbols)} assets already completed and will be skipped.")
+            fold_rows = pd.read_csv(fold_path).to_dict(orient="records")
+        if completed:
+            _log(f"Resume: {len(completed)} assets already completed.")
 
-    pending = [symbol for symbol in assets if symbol not in completed_symbols]
-    results = list(existing_results)
-    fold_rows = list(existing_folds)
-    _log(
-        f"Step 5/6 - Running leave-one-out predictive analysis for {len(pending)} assets "
-        f"with {workers} worker(s). No Backtest is involved."
-    )
+    pending = [symbol for symbol in assets if symbol not in completed]
+    _log(f"Step 5/6 - Leave-one-out predictive analysis: pending={len(pending)}, workers={workers}.")
 
-    experiment_started = time.perf_counter()
+    loo_started = time.perf_counter()
     if pending:
         with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as executor:
             futures = {
                 executor.submit(
-                    _analyse_one_asset,
+                    _analyse_asset,
                     symbol,
                     assets,
                     feature_panel,
                     training_panel,
-                    fold_specs,
+                    folds,
                     latest_date,
                     full_corr,
-                    latest_60_corr,
+                    corr_60,
                     winner_assets,
                     int(args.random_state),
                 ): symbol
                 for symbol in pending
             }
-            completed = len(completed_symbols)
+            done_count = len(completed)
             for future in as_completed(futures):
                 symbol = futures[future]
                 result, symbol_folds = future.result()
@@ -896,41 +808,44 @@ def main() -> int:
                 fold_rows = [row for row in fold_rows if str(row.get("symbol") or "").upper() != symbol]
                 results.append(result)
                 fold_rows.extend(symbol_folds)
-                completed += 1
-                results.sort(key=lambda row: assets.index(str(row.get("symbol") or "").upper()))
-                fold_rows.sort(key=lambda row: (assets.index(str(row.get("symbol") or "").upper()), int(row.get("fold") or 0)))
+                done_count += 1
+
+                results.sort(key=lambda row: assets.index(str(row["symbol"]).upper()))
+                fold_rows.sort(
+                    key=lambda row: (
+                        assets.index(str(row["symbol"]).upper()),
+                        int(row.get("fold") or 0),
+                    )
+                )
                 _write_csv(result_path, results)
                 _write_csv(fold_path, fold_rows)
                 _log(
-                    f"LOO {completed}/{len(assets)} - {symbol} completed in {float(result['elapsed_seconds']):.1f}s; "
-                    f"OOS Top-3={result.get('oos_top3_frequency')!s}, "
-                    f"state novelty={result.get('state_novelty')!s}."
+                    f"LOO {done_count}/{len(assets)} - {symbol}: "
+                    f"Top-3 OOS={result.get('oos_top3_frequency')}, "
+                    f"latest novelty={result.get('state_novelty')}, "
+                    f"{result.get('elapsed_seconds', 0.0):.1f}s."
                 )
 
-    _log("Step 6/6 - Building the empirical signature distribution of the existing Strategy assets...")
-    result_frame = pd.DataFrame(results)
-    if result_frame.empty:
-        raise RuntimeError("No leave-one-out result was produced.")
-    result_frame = result_frame.sort_values("symbol").reset_index(drop=True)
+    _log("Step 6/6 - Building empirical signature distributions...")
+    result_frame = pd.DataFrame(results).sort_values("symbol").reset_index(drop=True)
     result_frame.to_csv(result_path, index=False)
-    distribution = _distribution_summary(result_frame)
     summary = {
         "schema_version": 1,
         "strategy_id": strategy_id,
         "strategy_sequence": strategy_sequence,
         "asset_count": len(assets),
         "completed_asset_count": int(len(result_frame)),
-        "elapsed_seconds": float(time.perf_counter() - experiment_started),
-        "metric_distributions": distribution,
+        "leave_one_out_elapsed_seconds": float(time.perf_counter() - loo_started),
+        "metric_distributions": _distribution_summary(result_frame),
         "interpretation_policy": (
-            "These distributions describe the 56 assets already present in the Strategy. "
-            "They are not automatic acceptance thresholds and do not use Backtest capital as a label."
+            "These distributions describe assets already present in the Strategy. "
+            "They are not automatic acceptance thresholds and do not use Backtest capital."
         ),
     }
     _write_json(output_dir / "signature_distribution.json", summary)
 
-    _log(f"Experiment completed. Outputs: {output_dir}")
-    _log("Primary files: asset_signatures.csv, asset_signature_folds.csv, signature_distribution.json.")
+    _log(f"Completed. Outputs: {output_dir}")
+    _log("Main files: asset_signatures.csv, asset_signature_folds.csv, signature_distribution.json.")
     return 0
 
 
