@@ -1,34 +1,13 @@
 from __future__ import annotations
 
-import statistics
-import threading
 from typing import Any
 
 import pandas as pd
 
-from ..infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, JOBS_COLLECTION
+from ..infrastructure.persistence.mongo_repository import JOBS_COLLECTION
 
 
 _INSTALLED = False
-_MAX_BASELINE_RELATIVE_DRIFT = 0.005
-_REQUEST_LOCK = threading.RLock()
-_BASELINE_REQUEST_CONTEXT: dict[int, dict[str, Any]] = {}
-
-
-def _finite(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if pd.isna(number):
-        return None
-    return number
-
-
-def _median(rows: list[dict[str, Any]], key: str) -> float | None:
-    values = [_finite(row.get(key)) for row in rows]
-    clean = [value for value in values if value is not None]
-    return float(statistics.median(clean)) if clean else None
 
 
 def _normalized_assets(values: Any) -> list[str]:
@@ -68,31 +47,31 @@ def _certified_job(
 
     if not source_id or not source_hash or not last_backtest_id:
         raise RuntimeError(
-            "Asset Discovery requires an exact completed certified backtest for the current Strategy revision before research can start."
+            "Asset Discovery requires an exact completed Strategy backtest snapshot for the current revision before research can start."
         )
     if str(strategy.get("last_backtest_status") or "").strip().lower() != "completed":
-        raise RuntimeError("Asset Discovery certified Strategy backtest is not completed.")
+        raise RuntimeError("Asset Discovery Strategy backtest snapshot is not completed.")
     if int(strategy.get("last_backtest_revision") or 0) != source_revision:
         raise RuntimeError(
-            "Asset Discovery certified Strategy backtest revision does not match the current Strategy revision."
+            "Asset Discovery Strategy backtest revision does not match the current Strategy revision."
         )
 
     job = db[JOBS_COLLECTION].find_one({"id": last_backtest_id}) or {}
     if str(job.get("status") or "").strip().lower() != "completed":
-        raise RuntimeError("Asset Discovery could not load the completed certified Strategy backtest.")
+        raise RuntimeError("Asset Discovery could not load the completed Strategy backtest snapshot.")
     if str(job.get("strategy_profile_id") or "").strip() != source_id:
-        raise RuntimeError("Asset Discovery certified backtest belongs to another Strategy.")
+        raise RuntimeError("Asset Discovery backtest snapshot belongs to another Strategy.")
     if int(job.get("strategy_profile_revision") or 0) != source_revision:
-        raise RuntimeError("Asset Discovery certified backtest revision is stale.")
+        raise RuntimeError("Asset Discovery backtest snapshot revision is stale.")
     if str(job.get("strategy_configuration_hash") or "").strip() != source_hash:
-        raise RuntimeError("Asset Discovery certified backtest configuration hash is stale.")
+        raise RuntimeError("Asset Discovery backtest snapshot configuration hash is stale.")
 
     request = job.get("request") if isinstance(job.get("request"), dict) else {}
     if not request:
-        raise RuntimeError("Asset Discovery certified backtest request snapshot is unavailable.")
+        raise RuntimeError("Asset Discovery Strategy backtest request snapshot is unavailable.")
     if _iso_date(request.get("analysis_end_date")) != _iso_date(evaluation_end):
         raise RuntimeError(
-            "Asset Discovery snapshot end differs from the certified Strategy backtest. Run a new certified Strategy backtest for the current market snapshot first."
+            "Asset Discovery snapshot end differs from the Strategy backtest snapshot. Run a new Strategy backtest for the current market snapshot first."
         )
 
     try:
@@ -101,52 +80,23 @@ def _certified_job(
         raise RuntimeError("Asset Discovery could not resolve the current Strategy model snapshot.") from exc
 
     current_model_hash = str(model_snapshot.get("settings_hash") or "").strip()
-    certified_model_hash = str(job.get("research_model_settings_hash") or "").strip()
-    if current_model_hash and certified_model_hash and current_model_hash != certified_model_hash:
+    snapshot_model_hash = str(job.get("research_model_settings_hash") or "").strip()
+    if current_model_hash and snapshot_model_hash and current_model_hash != snapshot_model_hash:
         raise RuntimeError(
-            "Asset Discovery current model settings differ from the certified Strategy backtest. Run a new certified Strategy backtest first."
+            "Asset Discovery current model settings differ from the Strategy backtest snapshot. Run a new Strategy backtest first."
         )
 
     return job, request
 
 
-def _certified_ending_capital(db: Any, job: dict[str, Any]) -> float:
-    backtest_id = str(job.get("id") or "").strip()
-    comparison = db[COMPARISONS_COLLECTION].find_one({"job_id": backtest_id}) or {}
-    raw_rows = comparison.get("results") if isinstance(comparison.get("results"), list) else []
-    model_family = str(job.get("research_model_family") or "").strip()
-    rows = [
-        row
-        for row in raw_rows
-        if isinstance(row, dict)
-        and bool(row.get("portfolio_rotation"))
-        and (
-            not model_family
-            or str(row.get("model_family") or row.get("backend") or "").strip() == model_family
-        )
-    ]
-    if not rows:
-        rows = [row for row in raw_rows if isinstance(row, dict) and bool(row.get("portfolio_rotation"))]
-    ending_capital = _median(rows, "strategy_ending_capital")
-    if ending_capital is None or ending_capital <= 0.0:
-        raise RuntimeError("Asset Discovery certified Strategy ending capital is unavailable.")
-    return ending_capital
-
-
-def _parity_snapshot(context: dict[str, Any], replay_capital: float) -> dict[str, Any]:
-    certified_capital = float(context["certified_ending_capital"])
-    relative_drift = abs(replay_capital / certified_capital - 1.0)
-    return {
-        "status": "passed" if relative_drift <= _MAX_BASELINE_RELATIVE_DRIFT else "failed",
-        "certified_backtest_id": str(context.get("certified_backtest_id") or ""),
-        "certified_ending_capital": certified_capital,
-        "replayed_ending_capital": replay_capital,
-        "relative_drift": relative_drift,
-        "maximum_relative_drift": _MAX_BASELINE_RELATIVE_DRIFT,
-    }
-
-
 def install_asset_discovery_certified_baseline() -> None:
+    """Lock Asset Discovery to the exact Strategy execution structure.
+
+    The prior backtest is used only to reconstruct execution semantics
+    (revision/hash/assets/anchors/research split/model snapshot). Its ending
+    capital is NOT a gate. The economic baseline is always the fresh full-
+    history replay produced inside the current Asset Discovery run.
+    """
     global _INSTALLED
     if _INSTALLED:
         return
@@ -154,13 +104,12 @@ def install_asset_discovery_certified_baseline() -> None:
     from . import asset_discovery as service
 
     original_request = service._marginal_execution_request
-    original_rotation_replay = service._run_rotation_replay
 
-    if getattr(original_request, "_asset_discovery_certified_baseline", False):
+    if getattr(original_request, "_asset_discovery_dynamic_baseline", False):
         _INSTALLED = True
         return
 
-    def certified_execution_request(
+    def strategy_snapshot_execution_request(
         db: Any,
         base_config: Any,
         strategy: dict[str, Any],
@@ -185,87 +134,45 @@ def install_asset_discovery_certified_baseline() -> None:
             analysis_start_date=analysis_start_date,
             analysis_end_date=analysis_end_date,
         )
-        job, certified = _certified_job(service, db, strategy, analysis_end_date or end_session)
+        _, snapshot = _certified_job(service, db, strategy, analysis_end_date or end_session)
 
-        certified_assets = _normalized_assets(certified.get("assets"))
+        snapshot_assets = _normalized_assets(snapshot.get("assets"))
         baseline_assets = _normalized_assets(reference_assets)
-        if certified_assets != baseline_assets:
+        if snapshot_assets != baseline_assets:
             raise RuntimeError(
-                "Asset Discovery baseline assets do not match the exact asset universe of the certified Strategy backtest."
+                "Asset Discovery baseline assets do not match the exact asset universe of the Strategy backtest snapshot."
             )
 
-        certified_anchors = _normalized_assets(certified.get("calendar_anchor_assets"))
-        certified_reference = _normalized_assets(certified.get("research_reference_assets"))
-        certified_candidates = _normalized_assets(certified.get("research_candidate_assets"))
+        snapshot_anchors = _normalized_assets(snapshot.get("calendar_anchor_assets"))
+        snapshot_reference = _normalized_assets(snapshot.get("research_reference_assets"))
+        snapshot_candidates = _normalized_assets(snapshot.get("research_candidate_assets"))
         new_candidates = _normalized_assets(candidate_assets)
 
-        if not certified_anchors:
-            certified_anchors = list(certified_reference or certified_assets)
-        if not certified_reference:
-            certified_reference = list(certified_assets)
+        if not snapshot_anchors:
+            snapshot_anchors = list(snapshot_reference or snapshot_assets)
+        if not snapshot_reference:
+            snapshot_reference = list(snapshot_assets)
 
-        combined_candidates = list(dict.fromkeys([*certified_candidates, *new_candidates]))
-        certified_family = str(certified.get("research_model_family") or "").strip()
-        certified_settings = (
-            dict(certified.get("research_model_settings") or {})
-            if isinstance(certified.get("research_model_settings"), dict)
+        combined_candidates = list(dict.fromkeys([*snapshot_candidates, *new_candidates]))
+        snapshot_family = str(snapshot.get("research_model_family") or "").strip()
+        snapshot_settings = (
+            dict(snapshot.get("research_model_settings") or {})
+            if isinstance(snapshot.get("research_model_settings"), dict)
             else None
         )
 
         updates: dict[str, Any] = {
-            "calendar_anchor_assets": certified_anchors,
-            "research_reference_assets": certified_reference,
+            "calendar_anchor_assets": snapshot_anchors,
+            "research_reference_assets": snapshot_reference,
             "research_candidate_assets": combined_candidates,
         }
-        if certified_family:
-            updates["research_model_family"] = certified_family
-        if certified_settings is not None:
-            updates["research_model_settings"] = certified_settings
+        if snapshot_family:
+            updates["research_model_family"] = snapshot_family
+        if snapshot_settings is not None:
+            updates["research_model_settings"] = snapshot_settings
 
-        locked_request = request.model_copy(update=updates)
+        return request.model_copy(update=updates)
 
-        if not new_candidates:
-            context = {
-                "certified_backtest_id": str(job.get("id") or ""),
-                "certified_ending_capital": _certified_ending_capital(db, job),
-            }
-            with _REQUEST_LOCK:
-                _BASELINE_REQUEST_CONTEXT[id(locked_request)] = context
-
-        return locked_request
-
-    def rotation_replay_with_certified_parity(
-        frames: dict[str, pd.DataFrame],
-        request: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> tuple[dict[str, Any], pd.DatetimeIndex]:
-        with _REQUEST_LOCK:
-            context = _BASELINE_REQUEST_CONTEXT.pop(id(request), None)
-
-        metrics, sessions = original_rotation_replay(frames, request, *args, **kwargs)
-        if context is None:
-            return metrics, sessions
-
-        replay_capital = _finite((metrics or {}).get("ending_capital"))
-        if replay_capital is None or replay_capital <= 0.0:
-            raise RuntimeError("Asset Discovery baseline replay produced no valid ending capital.")
-
-        parity = _parity_snapshot(context, replay_capital)
-        enriched = dict(metrics or {})
-        enriched["certified_baseline_parity"] = parity
-
-        if parity["status"] != "passed":
-            raise RuntimeError(
-                "Asset Discovery baseline parity check failed before candidate evaluation: the fresh Strategy replay does not reproduce the certified Strategy capital. "
-                f"Certified={parity['certified_ending_capital']:.6f}, "
-                f"replay={parity['replayed_ending_capital']:.6f}, "
-                f"drift={parity['relative_drift']:.4%}."
-            )
-        return enriched, sessions
-
-    setattr(certified_execution_request, "_asset_discovery_certified_baseline", True)
-    setattr(rotation_replay_with_certified_parity, "_asset_discovery_certified_baseline", True)
-    service._marginal_execution_request = certified_execution_request
-    service._run_rotation_replay = rotation_replay_with_certified_parity
+    setattr(strategy_snapshot_execution_request, "_asset_discovery_dynamic_baseline", True)
+    service._marginal_execution_request = strategy_snapshot_execution_request
     _INSTALLED = True
