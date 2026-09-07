@@ -64,11 +64,15 @@ def install_asset_discovery_economic_append_guard() -> None:
         payload = dict(original(db)) if original is not None else {}
         policy = dict(payload.get("persistence_policy") or {})
         policy.update({
-            "selection_policy": "predictive_discovery_then_selected_universe_full_strategy_economic_validation",
+            "selection_policy": (
+                "predictive_discovery_then_positive_individual_full_history_capital_qualification_"
+                "then_selected_universe_full_strategy_economic_validation"
+            ),
             "full_history_capital_lift_required_before_append": True,
             "selected_universe_validation_runs": 2,
             "selected_universe_validation_scope": "baseline_and_exact_combined_selection",
-            "per_candidate_marginal_replay_required_before_append": False,
+            "per_candidate_marginal_replay_required_before_append": True,
+            "certified_baseline_parity_required": True,
         })
         payload["persistence_policy"] = policy
         return payload
@@ -79,6 +83,8 @@ def install_asset_discovery_economic_append_guard() -> None:
         policy = dict(payload.get("persistence_policy") or {})
         policy.update({
             "full_history_capital_lift_required_before_append": True,
+            "per_candidate_marginal_replay_required": True,
+            "certified_baseline_parity_required": True,
             "economic_append_gate": "exact_selected_universe_must_increase_final_strategy_capital",
         })
         payload["persistence_policy"] = policy
