@@ -4,6 +4,8 @@ import argparse
 import json
 import math
 import sys
+import threading
+import time
 from datetime import datetime
 from typing import Any
 
@@ -11,8 +13,6 @@ import numpy as np
 import pandas as pd
 
 from ..core.environment import load_project_environment
-
-
 
 
 load_project_environment()
@@ -30,6 +30,16 @@ from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
 from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
 from .market_data import load_market_bars, validate_and_clean_bars
+
+
+_PROGRESS_LOCK = threading.Lock()
+_PROGRESS_STATE: dict[str, Any] = {
+    "percent": 0.0,
+    "stage": "",
+    "completed_runs": 0,
+    "last_real_emit": 0.0,
+    "stage_started": 0.0,
+}
 
 
 def configure_console_utf8() -> None:
@@ -103,8 +113,53 @@ def load_config(db: Any, job_id: str) -> BacktestExecutionRequest:
 
 def emit_progress(percent: float, stage: str, completed_runs: int = 0) -> None:
     safe_stage = str(stage).replace("|", "/").strip()
-    print(f"JOB_PROGRESS|{float(percent):.1f}|{int(completed_runs)}|{safe_stage}", flush=True)
+    safe_percent = float(percent)
+    safe_completed = int(completed_runs)
+    now = time.monotonic()
+    with _PROGRESS_LOCK:
+        previous_stage = str(_PROGRESS_STATE.get("stage") or "")
+        previous_percent = float(_PROGRESS_STATE.get("percent") or 0.0)
+        if safe_stage != previous_stage or abs(safe_percent - previous_percent) > 1e-9:
+            _PROGRESS_STATE["stage_started"] = now
+        _PROGRESS_STATE.update({
+            "percent": safe_percent,
+            "stage": safe_stage,
+            "completed_runs": safe_completed,
+            "last_real_emit": now,
+        })
+    print(f"JOB_PROGRESS|{safe_percent:.1f}|{safe_completed}|{safe_stage}", flush=True)
 
+
+def _start_progress_heartbeat(interval_seconds: float = 15.0) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_event.wait(interval_seconds):
+            now = time.monotonic()
+            with _PROGRESS_LOCK:
+                percent = float(_PROGRESS_STATE.get("percent") or 0.0)
+                stage = str(_PROGRESS_STATE.get("stage") or "").strip()
+                completed_runs = int(_PROGRESS_STATE.get("completed_runs") or 0)
+                last_real_emit = float(_PROGRESS_STATE.get("last_real_emit") or 0.0)
+                stage_started = float(_PROGRESS_STATE.get("stage_started") or last_real_emit or now)
+            if not stage or last_real_emit <= 0.0:
+                continue
+            if now - last_real_emit < interval_seconds:
+                continue
+            elapsed = max(0.0, now - stage_started)
+            print(
+                f"JOB_PROGRESS|{percent:.1f}|{completed_runs}|"
+                f"{stage} — still working ({elapsed:.0f}s)",
+                flush=True,
+            )
+
+    thread = threading.Thread(
+        target=heartbeat,
+        name="backtest-progress-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
 
 
 def emit_progress_detail(detail: dict[str, Any]) -> None:
@@ -287,9 +342,6 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
     if len(bars_by_symbol) < 2:
         raise ValueError("Compound rotation needs at least two successfully loaded assets.")
 
-    
-    
-    
     reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
     expected_signature = str(
         getattr(config, "expected_market_data_signature_sha256", None) or ""
@@ -301,16 +353,22 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         )
 
     emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
-    results = run_rotation_models(
-        bars_by_symbol,
-        config,
-        calculate_reference_fees,
-        apply_slippage,
-        progress_callback=emit_progress,
-        trade_callback=emit_trade,
-        progress_detail_callback=emit_progress_detail,
-        technical_log_callback=emit_research_technical,
-    )
+    heartbeat_stop, heartbeat_thread = _start_progress_heartbeat()
+    try:
+        results = run_rotation_models(
+            bars_by_symbol,
+            config,
+            calculate_reference_fees,
+            apply_slippage,
+            progress_callback=emit_progress,
+            trade_callback=emit_trade,
+            progress_detail_callback=emit_progress_detail,
+            technical_log_callback=emit_research_technical,
+        )
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
+
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
