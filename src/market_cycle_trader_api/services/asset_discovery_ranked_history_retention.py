@@ -24,7 +24,8 @@ def _result_symbols(document: dict[str, Any] | None) -> list[str]:
 
 
 def _persist_previous_ranked_set(service: Any, db: Any, document: dict[str, Any]) -> None:
-    ranked = _result_symbols(document)
+    completed = str(document.get("status") or "").strip().lower() == "completed"
+    ranked = _result_symbols(document) if completed else []
     db[service.COLLECTION].replace_one(
         {"_id": RETENTION_ID},
         {
@@ -119,7 +120,6 @@ def install_asset_discovery_ranked_history_retention() -> None:
         *,
         results: list[dict[str, Any]] | None = None,
     ) -> None:
-        retention_summary: dict[str, Any] | None = None
         if status == "completed" and results is not None:
             try:
                 retention_summary = _persist_ranked_history_frames(service, history, db, results)
@@ -131,11 +131,10 @@ def install_asset_discovery_ranked_history_retention() -> None:
                     }},
                 )
             except Exception as exc:
-                retention_summary = {"status": "failed", "error": str(exc)[:500]}
                 db[service.COLLECTION].update_one(
                     {"_id": service.CURRENT_ID, "run_id": run_id},
                     {"$set": {
-                        "ranked_history_retention": service.bson_value(retention_summary),
+                        "ranked_history_retention": service.bson_value({"status": "failed", "error": str(exc)[:500]}),
                         "updated_at": service.utc_now(),
                     }},
                 )
