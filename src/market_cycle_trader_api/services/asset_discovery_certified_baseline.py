@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import statistics
+import threading
 from typing import Any
 
 import pandas as pd
@@ -10,6 +11,8 @@ from ..infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION
 
 _INSTALLED = False
 _MAX_BASELINE_RELATIVE_DRIFT = 0.005
+_REQUEST_LOCK = threading.RLock()
+_BASELINE_REQUEST_CONTEXT: dict[int, dict[str, Any]] = {}
 
 
 def _finite(value: Any) -> float | None:
@@ -52,7 +55,12 @@ def _source_id(strategy: dict[str, Any]) -> str:
     return str(strategy.get("_id") or strategy.get("id") or "").strip()
 
 
-def _certified_job(service: Any, db: Any, strategy: dict[str, Any], evaluation_end: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _certified_job(
+    service: Any,
+    db: Any,
+    strategy: dict[str, Any],
+    evaluation_end: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     source_id = _source_id(strategy)
     source_revision = int(strategy.get("revision") or 1)
     source_hash = str(strategy.get("configuration_hash") or "").strip()
@@ -65,7 +73,9 @@ def _certified_job(service: Any, db: Any, strategy: dict[str, Any], evaluation_e
     if str(strategy.get("last_backtest_status") or "").strip().lower() != "completed":
         raise RuntimeError("Asset Discovery certified Strategy backtest is not completed.")
     if int(strategy.get("last_backtest_revision") or 0) != source_revision:
-        raise RuntimeError("Asset Discovery certified Strategy backtest revision does not match the current Strategy revision.")
+        raise RuntimeError(
+            "Asset Discovery certified Strategy backtest revision does not match the current Strategy revision."
+        )
 
     job = db[JOBS_COLLECTION].find_one({"id": last_backtest_id}) or {}
     if str(job.get("status") or "").strip().lower() != "completed":
@@ -123,6 +133,19 @@ def _certified_ending_capital(db: Any, job: dict[str, Any]) -> float:
     return ending_capital
 
 
+def _parity_snapshot(context: dict[str, Any], replay_capital: float) -> dict[str, Any]:
+    certified_capital = float(context["certified_ending_capital"])
+    relative_drift = abs(replay_capital / certified_capital - 1.0)
+    return {
+        "status": "passed" if relative_drift <= _MAX_BASELINE_RELATIVE_DRIFT else "failed",
+        "certified_backtest_id": str(context.get("certified_backtest_id") or ""),
+        "certified_ending_capital": certified_capital,
+        "replayed_ending_capital": replay_capital,
+        "relative_drift": relative_drift,
+        "maximum_relative_drift": _MAX_BASELINE_RELATIVE_DRIFT,
+    }
+
+
 def install_asset_discovery_certified_baseline() -> None:
     global _INSTALLED
     if _INSTALLED:
@@ -131,7 +154,7 @@ def install_asset_discovery_certified_baseline() -> None:
     from . import asset_discovery as service
 
     original_request = service._marginal_execution_request
-    original_replay = service._run_marginal_capital_replay
+    original_rotation_replay = service._run_rotation_replay
 
     if getattr(original_request, "_asset_discovery_certified_baseline", False):
         _INSTALLED = True
@@ -199,52 +222,50 @@ def install_asset_discovery_certified_baseline() -> None:
         if certified_settings is not None:
             updates["research_model_settings"] = certified_settings
 
-        return request.model_copy(update=updates)
+        locked_request = request.model_copy(update=updates)
 
-    def replay_with_certified_baseline(db: Any, run_id: str, *args: Any, **kwargs: Any) -> Any:
-        strategy = kwargs.get("strategy")
-        end_session = str(kwargs.get("end_session") or "").strip()
-        if not isinstance(strategy, dict) or not end_session:
-            return original_replay(db, run_id, *args, **kwargs)
+        if not new_candidates:
+            context = {
+                "certified_backtest_id": str(job.get("id") or ""),
+                "certified_ending_capital": _certified_ending_capital(db, job),
+            }
+            with _REQUEST_LOCK:
+                _BASELINE_REQUEST_CONTEXT[id(locked_request)] = context
 
-        job, _ = _certified_job(service, db, strategy, end_session)
-        certified_capital = _certified_ending_capital(db, job)
+        return locked_request
 
-        retained, summary = original_replay(db, run_id, *args, **kwargs)
-        replay_summary = dict(summary or {})
-        baseline = replay_summary.get("baseline") if isinstance(replay_summary.get("baseline"), dict) else {}
-        replay_capital = _finite(baseline.get("ending_capital"))
+    def rotation_replay_with_certified_parity(
+        frames: dict[str, pd.DataFrame],
+        request: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], pd.DatetimeIndex]:
+        with _REQUEST_LOCK:
+            context = _BASELINE_REQUEST_CONTEXT.pop(id(request), None)
+
+        metrics, sessions = original_rotation_replay(frames, request, *args, **kwargs)
+        if context is None:
+            return metrics, sessions
+
+        replay_capital = _finite((metrics or {}).get("ending_capital"))
         if replay_capital is None or replay_capital <= 0.0:
             raise RuntimeError("Asset Discovery baseline replay produced no valid ending capital.")
 
-        relative_drift = abs(replay_capital / certified_capital - 1.0)
-        parity = {
-            "status": "passed" if relative_drift <= _MAX_BASELINE_RELATIVE_DRIFT else "failed",
-            "certified_backtest_id": str(job.get("id") or ""),
-            "certified_ending_capital": certified_capital,
-            "replayed_ending_capital": replay_capital,
-            "relative_drift": relative_drift,
-            "maximum_relative_drift": _MAX_BASELINE_RELATIVE_DRIFT,
-        }
-        replay_summary["certified_baseline"] = parity
+        parity = _parity_snapshot(context, replay_capital)
+        enriched = dict(metrics or {})
+        enriched["certified_baseline_parity"] = parity
 
-        db[service.COLLECTION].update_one(
-            {"_id": service.CURRENT_ID, "run_id": run_id},
-            {"$set": {
-                "certified_baseline": service.bson_value(parity),
-                "updated_at": service.utc_now(),
-            }},
-        )
-
-        if relative_drift > _MAX_BASELINE_RELATIVE_DRIFT:
+        if parity["status"] != "passed":
             raise RuntimeError(
-                "Asset Discovery baseline parity check failed: the fresh Strategy replay does not reproduce the certified Strategy capital. "
-                f"Certified={certified_capital:.6f}, replay={replay_capital:.6f}, drift={relative_drift:.4%}."
+                "Asset Discovery baseline parity check failed before candidate evaluation: the fresh Strategy replay does not reproduce the certified Strategy capital. "
+                f"Certified={parity['certified_ending_capital']:.6f}, "
+                f"replay={parity['replayed_ending_capital']:.6f}, "
+                f"drift={parity['relative_drift']:.4%}."
             )
-        return retained, replay_summary
+        return enriched, sessions
 
     setattr(certified_execution_request, "_asset_discovery_certified_baseline", True)
-    setattr(replay_with_certified_baseline, "_asset_discovery_certified_baseline", True)
+    setattr(rotation_replay_with_certified_parity, "_asset_discovery_certified_baseline", True)
     service._marginal_execution_request = certified_execution_request
-    service._run_marginal_capital_replay = replay_with_certified_baseline
+    service._run_rotation_replay = rotation_replay_with_certified_parity
     _INSTALLED = True
