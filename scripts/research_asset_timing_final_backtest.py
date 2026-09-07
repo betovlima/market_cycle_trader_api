@@ -1,195 +1,310 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+import pandas as pd
+from pymongo import MongoClient
 
-from market_cycle_trader_api.infrastructure.persistence.mongo_repository import MongoRepository  # noqa: E402
-from market_cycle_trader_api.services.strategy_configuration import get_strategy_profile  # noqa: E402
-from market_cycle_trader_api.services.jobs import create_job, get_job  # noqa: E402
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-SCRIPT_VERSION = "asset-timing-final-backtest-v1"
+import research_asset_signature_leave_one_out as common  # noqa: E402
+from research_asset_signature_pipeline_backtest import (  # noqa: E402
+    JOBS_COLLECTION,
+    compare_results,
+    exact_baseline_job,
+)
+from research_asset_signature_pipeline_ranking import canonical_hash  # noqa: E402
+
+SCRIPT_VERSION = "asset-timing-final-backtest-v1.1"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Runs one full Strategy backtest using the already-frozen asset-timing qualified universe."
-    )
-    parser.add_argument("--strategy-sequence", type=int, default=10)
-    parser.add_argument("--snapshot-end", required=True)
-    parser.add_argument("--mongo-uri", default=os.getenv("MONGO_URI") or "mongodb://localhost:27017")
-    parser.add_argument("--database", default=os.getenv("MONGO_DB") or os.getenv("MONGODB_DB") or "market_cycle_trader")
-    parser.add_argument("--output-root", default="research_output")
-    parser.add_argument("--frozen-snapshot", default=None)
-    parser.add_argument("--poll-seconds", type=float, default=5.0)
-    return parser.parse_args()
+def _log(message: str) -> None:
+    stamp = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def _sha256_json(value: Any) -> str:
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def _is_local_mongo(uri: str) -> bool:
-    raw = str(uri or "").lower()
-    return any(token in raw for token in ("localhost", "127.0.0.1", "::1"))
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run exactly one full Strategy backtest after the point-in-time asset timing "
+            "qualification universe has been frozen."
+        )
+    )
+    parser.add_argument("--strategy-sequence", type=int, default=10)
+    parser.add_argument("--strategy-id", default=None)
+    parser.add_argument("--snapshot-end", required=True)
+    parser.add_argument("--mongo-uri", default=None)
+    parser.add_argument("--database", default=None)
+    parser.add_argument("--env-file", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--frozen-snapshot", default=None)
+    parser.add_argument("--baseline-job-id", default=None)
+    parser.add_argument("--allow-remote-mongo", action="store_true")
+    return parser
 
 
-def _get(value: Any, name: str, default: Any = None) -> Any:
-    if isinstance(value, dict):
-        return value.get(name, default)
-    return getattr(value, name, default)
+def _verify_frozen_snapshot(frozen: dict[str, Any]) -> None:
+    expected = str(frozen.get("decision_snapshot_sha256") or "")
+    canonical = dict(frozen)
+    canonical.pop("decision_snapshot_sha256", None)
+    actual = _sha256_json(canonical)
+    if not expected or actual != expected:
+        raise RuntimeError(
+            "Frozen timing snapshot hash mismatch. The qualification decision changed after freezing."
+        )
+    if frozen.get("full_strategy_backtest_used_for_selection") is not False:
+        raise RuntimeError("Frozen snapshot does not certify Backtest-independent asset qualification.")
 
 
-def _strategy_config(profile: Any) -> Any:
-    for name in ("config", "configuration", "strategy_config"):
-        value = _get(profile, name)
-        if value is not None:
-            return value
-    raise RuntimeError("Could not resolve Strategy configuration snapshot.")
+def _build_job(
+    baseline_job: dict[str, Any],
+    strategy: dict[str, Any],
+    qualified_assets: list[str],
+    frozen: dict[str, Any],
+    snapshot_end: pd.Timestamp,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    request = deepcopy(baseline_job.get("request") or {})
+    if not request:
+        raise RuntimeError("Baseline Backtest has no immutable request payload.")
 
-
-def _request_from_config(config: Any, profile: Any, assets: list[str], snapshot_end: str) -> dict[str, Any]:
-    if hasattr(config, "model_dump"):
-        request = config.model_dump(mode="json")
-    elif isinstance(config, dict):
-        request = dict(config)
-    else:
-        request = dict(vars(config))
-
-    request["assets"] = list(assets)
-    request["end_date"] = snapshot_end
-    request["analysis_end_date"] = snapshot_end
+    qualified_set = set(qualified_assets)
+    request["assets"] = list(qualified_assets)
+    request["analysis_end_date"] = snapshot_end.date().isoformat()
+    request["end_date"] = snapshot_end.date().isoformat()
     request["research_market_data_mode"] = "database_only"
-    request["internal_job"] = True
-    request["certifies_strategy"] = False
-    request["research_experiment"] = "asset_timing_vs_buyhold_final_validation"
-    request["research_reference_assets"] = []
-    request["research_candidate_assets"] = list(assets)
+    request["research_reference_assets"] = list(frozen.get("retained_existing_assets") or [])
+    request["research_candidate_assets"] = list(frozen.get("added_candidate_assets") or [])
 
-    strategy_profile_id = _get(profile, "id") or _get(profile, "_id") or _get(profile, "strategy_profile_id")
-    revision = _get(profile, "revision")
-    configuration_hash = _get(profile, "configuration_hash") or _get(profile, "config_hash")
-    if strategy_profile_id is not None:
-        request["strategy_profile_id"] = str(strategy_profile_id)
-    if revision is not None:
-        request["strategy_revision"] = revision
-    if configuration_hash is not None:
-        request["strategy_configuration_hash"] = str(configuration_hash)
-    return request
-
-
-def _wait_job(db: Any, job_id: str, poll_seconds: float) -> dict[str, Any]:
-    import time
-
-    terminal = {"completed", "failed", "cancelled", "canceled", "stopped"}
-    while True:
-        job = get_job(db, job_id)
-        if job is None:
-            raise RuntimeError(f"Backtest job {job_id} disappeared.")
-        status = str(_get(job, "status", "")).lower()
-        progress = _get(job, "progress")
-        stage = _get(job, "progress_stage") or _get(job, "stage") or ""
-        print(f"Backtest {job_id}: status={status} progress={progress} stage={stage}")
-        if status in terminal:
-            if status != "completed":
-                raise RuntimeError(f"Final Strategy backtest ended with status={status}: {_get(job, 'error')}")
-            if hasattr(job, "model_dump"):
-                return job.model_dump(mode="json")
-            if isinstance(job, dict):
-                return job
-            return dict(vars(job))
-        time.sleep(max(1.0, float(poll_seconds)))
-
-
-def _extract_metrics(job: dict[str, Any]) -> dict[str, Any]:
-    candidates = [
-        job.get("metrics"),
-        job.get("result", {}).get("metrics") if isinstance(job.get("result"), dict) else None,
-        job.get("results", {}).get("metrics") if isinstance(job.get("results"), dict) else None,
+    anchors = [
+        str(item).upper()
+        for item in request.get("calendar_anchor_assets") or []
+        if str(item).upper() in qualified_set
     ]
-    for value in candidates:
-        if isinstance(value, dict) and value:
-            return value
-    return {}
+    if len(anchors) < 2:
+        anchors = list(qualified_assets[: min(2, len(qualified_assets))])
+    request["calendar_anchor_assets"] = anchors
+
+    now = datetime.now(timezone.utc)
+    job = deepcopy(baseline_job)
+    job.pop("_id", None)
+    for key in (
+        "process_id",
+        "return_code",
+        "timed_out",
+        "error",
+        "cancel_requested",
+        "cancel_reason",
+    ):
+        job.pop(key, None)
+    job.update(
+        {
+            "id": now.strftime("%Y%m%dT%H%M%S") + "-timing-" + uuid4().hex[:8],
+            "status": "queued",
+            "stage": "Queued",
+            "progress": 0,
+            "completed_runs": 0,
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "finished_at": None,
+            "request": request,
+            "strategy_profile_name": f"{strategy.get('name') or 'Strategy'} · timing-qualified universe",
+            "strategy_configuration_hash": canonical_hash(request),
+            "source_strategy_configuration_hash": strategy.get("configuration_hash"),
+            "research_reference_assets": list(frozen.get("retained_existing_assets") or []),
+            "research_candidate_assets": list(frozen.get("added_candidate_assets") or []),
+            "certifies_strategy": False,
+            "internal_job": True,
+            "tuning_summary_only": False,
+            "tuning_run_id": None,
+            "tuning_candidate_id": None,
+            "logs": [
+                "Final research Backtest queued only after asset timing qualification was frozen."
+            ],
+            "progress_detail": {},
+            "timing_validation_snapshot_sha256": frozen["decision_snapshot_sha256"],
+            "timing_ranking_sha256": frozen["ranking_sha256"],
+            "qualified_assets_sha256": frozen["qualified_assets_sha256"],
+            "experiment_kind": "post_asset_timing_qualification_full_backtest",
+        }
+    )
+    return job, request
 
 
 def main() -> int:
-    args = parse_args()
-    if not _is_local_mongo(args.mongo_uri):
-        raise RuntimeError("This research final-backtest script only accepts a local MongoDB connection.")
+    args = _parser().parse_args()
+    common.load_project_environment(args.env_file)
 
-    output = Path(args.output_root) / f"asset_timing_strategy_{args.strategy_sequence}_{str(args.snapshot_end)[:10]}"
-    frozen_path = Path(args.frozen_snapshot) if args.frozen_snapshot else output / "timing_validation_snapshot_frozen.json"
+    mongo_uri = str(
+        args.mongo_uri
+        or os.getenv("MONGO_URL")
+        or os.getenv("MONGO_URI")
+        or "mongodb://localhost:27017"
+    ).strip()
+    database_name = str(args.database or os.getenv("MONGO_DATABASE") or "").strip()
+    if not database_name:
+        raise RuntimeError("MONGO_DATABASE is required in .env or via --database.")
+    common._assert_local_mongo(mongo_uri, bool(args.allow_remote_mongo))
+
+    snapshot_end = common._normalize_date(args.snapshot_end)
+    output_dir = Path(
+        args.output_dir
+        or PROJECT_ROOT
+        / "research_output"
+        / f"asset_timing_strategy_{args.strategy_sequence}_{snapshot_end.date().isoformat()}"
+    ).resolve()
+    frozen_path = Path(args.frozen_snapshot).resolve() if args.frozen_snapshot else output_dir / "timing_validation_snapshot_frozen.json"
     if not frozen_path.exists():
-        raise RuntimeError(f"Frozen timing snapshot not found: {frozen_path}")
+        raise RuntimeError(f"Frozen timing qualification snapshot not found: {frozen_path}")
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    _verify_frozen_snapshot(frozen)
 
-    expected_hash = frozen.get("decision_snapshot_sha256")
-    verify = dict(frozen)
-    verify.pop("decision_snapshot_sha256", None)
-    actual_hash = _sha256_json(verify)
-    if expected_hash != actual_hash:
-        raise RuntimeError(
-            "Frozen timing snapshot hash mismatch. The qualification decision was changed after freezing."
+    if int(frozen.get("strategy_sequence") or 0) != int(args.strategy_sequence):
+        raise RuntimeError("Frozen snapshot Strategy sequence does not match the requested Strategy.")
+    if str(frozen.get("snapshot_end") or "") != snapshot_end.date().isoformat():
+        raise RuntimeError("Frozen snapshot market date does not match --snapshot-end.")
+
+    qualified_assets = [str(item).strip().upper() for item in frozen.get("qualified_assets") or [] if str(item).strip()]
+    qualified_assets = list(dict.fromkeys(qualified_assets))
+    if len(qualified_assets) < 2:
+        raise RuntimeError("Frozen qualified universe has fewer than two assets; full rotation Backtest cannot run.")
+
+    client = MongoClient(
+        mongo_uri,
+        serverSelectionTimeoutMS=3_000,
+        connectTimeoutMS=3_000,
+        maxPoolSize=8,
+        retryWrites=False,
+    )
+    client.admin.command("ping")
+    db = client[database_name]
+    strategy = common._strategy_document(db, args.strategy_sequence, args.strategy_id)
+    baseline_job = exact_baseline_job(db, strategy, snapshot_end, args.baseline_job_id)
+    client.close()
+
+    _log(
+        f"Frozen universe verified: {len(qualified_assets)} assets. "
+        f"Baseline job={baseline_job['id']}."
+    )
+    _log("Starting ONE full Strategy Backtest. Its result cannot add/remove assets from this frozen run.")
+
+    from market_cycle_trader_api.core.runtime import close_mongo, database, initialize_mongo
+    from market_cycle_trader_api.services.jobs import run_job
+    from market_cycle_trader_api.services.results import build_results
+
+    initialize_mongo(role="research")
+    runtime_db = database()
+    job, request = _build_job(
+        baseline_job,
+        strategy,
+        qualified_assets,
+        frozen,
+        snapshot_end,
+    )
+    _write_json(output_dir / "baseline_backtest_job.json", {key: value for key, value in baseline_job.items() if key != "_id"})
+    _write_json(output_dir / "final_strategy_backtest_request.json", request)
+    runtime_db[JOBS_COLLECTION].insert_one(deepcopy(job))
+
+    started = time.perf_counter()
+    try:
+        baseline_results = build_results(str(baseline_job["id"]))
+        _write_json(output_dir / "baseline_backtest_results.json", baseline_results)
+        run_job(job["id"])
+        completed = runtime_db[JOBS_COLLECTION].find_one({"id": job["id"]}) or {}
+        _write_json(
+            output_dir / "final_strategy_backtest_job.json",
+            {key: value for key, value in completed.items() if key != "_id"},
         )
-    if frozen.get("full_strategy_backtest_used_for_selection") is not False:
-        raise RuntimeError("Frozen snapshot does not certify backtest-independent selection.")
+        if completed.get("status") != "completed":
+            _write_json(
+                output_dir / "final_experiment_summary.json",
+                {
+                    "status": "backtest_failed",
+                    "backtest_job_id": job["id"],
+                    "timing_validation_snapshot_sha256": frozen["decision_snapshot_sha256"],
+                    "qualified_assets": qualified_assets,
+                    "full_strategy_backtest_used_for_selection": False,
+                },
+            )
+            raise RuntimeError(f"Final Strategy Backtest failed: {job['id']}")
 
-    assets = [str(item).upper() for item in frozen.get("qualified_assets") or []]
-    if len(assets) < 2:
-        raise RuntimeError("Frozen qualified universe must contain at least two assets for Strategy rotation.")
+        candidate_results = build_results(job["id"])
+        comparison = compare_results(baseline_results, candidate_results)
+        comparison.update(
+            {
+                "baseline_job_id": baseline_job["id"],
+                "candidate_job_id": job["id"],
+                "original_asset_count": len(frozen.get("original_assets") or []),
+                "qualified_asset_count": len(qualified_assets),
+                "retained_existing_assets": frozen.get("retained_existing_assets") or [],
+                "removed_existing_assets": frozen.get("removed_existing_assets") or [],
+                "added_candidate_assets": frozen.get("added_candidate_assets") or [],
+                "timing_validation_snapshot_sha256": frozen["decision_snapshot_sha256"],
+                "interpretation": (
+                    "This one full Backtest validates the already-frozen timing-qualified universe. "
+                    "It did not participate in asset qualification."
+                ),
+            }
+        )
+        _write_json(output_dir / "final_strategy_backtest_results.json", candidate_results)
+        _write_json(output_dir / "backtest_comparison.json", comparison)
+        _write_json(
+            output_dir / "final_experiment_summary.json",
+            {
+                "schema_version": 2,
+                "status": "completed",
+                "script_version": SCRIPT_VERSION,
+                "strategy_id": str(strategy.get("_id") or ""),
+                "strategy_sequence": int(strategy.get("strategy_sequence") or args.strategy_sequence),
+                "snapshot_end": snapshot_end.date().isoformat(),
+                "original_asset_count": len(frozen.get("original_assets") or []),
+                "qualified_asset_count": len(qualified_assets),
+                "qualified_assets": qualified_assets,
+                "retained_existing_assets": frozen.get("retained_existing_assets") or [],
+                "removed_existing_assets": frozen.get("removed_existing_assets") or [],
+                "added_candidate_assets": frozen.get("added_candidate_assets") or [],
+                "timing_validation_snapshot_sha256": frozen["decision_snapshot_sha256"],
+                "timing_ranking_sha256": frozen["ranking_sha256"],
+                "qualified_assets_sha256": frozen["qualified_assets_sha256"],
+                "full_strategy_backtest_used_for_selection": False,
+                "full_strategy_backtest_run_after_freeze": True,
+                "baseline_backtest_job_id": baseline_job["id"],
+                "candidate_backtest_job_id": job["id"],
+                "backtest_elapsed_seconds": float(time.perf_counter() - started),
+                "backtest_comparison": comparison,
+            },
+        )
+    finally:
+        close_mongo()
 
-    repository = MongoRepository(args.mongo_uri, args.database)
-    db = repository.db
-    profile = get_strategy_profile(db, sequence=int(args.strategy_sequence))
-    if profile is None:
-        raise RuntimeError(f"Strategy #{args.strategy_sequence} was not found.")
-    config = _strategy_config(profile)
-
-    request = _request_from_config(config, profile, assets, str(args.snapshot_end)[:10])
-    request["research_timing_snapshot_hash"] = expected_hash
-    request["research_timing_script_version"] = frozen.get("script_version")
-    request_path = output / "final_strategy_backtest_request.json"
-    request_path.write_text(json.dumps(request, indent=2, default=str), encoding="utf-8")
-
-    print(f"Frozen universe: {len(assets)} assets")
-    print("Starting ONE full Strategy backtest. This backtest does not alter the frozen qualification.")
-    job = create_job(db, request)
-    job_id = str(_get(job, "job_id") or _get(job, "id") or _get(job, "_id") or "")
-    if not job_id:
-        raise RuntimeError("Backtest service did not return a job id.")
-
-    final_job = _wait_job(db, job_id, args.poll_seconds)
-    (output / "final_strategy_backtest_job.json").write_text(json.dumps(final_job, indent=2, default=str), encoding="utf-8")
-    metrics = _extract_metrics(final_job)
-    (output / "final_strategy_backtest_metrics.json").write_text(json.dumps(metrics, indent=2, default=str), encoding="utf-8")
-
-    summary = {
-        "script_version": SCRIPT_VERSION,
-        "strategy_sequence": int(args.strategy_sequence),
-        "snapshot_end": str(args.snapshot_end)[:10],
-        "qualified_assets": assets,
-        "qualified_asset_count": len(assets),
-        "timing_decision_snapshot_sha256": expected_hash,
-        "full_strategy_backtest_used_for_selection": False,
-        "full_strategy_backtest_run_after_freeze": True,
-        "job_id": job_id,
-        "metrics": metrics,
-    }
-    (output / "final_experiment_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
-
-    print("Final Strategy backtest completed.")
-    print(f"Summary: {output / 'final_experiment_summary.json'}")
+    _log(f"Completed. Final comparison: {output_dir / 'backtest_comparison.json'}")
     return 0
 
 
