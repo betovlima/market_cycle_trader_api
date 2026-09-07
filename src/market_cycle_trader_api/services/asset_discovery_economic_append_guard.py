@@ -72,7 +72,9 @@ def install_asset_discovery_economic_append_guard() -> None:
             "selected_universe_validation_runs": 2,
             "selected_universe_validation_scope": "baseline_and_exact_combined_selection",
             "per_candidate_marginal_replay_required_before_append": True,
-            "certified_baseline_parity_required": True,
+            "economic_baseline": "fresh_full_history_strategy_replay_in_current_discovery_run",
+            "historical_ending_capital_is_gate": False,
+            "strategy_snapshot_fidelity_required": True,
         })
         payload["persistence_policy"] = policy
         return payload
@@ -84,8 +86,10 @@ def install_asset_discovery_economic_append_guard() -> None:
         policy.update({
             "full_history_capital_lift_required_before_append": True,
             "per_candidate_marginal_replay_required": True,
-            "certified_baseline_parity_required": True,
-            "economic_append_gate": "exact_selected_universe_must_increase_final_strategy_capital",
+            "economic_baseline": "fresh_full_history_strategy_replay_in_current_discovery_run",
+            "historical_ending_capital_is_gate": False,
+            "strategy_snapshot_fidelity_required": True,
+            "economic_append_gate": "exact_selected_universe_must_increase_current_run_baseline_capital",
         })
         payload["persistence_policy"] = policy
         return payload
