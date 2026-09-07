@@ -8,16 +8,18 @@ from typing import Any, Callable
 import pandas as pd
 
 
-POLICY_VERSION = "predictive-full-history-v2-fast-single-request"
+POLICY_VERSION = "predictive-full-history-v3-prefetch-cache"
 _AUTO_WORKER_NAME = "asset-discovery-ranker"
-_HISTORY_CACHE_LIMIT = 64
+_HISTORY_CACHE_LIMIT = 512
 _INSTALLED = False
 _ORIGINAL_MARGINAL_REPLAY: Callable[..., Any] | None = None
 _ORIGINAL_GET_STATUS: Callable[..., dict[str, Any]] | None = None
 _ORIGINAL_CANDIDATE_FRAME: Callable[..., Any] | None = None
 _ORIGINAL_CANDIDATE_HISTORY_COVERAGE: Callable[..., Any] | None = None
+_ORIGINAL_IDENTITY_INTEGRITY: Callable[..., Any] | None = None
 _HISTORY_CACHE_LOCK = threading.Lock()
 _HISTORY_CACHE: OrderedDict[tuple[str, ...], tuple[Any, dict[str, Any]]] = OrderedDict()
+_HISTORY_FAILURES: dict[tuple[str, ...], str] = {}
 
 
 def _automatic_worker() -> bool:
@@ -49,7 +51,52 @@ def _utc_timestamp(value: Any) -> pd.Timestamp:
     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
 
 
-def _download_complete_candidate_history_fast(
+def _copy_frame(frame: Any) -> Any:
+    try:
+        return frame.copy(deep=False)
+    except Exception:
+        try:
+            return frame.copy()
+        except Exception:
+            return frame
+
+
+def _clear_transient_history_cache() -> None:
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_CACHE.clear()
+        _HISTORY_FAILURES.clear()
+
+
+def _cache_success(key: tuple[str, ...], frame: Any, coverage: dict[str, Any]) -> None:
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_FAILURES.pop(key, None)
+        _HISTORY_CACHE[key] = (_copy_frame(frame), dict(coverage or {}))
+        _HISTORY_CACHE.move_to_end(key)
+        while len(_HISTORY_CACHE) > _HISTORY_CACHE_LIMIT:
+            evicted_key, _value = _HISTORY_CACHE.popitem(last=False)
+            _HISTORY_FAILURES.pop(evicted_key, None)
+
+
+def _cache_failure(key: tuple[str, ...], reason: str) -> None:
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_CACHE.pop(key, None)
+        _HISTORY_FAILURES[key] = str(reason or "candidate_history_prefetch_failed")[:300]
+
+
+def _cache_lookup(key: tuple[str, ...]) -> tuple[Any | None, dict[str, Any] | None, str | None]:
+    with _HISTORY_CACHE_LOCK:
+        failure = _HISTORY_FAILURES.get(key)
+        if failure:
+            return None, None, failure
+        cached = _HISTORY_CACHE.get(key)
+        if cached is None:
+            return None, None, None
+        _HISTORY_CACHE.move_to_end(key)
+        frame, coverage = cached
+        return _copy_frame(frame), dict(coverage or {}), None
+
+
+def _download_complete_candidate_history(
     service: Any,
     db: Any,
     symbol: str,
@@ -57,13 +104,7 @@ def _download_complete_candidate_history_fast(
     end_session: Any,
     required_sessions: Any,
 ) -> tuple[Any, dict[str, Any]]:
-    """Load a complete daily candidate history in one Alpaca request.
-
-    The generic market-data helper intentionally chunks long ranges for arbitrary
-    timeframes. Asset Discovery uses daily bars only; a Strategy window from 2016
-    is roughly 2.7k rows, so a single StockBarsRequest is substantially cheaper
-    while preserving the exact same coverage validation.
-    """
+    """Download the complete daily Strategy window once and validate it immediately."""
     candidate_config = config.model_copy(
         update={
             "end_date": pd.Timestamp(end_session).date().isoformat(),
@@ -110,81 +151,187 @@ def _cached_history_coverage(
         raise RuntimeError("Candidate history coverage is not installed.")
 
     key = _cache_key(symbol, config, end_session)
-    with _HISTORY_CACHE_LOCK:
-        cached = _HISTORY_CACHE.get(key)
-        if cached is not None:
-            _HISTORY_CACHE.move_to_end(key)
-            frame, coverage = cached
-            try:
-                copied_frame = frame.copy()
-            except Exception:
-                copied_frame = frame
-            return copied_frame, dict(coverage)
+    frame, coverage, failure = _cache_lookup(key)
+    if failure:
+        raise RuntimeError(failure)
+    if frame is not None and coverage is not None:
+        return frame, coverage
 
     if str(getattr(config, "timeframe", "")) == "1Day":
-        frame, coverage = _download_complete_candidate_history_fast(
-            service,
-            db,
-            symbol,
-            config,
-            end_session,
-            required_sessions,
-        )
-    else:
-        frame, coverage = original(db, symbol, config, end_session, required_sessions)
-
-    with _HISTORY_CACHE_LOCK:
         try:
-            cached_frame = frame.copy()
-        except Exception:
-            cached_frame = frame
-        _HISTORY_CACHE[key] = (cached_frame, dict(coverage or {}))
-        _HISTORY_CACHE.move_to_end(key)
-        while len(_HISTORY_CACHE) > _HISTORY_CACHE_LIMIT:
-            _HISTORY_CACHE.popitem(last=False)
+            frame, coverage = _download_complete_candidate_history(
+                service,
+                db,
+                symbol,
+                config,
+                end_session,
+                required_sessions,
+            )
+        except Exception as exc:
+            _cache_failure(key, str(exc).strip().lower())
+            raise
+    else:
+        try:
+            frame, coverage = original(db, symbol, config, end_session, required_sessions)
+        except Exception as exc:
+            _cache_failure(key, str(exc).strip().lower())
+            raise
+
+    _cache_success(key, frame, dict(coverage or {}))
     return frame, dict(coverage or {})
 
 
-def _probe_history_start(
+def _protected_market_history_symbols(service: Any, db: Any) -> set[str]:
+    current_config, _current_strategy = service.get_research_strategy_context(db)
+    winner_config, _winner_strategy = service.get_trader_winner_context(db)
+    return {
+        str(symbol or "").strip().upper()
+        for symbol in [*(current_config.assets or []), *(winner_config.assets or [])]
+        if str(symbol or "").strip()
+    }
+
+
+def _purge_unprotected_market_history(service: Any, db: Any, protected: set[str]) -> dict[str, Any]:
+    collection = db[service.ALPACA_MARKET_BARS_COLLECTION]
+    existing = {
+        str(symbol or "").strip().upper()
+        for symbol in collection.distinct("symbol")
+        if str(symbol or "").strip()
+    }
+    stale = sorted(existing - set(protected))
+    deleted_rows = 0
+    if stale:
+        result = collection.delete_many({"symbol": {"$in": stale}})
+        deleted_rows = int(getattr(result, "deleted_count", 0) or 0)
+    return {
+        "protected_symbol_count": len(protected),
+        "stale_symbol_count": len(stale),
+        "deleted_market_bar_rows": deleted_rows,
+        "protected_symbols": sorted(protected),
+    }
+
+
+def _prefetch_complete_histories(
     service: Any,
     db: Any,
-    symbol: str,
-    config: Any,
+    run_id: str,
+    symbols: list[str],
     *,
-    credentials: dict[str, str] | None = None,
+    config: Any,
+    end_session: Any,
+    required_sessions: Any,
 ) -> dict[str, Any]:
-    requested = pd.Timestamp(config.start_date)
-    if requested.tzinfo is not None:
-        requested = requested.tz_convert("UTC").tz_localize(None)
-    requested = requested.normalize()
-    tolerance_days = int(getattr(config, "market_data_history_start_tolerance_days", 0) or 0)
-    latest_allowed = requested + pd.Timedelta(days=tolerance_days)
+    normalized = list(dict.fromkeys(str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()))
+    workers = max(1, min(int(service._replay_worker_count()), len(normalized) or 1))
+    total = len(normalized)
+    completed = 0
+    complete_count = 0
+    history_rejected_count = 0
+    technical_failure_count = 0
 
-    auth = credentials or service.get_alpaca_credentials(db)
-    start = requested.tz_localize("UTC")
-    end = (latest_allowed + pd.Timedelta(days=1)).tz_localize("UTC")
-    frame = service.download_stock_bars(
-        api_key_id=auth["api_key_id"],
-        secret_key=auth["secret_key"],
-        symbol=symbol,
-        timeframe=config.timeframe,
-        start=start.to_pydatetime(),
-        end=end.to_pydatetime(),
-        feed=config.alpaca_historical_feed,
-        adjustment=config.alpaca_adjustment,
+    service._event(
+        db,
+        run_id,
+        f"Prefetching the complete Strategy history for {total} external assets using {workers} shared workers.",
+        phase="scanning",
+        changes={
+            "progress_step": "candidate_history_prefetch",
+            "stage_progress_percent": 0.0,
+            "current_stage": "Downloading complete candidate histories",
+            "stage_current": 0,
+            "stage_total": total,
+            "candidate_history_prefetch": {
+                "status": "running",
+                "total_count": total,
+                "completed_count": 0,
+                "complete_count": 0,
+                "history_rejected_count": 0,
+                "technical_failure_count": 0,
+                "workers": workers,
+                "cache": "shared_memory",
+            },
+        },
     )
-    actual = service._normalized_sessions(frame)
-    if actual.empty:
-        raise RuntimeError("insufficient_history")
-    first = pd.Timestamp(actual.min()).normalize()
-    if first > latest_allowed:
-        raise RuntimeError("insufficient_history")
-    return {
-        "history_start_probe": "passed",
-        "history_required_start": requested.date().isoformat(),
-        "history_start_probe_first_session": first.date().isoformat(),
-        "history_start_tolerance_days": tolerance_days,
+
+    def load(symbol: str) -> tuple[str, bool, str | None]:
+        key = _cache_key(symbol, config, end_session)
+        try:
+            frame, coverage = _download_complete_candidate_history(
+                service,
+                db,
+                symbol,
+                config,
+                end_session,
+                required_sessions,
+            )
+            _cache_success(key, frame, dict(coverage or {}))
+            return symbol, True, None
+        except Exception as exc:
+            reason = str(exc).strip().lower() or "candidate_history_prefetch_failed"
+            _cache_failure(key, reason)
+            return symbol, False, reason
+
+    if normalized:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="mct-asset-discovery-history-prefetch",
+        ) as executor:
+            futures = {executor.submit(load, symbol): symbol for symbol in normalized}
+            for future in as_completed(futures):
+                _symbol_value, ok, reason = future.result()
+                completed += 1
+                if ok:
+                    complete_count += 1
+                elif reason in {"insufficient_history", "discontinuous_history", "ticker_identity_discontinuity"}:
+                    history_rejected_count += 1
+                else:
+                    technical_failure_count += 1
+                progress = 100.0 * completed / max(1, total)
+                service._set_stage_progress(
+                    db,
+                    run_id,
+                    step="candidate_history_prefetch",
+                    percent=progress,
+                    label="Downloading complete candidate histories",
+                    current=completed,
+                    total=total,
+                )
+                db[service.COLLECTION].update_one(
+                    {"_id": service.CURRENT_ID, "run_id": run_id},
+                    {"$set": {
+                        "candidate_history_prefetch.completed_count": completed,
+                        "candidate_history_prefetch.complete_count": complete_count,
+                        "candidate_history_prefetch.history_rejected_count": history_rejected_count,
+                        "candidate_history_prefetch.technical_failure_count": technical_failure_count,
+                        "updated_at": service.utc_now(),
+                    }},
+                )
+
+    summary = {
+        "status": "completed",
+        "total_count": total,
+        "completed_count": completed,
+        "complete_count": complete_count,
+        "history_rejected_count": history_rejected_count,
+        "technical_failure_count": technical_failure_count,
+        "workers": workers,
+        "cache": "shared_memory",
+        "download_policy": "one_complete_series_per_sampled_asset_before_scoring",
     }
+    db[service.COLLECTION].update_one(
+        {"_id": service.CURRENT_ID, "run_id": run_id},
+        {"$set": {"candidate_history_prefetch": service.bson_value(summary), "updated_at": service.utc_now()}},
+    )
+    service._event(
+        db,
+        run_id,
+        (
+            f"Candidate history prefetch completed: {complete_count}/{total} complete histories cached; "
+            f"{history_rejected_count} historical rejections and {technical_failure_count} technical failures."
+        ),
+        phase="scanning",
+    )
+    return summary
 
 
 def _validate_shortlist_history(
@@ -200,7 +347,7 @@ def _validate_shortlist_history(
     if not shortlist:
         return [], {}, []
 
-    workers = max(1, min(4, len(shortlist)))
+    workers = max(1, min(int(service._replay_worker_count()), len(shortlist)))
     coverage_by_symbol: dict[str, dict[str, Any]] = {}
     total = len(shortlist)
     completed = 0
@@ -208,12 +355,12 @@ def _validate_shortlist_history(
     service._event(
         db,
         run_id,
-        f"Validating complete Strategy history for {total} predictive candidates.",
+        f"Confirming complete Strategy history from the prefetched cache for {total} predictive candidates.",
         phase="predictive_selection",
         changes={
             "progress_step": "predictive_selection",
             "stage_progress_percent": 0.0,
-            "current_stage": "Validating complete Strategy history",
+            "current_stage": "Confirming cached Strategy histories",
             "stage_current": 0,
             "stage_total": total,
         },
@@ -250,7 +397,7 @@ def _validate_shortlist_history(
                 run_id,
                 step="predictive_selection",
                 percent=(100.0 * completed / max(1, total)),
-                label="Validating complete Strategy history",
+                label="Confirming cached Strategy histories",
                 current=completed,
                 total=total,
             )
@@ -346,7 +493,7 @@ def _repair_current_campaign_from_validation(service: Any, db: Any, payload: dic
 
 def install_asset_discovery_predictive_history_integrity() -> None:
     global _INSTALLED, _ORIGINAL_MARGINAL_REPLAY, _ORIGINAL_GET_STATUS
-    global _ORIGINAL_CANDIDATE_FRAME, _ORIGINAL_CANDIDATE_HISTORY_COVERAGE
+    global _ORIGINAL_CANDIDATE_FRAME, _ORIGINAL_CANDIDATE_HISTORY_COVERAGE, _ORIGINAL_IDENTITY_INTEGRITY
     if _INSTALLED:
         return
 
@@ -360,31 +507,78 @@ def install_asset_discovery_predictive_history_integrity() -> None:
     _ORIGINAL_GET_STATUS = service.get_asset_discovery_status
     _ORIGINAL_CANDIDATE_FRAME = service._candidate_frame
     _ORIGINAL_CANDIDATE_HISTORY_COVERAGE = service._candidate_history_coverage
+    _ORIGINAL_IDENTITY_INTEGRITY = service._identity_integrity_for_symbols
 
-    def candidate_frame_with_start_probe(db: Any, symbol: str, config: Any, end_session: Any, *args: Any, **kwargs: Any) -> Any:
+    def identity_integrity_with_prefetch(
+        db: Any,
+        symbols: list[str],
+        *,
+        start_date: str,
+        end_date: str,
+        asset_metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        original = _ORIGINAL_IDENTITY_INTEGRITY
+        if original is None:
+            raise RuntimeError("Asset identity integrity is not installed.")
+        result = original(
+            db,
+            symbols,
+            start_date=start_date,
+            end_date=end_date,
+            asset_metadata=asset_metadata,
+        )
+        if not _automatic_worker():
+            return result
+
+        campaign = service._campaign(db) or {}
+        run_id = str(campaign.get("run_id") or "").strip()
+        config, _strategy = service.get_research_strategy_context(db)
+        required_sessions = service._required_xnys_sessions(config, end_date)
+        protected = _protected_market_history_symbols(service, db)
+
+        _clear_transient_history_cache()
+        cleanup = _purge_unprotected_market_history(service, db, protected)
+        db[service.COLLECTION].update_one(
+            {"_id": service.CURRENT_ID, "run_id": run_id},
+            {"$set": {"market_history_cleanup": service.bson_value(cleanup), "updated_at": service.utc_now()}},
+        )
+        service._event(
+            db,
+            run_id,
+            (
+                f"Market-history cleanup preserved {cleanup['protected_symbol_count']} Strategy/Winner symbols and removed "
+                f"{cleanup['deleted_market_bar_rows']} cached rows from {cleanup['stale_symbol_count']} other symbols."
+            ),
+            phase="scanning",
+        )
+
+        eligible = [
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+            and str((result.get(str(symbol or "").strip().upper()) or {}).get("status") or "").lower() == "passed"
+        ]
+        _prefetch_complete_histories(
+            service,
+            db,
+            run_id,
+            eligible,
+            config=config,
+            end_session=end_date,
+            required_sessions=required_sessions,
+        )
+        return result
+
+    def candidate_frame_from_prefetch(db: Any, symbol: str, config: Any, end_session: Any, *args: Any, **kwargs: Any) -> Any:
+        key = _cache_key(symbol, config, end_session)
+        frame, _coverage, failure = _cache_lookup(key)
+        if failure:
+            raise RuntimeError(failure)
+        if frame is not None:
+            return frame
         original = _ORIGINAL_CANDIDATE_FRAME
         if original is None:
             raise RuntimeError("Candidate frame loader is not installed.")
-        if _automatic_worker():
-            try:
-                _probe_history_start(
-                    service,
-                    db,
-                    symbol,
-                    config,
-                    credentials=kwargs.get("credentials") if isinstance(kwargs.get("credentials"), dict) else None,
-                )
-                db[service.COLLECTION].update_one(
-                    {"_id": service.CURRENT_ID},
-                    {"$inc": {"history_start_probe_passed_count": 1}, "$set": {"updated_at": service.utc_now()}},
-                )
-            except RuntimeError as exc:
-                if str(exc).strip().lower() == "insufficient_history":
-                    db[service.COLLECTION].update_one(
-                        {"_id": service.CURRENT_ID},
-                        {"$inc": {"history_start_probe_rejected_count": 1}, "$set": {"updated_at": service.utc_now()}},
-                    )
-                raise
         return original(db, symbol, config, end_session, *args, **kwargs)
 
     def candidate_history_coverage_cached(db: Any, symbol: str, config: Any, end_session: Any, required_sessions: Any) -> Any:
@@ -434,7 +628,7 @@ def install_asset_discovery_predictive_history_integrity() -> None:
             db,
             run_id,
             (
-                f"Predictive historical-integrity validation retained {len(retained)} of {len(shortlist)} candidates; "
+                f"Predictive historical-integrity validation retained {len(retained)} of {len(shortlist)} candidates from the prefetched cache; "
                 f"{len(rejected)} candidates without complete Strategy history were rejected."
             ),
             phase="predictive_selection",
@@ -445,7 +639,7 @@ def install_asset_discovery_predictive_history_integrity() -> None:
                 "validation_candidate_count": len(retained),
                 "progress_step": "predictive_selection",
                 "stage_progress_percent": 100.0,
-                "current_stage": "Complete Strategy history validated",
+                "current_stage": "Complete Strategy history validated from cache",
                 "stage_current": len(shortlist),
                 "stage_total": len(shortlist),
             },
@@ -463,17 +657,20 @@ def install_asset_discovery_predictive_history_integrity() -> None:
         policy["predictive_history_integrity"] = {
             "version": POLICY_VERSION,
             "rule": "complete_strategy_history_before_persistence",
-            "fast_start_probe": True,
-            "daily_full_history_download": "single_alpaca_request_per_candidate",
-            "full_history_cache": "exact_snapshot_in_process",
+            "market_history_retention": "selected_strategy_and_winner_only_between_campaigns",
+            "candidate_history_download": "one_complete_series_before_candidate_scoring",
+            "candidate_history_cache": "shared_memory_reused_by_configured_workers",
+            "candidate_history_persistence": "memory_only_until_asset_is_added_to_strategy",
         }
         payload["persistence_policy"] = policy
         return payload
 
-    setattr(candidate_frame_with_start_probe, "_asset_discovery_predictive_history_start_probe", True)
+    setattr(identity_integrity_with_prefetch, "_asset_discovery_history_prefetch", True)
+    setattr(candidate_frame_from_prefetch, "_asset_discovery_candidate_frame_prefetch", True)
     setattr(candidate_history_coverage_cached, "_asset_discovery_predictive_history_cache", True)
     setattr(history_filtered_marginal_replay, "_asset_discovery_predictive_history_integrity", True)
-    service._candidate_frame = candidate_frame_with_start_probe
+    service._identity_integrity_for_symbols = identity_integrity_with_prefetch
+    service._candidate_frame = candidate_frame_from_prefetch
     service._candidate_history_coverage = candidate_history_coverage_cached
     service._run_marginal_capital_replay = history_filtered_marginal_replay
     service.get_asset_discovery_status = get_status_with_history_integrity
