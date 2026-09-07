@@ -79,6 +79,10 @@ def install_asset_discovery_predictive_selection_validation() -> None:
         snapshot_end = str(baseline.get("market_snapshot_end") or "").strip()
         if not snapshot_end:
             snapshot_end = str((document.get("discovery_selection_model") or {}).get("snapshot_end") or "").strip()
+        if not snapshot_end:
+            raise service.AssetDiscoveryConflict(
+                "The Predictive Asset Discovery snapshot is unavailable. Run a new Discovery campaign."
+            )
 
         identity_ok = all(
             str((((metadata.get(symbol) or {}).get("identity_integrity") or {}).get("status") or "")).lower() == "passed"
@@ -86,9 +90,38 @@ def install_asset_discovery_predictive_selection_validation() -> None:
         )
         predictive_ok = all(service._item_is_persistent_candidate(metadata.get(symbol)) for symbol in requested_symbols)
         source_ok = bool(source_id) and (not campaign_source_id or campaign_source_id == source_id)
+
+        # Defense-in-depth: even if a stale catalog entry or an older campaign reaches
+        # this boundary, a candidate cannot be appended unless it covers the complete
+        # Strategy research window. For the current Strategy this starts at 2016-01-01
+        # (first XNYS session 2016-01-04) and extends through the campaign snapshot.
+        baseline_frames = service._baseline_frames(source_config, snapshot_end)
+        required_sessions = service._baseline_required_sessions(baseline_frames, source_config, snapshot_end)
+        coverage_by_symbol: dict[str, Any] = {}
+        for symbol in added_symbols:
+            try:
+                _frame, coverage = service._candidate_history_coverage(
+                    db,
+                    symbol,
+                    source_config,
+                    snapshot_end,
+                    required_sessions,
+                )
+                coverage_by_symbol[symbol] = dict(coverage or {})
+            except Exception as exc:
+                coverage_by_symbol[symbol] = {
+                    "history_window_complete": False,
+                    "reason": str(exc)[:300],
+                }
+        history_ok = all(
+            bool((coverage_by_symbol.get(symbol) or {}).get("history_window_complete"))
+            for symbol in added_symbols
+        )
+
         gates = {
             "predictive_candidate_selection": bool(predictive_ok),
             "identity_integrity": bool(identity_ok),
+            "full_strategy_history": bool(history_ok),
             "source_snapshot_integrity": bool(source_ok),
         }
         decision = "PASS" if all(gates.values()) else "FAIL"
@@ -106,18 +139,21 @@ def install_asset_discovery_predictive_selection_validation() -> None:
             "source_model_settings_hash": str(model_snapshot.get("settings_hash") or ""),
             "source_model_settings_revision": int(model_snapshot.get("settings_revision") or 0),
             "source_asset_count": len(source_assets),
-            "snapshot_end": snapshot_end or None,
+            "snapshot_end": snapshot_end,
             "research_window": document.get("research_window") if isinstance(document.get("research_window"), dict) else {},
             "validation_method": _PREDICTIVE_VALIDATION_METHOD,
             "economic_validation_status": "not_run",
-            "current_stage": "Predictive selection integrity validated",
+            "current_stage": "Predictive selection and full Strategy history validated",
             "progress_percent": 100.0,
             "context": {
                 "predictive_campaign": True,
                 "exact_campaign_selection": True,
+                "full_strategy_history_checked": True,
+                "history_required_start": str(source_config.start_date),
                 "economic_replay_run": False,
                 "economic_replay_required_for_research_append": False,
             },
+            "history_coverage": coverage_by_symbol,
             "deltas": {},
             "gates": gates,
             "decision": decision,
@@ -134,7 +170,7 @@ def install_asset_discovery_predictive_selection_validation() -> None:
                 "updated_at": now,
                 "message": (
                     f"Predictive selection integrity {decision} for {', '.join(added_symbols)}. "
-                    "No full-history economic replay was executed."
+                    "Complete Strategy history was checked; no economic replay was executed."
                 ),
                 "full_strategy_validation": service.bson_value(validation),
             }},
