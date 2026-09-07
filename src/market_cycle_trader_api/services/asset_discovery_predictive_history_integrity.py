@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
+import pandas as pd
 
-POLICY_VERSION = "predictive-full-history-v1"
+
+POLICY_VERSION = "predictive-full-history-v2-fast-start-probe"
 _AUTO_WORKER_NAME = "asset-discovery-ranker"
+_HISTORY_CACHE_LIMIT = 64
 _INSTALLED = False
 _ORIGINAL_MARGINAL_REPLAY: Callable[..., Any] | None = None
 _ORIGINAL_GET_STATUS: Callable[..., dict[str, Any]] | None = None
+_ORIGINAL_CANDIDATE_FRAME: Callable[..., Any] | None = None
+_ORIGINAL_CANDIDATE_HISTORY_COVERAGE: Callable[..., Any] | None = None
+_HISTORY_CACHE_LOCK = threading.Lock()
+_HISTORY_CACHE: OrderedDict[tuple[str, str, str, str, str], tuple[Any, dict[str, Any]]] = OrderedDict()
 
 
 def _automatic_worker() -> bool:
@@ -24,9 +32,93 @@ def _coverage_ok(coverage: Any) -> bool:
     return isinstance(coverage, dict) and bool(coverage.get("history_window_complete"))
 
 
+def _cache_key(symbol: str, config: Any, end_session: Any) -> tuple[str, str, str, str, str]:
+    return (
+        str(symbol or "").strip().upper(),
+        str(getattr(config, "start_date", "") or ""),
+        str(pd.Timestamp(end_session).date()),
+        str(getattr(config, "alpaca_historical_feed", "") or ""),
+        str(getattr(config, "alpaca_adjustment", "") or ""),
+    )
+
+
+def _cached_history_coverage(
+    service: Any,
+    db: Any,
+    symbol: str,
+    config: Any,
+    end_session: Any,
+    required_sessions: Any,
+) -> tuple[Any, dict[str, Any]]:
+    original = _ORIGINAL_CANDIDATE_HISTORY_COVERAGE
+    if original is None:
+        raise RuntimeError("Candidate history coverage is not installed.")
+
+    key = _cache_key(symbol, config, end_session)
+    with _HISTORY_CACHE_LOCK:
+        cached = _HISTORY_CACHE.get(key)
+        if cached is not None:
+            _HISTORY_CACHE.move_to_end(key)
+            frame, coverage = cached
+            try:
+                copied_frame = frame.copy()
+            except Exception:
+                copied_frame = frame
+            return copied_frame, dict(coverage)
+
+    frame, coverage = original(db, symbol, config, end_session, required_sessions)
+    with _HISTORY_CACHE_LOCK:
+        try:
+            cached_frame = frame.copy()
+        except Exception:
+            cached_frame = frame
+        _HISTORY_CACHE[key] = (cached_frame, dict(coverage or {}))
+        _HISTORY_CACHE.move_to_end(key)
+        while len(_HISTORY_CACHE) > _HISTORY_CACHE_LIMIT:
+            _HISTORY_CACHE.popitem(last=False)
+    return frame, dict(coverage or {})
+
+
+def _probe_history_start(service: Any, symbol: str, config: Any) -> dict[str, Any]:
+    requested = pd.Timestamp(config.start_date)
+    if requested.tzinfo is not None:
+        requested = requested.tz_convert("UTC").tz_localize(None)
+    requested = requested.normalize()
+    tolerance_days = int(getattr(config, "market_data_history_start_tolerance_days", 0) or 0)
+    latest_allowed = requested + pd.Timedelta(days=tolerance_days)
+    probe_end = latest_allowed + pd.Timedelta(days=2)
+
+    probe_config = config.model_copy(
+        update={
+            "end_date": probe_end.date().isoformat(),
+            "mongo_cache_enabled": False,
+            "market_data_history_backfill_enabled": False,
+        }
+    )
+    frame = service._download_alpaca_bars(
+        symbol,
+        probe_config,
+        requested.date().isoformat(),
+        probe_end.date().isoformat(),
+    )
+    actual = service._normalized_sessions(frame)
+    if actual.empty:
+        raise RuntimeError("insufficient_history")
+    first = pd.Timestamp(actual.min()).normalize()
+    if first > latest_allowed:
+        raise RuntimeError("insufficient_history")
+    return {
+        "history_start_probe": "passed",
+        "history_required_start": requested.date().isoformat(),
+        "history_start_probe_first_session": first.date().isoformat(),
+        "history_start_tolerance_days": tolerance_days,
+    }
+
+
 def _validate_shortlist_history(
     service: Any,
     db: Any,
+    run_id: str,
     shortlist: list[dict[str, Any]],
     *,
     config: Any,
@@ -38,6 +130,22 @@ def _validate_shortlist_history(
 
     workers = max(1, min(4, len(shortlist)))
     coverage_by_symbol: dict[str, dict[str, Any]] = {}
+    total = len(shortlist)
+    completed = 0
+
+    service._event(
+        db,
+        run_id,
+        f"Validating complete Strategy history for {total} predictive candidates.",
+        phase="predictive_selection",
+        changes={
+            "progress_step": "predictive_history",
+            "stage_progress_percent": 0.0,
+            "current_stage": "Validating complete Strategy history",
+            "stage_current": 0,
+            "stage_total": total,
+        },
+    )
 
     def validate(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         symbol = _symbol(item)
@@ -62,8 +170,18 @@ def _validate_shortlist_history(
         futures = {executor.submit(validate, item): item for item in shortlist}
         for future in as_completed(futures):
             symbol, coverage = future.result()
+            completed += 1
             if symbol:
                 coverage_by_symbol[symbol] = coverage
+            service._set_stage_progress(
+                db,
+                run_id,
+                step="predictive_history",
+                percent=(100.0 * completed / max(1, total)),
+                label="Validating complete Strategy history",
+                current=completed,
+                total=total,
+            )
 
     retained: list[dict[str, Any]] = []
     rejected: list[str] = []
@@ -156,6 +274,7 @@ def _repair_current_campaign_from_validation(service: Any, db: Any, payload: dic
 
 def install_asset_discovery_predictive_history_integrity() -> None:
     global _INSTALLED, _ORIGINAL_MARGINAL_REPLAY, _ORIGINAL_GET_STATUS
+    global _ORIGINAL_CANDIDATE_FRAME, _ORIGINAL_CANDIDATE_HISTORY_COVERAGE
     if _INSTALLED:
         return
 
@@ -167,6 +286,31 @@ def install_asset_discovery_predictive_history_integrity() -> None:
 
     _ORIGINAL_MARGINAL_REPLAY = service._run_marginal_capital_replay
     _ORIGINAL_GET_STATUS = service.get_asset_discovery_status
+    _ORIGINAL_CANDIDATE_FRAME = service._candidate_frame
+    _ORIGINAL_CANDIDATE_HISTORY_COVERAGE = service._candidate_history_coverage
+
+    def candidate_frame_with_start_probe(db: Any, symbol: str, config: Any, end_session: Any, *args: Any, **kwargs: Any) -> Any:
+        original = _ORIGINAL_CANDIDATE_FRAME
+        if original is None:
+            raise RuntimeError("Candidate frame loader is not installed.")
+        if _automatic_worker():
+            try:
+                _probe_history_start(service, symbol, config)
+                db[service.COLLECTION].update_one(
+                    {"_id": service.CURRENT_ID},
+                    {"$inc": {"history_start_probe_passed_count": 1}, "$set": {"updated_at": service.utc_now()}},
+                )
+            except RuntimeError as exc:
+                if str(exc).strip().lower() == "insufficient_history":
+                    db[service.COLLECTION].update_one(
+                        {"_id": service.CURRENT_ID},
+                        {"$inc": {"history_start_probe_rejected_count": 1}, "$set": {"updated_at": service.utc_now()}},
+                    )
+                raise
+        return original(db, symbol, config, end_session, *args, **kwargs)
+
+    def candidate_history_coverage_cached(db: Any, symbol: str, config: Any, end_session: Any, required_sessions: Any) -> Any:
+        return _cached_history_coverage(service, db, symbol, config, end_session, required_sessions)
 
     def history_filtered_marginal_replay(db: Any, run_id: str, *args: Any, **kwargs: Any) -> Any:
         original = _ORIGINAL_MARGINAL_REPLAY
@@ -183,6 +327,7 @@ def install_asset_discovery_predictive_history_integrity() -> None:
         retained, coverage_by_symbol, rejected = _validate_shortlist_history(
             service,
             db,
+            run_id,
             shortlist,
             config=config,
             end_session=end_session,
@@ -211,7 +356,7 @@ def install_asset_discovery_predictive_history_integrity() -> None:
             db,
             run_id,
             (
-                f"Predictive historical-integrity validation retained {len(retained)} of {len(shortlist)} market-adherent candidates; "
+                f"Predictive historical-integrity validation retained {len(retained)} of {len(shortlist)} candidates; "
                 f"{len(rejected)} candidates without complete Strategy history were rejected."
             ),
             phase="predictive_selection",
@@ -220,8 +365,11 @@ def install_asset_discovery_predictive_history_integrity() -> None:
                 "historical_integrity_validated_count": len(retained),
                 "historical_integrity_rejected_count": len(rejected),
                 "validation_candidate_count": len(retained),
-                "stage_current": len(retained),
-                "stage_total": len(retained),
+                "progress_step": "predictive_selection",
+                "stage_progress_percent": 100.0,
+                "current_stage": "Complete Strategy history validated",
+                "stage_current": len(shortlist),
+                "stage_total": len(shortlist),
             },
         )
 
@@ -237,11 +385,17 @@ def install_asset_discovery_predictive_history_integrity() -> None:
         policy["predictive_history_integrity"] = {
             "version": POLICY_VERSION,
             "rule": "complete_strategy_history_before_persistence",
+            "fast_start_probe": True,
+            "full_history_cache": "exact_snapshot_in_process",
         }
         payload["persistence_policy"] = policy
         return payload
 
+    setattr(candidate_frame_with_start_probe, "_asset_discovery_predictive_history_start_probe", True)
+    setattr(candidate_history_coverage_cached, "_asset_discovery_predictive_history_cache", True)
     setattr(history_filtered_marginal_replay, "_asset_discovery_predictive_history_integrity", True)
+    service._candidate_frame = candidate_frame_with_start_probe
+    service._candidate_history_coverage = candidate_history_coverage_cached
     service._run_marginal_capital_replay = history_filtered_marginal_replay
     service.get_asset_discovery_status = get_status_with_history_integrity
     _INSTALLED = True
