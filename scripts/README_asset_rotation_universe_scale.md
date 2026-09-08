@@ -1,6 +1,6 @@
 # Asset Rotation Universe Scale
 
-Research-only experiment. Current script version: `asset-rotation-universe-scale-v1.1.0`.
+Research-only experiment. Current script version: `asset-rotation-universe-scale-v1.1.1`.
 
 It measures the effect of expanding the opportunity set available to the Strategy's existing intelligent-rotation engine without changing the immutable LightGBM model settings.
 
@@ -21,7 +21,7 @@ No `_v101.py`, `_v102.py`, etc. file naming is used for this experiment.
 3. If the largest requested series exceeds 56, discover and prepare enough external assets. Existing complete Mongo history is reused; missing histories are downloaded to RAM only. Previous candidate rankings are not read.
 4. Close MongoDB and freeze the nested universes in memory.
 5. Execute 56 -> 82 -> 250 -> 500 with identical LightGBM settings, costs and economic window. Each series is intelligent rotation versus equal-weight Buy & Hold across the same series universe.
-6. Write the compact cross-series comparison and local diagnostics.
+6. Write the compact cross-series comparison and local diagnostics, then create a ZIP archive of the complete analysis directory next to that directory.
 
 For `--series 56`, step 3 is skipped entirely, including the Alpaca universe lookup.
 
@@ -94,5 +94,8 @@ Use `--max-candidate-scans` if more than the default 2500 Alpaca symbols must be
 - `universe_<N>_trades.csv`: executed rotations.
 - `universe_scale_comparison.csv`: compact 56/82/250/500 comparison.
 - `universe_scale_summary.json`: machine-readable final summary.
+- `<analysis-directory>.zip`: compressed copy of the complete analysis directory, created only after all final artifacts have been written.
+
+The ZIP is created as a sibling of the analysis directory, so it never includes itself. If a ZIP with the same name already exists, it is replaced atomically after the new archive is complete.
 
 The primary comparison within each series is intelligent rotation versus equal-weight Buy & Hold over the same universe. The secondary comparison is rotation performance across universe sizes.
