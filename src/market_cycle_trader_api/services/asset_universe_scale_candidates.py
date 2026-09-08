@@ -103,7 +103,18 @@ class CandidateUniverseLoader:
         diagnostics: list[dict[str, Any]] = []
         scanned = 0
 
-        while len(accepted_symbols) < required_external and scanned < scan_limit:
+        while len(accepted_symbols) < required_external:
+            if scanned >= scan_limit:
+                if scan_limit >= len(order):
+                    break
+                previous_limit = scan_limit
+                scan_limit = len(order)
+                self.log(
+                    f"Initial candidate scan budget {previous_limit} exhausted with "
+                    f"{len(accepted_symbols)}/{required_external} qualified. "
+                    "Continuing through the remaining deterministic candidate universe instead of aborting."
+                )
+
             batch = order[scanned : min(scan_limit, scanned + self.workers)]
             if not batch:
                 break
@@ -147,8 +158,8 @@ class CandidateUniverseLoader:
         if len(accepted_symbols) < required_external:
             raise RuntimeError(
                 f"Could only qualify {len(accepted_symbols)} external assets after "
-                f"scanning {scanned}; {required_external} are required. "
-                "Increase --max-candidate-scans."
+                f"scanning the available deterministic universe ({scanned} symbols); "
+                f"{required_external} are required."
             )
         return accepted_frames, accepted_symbols, diagnostics, scanned
 
