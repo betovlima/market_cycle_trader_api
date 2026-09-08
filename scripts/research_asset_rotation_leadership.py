@@ -7,8 +7,9 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -24,16 +25,21 @@ for path in (SRC_ROOT, SCRIPT_ROOT):
 import research_asset_signature_leave_one_out as common  # noqa: E402
 import research_asset_timing_vs_buyhold as timing  # noqa: E402
 from research_asset_timing_vs_buyhold_execution import _immutable_model_snapshot  # noqa: E402
+from market_cycle_trader_api.engine.absolute_utility_cash_gate import (  # noqa: E402
+    absolute_utility_cash_gate_enabled,
+)
 from market_cycle_trader_api.engine.capital_rotation import (  # noqa: E402
     ROTATION_FEATURES,
     _build_walk_forward_folds,
+    _simple_policy_growth,
+    _utility_policy,
     prepare_rotation_panel,
 )
 from market_cycle_trader_api.engine.research_challengers import _lightgbm_fit_models  # noqa: E402
 from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest, BacktestRequest  # noqa: E402
 from market_cycle_trader_api.services.model_research import apply_execution_profile  # noqa: E402
 
-SCRIPT_VERSION = "asset-rotation-leadership-v1.0"
+SCRIPT_VERSION = "asset-rotation-leadership-v1.1"
 EXPERIMENT_NAME = "point_in_time_intrinsic_timing_plus_rotation_leadership"
 DEFAULT_WORKERS = 4
 
@@ -70,10 +76,10 @@ def _sha256_json(value: Any) -> str:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Revalidate the complete research universe using two independent OOS evidences: "
-            "(1) intrinsic same-asset timing vs Buy & Hold already frozen by the previous study, "
-            "and (2) useful cross-sectional LightGBM leadership episodes. "
-            "No full Strategy Backtest is used for qualification."
+            "Revalidate all complete-history assets from scratch using the immutable Strategy "
+            "LightGBM snapshot. Qualification combines (a) intrinsic OOS timing vs same-asset "
+            "Buy & Hold and (b) useful OOS cross-sectional leadership. No full Strategy "
+            "Backtest result is read or used before the universe is frozen."
         )
     )
     parser.add_argument("--strategy-sequence", type=int, default=10)
@@ -84,45 +90,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=None)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--candidate-symbols", nargs="*", default=None)
-    parser.add_argument("--timing-output-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--allow-remote-mongo", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     return parser
-
-
-def _verify_timing_snapshot(
-    frozen: dict[str, Any],
-    strategy: dict[str, Any],
-    snapshot_end: pd.Timestamp,
-) -> None:
-    expected = str(frozen.get("decision_snapshot_sha256") or "")
-    canonical = dict(frozen)
-    canonical.pop("decision_snapshot_sha256", None)
-    actual = _sha256_json(canonical)
-    if not expected or expected != actual:
-        raise RuntimeError("Prior timing snapshot hash mismatch.")
-
-    checks = {
-        "strategy_id": str(frozen.get("strategy_id") or "")
-        == str(strategy.get("_id") or ""),
-        "strategy_revision": int(frozen.get("strategy_revision") or 0)
-        == int(strategy.get("revision") or 0),
-        "strategy_configuration_hash": str(
-            frozen.get("strategy_configuration_hash") or ""
-        )
-        == str(strategy.get("configuration_hash") or ""),
-        "snapshot_end": str(frozen.get("snapshot_end") or "")
-        == snapshot_end.date().isoformat(),
-        "backtest_independent": frozen.get("full_strategy_backtest_used_for_selection")
-        is False,
-    }
-    failed = [name for name, accepted in checks.items() if not accepted]
-    if failed:
-        raise RuntimeError(
-            "Prior timing evidence does not match this Strategy/snapshot: "
-            + ", ".join(failed)
-        )
 
 
 def _execution_config(
@@ -193,104 +164,211 @@ def _leadership_qualification(row: dict[str, Any]) -> tuple[bool, list[str]]:
     return bool(all(checks.values())), failed
 
 
-def _fit_one_asset(
+def _fit_model(
     symbol: str,
     frame: pd.DataFrame,
     train_dates: pd.DatetimeIndex,
     config: BacktestExecutionRequest,
-    fold_id: int,
+    *,
+    phase: str,
 ) -> Any:
     fitted = _lightgbm_fit_models(
         {symbol: frame},
         [symbol],
         train_dates,
         config,
-        phase=f"rotation_leadership_{symbol}_fold_{fold_id}_final",
+        phase=phase,
     )
     model = fitted.get(symbol)
     if model is None:
-        raise RuntimeError(f"{symbol}: LightGBM model was not fitted for fold {fold_id}.")
+        raise RuntimeError(f"{symbol}: LightGBM did not fit a model for {phase}.")
     return model
 
 
-def _predict_fold(
-    fold: dict[str, Any],
-    frames: dict[str, pd.DataFrame],
+def _calibrate_and_fit(
+    symbol: str,
+    frame: pd.DataFrame,
     common_dates: pd.DatetimeIndex,
-    symbols: list[str],
+    fold: dict[str, Any],
     config: BacktestExecutionRequest,
-    workers: int,
-) -> pd.DataFrame:
+) -> tuple[Callable[[pd.Timestamp, int, int], tuple[int, float]], Any, float, float, float]:
     fold_id = int(fold["fold_id"])
+
+    # Match the Strategy engine: one repetition seed is kept constant across folds.
+    rep_config = config.model_copy(update={"random_state": int(config.random_state)})
+    train_dates = common_dates[: int(fold["train_end_index"])]
+    calibration_dates = common_dates[
+        int(fold["calibration_start_index"]): int(fold["calibration_end_index"])
+    ]
     final_fit_dates = common_dates[: int(fold["final_fit_end_index"])]
-    rep_config = config.model_copy(update={"random_state": int(config.random_state) + fold_id})
 
-    _log(
-        f"Fold {fold_id}: fitting {len(symbols)} final LightGBM asset models "
-        f"with {min(workers, len(symbols))} workers..."
+    calibration_model = _fit_model(
+        symbol,
+        frame,
+        train_dates,
+        rep_config,
+        phase=f"rotation_leadership_{symbol}_fold_{fold_id}_calibration",
     )
-    models: dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(symbols)))) as executor:
-        futures = {
-            executor.submit(
-                _fit_one_asset,
-                symbol,
-                frames[symbol],
-                final_fit_dates,
-                rep_config,
-                fold_id,
-            ): symbol
-            for symbol in symbols
-        }
-        completed = 0
-        for future in as_completed(futures):
-            symbol = futures[future]
-            models[symbol] = future.result()
-            completed += 1
-            if completed == 1 or completed % 10 == 0 or completed == len(symbols):
-                _log(f"Fold {fold_id}: trained {completed}/{len(symbols)} models.")
+    calibration_models = {symbol: calibration_model}
 
+    candidate_margins = tuple(
+        float(value) for value in rep_config.rotation_switch_margin_candidates
+    )
+    if not candidate_margins:
+        raise RuntimeError(f"{symbol}: rotation_switch_margin_candidates is empty.")
+
+    best_candidate = candidate_margins[0]
+    best_score = float("-inf")
+    margin_config = (
+        rep_config.model_copy(
+            update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"}
+        )
+        if absolute_utility_cash_gate_enabled(rep_config)
+        else rep_config
+    )
+    for candidate in candidate_margins:
+        calibration_policy = _utility_policy(
+            calibration_models,
+            {symbol: frame},
+            [symbol],
+            margin_config,
+            candidate,
+        )
+        score = _simple_policy_growth(
+            calibration_policy,
+            {symbol: frame},
+            [symbol],
+            calibration_dates,
+            rep_config,
+        )
+        if float(score) > best_score:
+            best_score = float(score)
+            best_candidate = float(candidate)
+
+    final_model = _fit_model(
+        symbol,
+        frame,
+        final_fit_dates,
+        rep_config,
+        phase=f"rotation_leadership_{symbol}_fold_{fold_id}_final",
+    )
+    effective_margin = max(
+        float(rep_config.rotation_switch_margin), float(best_candidate)
+    )
+    policy = _utility_policy(
+        {symbol: final_model},
+        {symbol: frame},
+        [symbol],
+        rep_config,
+        effective_margin,
+        cash_gate_base_state=(
+            {"position": 0, "holding_days": 0, "pending_sample": None}
+            if absolute_utility_cash_gate_enabled(rep_config)
+            else None
+        ),
+        fold_id=fold_id,
+        calibrated_switch_margin=float(best_candidate),
+    )
+    return (
+        policy,
+        final_model,
+        float(best_candidate),
+        float(effective_margin),
+        float(best_score),
+    )
+
+
+def _prediction_rows(
+    symbol: str,
+    frame: pd.DataFrame,
+    fold: dict[str, Any],
+    model: Any,
+) -> list[dict[str, Any]]:
+    fold_id = int(fold["fold_id"])
     decision_dates = pd.DatetimeIndex(fold["decision_dates"]).sort_values()[:-1]
-    rows: list[dict[str, Any]] = []
-    for symbol in symbols:
-        frame = frames[symbol]
-        dates = decision_dates.intersection(pd.DatetimeIndex(frame.index))
-        if dates.empty:
-            continue
-        features = frame.loc[dates, ROTATION_FEATURES]
-        valid_mask = ~features.isna().any(axis=1)
-        features = features.loc[valid_mask]
-        if features.empty:
-            continue
-        dates = pd.DatetimeIndex(features.index)
-        predicted = np.asarray(models[symbol].predict(features), dtype=float)
-        realized_utility = pd.to_numeric(
-            frame.loc[dates, "forward_risk_adjusted_utility"], errors="coerce"
-        ).to_numpy(dtype=float)
-        realized_net = pd.to_numeric(
-            frame.loc[dates, "forward_net_log_return"], errors="coerce"
-        ).to_numpy(dtype=float)
+    dates = decision_dates.intersection(pd.DatetimeIndex(frame.index))
+    if dates.empty:
+        return []
 
-        for timestamp, utility, future_utility, future_net in zip(
-            dates, predicted, realized_utility, realized_net, strict=True
-        ):
-            if not np.isfinite(utility):
-                continue
-            rows.append(
-                {
-                    "fold": fold_id,
-                    "timestamp": pd.Timestamp(timestamp).isoformat(),
-                    "symbol": symbol,
-                    "predicted_utility": float(utility),
-                    "realized_utility": (
-                        float(future_utility) if np.isfinite(future_utility) else None
-                    ),
-                    "forward_net_log_return": (
-                        float(future_net) if np.isfinite(future_net) else None
-                    ),
-                }
-            )
-    return pd.DataFrame(rows)
+    features = frame.loc[dates, ROTATION_FEATURES]
+    valid = ~features.isna().any(axis=1)
+    features = features.loc[valid]
+    if features.empty:
+        return []
+    dates = pd.DatetimeIndex(features.index)
+    predicted = np.asarray(model.predict(features), dtype=float)
+    realized_utility = pd.to_numeric(
+        frame.loc[dates, "forward_risk_adjusted_utility"], errors="coerce"
+    ).to_numpy(dtype=float)
+    realized_net = pd.to_numeric(
+        frame.loc[dates, "forward_net_log_return"], errors="coerce"
+    ).to_numpy(dtype=float)
+
+    rows: list[dict[str, Any]] = []
+    for timestamp, utility, future_utility, future_net in zip(
+        dates, predicted, realized_utility, realized_net, strict=True
+    ):
+        if not np.isfinite(utility):
+            continue
+        rows.append(
+            {
+                "fold": fold_id,
+                "timestamp": pd.Timestamp(timestamp).isoformat(),
+                "symbol": symbol,
+                "predicted_utility": float(utility),
+                "realized_utility": (
+                    float(future_utility) if np.isfinite(future_utility) else None
+                ),
+                "forward_net_log_return": (
+                    float(future_net) if np.isfinite(future_net) else None
+                ),
+            }
+        )
+    return rows
+
+
+def _analyse_asset(
+    symbol: str,
+    source: str,
+    raw: pd.DataFrame,
+    frame: pd.DataFrame,
+    common_dates: pd.DatetimeIndex,
+    folds: list[dict[str, Any]],
+    config: BacktestExecutionRequest,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    started = time.perf_counter()
+    fold_metrics: list[Any] = []
+    predictions: list[dict[str, Any]] = []
+
+    for fold in folds:
+        policy, final_model, calibrated, effective, calibration_score = _calibrate_and_fit(
+            symbol,
+            frame,
+            common_dates,
+            fold,
+            config,
+        )
+        fold_metric = timing._simulate_fold(
+            symbol,
+            raw,
+            frame,
+            fold,
+            policy,
+            config,
+            calibrated,
+            effective,
+            calibration_score,
+        )
+        fold_metrics.append(fold_metric)
+        predictions.extend(_prediction_rows(symbol, frame, fold, final_model))
+
+    aggregate = timing._aggregate(symbol, source, fold_metrics)
+    aggregate["elapsed_seconds"] = float(time.perf_counter() - started)
+    return (
+        aggregate,
+        [asdict(row) for row in fold_metrics],
+        predictions,
+    )
 
 
 def _rank_predictions(predictions: pd.DataFrame) -> pd.DataFrame:
@@ -495,131 +573,175 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "asset_history_integrity.csv", pd.DataFrame(history_rows))
 
-    timing_output_dir = Path(
-        args.timing_output_dir
-        or PROJECT_ROOT
-        / "research_output"
-        / f"asset_timing_strategy_{strategy_sequence}_{snapshot_end.date().isoformat()}"
-    ).resolve()
-    timing_snapshot_path = timing_output_dir / "timing_validation_snapshot_frozen.json"
-    timing_summary_path = timing_output_dir / "asset_timing_summary.csv"
-    if not timing_snapshot_path.exists() or not timing_summary_path.exists():
-        raise RuntimeError(
-            "Prior point-in-time timing evidence is required and was not found. "
-            f"Expected {timing_snapshot_path} and {timing_summary_path}."
-        )
-    timing_snapshot = json.loads(timing_snapshot_path.read_text(encoding="utf-8"))
-    _verify_timing_snapshot(timing_snapshot, strategy, snapshot_end)
-    timing_summary = pd.read_csv(timing_summary_path)
-    timing_summary["symbol"] = timing_summary["symbol"].astype(str).str.upper()
-    timing_symbols = set(timing_summary["symbol"])
-    missing_timing = [
-        symbol for symbol in research_assets if symbol not in timing_symbols
-    ]
-    extra_timing = sorted(timing_symbols - set(research_assets))
-    if missing_timing or extra_timing:
-        raise RuntimeError(
-            "Prior timing evidence universe differs from this research universe. "
-            f"missing={missing_timing}, extra={extra_timing}."
-        )
-
     client.close()
     _log(
-        "MongoDB closed. Leadership training uses only the in-memory OHLCV snapshot. "
+        "MongoDB closed. All qualification below runs from the immutable in-memory market snapshot. "
         f"model={family}, settings_hash={settings_hash}."
     )
 
-    _log("Building the exact Strategy rotation feature panel...")
+    _log("Building the exact Strategy rotation feature panel and walk-forward folds...")
     aligned_frames, common_dates = prepare_rotation_panel(research_frames, config)
     symbols = sorted(aligned_frames)
     folds = _build_walk_forward_folds(common_dates, config)
     if not folds:
         raise RuntimeError("No walk-forward folds were produced.")
 
-    prediction_path = output_dir / "leadership_predictions.csv"
-    existing_predictions = pd.DataFrame()
-    completed_folds: set[int] = set()
-    if not args.no_resume and prediction_path.exists():
-        existing_predictions = pd.read_csv(prediction_path)
-        if not existing_predictions.empty:
-            for fold_id, group in existing_predictions.groupby("fold"):
-                if set(group["symbol"].astype(str).str.upper()) == set(symbols):
-                    completed_folds.add(int(fold_id))
-            if completed_folds:
-                _log(f"Resume: complete leadership folds already present={sorted(completed_folds)}.")
+    intrinsic_path = output_dir / "intrinsic_timing_summary.csv"
+    fold_path = output_dir / "intrinsic_timing_folds.csv"
+    raw_prediction_path = output_dir / "leadership_predictions_raw.csv"
 
-    prediction_frames: list[pd.DataFrame] = []
-    if not existing_predictions.empty:
-        prediction_frames.append(existing_predictions)
+    intrinsic_rows: list[dict[str, Any]] = []
+    fold_rows: list[dict[str, Any]] = []
+    prediction_rows: list[dict[str, Any]] = []
+    completed: set[str] = set()
 
-    for fold in folds:
-        fold_id = int(fold["fold_id"])
-        if fold_id in completed_folds:
-            continue
-        started = time.perf_counter()
-        fold_predictions = _predict_fold(
-            fold,
-            aligned_frames,
-            common_dates,
-            symbols,
-            config,
-            workers,
+    if not args.no_resume and intrinsic_path.exists() and raw_prediction_path.exists():
+        intrinsic_existing = pd.read_csv(intrinsic_path)
+        prediction_existing = pd.read_csv(raw_prediction_path)
+        fold_existing = (
+            pd.read_csv(fold_path) if fold_path.exists() else pd.DataFrame()
         )
-        prediction_frames = [
-            frame
-            for frame in prediction_frames
-            if "fold" not in frame.columns
-            or not (pd.to_numeric(frame["fold"], errors="coerce") == fold_id).any()
-        ]
-        prediction_frames.append(fold_predictions)
-        combined_predictions = pd.concat(prediction_frames, ignore_index=True)
-        combined_predictions = combined_predictions.sort_values(
-            ["fold", "timestamp", "symbol"]
-        ).reset_index(drop=True)
-        _write_csv(prediction_path, combined_predictions)
-        _log(
-            f"Fold {fold_id}: leadership predictions completed in "
-            f"{time.perf_counter() - started:.1f}s."
-        )
+        if not intrinsic_existing.empty:
+            intrinsic_existing["symbol"] = (
+                intrinsic_existing["symbol"].astype(str).str.upper()
+            )
+        if not prediction_existing.empty:
+            prediction_existing["symbol"] = (
+                prediction_existing["symbol"].astype(str).str.upper()
+            )
 
-    predictions = pd.read_csv(prediction_path)
-    ranked = _rank_predictions(predictions)
+        intrinsic_symbols = set(intrinsic_existing.get("symbol", []))
+        prediction_fold_counts = (
+            prediction_existing.groupby("symbol")["fold"].nunique().to_dict()
+            if not prediction_existing.empty
+            else {}
+        )
+        completed = {
+            symbol
+            for symbol in symbols
+            if symbol in intrinsic_symbols
+            and int(prediction_fold_counts.get(symbol, 0)) == len(folds)
+        }
+        if completed:
+            intrinsic_rows = intrinsic_existing[
+                intrinsic_existing["symbol"].isin(completed)
+            ].to_dict(orient="records")
+            prediction_rows = prediction_existing[
+                prediction_existing["symbol"].isin(completed)
+            ].to_dict(orient="records")
+            if not fold_existing.empty and "symbol" in fold_existing.columns:
+                fold_existing["symbol"] = fold_existing["symbol"].astype(str).str.upper()
+                fold_rows = fold_existing[
+                    fold_existing["symbol"].isin(completed)
+                ].to_dict(orient="records")
+            _log(f"Resume: {len(completed)}/{len(symbols)} assets already complete.")
+
+    pending = [symbol for symbol in symbols if symbol not in completed]
+    _log(
+        f"Point-in-time intrinsic timing + leadership model generation: "
+        f"pending={len(pending)}, workers={min(workers, max(1, len(pending)))}."
+    )
+    with ThreadPoolExecutor(
+        max_workers=min(workers, max(1, len(pending)))
+    ) as executor:
+        futures = {
+            executor.submit(
+                _analyse_asset,
+                symbol,
+                "strategy_existing" if symbol in baseline_set else "candidate",
+                research_frames[symbol],
+                aligned_frames[symbol],
+                common_dates,
+                folds,
+                config,
+            ): symbol
+            for symbol in pending
+        }
+        done_count = len(completed)
+        for future in as_completed(futures):
+            symbol = futures[future]
+            aggregate, asset_folds, asset_predictions = future.result()
+
+            intrinsic_rows = [
+                row for row in intrinsic_rows
+                if str(row.get("symbol") or "").upper() != symbol
+            ]
+            fold_rows = [
+                row for row in fold_rows
+                if str(row.get("symbol") or "").upper() != symbol
+            ]
+            prediction_rows = [
+                row for row in prediction_rows
+                if str(row.get("symbol") or "").upper() != symbol
+            ]
+            intrinsic_rows.append(aggregate)
+            fold_rows.extend(asset_folds)
+            prediction_rows.extend(asset_predictions)
+            done_count += 1
+
+            intrinsic_frame = pd.DataFrame(intrinsic_rows).sort_values(
+                "symbol"
+            ).reset_index(drop=True)
+            fold_frame = pd.DataFrame(fold_rows).sort_values(
+                ["symbol", "fold"]
+            ).reset_index(drop=True)
+            prediction_frame = pd.DataFrame(prediction_rows).sort_values(
+                ["fold", "timestamp", "symbol"]
+            ).reset_index(drop=True)
+            _write_csv(intrinsic_path, intrinsic_frame)
+            _write_csv(fold_path, fold_frame)
+            _write_csv(raw_prediction_path, prediction_frame)
+
+            _log(
+                f"Asset {done_count}/{len(symbols)} - {symbol}: "
+                f"beat_BH={float(aggregate['beat_buy_hold_fold_rate']):.1%}, "
+                f"timing={float(aggregate['compound_oos_timing_return']):.2%}, "
+                f"BH={float(aggregate['compound_oos_buy_hold_return']):.2%}, "
+                f"excess={float(aggregate['compound_oos_excess_return']):.2%}."
+            )
+
+    intrinsic = pd.read_csv(intrinsic_path)
+    intrinsic["symbol"] = intrinsic["symbol"].astype(str).str.upper()
+    intrinsic_records: list[dict[str, Any]] = []
+    for row in intrinsic.to_dict(orient="records"):
+        qualified, failures = _intrinsic_qualification(row)
+        row["intrinsic_timing_qualified"] = qualified
+        row["intrinsic_timing_fail_reasons"] = "|".join(failures)
+        intrinsic_records.append(row)
+    intrinsic = pd.DataFrame(intrinsic_records)
+    _write_csv(intrinsic_path, intrinsic)
+
+    raw_predictions = pd.read_csv(raw_prediction_path)
+    ranked = _rank_predictions(raw_predictions)
     _write_csv(output_dir / "leadership_ranked_predictions.csv", ranked)
 
     leadership = _leadership_summary(ranked, symbols, len(folds))
-    leadership_rows: list[dict[str, Any]] = []
+    leadership_records: list[dict[str, Any]] = []
     for row in leadership.to_dict(orient="records"):
         qualified, failures = _leadership_qualification(row)
         row["leadership_qualified"] = qualified
         row["leadership_fail_reasons"] = "|".join(failures)
-        leadership_rows.append(row)
-    leadership = pd.DataFrame(leadership_rows)
+        leadership_records.append(row)
+    leadership = pd.DataFrame(leadership_records)
     _write_csv(output_dir / "leadership_summary.csv", leadership)
 
-    timing_records: list[dict[str, Any]] = []
-    for row in timing_summary.to_dict(orient="records"):
-        corrected, failures = _intrinsic_qualification(row)
-        row["intrinsic_timing_qualified_v2"] = corrected
-        row["intrinsic_timing_fail_reasons_v2"] = "|".join(failures)
-        timing_records.append(row)
-    timing_v2 = pd.DataFrame(timing_records)
-    _write_csv(output_dir / "timing_metrics_revalidated.csv", timing_v2)
-
-    combined = timing_v2.merge(leadership, on="symbol", how="inner", validate="one_to_one")
-    if len(combined) != len(research_assets):
+    combined = intrinsic.merge(
+        leadership, on="symbol", how="inner", validate="one_to_one"
+    )
+    if len(combined) != len(symbols):
         raise RuntimeError(
-            f"Qualification merge produced {len(combined)} rows for "
-            f"{len(research_assets)} research assets."
+            f"Qualification merge produced {len(combined)} rows for {len(symbols)} assets."
         )
+
     combined["qualified"] = (
-        combined["intrinsic_timing_qualified_v2"].astype(bool)
+        combined["intrinsic_timing_qualified"].astype(bool)
         | combined["leadership_qualified"].astype(bool)
     )
     combined["qualification_path"] = np.select(
         [
-            combined["intrinsic_timing_qualified_v2"].astype(bool)
+            combined["intrinsic_timing_qualified"].astype(bool)
             & combined["leadership_qualified"].astype(bool),
-            combined["intrinsic_timing_qualified_v2"].astype(bool),
+            combined["intrinsic_timing_qualified"].astype(bool),
             combined["leadership_qualified"].astype(bool),
         ],
         ["intrinsic_and_leadership", "intrinsic_timing", "rotation_leadership"],
@@ -632,7 +754,7 @@ def main() -> int:
         [
             "qualified",
             "leadership_qualified",
-            "intrinsic_timing_qualified_v2",
+            "intrinsic_timing_qualified",
             "leadership_event_realized_utility_median",
             "compound_oos_excess_return",
             "symbol",
@@ -642,7 +764,9 @@ def main() -> int:
     combined["research_rank"] = np.arange(1, len(combined) + 1)
     _write_csv(output_dir / "asset_rotation_qualification.csv", combined)
 
-    qualified_assets = combined.loc[combined["qualified"], "symbol"].astype(str).tolist()
+    qualified_assets = combined.loc[
+        combined["qualified"], "symbol"
+    ].astype(str).tolist()
     qualified_set = set(qualified_assets)
     retained_existing = [
         symbol for symbol in baseline_assets if symbol in qualified_set
@@ -661,7 +785,7 @@ def main() -> int:
     ranking_sha256 = _sha256_json(ranking_records)
     qualified_assets_sha256 = _sha256_json(qualified_assets)
     frozen = {
-        "schema_version": 3,
+        "schema_version": 4,
         "experiment": EXPERIMENT_NAME,
         "script_version": SCRIPT_VERSION,
         "strategy_id": str(strategy.get("_id") or ""),
@@ -674,27 +798,31 @@ def main() -> int:
         "strategy_start": start_date.date().isoformat(),
         "snapshot_end": snapshot_end.date().isoformat(),
         "candidate_source": candidate_source,
-        "selection_rule": "intrinsic_timing_qualified_v2 OR rotation_leadership_qualified_v1",
+        "selection_rule": "intrinsic_timing_qualified OR rotation_leadership_qualified",
         "intrinsic_rule": {
-            "compound_oos_timing_return_positive": True,
-            "compound_oos_excess_return_positive": True,
-            "median_fold_excess_return_positive": True,
-            "majority_folds_beat_buy_hold": True,
-            "removed_market_vs_cash_auxiliary_gate": True,
+            "compound_oos_timing_return_gt": 0.0,
+            "compound_oos_excess_return_gt": 0.0,
+            "median_fold_excess_return_gt": 0.0,
+            "beat_buy_hold_fold_rate_gt": 0.5,
+            "market_vs_cash_auxiliary_gate_used": False,
         },
         "leadership_rule": {
             "top3_event_definition": (
                 "first OOS session of each contiguous predicted Top-3 leadership episode"
             ),
-            "event_exists": True,
+            "event_count_gt": 0,
             "event_fold_rate_gt": 0.5,
             "event_median_realized_utility_gt": 0.0,
             "event_positive_utility_rate_gt": 0.5,
             "event_mean_forward_net_log_return_gt": 0.0,
         },
+        "strategy_seed_policy": (
+            "same immutable Strategy repetition seed across all walk-forward folds"
+        ),
         "baseline_distribution_used_as_threshold": False,
         "correlation_used_for_selection": False,
         "full_strategy_backtest_used_for_selection": False,
+        "prior_full_strategy_backtest_results_read": False,
         "prior_full_strategy_backtest_results_used_for_selection": False,
         "same_asset_buy_hold_used_as_intrinsic_benchmark": True,
         "cross_sectional_predicted_utility_used_for_leadership": True,
@@ -706,7 +834,6 @@ def main() -> int:
         "removed_existing_assets": removed_existing,
         "added_candidate_assets": added_candidates,
         "rejected_candidate_assets": rejected_candidates,
-        "prior_timing_snapshot_sha256": timing_snapshot["decision_snapshot_sha256"],
         "ranking_sha256": ranking_sha256,
         "qualified_assets_sha256": qualified_assets_sha256,
     }
@@ -715,15 +842,15 @@ def main() -> int:
     _write_json(frozen_path, frozen)
 
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "experiment": EXPERIMENT_NAME,
         "script_version": SCRIPT_VERSION,
-        "data_source": "local_mongodb_then_ram_cpu",
+        "data_source": "local_mongodb_once_then_ram_cpu",
         "mongo_writes": False,
         "alpaca_network_used": False,
         "full_strategy_backtest_run": False,
         "full_strategy_backtest_used_for_selection": False,
-        "prior_full_strategy_backtest_results_used_for_selection": False,
+        "prior_full_strategy_backtest_results_read": False,
         "full_strategy_history_required": True,
         "expected_xnys_sessions": int(len(expected)),
         "walk_forward_fold_count": int(len(folds)),
@@ -739,7 +866,7 @@ def main() -> int:
             "complete_external_candidates": len(valid_candidates),
             "evaluated": len(combined),
             "intrinsic_timing_qualified": int(
-                combined["intrinsic_timing_qualified_v2"].sum()
+                combined["intrinsic_timing_qualified"].sum()
             ),
             "rotation_leadership_qualified": int(
                 combined["leadership_qualified"].sum()
@@ -767,7 +894,7 @@ def main() -> int:
     _log(f"Frozen snapshot: {frozen_path}")
     _log(
         "Qualification finished. Only now may one full Strategy Backtest be run "
-        "against the frozen universe."
+        "against this immutable universe."
     )
     return 0
 
