@@ -30,7 +30,7 @@ from research_asset_signature_pipeline_backtest import (  # noqa: E402
 )
 from research_asset_signature_pipeline_ranking import canonical_hash  # noqa: E402
 
-SCRIPT_VERSION = "asset-timing-final-backtest-v1.1"
+SCRIPT_VERSION = "asset-timing-final-backtest-v1.3"
 
 
 def _log(message: str) -> None:
@@ -158,6 +158,31 @@ def _build_job(
     return job, request
 
 
+def _bind_explicit_runtime_mongo(mongo_uri: str, database_name: str) -> Any:
+    """Bind the research process and its Backtest subprocess to the exact Mongo used above."""
+    os.environ["MONGO_URL"] = mongo_uri
+    os.environ["MONGO_URI"] = mongo_uri
+    os.environ["MONGO_DATABASE"] = database_name
+
+    # These modules may already be imported by the research helpers, so their
+    # module-level environment snapshots must be synchronized explicitly.
+    from market_cycle_trader_api.infrastructure.persistence import mongo_repository
+    from market_cycle_trader_api.core import runtime
+
+    mongo_repository.MONGO_URI = mongo_uri
+    mongo_repository.MONGO_DATABASE = database_name
+    runtime.MONGO_URI = mongo_uri
+    runtime.MONGO_DATABASE = database_name
+
+    runtime.initialize_mongo(role="research")
+    if not bool(runtime.MONGO_STATUS.get("available")):
+        raise RuntimeError(
+            "Explicit local MongoDB runtime initialization failed: "
+            + str(runtime.MONGO_STATUS.get("message") or "unknown MongoDB initialization error")
+        )
+    return runtime
+
+
 def main() -> int:
     args = _parser().parse_args()
     common.load_project_environment(args.env_file)
@@ -215,12 +240,12 @@ def main() -> int:
     )
     _log("Starting ONE full Strategy Backtest. Its result cannot add/remove assets from this frozen run.")
 
-    from market_cycle_trader_api.core.runtime import close_mongo, database, initialize_mongo
+    runtime = _bind_explicit_runtime_mongo(mongo_uri, database_name)
     from market_cycle_trader_api.services.jobs import run_job
     from market_cycle_trader_api.services.results import build_results
 
-    initialize_mongo(role="research")
-    runtime_db = database()
+    runtime_db = runtime.database()
+    _log(f"Runtime MongoDB bound explicitly to database={database_name}.")
     job, request = _build_job(
         baseline_job,
         strategy,
@@ -302,7 +327,7 @@ def main() -> int:
             },
         )
     finally:
-        close_mongo()
+        runtime.close_mongo()
 
     _log(f"Completed. Final comparison: {output_dir / 'backtest_comparison.json'}")
     return 0
