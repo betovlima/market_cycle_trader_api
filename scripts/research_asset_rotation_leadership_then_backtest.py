@@ -6,14 +6,14 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_VERSION = "asset-rotation-leadership-then-backtest-v1.0"
+SCRIPT_VERSION = "asset-rotation-leadership-then-backtest-v1.1"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run rotation-leadership qualification, freeze the resulting universe, "
-            "then execute exactly one full Strategy Backtest."
+            "Run intrinsic-timing plus rotation-leadership qualification from scratch, "
+            "freeze the resulting universe, then execute exactly one full Strategy Backtest."
         )
     )
     parser.add_argument("--strategy-sequence", type=int, default=10)
@@ -24,7 +24,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=None)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--candidate-symbols", nargs="*", default=None)
-    parser.add_argument("--timing-output-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--baseline-job-id", default=None)
     parser.add_argument("--qualification-only", action="store_true")
@@ -63,7 +62,6 @@ def main() -> int:
     _append(qualification, "--mongo-uri", args.mongo_uri)
     _append(qualification, "--database", args.database)
     _append(qualification, "--env-file", args.env_file)
-    _append(qualification, "--timing-output-dir", args.timing_output_dir)
     if args.candidate_symbols:
         qualification.append("--candidate-symbols")
         qualification.extend(str(item) for item in args.candidate_symbols)
@@ -103,7 +101,7 @@ def main() -> int:
     _append(final_backtest, "--baseline-job-id", args.baseline_job_id)
 
     print(
-        "=== PHASE 2: ONE FULL STRATEGY BACKTEST OF THE FROZEN LEADERSHIP-QUALIFIED UNIVERSE ===",
+        "=== PHASE 2: ONE FULL STRATEGY BACKTEST OF THE FROZEN RESEARCH UNIVERSE ===",
         flush=True,
     )
     subprocess.run(final_backtest, check=True, cwd=PROJECT_ROOT)
