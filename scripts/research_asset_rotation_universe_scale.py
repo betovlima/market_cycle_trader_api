@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ from market_cycle_trader_api.services.asset_universe_scale_candidates import (  
     CandidateUniverseLoader,
 )
 
-SCRIPT_VERSION = "asset-rotation-universe-scale-v1.1.0"
+SCRIPT_VERSION = "asset-rotation-universe-scale-v1.1.1"
 DEFAULT_SERIES = (56, 82, 250, 500)
 DEFAULT_WORKERS = 4
 
@@ -59,6 +60,31 @@ def _write_csv(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_name(".mct_write.tmp")
     frame.to_csv(temporary, index=False)
     temporary.replace(path)
+
+
+def _archive_output_dir(output_dir: Path) -> Path:
+    archive_path = output_dir.parent / f"{output_dir.name}.zip"
+    temporary = archive_path.with_name(f".{archive_path.name}.tmp")
+    if temporary.exists():
+        temporary.unlink()
+
+    with zipfile.ZipFile(
+        temporary,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        allowZip64=True,
+    ) as archive:
+        for path in sorted(output_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            archive.write(
+                path,
+                arcname=(Path(output_dir.name) / path.relative_to(output_dir)).as_posix(),
+            )
+
+    temporary.replace(archive_path)
+    return archive_path
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -486,7 +512,9 @@ def main() -> int:
             f"Sharpe={float(row.get('strategy_sharpe') or 0):.3f}; "
             f"MaxDD={float(row.get('maximum_drawdown') or 0) * 100:.2f}%."
         )
+    archive_path = _archive_output_dir(output_dir)
     _log(f"Artifacts: {output_dir}")
+    _log(f"Archive: {archive_path}")
     return 0
 
 
