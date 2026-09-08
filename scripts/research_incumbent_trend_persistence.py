@@ -7,7 +7,9 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any
+import zipfile
 
 import pandas as pd
 
@@ -31,12 +33,16 @@ from market_cycle_trader_api.services.incumbent_trend_persistence import (  # no
     wrap_incumbent_trend_persistence_policy,
 )
 
-SCRIPT_VERSION = "incumbent-trend-persistence-v1.0.0"
+SCRIPT_VERSION = "incumbent-trend-persistence-v1.0.1"
 PERSISTENCE_SETTINGS = IncumbentTrendPersistenceSettings(
     enabled=True,
     max_current_rank=5,
     max_challenger_gap_zscore=1.0,
     min_evidence_count=4,
+)
+BASELINE_REQUIRED_FILES = (
+    "universe_candidate_history_integrity.csv",
+    "universe_scale_summary.json",
 )
 
 
@@ -51,12 +57,7 @@ def _bool_mask(series: pd.Series) -> pd.Series:
 
 
 class FrozenBaselineCandidateLoader(CandidateUniverseLoader):
-    """Reload exactly the external assets accepted by the baseline experiment.
-
-    This deliberately does not discover substitutes. If one frozen asset can no
-    longer be reproduced, the experiment fails instead of silently changing the
-    universe being compared.
-    """
+    """Reload exactly the external assets accepted by the baseline experiment."""
 
     def prepare(
         self,
@@ -179,6 +180,71 @@ def _strip_custom_option(argv: list[str], name: str) -> list[str]:
     return output
 
 
+def _default_baseline_dir(pre: argparse.Namespace) -> Path:
+    return (
+        PROJECT_ROOT
+        / "research_output"
+        / (
+            f"asset_rotation_universe_scale_strategy_{pre.strategy_sequence}_"
+            f"{pre.analysis_start}_to_{pre.analysis_end}"
+        )
+    ).resolve()
+
+
+def _find_archive_member(archive: zipfile.ZipFile, filename: str) -> str:
+    matches = [
+        name
+        for name in archive.namelist()
+        if not name.endswith("/") and Path(name).name == filename
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Baseline archive must contain exactly one {filename}; found={len(matches)}."
+        )
+    return matches[0]
+
+
+def _resolve_baseline_artifacts(
+    pre: argparse.Namespace,
+) -> tuple[Path, tempfile.TemporaryDirectory[str] | None, Path]:
+    requested = (
+        Path(pre.baseline_output_dir).resolve()
+        if pre.baseline_output_dir
+        else _default_baseline_dir(pre)
+    )
+
+    if requested.suffix.lower() == ".zip":
+        baseline_dir = requested.with_suffix("")
+        archive_path = requested
+    else:
+        baseline_dir = requested
+        archive_path = requested.parent / f"{requested.name}.zip"
+
+    missing = [name for name in BASELINE_REQUIRED_FILES if not (baseline_dir / name).exists()]
+    if not missing:
+        return baseline_dir, None, baseline_dir
+
+    if not archive_path.exists():
+        missing_paths = ", ".join(str(baseline_dir / name) for name in missing)
+        raise RuntimeError(
+            "Baseline universe artifacts are required before this experiment. "
+            f"Missing: {missing_paths}. Baseline archive also not found: {archive_path}"
+        )
+
+    temporary = tempfile.TemporaryDirectory(prefix="mct_incumbent_baseline_")
+    materialized = Path(temporary.name).resolve()
+    with zipfile.ZipFile(archive_path, mode="r") as archive:
+        for filename in BASELINE_REQUIRED_FILES:
+            member = _find_archive_member(archive, filename)
+            (materialized / filename).write_bytes(archive.read(member))
+
+    universe_scale._log(
+        "Baseline folder artifacts not found; reusing required artifacts directly from archive: "
+        f"{archive_path}"
+    )
+    return materialized, temporary, archive_path
+
+
 def _patch_lightgbm_snapshot() -> None:
     original = universe_scale._immutable_model_snapshot
 
@@ -202,10 +268,7 @@ def _patch_final_policy_only() -> None:
     def research_policy(*args: Any, **kwargs: Any):
         base_policy = original(*args, **kwargs)
         diagnostics = kwargs.get("decision_diagnostics")
-        if diagnostics is None:
-            # Calibration remains byte-for-byte equivalent to the baseline logic.
-            return base_policy
-        if len(args) < 4:
+        if diagnostics is None or len(args) < 4:
             return base_policy
         frames = args[1]
         symbols = args[2]
@@ -224,10 +287,7 @@ def _patch_final_policy_only() -> None:
     research_challengers._utility_policy = research_policy
 
 
-def _comparison(
-    baseline_dir: Path,
-    output_dir: Path,
-) -> pd.DataFrame:
+def _comparison(baseline_dir: Path, output_dir: Path) -> pd.DataFrame:
     baseline_path = baseline_dir / "universe_scale_summary.json"
     variant_path = output_dir / "universe_scale_summary.json"
     if not baseline_path.exists():
@@ -283,30 +343,16 @@ def _comparison(
                 "persistence_holds_applied": guard_count,
             }
         )
+    if not rows:
+        raise RuntimeError("No matching baseline universe size was found for comparison.")
     return pd.DataFrame(rows).sort_values("universe_size")
 
 
 def main() -> int:
     original_argv = list(sys.argv[1:])
     pre = _preparse(original_argv)
-    baseline_dir = (
-        Path(pre.baseline_output_dir).resolve()
-        if pre.baseline_output_dir
-        else (
-            PROJECT_ROOT
-            / "research_output"
-            / (
-                f"asset_rotation_universe_scale_strategy_{pre.strategy_sequence}_"
-                f"{pre.analysis_start}_to_{pre.analysis_end}"
-            )
-        ).resolve()
-    )
+    baseline_dir, baseline_temp, baseline_source = _resolve_baseline_artifacts(pre)
     seed_file = baseline_dir / "universe_candidate_history_integrity.csv"
-    if not seed_file.exists():
-        raise RuntimeError(
-            "Baseline universe artifacts are required before this experiment. "
-            f"Missing: {seed_file}"
-        )
 
     output_dir = (
         Path(pre.output_dir).resolve()
@@ -333,59 +379,63 @@ def main() -> int:
         forwarded.extend(["--output-dir", str(output_dir)])
     sys.argv = [sys.argv[0], *forwarded]
 
-    status = universe_scale.main()
-    if status != 0:
-        return int(status)
+    try:
+        status = universe_scale.main()
+        if status != 0:
+            return int(status)
 
-    manifest_path = output_dir / "universe_scale_manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.update(
-        {
-            "experiment": "incumbent_trend_persistence_vs_base_rotation",
-            "baseline_output_dir": str(baseline_dir),
-            "baseline_seed_file": str(seed_file),
-            "frozen_universe_reused": True,
-            "incumbent_trend_persistence": PERSISTENCE_SETTINGS.as_dict(),
-            "calibration_policy_changed": False,
-            "model_target_changed": False,
-            "lightgbm_hyperparameters_changed": False,
-        }
-    )
-    universe_scale._write_json(manifest_path, manifest)
-
-    comparison = _comparison(baseline_dir, output_dir)
-    universe_scale._write_csv(
-        output_dir / "incumbent_persistence_comparison.csv",
-        comparison,
-    )
-    universe_scale._write_json(
-        output_dir / "incumbent_persistence_comparison.json",
-        {
-            "schema_version": 1,
-            "script_version": SCRIPT_VERSION,
-            "hypothesis": (
-                "Protect a still-healthy incumbent when a challenger is only moderately "
-                "better on the same-date cross-sectional score scale."
-            ),
-            "settings": PERSISTENCE_SETTINGS.as_dict(),
-            "series": comparison.to_dict(orient="records"),
-        },
-    )
-
-    archive_path = universe_scale._archive_output_dir(output_dir)
-    print("\n=== INCUMBENT TREND PERSISTENCE COMPARISON ===", flush=True)
-    for row in comparison.to_dict(orient="records"):
-        delta = row.get("capital_delta_ratio")
-        delta_text = f"{float(delta) * 100:+.2f}%" if delta is not None else "n/a"
-        universe_scale._log(
-            f"{int(row['universe_size'])} assets: "
-            f"baseline=${float(row['baseline_ending_capital']):,.2f}; "
-            f"persistence=${float(row['persistence_ending_capital']):,.2f}; "
-            f"delta={delta_text}; holds={int(row['persistence_holds_applied'])}."
+        manifest_path = output_dir / "universe_scale_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "experiment": "incumbent_trend_persistence_vs_base_rotation",
+                "baseline_artifact_source": str(baseline_source),
+                "baseline_seed_file": str(seed_file),
+                "frozen_universe_reused": True,
+                "incumbent_trend_persistence": PERSISTENCE_SETTINGS.as_dict(),
+                "calibration_policy_changed": False,
+                "model_target_changed": False,
+                "lightgbm_hyperparameters_changed": False,
+            }
         )
-    universe_scale._log(f"Persistence artifacts: {output_dir}")
-    universe_scale._log(f"Persistence archive: {archive_path}")
-    return 0
+        universe_scale._write_json(manifest_path, manifest)
+
+        comparison = _comparison(baseline_dir, output_dir)
+        universe_scale._write_csv(
+            output_dir / "incumbent_persistence_comparison.csv",
+            comparison,
+        )
+        universe_scale._write_json(
+            output_dir / "incumbent_persistence_comparison.json",
+            {
+                "schema_version": 1,
+                "script_version": SCRIPT_VERSION,
+                "hypothesis": (
+                    "Protect a still-healthy incumbent when a challenger is only moderately "
+                    "better on the same-date cross-sectional score scale."
+                ),
+                "settings": PERSISTENCE_SETTINGS.as_dict(),
+                "series": comparison.to_dict(orient="records"),
+            },
+        )
+
+        archive_path = universe_scale._archive_output_dir(output_dir)
+        print("\n=== INCUMBENT TREND PERSISTENCE COMPARISON ===", flush=True)
+        for row in comparison.to_dict(orient="records"):
+            delta = row.get("capital_delta_ratio")
+            delta_text = f"{float(delta) * 100:+.2f}%" if delta is not None else "n/a"
+            universe_scale._log(
+                f"{int(row['universe_size'])} assets: "
+                f"baseline=${float(row['baseline_ending_capital']):,.2f}; "
+                f"persistence=${float(row['persistence_ending_capital']):,.2f}; "
+                f"delta={delta_text}; holds={int(row['persistence_holds_applied'])}."
+            )
+        universe_scale._log(f"Persistence artifacts: {output_dir}")
+        universe_scale._log(f"Persistence archive: {archive_path}")
+        return 0
+    finally:
+        if baseline_temp is not None:
+            baseline_temp.cleanup()
 
 
 if __name__ == "__main__":
