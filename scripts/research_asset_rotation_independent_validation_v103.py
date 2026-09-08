@@ -118,11 +118,10 @@ def _decision_dates(
         raise RuntimeError("Independent validation interval is too short.")
 
     validation_sessions = normalized[validation_index : end_index + 1]
+    expected_start = normalized[validation_index].normalize().tz_localize(None)
+    expected_end = _utc_day(validation_end).tz_localize(None)
     expected = _utc_index(
-        base.common._expected_sessions(
-            normalized[validation_index].normalize(),
-            _utc_day(validation_end),
-        )
+        base.common._expected_sessions(expected_start, expected_end)
     ).normalize()
     actual = validation_sessions.normalize()
     if not actual.equals(expected):
@@ -187,7 +186,6 @@ def main() -> int:
     # Keep all v1.0.2 protections: Windows long-path-safe writes and frozen-universe anchors.
     v101.SCRIPT_VERSION = SCRIPT_VERSION
     base.SCRIPT_VERSION = SCRIPT_VERSION
-    v101._write_json = v101._write_json
     return int(v101.main())
 
 
