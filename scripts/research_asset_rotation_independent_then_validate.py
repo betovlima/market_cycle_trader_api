@@ -12,7 +12,7 @@ import exchange_calendars as xcals
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_VERSION = "asset-rotation-independent-then-validate-v1.0"
+SCRIPT_VERSION = "asset-rotation-independent-then-validate-v1.0.1"
 DEFAULT_VALIDATION_SESSIONS = 252
 
 
@@ -234,7 +234,7 @@ def main() -> int:
 
     validation = [
         python,
-        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_independent_validation.py"),
+        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_independent_validation_v101.py"),
         "--strategy-sequence",
         str(args.strategy_sequence),
         "--selection-end",
