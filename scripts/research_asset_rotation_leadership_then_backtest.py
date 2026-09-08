@@ -6,13 +6,13 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_VERSION = "asset-rotation-leadership-then-backtest-v1.1"
+SCRIPT_VERSION = "asset-rotation-leadership-then-backtest-v1.2"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run intrinsic-timing plus rotation-leadership qualification from scratch, "
+            "Run point-in-time asset diagnostics plus rotation-opportunity qualification, "
             "freeze the resulting universe, then execute exactly one full Strategy Backtest."
         )
     )
@@ -48,7 +48,7 @@ def main() -> int:
 
     qualification = [
         python,
-        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_leadership.py"),
+        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_leadership_v12.py"),
         "--strategy-sequence",
         str(args.strategy_sequence),
         "--snapshot-end",
@@ -69,14 +69,14 @@ def main() -> int:
         qualification.append("--no-resume")
 
     print(
-        f"=== PHASE 1: INTRINSIC TIMING + ROTATION LEADERSHIP ({SCRIPT_VERSION}) ===",
+        f"=== PHASE 1: TIMING DIAGNOSTIC + ROTATION-OPPORTUNITY QUALIFICATION ({SCRIPT_VERSION}) ===",
         flush=True,
     )
     subprocess.run(qualification, check=True, cwd=PROJECT_ROOT)
 
     if args.qualification_only:
         print(
-            "Qualification-only requested. Frozen universe created; full Strategy Backtest not run.",
+            "Qualification-only requested. Rotation-qualified universe frozen; full Strategy Backtest not run.",
             flush=True,
         )
         return 0
@@ -101,7 +101,7 @@ def main() -> int:
     _append(final_backtest, "--baseline-job-id", args.baseline_job_id)
 
     print(
-        "=== PHASE 2: ONE FULL STRATEGY BACKTEST OF THE FROZEN RESEARCH UNIVERSE ===",
+        "=== PHASE 2: ONE FULL STRATEGY BACKTEST OF THE FROZEN ROTATION-QUALIFIED UNIVERSE ===",
         flush=True,
     )
     subprocess.run(final_backtest, check=True, cwd=PROJECT_ROOT)
