@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_VERSION = "asset-timing-then-backtest-v1.2"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,7 +47,7 @@ def main() -> int:
 
     qualification = [
         python,
-        str(PROJECT_ROOT / "scripts" / "research_asset_timing_vs_buyhold.py"),
+        str(PROJECT_ROOT / "scripts" / "research_asset_timing_vs_buyhold_execution.py"),
         "--strategy-sequence",
         str(args.strategy_sequence),
         "--snapshot-end",
@@ -67,7 +68,7 @@ def main() -> int:
     if args.no_resume:
         qualification.append("--no-resume")
 
-    print("=== PHASE 1: ASSET TIMING QUALIFICATION ===", flush=True)
+    print(f"=== PHASE 1: ASSET TIMING QUALIFICATION ({SCRIPT_VERSION}) ===", flush=True)
     subprocess.run(qualification, check=True, cwd=PROJECT_ROOT)
     if args.qualification_only:
         print("Qualification-only requested. Frozen universe created; full Strategy Backtest not run.", flush=True)
