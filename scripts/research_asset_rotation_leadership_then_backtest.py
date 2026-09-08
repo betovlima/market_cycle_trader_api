@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_VERSION = "asset-rotation-leadership-then-backtest-v1.2"
+SCRIPT_VERSION = "asset-rotation-leadership-then-backtest-v1.3"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -48,7 +48,7 @@ def main() -> int:
 
     qualification = [
         python,
-        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_leadership_v12.py"),
+        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_leadership_v13.py"),
         "--strategy-sequence",
         str(args.strategy_sequence),
         "--snapshot-end",
