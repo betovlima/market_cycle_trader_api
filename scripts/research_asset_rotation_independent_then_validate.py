@@ -12,7 +12,7 @@ import exchange_calendars as xcals
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_VERSION = "asset-rotation-independent-then-validate-v1.0.1"
+SCRIPT_VERSION = "asset-rotation-independent-then-validate-v1.0.2"
 DEFAULT_VALIDATION_SESSIONS = 252
 
 
@@ -31,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--strategy-sequence", type=int, default=10)
     parser.add_argument("--strategy-id", default=None)
+    parser.add_argument("--history-start", required=True)
     parser.add_argument("--snapshot-end", required=True)
     parser.add_argument("--validation-sessions", type=int, default=DEFAULT_VALIDATION_SESSIONS)
     parser.add_argument("--universe-file", default=None)
@@ -54,18 +55,26 @@ def _truthy(value: object) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
-def _split(snapshot_end: str, validation_sessions: int) -> tuple[str, str, str]:
+def _split(
+    history_start: str,
+    snapshot_end: str,
+    validation_sessions: int,
+) -> tuple[str, str, str]:
     count = int(validation_sessions)
     if count < 60:
         raise RuntimeError("Independent final validation requires at least 60 market sessions.")
     calendar = xcals.get_calendar("XNYS")
+    start = pd.Timestamp(history_start).normalize()
     snapshot = pd.Timestamp(snapshot_end).normalize()
+    first = pd.Timestamp(calendar.date_to_session(start, direction="next"))
     end_session = pd.Timestamp(calendar.date_to_session(snapshot, direction="previous"))
-    first = pd.Timestamp(calendar.date_to_session("2016-01-01", direction="next"))
+    if first >= end_session:
+        raise RuntimeError("Expected --history-start to be before --snapshot-end.")
     sessions = pd.DatetimeIndex(calendar.sessions_in_range(first, end_session))
     if len(sessions) <= count + 700:
         raise RuntimeError(
-            f"Not enough Strategy history to reserve {count} final validation sessions."
+            f"Not enough Strategy history from {start.date().isoformat()} to "
+            f"{end_session.date().isoformat()} to reserve {count} final validation sessions."
         )
     validation_start = pd.Timestamp(sessions[-count])
     selection_end = pd.Timestamp(sessions[-count - 1])
@@ -130,12 +139,28 @@ def _write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+def _verify_frozen_history_start(frozen_path: Path, history_start: str) -> None:
+    if not frozen_path.exists():
+        raise RuntimeError(f"Frozen pre-validation selection not found: {frozen_path}.")
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    requested = pd.Timestamp(history_start).date().isoformat()
+    actual = str(frozen.get("strategy_start") or "")
+    if actual != requested:
+        raise RuntimeError(
+            "Frozen pre-validation selection was built with a different Strategy history start: "
+            f"frozen={actual or 'missing'}, requested={requested}. "
+            "Run phase 1 again with the Strategy configured for the requested Full Strategy History."
+        )
+
+
 def main() -> int:
     args = _parser().parse_args()
     if args.selection_only and args.validation_only:
         raise RuntimeError("Use either --selection-only or --validation-only, not both.")
 
+    history_start = pd.Timestamp(args.history_start).date().isoformat()
     selection_end, validation_start, validation_end = _split(
+        history_start,
         args.snapshot_end,
         args.validation_sessions,
     )
@@ -160,7 +185,7 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
 
     universe_record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "script_version": SCRIPT_VERSION,
         "strategy_sequence": int(args.strategy_sequence),
         "source_file": str(universe_file),
@@ -169,6 +194,7 @@ def main() -> int:
         "external_candidate_count": len(candidates),
         "external_candidates": candidates,
         "external_candidates_sha256": _sha256_json(candidates),
+        "history_start": history_start,
         "selection_end": selection_end,
         "validation_start": validation_start,
         "validation_end": validation_end,
@@ -182,6 +208,9 @@ def main() -> int:
     _write_json(root / "independent_validation_design.json", universe_record)
 
     _log("INDEPENDENT FINAL-PERIOD TEST")
+    _log(
+        f"Full Strategy History parameter: {history_start} -> {validation_end}."
+    )
     _log(
         f"Candidate universe frozen from history-integrity only: external={len(candidates)}; "
         "previous qualification results are NOT read."
@@ -221,22 +250,21 @@ def main() -> int:
             flush=True,
         )
         subprocess.run(selection, check=True, cwd=PROJECT_ROOT)
+        _verify_frozen_history_start(frozen, history_start)
 
     if args.selection_only:
         _log(f"Selection frozen at: {frozen}")
         return 0
 
-    if not frozen.exists():
-        raise RuntimeError(
-            f"Frozen pre-validation selection not found: {frozen}. "
-            "Run without --validation-only first."
-        )
+    _verify_frozen_history_start(frozen, history_start)
 
     validation = [
         python,
-        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_independent_validation_v101.py"),
+        str(PROJECT_ROOT / "scripts" / "research_asset_rotation_independent_validation_v103.py"),
         "--strategy-sequence",
         str(args.strategy_sequence),
+        "--history-start",
+        history_start,
         "--selection-end",
         selection_end,
         "--validation-start",
