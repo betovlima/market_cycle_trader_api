@@ -1,6 +1,29 @@
-# Asset Rotation Universe Scale v1
+# Asset Rotation Universe Scale
 
-Research-only experiment. It measures the effect of expanding the opportunity set available to the Strategy's existing intelligent-rotation engine without changing the immutable LightGBM model settings.
+Research-only experiment. Current script version: `asset-rotation-universe-scale-v1.1.0`.
+
+It measures the effect of expanding the opportunity set available to the Strategy's existing intelligent-rotation engine without changing the immutable LightGBM model settings.
+
+## Architecture
+
+The Git history carries versions; filenames remain stable.
+
+- `scripts/research_asset_rotation_universe_scale.py`: command-line entry point and experiment orchestration.
+- `src/market_cycle_trader_api/services/asset_universe_scale_candidates.py`: external-universe discovery, full-history validation, objective quality checks and RAM-only candidate loading.
+- Existing engine/service modules continue to own LightGBM rotation, transaction costs, Strategy snapshots and market-data access.
+
+No `_v101.py`, `_v102.py`, etc. file naming is used for this experiment.
+
+## Execution sequence
+
+1. Load Strategy #10, requested dates and immutable LightGBM snapshot.
+2. Load the 56 Strategy assets from MongoDB and validate Full Strategy History.
+3. If the largest requested series exceeds 56, discover and prepare enough external assets. Existing complete Mongo history is reused; missing histories are downloaded to RAM only. Previous candidate rankings are not read.
+4. Close MongoDB and freeze the nested universes in memory.
+5. Execute 56 -> 82 -> 250 -> 500 with identical LightGBM settings, costs and economic window. Each series is intelligent rotation versus equal-weight Buy & Hold across the same series universe.
+6. Write the compact cross-series comparison and local diagnostics.
+
+For `--series 56`, step 3 is skipped entirely, including the Alpaca universe lookup.
 
 ## Question
 
@@ -21,15 +44,15 @@ External assets are not selected from full Strategy Backtest results. The resear
 
 1. Alpaca active/tradable `us_equity` universe on supported US exchanges.
 2. Full Strategy History coverage from `--history-start` through `--snapshot-end`.
-3. Existing Asset Discovery price, dollar-volume and volume-quality settings.
+3. Asset Discovery price, dollar-volume and volume-quality settings read from MongoDB when available; research defaults are used only if the settings document is absent.
 4. Existing Asset Discovery behavior-risk checks.
 5. Deterministic ordering using Strategy configuration hash + snapshot date + symbol.
 
-This is a scale experiment, not a new independent final validation. Current-eligibility information is used to construct the larger historical universes, so the result must not be described as an untouched holdout result.
+This is a scale experiment, not a new independent final validation. Current-eligibility information is used to construct the larger historical universes, so the result must not be described as an untouched final validation period.
 
 ## Persistence contract
 
-The script opens MongoDB read-only at the application level. It does not call insert/update/delete operations.
+The experiment does not call MongoDB insert/update/delete operations.
 
 - Strategy baseline history already in MongoDB is reused.
 - Candidate history already complete in MongoDB is read.
@@ -39,7 +62,7 @@ The script opens MongoDB read-only at the application level. It does not call in
 - Backtest predictions/trades/results are written only to local `research_output` files.
 - The experiment reports `persistent_candidate_history_added = 0`.
 
-Only after the research identifies the universe/assets we actually want to keep should a separate explicit promotion/persistence step be implemented.
+Only after research identifies which assets should be retained should a separate explicit persistence step be implemented.
 
 ## Run
 
@@ -62,7 +85,7 @@ Use `--max-candidate-scans` if more than the default 2500 Alpaca symbols must be
 
 ## Main artifacts
 
-- `universe_scale_manifest.json`: immutable experiment description and persistence contract.
+- `universe_scale_manifest.json`: experiment description and persistence contract.
 - `universe_candidate_history_integrity.csv`: accepted/rejected eligibility diagnostics.
 - `universe_data_inventory.csv`: raw-frame row counts and RAM footprint estimates.
 - `universe_<N>_assets.json`: exact nested asset list for each series.
