@@ -118,18 +118,72 @@ def _find_numeric(value: Any, aliases: tuple[str, ...]) -> float | None:
     return None
 
 
+def _find_worst_fold_return(value: Any) -> float | None:
+    if isinstance(value, dict):
+        folds = value.get("walk_forward_folds")
+        if isinstance(folds, list):
+            returns: list[float] = []
+            for fold in folds:
+                if not isinstance(fold, dict):
+                    continue
+                try:
+                    number = float(fold.get("strategy_return"))
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(number):
+                    returns.append(number)
+            if returns:
+                return float(min(returns))
+        for nested in value.values():
+            found = _find_worst_fold_return(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_worst_fold_return(nested)
+            if found is not None:
+                return found
+    return None
+
+
 def normalized_metrics(results: dict[str, Any]) -> dict[str, Any]:
     aliases = {
-        "ending_capital": ("ending_capital", "final_capital", "ending_equity"),
-        "cagr": ("cagr", "compound_annual_growth_rate"),
-        "sharpe": ("sharpe", "sharpe_ratio"),
-        "maximum_drawdown": ("maximum_drawdown", "max_drawdown", "max_dd"),
-        "worst_fold_return": ("worst_fold_return", "worst_fold"),
-        "switches": ("switches", "switch_count", "rotation_count"),
+        "ending_capital": (
+            "strategy_ending_capital",
+            "ending_capital",
+            "final_capital",
+            "ending_equity",
+        ),
+        "cagr": ("strategy_cagr", "cagr", "compound_annual_growth_rate"),
+        "sharpe": ("strategy_sharpe", "sharpe", "sharpe_ratio"),
+        "maximum_drawdown": (
+            "strategy_maximum_drawdown",
+            "maximum_drawdown",
+            "max_drawdown",
+            "max_dd",
+        ),
+        "switches": (
+            "capital_rotations",
+            "switches",
+            "switch_count",
+            "rotation_count",
+        ),
         "cash_days": ("cash_days",),
         "market_exposure": ("market_exposure", "exposure"),
     }
-    return {metric: _find_numeric(results, names) for metric, names in aliases.items()}
+    normalized = {metric: _find_numeric(results, names) for metric, names in aliases.items()}
+    normalized["worst_fold_return"] = _find_worst_fold_return(results)
+    ordered = (
+        "ending_capital",
+        "cagr",
+        "sharpe",
+        "maximum_drawdown",
+        "worst_fold_return",
+        "switches",
+        "cash_days",
+        "market_exposure",
+    )
+    return {metric: normalized.get(metric) for metric in ordered}
 
 
 def compare_results(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
