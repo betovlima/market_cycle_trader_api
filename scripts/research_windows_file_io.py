@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,13 @@ def ensure_dir(path: str | os.PathLike[str] | Path) -> None:
 
 def exists(path: str | os.PathLike[str] | Path) -> bool:
     return os.path.exists(windows_long_path(path))
+
+
+def remove_tree(path: str | os.PathLike[str] | Path) -> None:
+    target = Path(path).resolve()
+    if not exists(target):
+        return
+    shutil.rmtree(windows_long_path(target))
 
 
 def read_text(path: str | os.PathLike[str] | Path) -> str:
