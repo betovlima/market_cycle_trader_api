@@ -1,6 +1,6 @@
 # Asset Marginal Rotation Contribution v1
 
-Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.3`.
+Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.4`.
 
 ## Hypothesis
 
@@ -32,7 +32,13 @@ The marginal candidate pool explicitly prefers `leadership_qualified`; intrinsic
 
 The project checkout can already consume most of the legacy Windows path budget. v1.0.3 makes research artifact I/O long-path safe through `research_windows_file_io.py` and uses short Phase 1B / validation subdirectory names.
 
-The existing Phase 1A directory name is deliberately preserved so a failed v1.0.2 execution can resume from its already generated `intrinsic_timing_summary.csv`, `intrinsic_timing_folds.csv`, and `leadership_predictions_raw.csv` instead of recomputing every asset.
+The existing Phase 1A directory name is deliberately preserved so a failed execution can resume from its already generated `intrinsic_timing_summary.csv`, `intrinsic_timing_folds.csv`, and `leadership_predictions_raw.csv` instead of recomputing every asset.
+
+## Mixed ISO timestamp normalization — v1.0.4
+
+Leadership CSVs may legitimately contain UTC timestamps serialized in more than one ISO representation, for example `2020-07-20 04:00:00+00:00` and `2020-07-21T04:00:00+00:00`. Pandas 2.x may infer one representation from the first row and reject another valid representation later in the same column.
+
+v1.0.4 parses the leadership timestamp column with explicit mixed-ISO handling, always normalizes to UTC, and raises a targeted error only if a timestamp is genuinely invalid after parsing.
 
 ## Selection
 
