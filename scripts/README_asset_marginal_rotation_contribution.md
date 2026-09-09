@@ -16,7 +16,7 @@ Normal mode may reuse an explicitly supplied `--universe-file` or an existing de
 
 ## Strict fresh run — v1.0.5
 
-Use `--fresh-run` when no prior experiment file may influence the new execution.
+Use `--fresh-run` when no prior experiment file may influence the new execution. This is the recommended mode when reproducing the experiment from zero.
 
 Fresh mode:
 
