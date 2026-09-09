@@ -16,7 +16,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 import research_asset_rotation_independent_then_validate as independent  # noqa: E402
 import research_windows_file_io as file_io  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.3"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.4"
 DEFAULT_VALIDATION_SESSIONS = 252
 LEADERSHIP_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_leadership.py"
 VALIDATION_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_validation.py"
@@ -222,7 +222,7 @@ def main() -> int:
     file_io.write_json(
         root / "marginal_rotation_independent_design.json",
         {
-            "schema_version": 4,
+            "schema_version": 5,
             "script_version": SCRIPT_VERSION,
             "strategy_sequence": int(args.strategy_sequence),
             "history_start": history_start,
@@ -245,6 +245,7 @@ def main() -> int:
             "baseline_universe_is_immutable": True,
             "versioned_wrapper_dependencies": False,
             "windows_long_path_safe_io": True,
+            "mixed_iso_timestamp_parsing": True,
             "marginal_output_directory": str(marginal_dir),
             "final_primary_comparison": (
                 "expanded Strategy ending capital versus immutable baseline Strategy "
@@ -364,7 +365,7 @@ def main() -> int:
         else None
     )
     comparison = {
-        "schema_version": 3,
+        "schema_version": 4,
         "script_version": SCRIPT_VERSION,
         "baseline_ending_capital": baseline_capital,
         "expanded_ending_capital": expanded_capital,
