@@ -16,7 +16,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 import research_asset_rotation_independent_then_validate as independent  # noqa: E402
 import research_windows_file_io as file_io  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.4"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.5"
 DEFAULT_VALIDATION_SESSIONS = 252
 LEADERSHIP_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_leadership.py"
 VALIDATION_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_validation.py"
@@ -52,6 +52,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help=(
+            "Run from zero: delete only this experiment's output directory, ignore every "
+            "prior candidate-universe artifact, discover candidates from local MongoDB, "
+            "and disable Leadership resume. Cannot be combined with --validation-only "
+            "or --universe-file."
+        ),
+    )
     parser.add_argument("--selection-only", action="store_true")
     parser.add_argument("--validation-only", action="store_true")
     return parser
@@ -130,6 +140,9 @@ def _candidate_source(
     *,
     validation_end: str,
 ) -> tuple[Path | None, list[str] | None, str]:
+    if args.fresh_run:
+        return None, None, "all_local_mongo_cached_symbols_fresh"
+
     if args.universe_file:
         path = Path(args.universe_file).resolve()
         candidates = independent._candidate_universe(path)
@@ -169,11 +182,35 @@ def _resolve_marginal_dir(
     return short
 
 
+def _assert_safe_fresh_root(root: Path) -> None:
+    research_root = (PROJECT_ROOT / "research_output").resolve()
+    resolved = root.resolve()
+    try:
+        relative = resolved.relative_to(research_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "--fresh-run only deletes experiment output under PROJECT_ROOT/research_output. "
+            f"Resolved output directory is outside that root: {resolved}"
+        ) from exc
+    if not relative.parts or not relative.parts[0].startswith("asset_marginal_rotation_strategy_"):
+        raise RuntimeError(
+            "--fresh-run refused to delete an unexpected research_output path: "
+            f"{resolved}"
+        )
+
+
 def main() -> int:
     args = _parser().parse_args()
     if args.selection_only and args.validation_only:
         raise RuntimeError(
             "Use either --selection-only or --validation-only, not both."
+        )
+    if args.fresh_run and args.validation_only:
+        raise RuntimeError("--fresh-run cannot be combined with --validation-only.")
+    if args.fresh_run and args.universe_file:
+        raise RuntimeError(
+            "--fresh-run cannot be combined with --universe-file because a fresh run "
+            "must not reuse any prior candidate-universe artifact."
         )
 
     history_start = pd.Timestamp(args.history_start).date().isoformat()
@@ -192,6 +229,21 @@ def main() -> int:
             f"{validation_start}_to_{validation_end}"
         )
     ).resolve()
+
+    if args.fresh_run:
+        _assert_safe_fresh_root(root)
+        if file_io.exists(root):
+            print(
+                f"FRESH RUN: deleting prior experiment artifacts only from {root}",
+                flush=True,
+            )
+            file_io.remove_tree(root)
+        print(
+            "FRESH RUN: prior Leadership/candidate-universe artifacts will not be reused; "
+            "candidate discovery will start from the local MongoDB cache.",
+            flush=True,
+        )
+
     leadership_dir = root / f"leadership_selection_through_{selection_end}"
     marginal_dir = _resolve_marginal_dir(
         root,
@@ -222,7 +274,7 @@ def main() -> int:
     file_io.write_json(
         root / "marginal_rotation_independent_design.json",
         {
-            "schema_version": 5,
+            "schema_version": 6,
             "script_version": SCRIPT_VERSION,
             "strategy_sequence": int(args.strategy_sequence),
             "history_start": history_start,
@@ -238,8 +290,11 @@ def main() -> int:
                 len(candidates) if candidates is not None else None
             ),
             "leadership_native_local_mongo_discovery": bool(
-                candidate_source == "all_local_mongo_cached_symbols"
+                candidate_source.startswith("all_local_mongo_cached_symbols")
             ),
+            "fresh_run": bool(args.fresh_run),
+            "prior_experiment_artifacts_reused": False if args.fresh_run else None,
+            "leadership_resume_enabled": not bool(args.no_resume or args.fresh_run),
             "selection_uses_full_strategy_backtest": False,
             "selection_uses_validation_period": False,
             "baseline_universe_is_immutable": True,
@@ -274,17 +329,23 @@ def main() -> int:
                 )
             leadership.extend(["--candidate-symbols", *candidates])
         else:
-            print(
-                "No prior candidate-universe file was found. "
-                "Phase 1A will evaluate all external symbols already cached in local MongoDB.",
-                flush=True,
-            )
+            if args.fresh_run:
+                print(
+                    "Fresh Phase 1A will evaluate all external symbols already cached in local MongoDB.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "No prior candidate-universe file was found. "
+                    "Phase 1A will evaluate all external symbols already cached in local MongoDB.",
+                    flush=True,
+                )
 
         _append(leadership, "--strategy-id", args.strategy_id)
         _append(leadership, "--mongo-uri", args.mongo_uri)
         _append(leadership, "--database", args.database)
         _append(leadership, "--env-file", args.env_file)
-        if args.no_resume:
+        if args.no_resume or args.fresh_run:
             leadership.append("--no-resume")
 
         print("=== PHASE 1A: PRE-VALIDATION LEADERSHIP ===", flush=True)
@@ -365,7 +426,7 @@ def main() -> int:
         else None
     )
     comparison = {
-        "schema_version": 4,
+        "schema_version": 5,
         "script_version": SCRIPT_VERSION,
         "baseline_ending_capital": baseline_capital,
         "expanded_ending_capital": expanded_capital,
