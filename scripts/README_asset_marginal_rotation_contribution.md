@@ -1,12 +1,24 @@
 # Asset Marginal Rotation Contribution v1
 
-Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.0`.
+Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.1`.
 
 ## Hypothesis
 
 The Strategy baseline that produced the large compound result stays immutable. A new asset is admitted only when its OOS leadership displacement adds economic value relative to the leader the current universe would otherwise have selected.
 
 The selector uses existing walk-forward OOS leadership predictions and does **not** run a full Strategy backtest for every candidate.
+
+## Candidate source
+
+`--universe-file` is optional.
+
+- If explicitly supplied, that frozen history-integrity file defines the external candidate pool.
+- If omitted and the default prior Leadership history-integrity file exists, it is reused.
+- If neither exists, Phase 1A uses the native Leadership behavior and evaluates every external symbol already cached for the Strategy market-data identity in the local MongoDB.
+
+Therefore a previous `asset_rotation_leadership_strategy_<N>_<date>/asset_history_integrity.csv` run is no longer required just to start this experiment.
+
+`--validation-only` reuses the already frozen baseline/expanded snapshots and does not resolve the candidate universe again.
 
 ## Selection
 
