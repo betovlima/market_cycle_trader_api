@@ -16,8 +16,11 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import research_asset_rotation_independent_then_validate as independent  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.1"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.2"
 DEFAULT_VALIDATION_SESSIONS = 252
+LEADERSHIP_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_leadership.py"
+VALIDATION_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_validation.py"
+MARGINAL_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_contribution.py"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -69,6 +72,26 @@ def _write_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def _require_script(path: Path, label: str) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise RuntimeError(
+            f"{label} helper is missing from the checked-out branch: {resolved}. "
+            "Run git fetch origin && git reset --hard origin/research/asset-marginal-rotation-contribution-v1."
+        )
+    return resolved
+
+
+def _run(command: list[str], *, label: str) -> None:
+    print(f"Executing {label}: {' '.join(command[:2])}", flush=True)
+    completed = subprocess.run(command, cwd=PROJECT_ROOT)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{label} failed with exit code {completed.returncode}. "
+            "The complete child traceback is printed immediately above this message."
+        )
+
+
 def _validation_command(
     *,
     args: argparse.Namespace,
@@ -81,11 +104,7 @@ def _validation_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        str(
-            PROJECT_ROOT
-            / "scripts"
-            / "research_asset_rotation_independent_validation_v103.py"
-        ),
+        str(_require_script(VALIDATION_SCRIPT, "Marginal rotation validation")),
         "--strategy-sequence",
         str(args.strategy_sequence),
         "--history-start",
@@ -188,7 +207,7 @@ def main() -> int:
     _write_json(
         root / "marginal_rotation_independent_design.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "script_version": SCRIPT_VERSION,
             "strategy_sequence": int(args.strategy_sequence),
             "history_start": history_start,
@@ -209,6 +228,7 @@ def main() -> int:
             "selection_uses_full_strategy_backtest": False,
             "selection_uses_validation_period": False,
             "baseline_universe_is_immutable": True,
+            "versioned_wrapper_dependencies": False,
             "final_primary_comparison": (
                 "expanded Strategy ending capital versus immutable baseline Strategy "
                 "ending capital on the same untouched final period"
@@ -219,7 +239,7 @@ def main() -> int:
     if not args.validation_only:
         leadership = [
             sys.executable,
-            str(PROJECT_ROOT / "scripts" / "research_asset_rotation_leadership_v13.py"),
+            str(_require_script(LEADERSHIP_SCRIPT, "Marginal rotation leadership")),
             "--strategy-sequence",
             str(args.strategy_sequence),
             "--snapshot-end",
@@ -250,28 +270,21 @@ def main() -> int:
             leadership.append("--no-resume")
 
         print("=== PHASE 1A: PRE-VALIDATION LEADERSHIP ===", flush=True)
-        subprocess.run(leadership, check=True, cwd=PROJECT_ROOT)
+        _run(leadership, label="Phase 1A leadership")
 
         print(
             "=== PHASE 1B: GREEDY MARGINAL ROTATION CONTRIBUTION ===",
             flush=True,
         )
-        subprocess.run(
-            [
-                sys.executable,
-                str(
-                    PROJECT_ROOT
-                    / "scripts"
-                    / "research_asset_marginal_rotation_contribution.py"
-                ),
-                "--leadership-output-dir",
-                str(leadership_dir),
-                "--output-dir",
-                str(marginal_dir),
-            ],
-            check=True,
-            cwd=PROJECT_ROOT,
-        )
+        marginal = [
+            sys.executable,
+            str(_require_script(MARGINAL_SCRIPT, "Marginal rotation contribution")),
+            "--leadership-output-dir",
+            str(leadership_dir),
+            "--output-dir",
+            str(marginal_dir),
+        ]
+        _run(marginal, label="Phase 1B marginal contribution")
 
     if not expanded_snapshot.exists() or not baseline_snapshot.exists():
         raise RuntimeError(
@@ -285,7 +298,7 @@ def main() -> int:
         return 0
 
     print("=== PHASE 2A: UNTOUCHED BASELINE VALIDATION ===", flush=True)
-    subprocess.run(
+    _run(
         _validation_command(
             args=args,
             history_start=history_start,
@@ -295,15 +308,14 @@ def main() -> int:
             frozen_snapshot=baseline_snapshot,
             output_dir=baseline_validation_dir,
         ),
-        check=True,
-        cwd=PROJECT_ROOT,
+        label="Phase 2A baseline validation",
     )
 
     print(
         "=== PHASE 2B: UNTOUCHED EXPANDED-UNIVERSE VALIDATION ===",
         flush=True,
     )
-    subprocess.run(
+    _run(
         _validation_command(
             args=args,
             history_start=history_start,
@@ -313,8 +325,7 @@ def main() -> int:
             frozen_snapshot=expanded_snapshot,
             output_dir=expanded_validation_dir,
         ),
-        check=True,
-        cwd=PROJECT_ROOT,
+        label="Phase 2B expanded validation",
     )
 
     baseline_result = json.loads(
@@ -340,7 +351,7 @@ def main() -> int:
         else None
     )
     comparison = {
-        "schema_version": 1,
+        "schema_version": 2,
         "script_version": SCRIPT_VERSION,
         "baseline_ending_capital": baseline_capital,
         "expanded_ending_capital": expanded_capital,
