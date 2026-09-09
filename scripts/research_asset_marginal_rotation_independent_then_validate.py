@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -15,8 +14,9 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
 import research_asset_rotation_independent_then_validate as independent  # noqa: E402
+import research_windows_file_io as file_io  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.2"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.3"
 DEFAULT_VALIDATION_SESSIONS = 252
 LEADERSHIP_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_leadership.py"
 VALIDATION_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_validation.py"
@@ -62,22 +62,13 @@ def _append(command: list[str], flag: str, value: object | None) -> None:
         command.extend([flag, str(value)])
 
 
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
-        encoding="utf-8",
-    )
-    tmp.replace(path)
-
-
 def _require_script(path: Path, label: str) -> Path:
     resolved = path.resolve()
     if not resolved.is_file():
         raise RuntimeError(
             f"{label} helper is missing from the checked-out branch: {resolved}. "
-            "Run git fetch origin && git reset --hard origin/research/asset-marginal-rotation-contribution-v1."
+            "Run git fetch origin && git reset --hard "
+            "origin/research/asset-marginal-rotation-contribution-v1."
         )
     return resolved
 
@@ -154,6 +145,30 @@ def _candidate_source(
     return None, None, "all_local_mongo_cached_symbols"
 
 
+def _resolve_marginal_dir(
+    root: Path,
+    selection_end: str,
+    *,
+    validation_only: bool,
+) -> Path:
+    short = root / "marginal"
+    if not validation_only:
+        return short
+
+    short_expanded = short / "marginal_rotation_contribution_snapshot_frozen.json"
+    short_baseline = short / "marginal_rotation_baseline_snapshot_frozen.json"
+    if file_io.exists(short_expanded) and file_io.exists(short_baseline):
+        return short
+
+    legacy = root / f"marginal_selection_through_{selection_end}"
+    legacy_expanded = legacy / "marginal_rotation_contribution_snapshot_frozen.json"
+    legacy_baseline = legacy / "marginal_rotation_baseline_snapshot_frozen.json"
+    if file_io.exists(legacy_expanded) and file_io.exists(legacy_baseline):
+        return legacy
+
+    return short
+
+
 def main() -> int:
     args = _parser().parse_args()
     if args.selection_only and args.validation_only:
@@ -178,14 +193,14 @@ def main() -> int:
         )
     ).resolve()
     leadership_dir = root / f"leadership_selection_through_{selection_end}"
-    marginal_dir = root / f"marginal_selection_through_{selection_end}"
-    baseline_validation_dir = (
-        root / f"baseline_validation_{validation_start}_to_{validation_end}"
+    marginal_dir = _resolve_marginal_dir(
+        root,
+        selection_end,
+        validation_only=bool(args.validation_only),
     )
-    expanded_validation_dir = (
-        root / f"expanded_validation_{validation_start}_to_{validation_end}"
-    )
-    root.mkdir(parents=True, exist_ok=True)
+    baseline_validation_dir = root / "val_baseline"
+    expanded_validation_dir = root / "val_expanded"
+    file_io.ensure_dir(root)
 
     expanded_snapshot = (
         marginal_dir / "marginal_rotation_contribution_snapshot_frozen.json"
@@ -204,10 +219,10 @@ def main() -> int:
             validation_end=validation_end,
         )
 
-    _write_json(
+    file_io.write_json(
         root / "marginal_rotation_independent_design.json",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "script_version": SCRIPT_VERSION,
             "strategy_sequence": int(args.strategy_sequence),
             "history_start": history_start,
@@ -229,6 +244,8 @@ def main() -> int:
             "selection_uses_validation_period": False,
             "baseline_universe_is_immutable": True,
             "versioned_wrapper_dependencies": False,
+            "windows_long_path_safe_io": True,
+            "marginal_output_directory": str(marginal_dir),
             "final_primary_comparison": (
                 "expanded Strategy ending capital versus immutable baseline Strategy "
                 "ending capital on the same untouched final period"
@@ -286,7 +303,7 @@ def main() -> int:
         ]
         _run(marginal, label="Phase 1B marginal contribution")
 
-    if not expanded_snapshot.exists() or not baseline_snapshot.exists():
+    if not file_io.exists(expanded_snapshot) or not file_io.exists(baseline_snapshot):
         raise RuntimeError(
             "Marginal selection snapshots are missing. "
             "Run phase 1 first or remove --validation-only."
@@ -328,15 +345,11 @@ def main() -> int:
         label="Phase 2B expanded validation",
     )
 
-    baseline_result = json.loads(
-        (
-            baseline_validation_dir / "independent_validation_result.json"
-        ).read_text(encoding="utf-8")
+    baseline_result = file_io.read_json(
+        baseline_validation_dir / "independent_validation_result.json"
     )
-    expanded_result = json.loads(
-        (
-            expanded_validation_dir / "independent_validation_result.json"
-        ).read_text(encoding="utf-8")
+    expanded_result = file_io.read_json(
+        expanded_validation_dir / "independent_validation_result.json"
     )
     baseline_capital = _metric(baseline_result, "strategy_ending_capital")
     expanded_capital = _metric(expanded_result, "strategy_ending_capital")
@@ -351,7 +364,7 @@ def main() -> int:
         else None
     )
     comparison = {
-        "schema_version": 2,
+        "schema_version": 3,
         "script_version": SCRIPT_VERSION,
         "baseline_ending_capital": baseline_capital,
         "expanded_ending_capital": expanded_capital,
@@ -378,7 +391,7 @@ def main() -> int:
         ),
         "selection_used_validation_period": False,
     }
-    _write_json(
+    file_io.write_json(
         root / "marginal_rotation_independent_comparison.json",
         comparison,
     )

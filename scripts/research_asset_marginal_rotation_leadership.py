@@ -13,8 +13,9 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
 import research_asset_rotation_leadership as research  # noqa: E402
+import research_windows_file_io as file_io  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-leadership-v1.0.2"
+SCRIPT_VERSION = "asset-marginal-rotation-leadership-v1.0.3"
 _ANALYSIS_FAILURES: dict[str, str] = {}
 
 
@@ -64,7 +65,11 @@ def _failed_aggregate(symbol: str, source: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _placeholder_fold_rows(symbol: str, folds: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+def _placeholder_fold_rows(
+    symbol: str,
+    folds: list[dict[str, Any]],
+    reason: str,
+) -> list[dict[str, Any]]:
     return [
         {
             "symbol": symbol,
@@ -86,7 +91,8 @@ def _placeholder_prediction_rows(
         rows.append(
             {
                 "fold": int(fold["fold_id"]),
-                "timestamp": pd.Timestamp("1900-01-01", tz="UTC") + pd.Timedelta(days=offset),
+                "timestamp": pd.Timestamp("1900-01-01", tz="UTC")
+                + pd.Timedelta(days=offset),
                 "symbol": symbol,
                 "predicted_utility": np.nan,
                 "realized_utility": np.nan,
@@ -129,10 +135,14 @@ def _install_candidate_failure_isolation() -> None:
         numeric = pd.to_numeric(frame["predicted_utility"], errors="coerce")
         frame = frame.loc[np.isfinite(numeric)].copy()
         if frame.empty:
-            raise RuntimeError("No trainable assets produced finite OOS rotation predictions.")
+            raise RuntimeError(
+                "No trainable assets produced finite OOS rotation predictions."
+            )
         return original_rank_predictions(frame)
 
-    def leadership_qualification(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    def leadership_qualification(
+        row: dict[str, Any],
+    ) -> tuple[bool, list[str]]:
         symbol = str(row.get("symbol") or "").upper()
         reason = _ANALYSIS_FAILURES.get(symbol)
         if reason:
@@ -144,8 +154,14 @@ def _install_candidate_failure_isolation() -> None:
     research._leadership_qualification = leadership_qualification
 
 
+def _install_long_path_safe_writes() -> None:
+    research._write_json = file_io.write_json
+    research._write_csv = file_io.write_csv
+
+
 def main() -> int:
     _install_candidate_failure_isolation()
+    _install_long_path_safe_writes()
     research.SCRIPT_VERSION = SCRIPT_VERSION
     return int(research.main())
 

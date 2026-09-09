@@ -12,12 +12,17 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+SCRIPT_ROOT = Path(__file__).resolve().parent
+for path in (SRC_ROOT, SCRIPT_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-from market_cycle_trader_api.services.asset_marginal_rotation_contribution import greedy_marginal_rotation_selection  # noqa: E402
+from market_cycle_trader_api.services.asset_marginal_rotation_contribution import (  # noqa: E402
+    greedy_marginal_rotation_selection,
+)
+import research_windows_file_io as file_io  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.2"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.3"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,23 +35,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--leadership-output-dir", required=True)
     parser.add_argument("--output-dir", default=None)
     return parser
-
-
-def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
-        encoding="utf-8",
-    )
-    tmp.replace(path)
-
-
-def _write_csv(path: Path, frame: pd.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    frame.to_csv(tmp, index=False)
-    tmp.replace(path)
 
 
 def _sha256_json(value: Any) -> str:
@@ -82,10 +70,6 @@ def _candidate_pool(
     frame = qualification.copy()
     frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
 
-    # This research intentionally evaluates marginal contribution only after the
-    # candidate has demonstrated useful cross-sectional rotation leadership. The
-    # older combined `qualified` field also admits intrinsic-timing-only assets,
-    # which is not the hypothesis under test here.
     if "leadership_qualified" in frame.columns:
         accepted = _truthy(frame["leadership_qualified"])
     elif "qualified" in frame.columns:
@@ -118,7 +102,7 @@ def _snapshot(
     frozen.pop("decision_snapshot_sha256", None)
     frozen.update(
         {
-            "schema_version": 7,
+            "schema_version": 8,
             "script_version": SCRIPT_VERSION,
             "selection_rule": (
                 "immutable Strategy baseline control; no external asset added"
@@ -161,16 +145,16 @@ def main() -> int:
         if args.output_dir
         else leadership_dir / "marginal_rotation_contribution"
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    file_io.ensure_dir(output_dir)
 
     snapshot_path = leadership_dir / "rotation_leadership_snapshot_frozen.json"
     qualification_path = leadership_dir / "asset_rotation_qualification.csv"
     predictions_path = leadership_dir / "leadership_predictions_raw.csv"
     for path in (snapshot_path, qualification_path, predictions_path):
-        if not path.exists():
+        if not file_io.exists(path):
             raise RuntimeError(f"Required leadership artifact not found: {path}")
 
-    source = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    source = file_io.read_json(snapshot_path)
     baseline = list(
         dict.fromkeys(
             str(x).strip().upper()
@@ -183,23 +167,23 @@ def main() -> int:
             "Leadership snapshot does not contain a valid original baseline universe."
         )
 
-    qualification = pd.read_csv(qualification_path)
+    qualification = file_io.read_csv(qualification_path)
     candidates = _candidate_pool(qualification, set(baseline))
     result = greedy_marginal_rotation_selection(
-        predictions=pd.read_csv(predictions_path),
+        predictions=file_io.read_csv(predictions_path),
         baseline_assets=baseline,
         candidate_assets=candidates,
     )
 
-    _write_csv(
+    file_io.write_csv(
         output_dir / "marginal_rotation_selection_steps.csv",
         result.selected_steps,
     )
-    _write_csv(
+    file_io.write_csv(
         output_dir / "marginal_rotation_candidate_evaluations.csv",
         result.all_evaluations,
     )
-    _write_csv(
+    file_io.write_csv(
         output_dir / "marginal_rotation_selected_events.csv",
         result.selected_events,
     )
@@ -227,12 +211,12 @@ def main() -> int:
 
     expanded_path = output_dir / "marginal_rotation_contribution_snapshot_frozen.json"
     control_path = output_dir / "marginal_rotation_baseline_snapshot_frozen.json"
-    _write_json(expanded_path, expanded)
-    _write_json(control_path, control)
-    _write_json(
+    file_io.write_json(expanded_path, expanded)
+    file_io.write_json(control_path, control)
+    file_io.write_json(
         output_dir / "marginal_rotation_contribution_summary.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "script_version": SCRIPT_VERSION,
             "baseline_asset_count": len(result.baseline_assets),
             "candidate_pool_count": len(candidates),
@@ -245,12 +229,13 @@ def main() -> int:
             "full_backtest_per_candidate": False,
             "manual_acceptance_threshold": False,
             "economic_indifference_point": 0.0,
+            "windows_long_path_safe_io": True,
             "expanded_snapshot": str(expanded_path),
             "baseline_snapshot": str(control_path),
         },
     )
 
-    print("\n=== MARGINAL ROTATION CONTRIBUTION V1.0.2 ===", flush=True)
+    print("\n=== MARGINAL ROTATION CONTRIBUTION V1.0.3 ===", flush=True)
     print(f"Baseline assets: {len(result.baseline_assets)}", flush=True)
     print(f"Leadership-qualified candidates: {len(candidates)}", flush=True)
     print(f"Selected candidates: {len(result.selected_candidates)}", flush=True)
