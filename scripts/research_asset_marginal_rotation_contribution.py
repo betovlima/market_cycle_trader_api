@@ -22,7 +22,7 @@ from market_cycle_trader_api.services.asset_marginal_rotation_contribution impor
 )
 import research_windows_file_io as file_io  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.3"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.4"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -102,7 +102,7 @@ def _snapshot(
     frozen.pop("decision_snapshot_sha256", None)
     frozen.update(
         {
-            "schema_version": 8,
+            "schema_version": 9,
             "script_version": SCRIPT_VERSION,
             "selection_rule": (
                 "immutable Strategy baseline control; no external asset added"
@@ -120,6 +120,7 @@ def _snapshot(
             "marginal_rotation_contribution_used_for_selection": not control,
             "candidate_pool_requires_leadership_qualified": not control,
             "manual_candidate_acceptance_margin": False,
+            "mixed_iso_timestamp_parsing": True,
             "original_assets": list(baseline),
             "qualified_assets": final_assets,
             "retained_existing_assets": list(baseline),
@@ -216,7 +217,7 @@ def main() -> int:
     file_io.write_json(
         output_dir / "marginal_rotation_contribution_summary.json",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "script_version": SCRIPT_VERSION,
             "baseline_asset_count": len(result.baseline_assets),
             "candidate_pool_count": len(candidates),
@@ -230,12 +231,13 @@ def main() -> int:
             "manual_acceptance_threshold": False,
             "economic_indifference_point": 0.0,
             "windows_long_path_safe_io": True,
+            "mixed_iso_timestamp_parsing": True,
             "expanded_snapshot": str(expanded_path),
             "baseline_snapshot": str(control_path),
         },
     )
 
-    print("\n=== MARGINAL ROTATION CONTRIBUTION V1.0.3 ===", flush=True)
+    print("\n=== MARGINAL ROTATION CONTRIBUTION V1.0.4 ===", flush=True)
     print(f"Baseline assets: {len(result.baseline_assets)}", flush=True)
     print(f"Leadership-qualified candidates: {len(candidates)}", flush=True)
     print(f"Selected candidates: {len(result.selected_candidates)}", flush=True)
