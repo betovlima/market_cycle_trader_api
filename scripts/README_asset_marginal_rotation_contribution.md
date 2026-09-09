@@ -29,6 +29,8 @@ The experiment now owns two stable helpers:
 - `research_asset_marginal_rotation_leadership.py`: candidate failure isolation plus the stable Leadership engine;
 - `research_asset_marginal_rotation_validation.py`: strict history-start/session validation, frozen-universe anchors, and Windows long-path-safe writes plus the stable independent validator.
 
+The runner verifies those helper files before launching each subprocess and reports the child failure explicitly instead of hiding it behind a generic `CalledProcessError`.
+
 The marginal candidate pool explicitly prefers `leadership_qualified`; intrinsic-timing-only qualification cannot admit a candidate into this experiment.
 
 ## Selection
