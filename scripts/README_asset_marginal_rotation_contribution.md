@@ -1,5 +1,9 @@
 # Asset Marginal Rotation Contribution v1
 
+Historical v1 documentation. The active branch defaults to v2 chronological score replay;
+see [the v2 guide](README_asset_marginal_rotation_contribution_v2.md).
+The original event-sum selector remains available with `--selection-method legacy_event_sum`.
+
 Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.5`.
 
 ## Hypothesis

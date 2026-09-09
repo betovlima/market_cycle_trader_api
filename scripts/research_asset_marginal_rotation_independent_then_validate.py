@@ -15,8 +15,9 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import research_asset_rotation_independent_then_validate as independent  # noqa: E402
 import research_windows_file_io as file_io  # noqa: E402
+from research_marginal_reproducibility import code_identity, verify_validation_pair  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.5"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v2.0.0"
 DEFAULT_VALIDATION_SESSIONS = 252
 LEADERSHIP_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_leadership.py"
 VALIDATION_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_validation.py"
@@ -52,6 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--selection-method", choices=["cached_score_replay", "legacy_event_sum"], default="cached_score_replay")
     parser.add_argument(
         "--fresh-run",
         action="store_true",
@@ -201,6 +203,7 @@ def _assert_safe_fresh_root(root: Path) -> None:
 
 def main() -> int:
     args = _parser().parse_args()
+    identity = code_identity()
     if args.selection_only and args.validation_only:
         raise RuntimeError(
             "Use either --selection-only or --validation-only, not both."
@@ -225,7 +228,7 @@ def main() -> int:
         or PROJECT_ROOT
         / "research_output"
         / (
-            f"asset_marginal_rotation_strategy_{args.strategy_sequence}_"
+            f"asset_marginal_rotation_strategy_{args.strategy_sequence}_{args.selection_method}_v2_"
             f"{validation_start}_to_{validation_end}"
         )
     ).resolve()
@@ -276,6 +279,7 @@ def main() -> int:
         {
             "schema_version": 6,
             "script_version": SCRIPT_VERSION,
+            "code_identity": identity,
             "strategy_sequence": int(args.strategy_sequence),
             "history_start": history_start,
             "selection_end": selection_end,
@@ -294,7 +298,9 @@ def main() -> int:
             ),
             "fresh_run": bool(args.fresh_run),
             "prior_experiment_artifacts_reused": False if args.fresh_run else None,
-            "leadership_resume_enabled": not bool(args.no_resume or args.fresh_run),
+            "leadership_resume_enabled": False,
+            "selection_method": args.selection_method,
+            "cached_score_replay_per_candidate": args.selection_method == "cached_score_replay",
             "selection_uses_full_strategy_backtest": False,
             "selection_uses_validation_period": False,
             "baseline_universe_is_immutable": True,
@@ -345,8 +351,7 @@ def main() -> int:
         _append(leadership, "--mongo-uri", args.mongo_uri)
         _append(leadership, "--database", args.database)
         _append(leadership, "--env-file", args.env_file)
-        if args.no_resume or args.fresh_run:
-            leadership.append("--no-resume")
+        leadership.append("--no-resume")
 
         print("=== PHASE 1A: PRE-VALIDATION LEADERSHIP ===", flush=True)
         _run(leadership, label="Phase 1A leadership")
@@ -362,6 +367,8 @@ def main() -> int:
             str(leadership_dir),
             "--output-dir",
             str(marginal_dir),
+            "--selection-method",
+            args.selection_method,
         ]
         _run(marginal, label="Phase 1B marginal contribution")
 
@@ -375,6 +382,11 @@ def main() -> int:
         print(f"Expanded snapshot: {expanded_snapshot}", flush=True)
         print(f"Baseline snapshot: {baseline_snapshot}", flush=True)
         return 0
+
+    for frozen_path in (expanded_snapshot, baseline_snapshot):
+        frozen = file_io.read_json(frozen_path)
+        if frozen.get("selection_method") != args.selection_method:
+            raise RuntimeError("Frozen snapshot selection method differs from --selection-method. Use the matching v2 output directory or run selection again.")
 
     print("=== PHASE 2A: UNTOUCHED BASELINE VALIDATION ===", flush=True)
     _run(
@@ -413,6 +425,7 @@ def main() -> int:
     expanded_result = file_io.read_json(
         expanded_validation_dir / "independent_validation_result.json"
     )
+    verify_validation_pair(baseline_result, expanded_result)
     baseline_capital = _metric(baseline_result, "strategy_ending_capital")
     expanded_capital = _metric(expanded_result, "strategy_ending_capital")
     if baseline_capital is None or expanded_capital is None:
@@ -428,6 +441,9 @@ def main() -> int:
     comparison = {
         "schema_version": 5,
         "script_version": SCRIPT_VERSION,
+        "code_identity": identity,
+        "selection_method": args.selection_method,
+        "common_asset_market_data_identical": True,
         "baseline_ending_capital": baseline_capital,
         "expanded_ending_capital": expanded_capital,
         "capital_delta": expanded_capital - baseline_capital,

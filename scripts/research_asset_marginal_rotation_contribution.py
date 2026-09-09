@@ -20,9 +20,13 @@ for path in (SRC_ROOT, SCRIPT_ROOT):
 from market_cycle_trader_api.services.asset_marginal_rotation_contribution import (  # noqa: E402
     greedy_marginal_rotation_selection,
 )
+from market_cycle_trader_api.services.asset_marginal_score_replay import (  # noqa: E402
+    greedy_score_replay_selection,
+)
 import research_windows_file_io as file_io  # noqa: E402
+from research_marginal_reproducibility import code_identity  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v1.0.4"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v2.0.0"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -34,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--leadership-output-dir", required=True)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--selection-method", choices=["cached_score_replay", "legacy_event_sum"], default="cached_score_replay")
     return parser
 
 
@@ -140,6 +145,7 @@ def _snapshot(
 
 def main() -> int:
     args = _parser().parse_args()
+    identity = code_identity()
     leadership_dir = Path(args.leadership_output_dir).resolve()
     output_dir = (
         Path(args.output_dir).resolve()
@@ -170,11 +176,37 @@ def main() -> int:
 
     qualification = file_io.read_csv(qualification_path)
     candidates = _candidate_pool(qualification, set(baseline))
-    result = greedy_marginal_rotation_selection(
-        predictions=file_io.read_csv(predictions_path),
-        baseline_assets=baseline,
-        candidate_assets=candidates,
-    )
+    predictions = file_io.read_csv(predictions_path)
+    replay = args.selection_method == "cached_score_replay"
+    contract = None
+    if replay:
+        contract_path = leadership_dir / "marginal_replay_contract.json"
+        if not file_io.exists(contract_path):
+            raise RuntimeError("v2 needs a fresh Leadership export with execution prices and marginal_replay_contract.json. Use --fresh-run; the v1 ZIP alone cannot reconstruct these prices.")
+        contract = file_io.read_json(contract_path)
+        with open(file_io.windows_long_path(predictions_path), "rb") as handle:
+            predictions_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+        with open(file_io.windows_long_path(qualification_path), "rb") as handle:
+            qualification_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+        if (contract.get("schema_version") != 1
+                or contract.get("predictions_sha256") != predictions_hash
+                or contract.get("qualification_sha256") != qualification_hash
+                or contract.get("leadership_snapshot_sha256") != source.get("decision_snapshot_sha256")
+                or contract.get("strategy_configuration_hash") != source.get("strategy_configuration_hash")
+                or contract.get("selection_end") != source.get("snapshot_end")):
+            raise RuntimeError("Replay contract does not match the frozen Leadership artifacts.")
+        source_payload = dict(source)
+        source_hash = source_payload.pop("decision_snapshot_sha256", None)
+        if _sha256_json(source_payload) != source_hash:
+            raise RuntimeError("Leadership snapshot content hash mismatch.")
+        result = greedy_score_replay_selection(
+            predictions=predictions, baseline_assets=baseline, candidate_assets=candidates,
+            settings=contract["policy_settings"], selection_end=contract["selection_end"],
+        )
+    else:
+        result = greedy_marginal_rotation_selection(
+            predictions=predictions, baseline_assets=baseline, candidate_assets=candidates,
+        )
 
     file_io.write_csv(
         output_dir / "marginal_rotation_selection_steps.csv",
@@ -188,6 +220,10 @@ def main() -> int:
         output_dir / "marginal_rotation_selected_events.csv",
         result.selected_events,
     )
+    if replay:
+        file_io.write_csv(output_dir / "marginal_rotation_fold_contributions.csv", result.fold_evaluations)
+        file_io.write_csv(output_dir / "marginal_rotation_baseline_replay.csv", result.baseline_replay.daily)
+        file_io.write_csv(output_dir / "marginal_rotation_expanded_replay.csv", result.final_replay.daily)
 
     step_records = result.selected_steps.replace({np.nan: None}).to_dict(
         orient="records"
@@ -209,6 +245,18 @@ def main() -> int:
         steps_hash,
         control=True,
     )
+    for frozen, is_control in ((expanded, False), (control, True)):
+        frozen.update({
+            "selection_code_identity": identity,
+            "selection_method": args.selection_method,
+            "cached_score_replay_per_candidate": replay and not is_control,
+            "replay_contract_sha256": _sha256_json(contract) if contract else None,
+            "selection_objective": "net log ending capital difference" if replay else "legacy overlapping weighted-label event sum (proxy)",
+        })
+        if replay and not is_control:
+            frozen["selection_rule"] = "immutable Strategy baseline plus greedy positive net capital contribution from chronological cached OOS score replay"
+        frozen.pop("decision_snapshot_sha256", None)
+        frozen["decision_snapshot_sha256"] = _sha256_json(frozen)
 
     expanded_path = output_dir / "marginal_rotation_contribution_snapshot_frozen.json"
     control_path = output_dir / "marginal_rotation_baseline_snapshot_frozen.json"
@@ -217,11 +265,20 @@ def main() -> int:
     file_io.write_json(
         output_dir / "marginal_rotation_contribution_summary.json",
         {
-            "schema_version": 4,
+            "schema_version": 5,
             "script_version": SCRIPT_VERSION,
+            "code_identity": identity,
             "baseline_asset_count": len(result.baseline_assets),
             "candidate_pool_count": len(candidates),
             "candidate_pool_rule": "leadership_qualified",
+            "selection_method": args.selection_method,
+            "cached_score_replay_per_candidate": replay,
+            "model_refit_per_candidate": False,
+            "overlapping_forward_labels_used_for_marginal_objective": not replay,
+            "replay_margin_basis": contract["margin_basis"] if contract else None,
+            "replay_baseline_ending_capital": result.baseline_replay.ending_capital if replay else None,
+            "replay_expanded_ending_capital": result.final_replay.ending_capital if replay else None,
+            "replay_contract_sha256": _sha256_json(contract) if contract else None,
             "selected_candidate_count": len(result.selected_candidates),
             "final_asset_count": len(result.final_assets),
             "selected_candidates": result.selected_candidates,
@@ -237,15 +294,15 @@ def main() -> int:
         },
     )
 
-    print("\n=== MARGINAL ROTATION CONTRIBUTION V1.0.4 ===", flush=True)
+    print(f"\n=== MARGINAL ROTATION CONTRIBUTION V2: {args.selection_method} ===", flush=True)
     print(f"Baseline assets: {len(result.baseline_assets)}", flush=True)
     print(f"Leadership-qualified candidates: {len(candidates)}", flush=True)
     print(f"Selected candidates: {len(result.selected_candidates)}", flush=True)
     for row in result.selected_steps.to_dict(orient="records"):
+        contribution = row["marginal_net_log_growth"] if replay else row["marginal_forward_net_log_return_sum"]
         print(
             f"step={int(row['step'])} add={row['candidate']} "
-            f"events={int(row['displacement_event_count'])} "
-            f"marginal_log_sum={float(row['marginal_forward_net_log_return_sum']):+.6f} "
+            f"marginal_log_contribution={float(contribution):+.6f} "
             f"universe={int(row['resulting_universe_size'])}",
             flush=True,
         )

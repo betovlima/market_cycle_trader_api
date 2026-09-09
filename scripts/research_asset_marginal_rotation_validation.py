@@ -17,8 +17,10 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import research_asset_rotation_independent_validation as base  # noqa: E402
 import research_asset_rotation_leadership as leadership  # noqa: E402
+from research_marginal_reproducibility import code_identity, market_data_hashes  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-validation-v1.0.2"
+SCRIPT_VERSION = "asset-marginal-rotation-validation-v2.0.0"
+_MARKET_DATA_HASHES: dict[str, str] = {}
 
 
 def _windows_long_path(path: Path) -> str:
@@ -40,6 +42,9 @@ def _temporary_path(path: Path) -> Path:
 
 def _write_json(path: Path, value: Any) -> None:
     path = Path(path).resolve()
+    if path.name in {"independent_validation_result.json", "independent_validation_manifest.json"}:
+        value = {**value, "market_data_sha256_by_asset": dict(_MARKET_DATA_HASHES),
+                 "market_data_hash_format": "sorted_utc_ohlcv_csv_17g_v1", "code_identity": code_identity()}
     _ensure_parent(path)
     temporary = _temporary_path(path)
     with open(_windows_long_path(temporary), "w", encoding="utf-8", newline="") as handle:
@@ -249,6 +254,15 @@ def _install_frozen_universe_execution_config() -> None:
 
 def main() -> int:
     args = _bootstrap_args()
+    code_identity()  # Capture the implementation/environment before simulation.
+    original_prepare = base.prepare_rotation_panel
+
+    def prepare_with_hashes(raw_frames: dict[str, pd.DataFrame], config: Any):
+        _MARKET_DATA_HASHES.clear()
+        _MARKET_DATA_HASHES.update(market_data_hashes(raw_frames))
+        return original_prepare(raw_frames, config)
+
+    base.prepare_rotation_panel = prepare_with_hashes
     _install_history_start_contract(args.history_start)
     _install_frozen_universe_execution_config()
     base._strict_training_windows = _strict_training_windows

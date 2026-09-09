@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,34 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import research_asset_rotation_leadership as research  # noqa: E402
 import research_windows_file_io as file_io  # noqa: E402
+from research_marginal_reproducibility import code_identity  # noqa: E402
+from market_cycle_trader_api.services.asset_marginal_score_replay import (  # noqa: E402
+    export_execution_rows, replay_policy_settings,
+)
 
-SCRIPT_VERSION = "asset-marginal-rotation-leadership-v1.0.3"
+SCRIPT_VERSION = "asset-marginal-rotation-leadership-v2.0.0"
 _ANALYSIS_FAILURES: dict[str, str] = {}
+_REPLAY_CONFIG: dict[str, Any] = {}
+
+
+def _install_replay_export() -> None:
+    original_config = research._execution_config
+    original_rows = research._prediction_rows
+
+    def execution_config(*args: Any, **kwargs: Any):
+        config = original_config(*args, **kwargs)
+        _REPLAY_CONFIG.update({
+            "policy_settings": replay_policy_settings(config),
+            "maximum_label_horizon": max(int(h) for h in config.rotation_target_horizons),
+        })
+        return config
+
+    def prediction_rows(symbol: str, frame: pd.DataFrame, fold: dict[str, Any], model: Any):
+        rows = original_rows(symbol, frame, fold, model)
+        return export_execution_rows(rows, frame, fold, _REPLAY_CONFIG["maximum_label_horizon"])
+
+    research._execution_config = execution_config
+    research._prediction_rows = prediction_rows
 
 
 def _is_candidate_model_eligibility_failure(exc: Exception) -> bool:
@@ -160,10 +186,37 @@ def _install_long_path_safe_writes() -> None:
 
 
 def main() -> int:
+    args = research._parser().parse_args()
+    identity = code_identity()
+    if not args.no_resume:
+        raise RuntimeError("v2 Leadership requires --no-resume (or the runner's --fresh-run) to export a complete execution tape.")
     _install_candidate_failure_isolation()
     _install_long_path_safe_writes()
+    _install_replay_export()
     research.SCRIPT_VERSION = SCRIPT_VERSION
-    return int(research.main())
+    result = int(research.main())
+    output_dir = Path(args.output_dir or PROJECT_ROOT / "research_output" /
+        f"asset_rotation_leadership_strategy_{args.strategy_sequence}_{pd.Timestamp(args.snapshot_end).date().isoformat()}")
+    frozen = file_io.read_json(output_dir / "rotation_leadership_snapshot_frozen.json")
+    predictions_path = output_dir / "leadership_predictions_raw.csv"
+    with open(file_io.windows_long_path(predictions_path), "rb") as handle:
+        predictions_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+    with open(file_io.windows_long_path(output_dir / "asset_rotation_qualification.csv"), "rb") as handle:
+        qualification_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+    file_io.write_json(output_dir / "marginal_replay_contract.json", {
+        "schema_version": 1,
+        "script_version": SCRIPT_VERSION,
+        "code_identity": identity,
+        **_REPLAY_CONFIG,
+        "selection_end": frozen["snapshot_end"],
+        "strategy_configuration_hash": frozen["strategy_configuration_hash"],
+        "leadership_snapshot_sha256": frozen["decision_snapshot_sha256"],
+        "predictions_sha256": predictions_hash,
+        "qualification_sha256": qualification_hash,
+        "margin_basis": "immutable Strategy configured margin; no OOS margin tuning",
+        "execution_outcomes_used_as_action_features": False,
+    })
+    return result
 
 
 if __name__ == "__main__":
