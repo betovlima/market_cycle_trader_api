@@ -1,22 +1,34 @@
 # Asset Marginal Rotation Contribution v1
 
-Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.4`.
+Research-only experiment. Script version: `asset-marginal-rotation-contribution-v1.0.5`.
 
 ## Hypothesis
 
 The Strategy baseline that produced the large compound result stays immutable. A new asset is admitted only when its OOS leadership displacement adds economic value relative to the leader the current universe would otherwise have selected.
 
-The selector uses existing walk-forward OOS leadership predictions and does **not** run a full Strategy backtest for every candidate.
+The selector uses walk-forward OOS leadership predictions and does **not** run a full Strategy backtest for every candidate.
 
 ## Candidate source
 
-`--universe-file` is optional.
-
-- If explicitly supplied, that frozen history-integrity file defines the external candidate pool.
-- If omitted and the default prior Leadership history-integrity file exists, it is reused.
-- If neither exists, Phase 1A uses the native Leadership behavior and evaluates every external symbol already cached for the Strategy market-data identity in the local MongoDB.
+Normal mode may reuse an explicitly supplied `--universe-file` or an existing default Leadership history-integrity artifact. If neither exists, Phase 1A evaluates every external symbol already cached for the Strategy market-data identity in the local MongoDB.
 
 `--validation-only` reuses already frozen baseline/expanded snapshots and does not resolve the candidate universe again.
+
+## Strict fresh run — v1.0.5
+
+Use `--fresh-run` when no prior experiment file may influence the new execution.
+
+Fresh mode:
+
+- deletes only this experiment's existing output directory under `PROJECT_ROOT/research_output`;
+- ignores every prior candidate-universe / Leadership artifact;
+- discovers the external candidate pool directly from the local MongoDB cache;
+- automatically disables Leadership resume;
+- recomputes Phase 1A, Phase 1B, baseline validation and expanded validation from zero.
+
+`--fresh-run` cannot be combined with `--validation-only` or `--universe-file`.
+
+The safety guard refuses to recursively delete arbitrary directories outside the expected `research_output/asset_marginal_rotation_strategy_*` tree.
 
 ## Self-contained helpers
 
@@ -30,15 +42,11 @@ The marginal candidate pool explicitly prefers `leadership_qualified`; intrinsic
 
 ## Windows long-path safety — v1.0.3
 
-The project checkout can already consume most of the legacy Windows path budget. v1.0.3 makes research artifact I/O long-path safe through `research_windows_file_io.py` and uses short Phase 1B / validation subdirectory names.
-
-The existing Phase 1A directory name is deliberately preserved so a failed execution can resume from its already generated `intrinsic_timing_summary.csv`, `intrinsic_timing_folds.csv`, and `leadership_predictions_raw.csv` instead of recomputing every asset.
+The project checkout can already consume most of the legacy Windows path budget. Research artifact I/O is long-path safe through `research_windows_file_io.py` and uses short Phase 1B / validation subdirectory names.
 
 ## Mixed ISO timestamp normalization — v1.0.4
 
-Leadership CSVs may legitimately contain UTC timestamps serialized in more than one ISO representation, for example `2020-07-20 04:00:00+00:00` and `2020-07-21T04:00:00+00:00`. Pandas 2.x may infer one representation from the first row and reject another valid representation later in the same column.
-
-v1.0.4 parses the leadership timestamp column with explicit mixed-ISO handling, always normalizes to UTC, and raises a targeted error only if a timestamp is genuinely invalid after parsing.
+Leadership CSVs may legitimately contain UTC timestamps serialized in more than one ISO representation, for example `2020-07-20 04:00:00+00:00` and `2020-07-21T04:00:00+00:00`. The service parses the leadership timestamp column with explicit mixed-ISO handling, always normalizes to UTC, and raises a targeted error only if a timestamp is genuinely invalid after parsing.
 
 ## Selection
 
@@ -62,7 +70,7 @@ The runner reserves the last 252 XNYS sessions by default. Selection ends before
 
 The primary PASS condition is `expanded ending capital > baseline ending capital`.
 
-## Run
+## Run from zero
 
 ```bash
 git fetch origin
@@ -74,9 +82,8 @@ python scripts/research_asset_marginal_rotation_independent_then_validate.py \
   --history-start 2016-01-01 \
   --snapshot-end 2026-09-04 \
   --validation-sessions 252 \
-  --workers 4
+  --workers 4 \
+  --fresh-run
 ```
-
-Do not add `--no-resume` after a partial Phase 1A run unless you intentionally want to recompute all assets.
 
 Main outputs include `marginal_rotation_selection_steps.csv`, `marginal_rotation_candidate_evaluations.csv`, `marginal_rotation_selected_events.csv`, both frozen snapshots, and `marginal_rotation_independent_comparison.json`.
