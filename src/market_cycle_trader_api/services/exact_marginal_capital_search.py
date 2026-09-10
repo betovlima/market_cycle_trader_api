@@ -15,6 +15,14 @@ def finite_float(value: Any) -> float | None:
     return number if isfinite(number) else None
 
 
+def _preselector_rank(row: dict[str, Any]) -> int | None:
+    value = row.get("preselector_rank")
+    number = finite_float(value)
+    if isinstance(value, bool) or number is None or number <= 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
 def annotate_preselector_ranks(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach descending preselector ranks without filtering any candidate.
 
@@ -77,8 +85,16 @@ def build_preselector_recall(
     rows: Iterable[dict[str, Any]],
     cutoffs: Iterable[int] = DEFAULT_PRESELECTOR_CUTOFFS,
 ) -> list[dict[str, Any]]:
-    """Measure how many exact positive candidates are recovered by each rank cutoff."""
+    """Measure completed economic outcomes inside prefixes of the original queue.
+
+    A failed/rejected candidate still occupies its original rank. Never cap the
+    queue cutoff by the number of completed evaluations: doing so drops valid
+    lower-ranked outcomes even when K covers the entire queue. Unranked positive
+    outcomes remain in the recall denominator.
+    """
     values = [dict(row) for row in rows]
+    ranked_queue = [row for row in values if _preselector_rank(row) is not None]
+    last_queue_rank = max((_preselector_rank(row) for row in ranked_queue), default=0)
     completed = [
         row
         for row in values
@@ -90,26 +106,26 @@ def build_preselector_recall(
     rankable_completed = [
         row
         for row in completed
-        if isinstance(row.get("preselector_rank"), int)
-        and int(row["preselector_rank"]) > 0
+        if _preselector_rank(row) is not None
     ]
     rankable_count = len(rankable_completed)
     unranked_positive = sum(
-        1 for row in positives if not isinstance(row.get("preselector_rank"), int)
+        1 for row in positives if _preselector_rank(row) is None
     )
 
     normalized_cutoffs = sorted({max(1, int(value)) for value in cutoffs})
-    if rankable_count and rankable_count not in normalized_cutoffs:
-        normalized_cutoffs.append(rankable_count)
+    if last_queue_rank and last_queue_rank not in normalized_cutoffs:
+        normalized_cutoffs.append(last_queue_rank)
         normalized_cutoffs.sort()
 
     result: list[dict[str, Any]] = []
     for requested in normalized_cutoffs:
-        cutoff = min(requested, rankable_count) if rankable_count else 0
+        cutoff = min(requested, last_queue_rank)
+        queue_prefix = [row for row in ranked_queue if _preselector_rank(row) <= cutoff]
         top = [
             row
             for row in rankable_completed
-            if int(row.get("preselector_rank") or 0) <= cutoff
+            if _preselector_rank(row) <= cutoff
         ]
         top_positive = [row for row in top if float(row["ending_capital_delta_rate"]) > 0.0]
         best_delta = max(
@@ -120,6 +136,10 @@ def build_preselector_recall(
             {
                 "requested_cutoff": requested,
                 "effective_cutoff": cutoff,
+                "ranked_queue_candidates": len(ranked_queue),
+                "ranked_queue_max_rank": last_queue_rank,
+                "ranked_candidates_in_top_k": len(queue_prefix),
+                "uncompleted_candidates_in_top_k": len(queue_prefix) - len(top),
                 "completed_candidates": len(completed),
                 "rankable_completed_candidates": rankable_count,
                 "total_exact_positive_candidates": total_positive,
@@ -131,6 +151,10 @@ def build_preselector_recall(
                 ),
                 "positive_precision": (
                     float(len(top_positive) / len(top)) if top else None
+                ),
+                "positive_precision_basis": "completed economic outcomes in original queue prefix",
+                "evaluation_fraction_of_ranked_queue": (
+                    float(len(queue_prefix) / len(ranked_queue)) if ranked_queue else None
                 ),
                 "evaluation_fraction_of_completed": (
                     float(len(top) / len(completed)) if completed else None
