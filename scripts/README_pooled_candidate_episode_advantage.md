@@ -1,6 +1,6 @@
 # Pooled Candidate Episode Advantage v2
 
-Research-only experiment. Current version: `pooled-candidate-episode-advantage-v2.1.0`, API/package `10.8.42`.
+Research-only experiment. Current version: `pooled-candidate-episode-advantage-v2.1.1`, API/package `10.8.43`.
 
 Current branch: `research/pooled-candidate-episode-advantage-v2-1`, based on commit `9dbd0f1fa06493c68e730df61e78589e3951174e` of `research/pooled-candidate-episode-advantage-v2`.
 
@@ -19,6 +19,14 @@ That target/model combination failed to generalize. PCEA v2 isolates one hypothe
 > the one-session target is too noisy and too short relative to the multi-horizon LightGBM Utility policy; a candidate should instead be judged over the complete stateful interval during which adding it changes the protected 56-asset policy state.
 
 The pooled estimator, candidate-identity exclusion, features, LightGBM snapshot, transaction costs, baseline policy and zero economic indifference point remain unchanged.
+
+## v2.1.1 implementation patch: writable scoring mask
+
+Pandas Copy-on-Write can expose read-only NumPy views from `Series.to_numpy()`. The v2.1.0 scorer initialized its boolean validity mask directly from such a view and then mutated it with `&=`, which can raise `ValueError: output array is read-only` before any PCEA decision is evaluated.
+
+v2.1.1 changes only the implementation of that validity mask: the scorer now allocates its own writable boolean array and intersects timestamp/feature validity into that owned buffer. No feature, target, fold, model, candidate admission rule, censoring rule, policy rule or economic threshold changes. A regression test runs the scorer with pandas Copy-on-Write enabled.
+
+Because the failure occurs during in-memory scoring, it is unrelated to reuse of prior research artifacts. `--fresh-run` still recomputes the experiment from the local MongoDB market cache and Strategy definition.
 
 ## v2.1.0 correctness patch: inference without future outcomes
 

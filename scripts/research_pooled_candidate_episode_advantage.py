@@ -50,7 +50,7 @@ from market_cycle_trader_api.services.pooled_candidate_episode_advantage import 
     training_episode_samples,
 )
 
-SCRIPT_VERSION = "pooled-candidate-episode-advantage-v2.1.0"
+SCRIPT_VERSION = "pooled-candidate-episode-advantage-v2.1.1"
 EXPERIMENT = "pooled_asset_agnostic_stateful_divergence_episode_advantage"
 DEFAULT_VALIDATION_SESSIONS = 252
 MODEL_FEATURES = list(pcma.MODEL_FEATURES)
@@ -861,7 +861,7 @@ def main() -> int:
         },
     )
 
-    _log("=== POOLED CANDIDATE EPISODE ADVANTAGE V2.1 RESULT ===")
+    _log("=== POOLED CANDIDATE EPISODE ADVANTAGE V2.1.1 RESULT ===")
     _log(
         f"Prevalidation cross-fit observed episode log sum: "
         f"{crossfit_summary['observed_marginal_log_sum']:+.6f}; "
@@ -875,8 +875,8 @@ def main() -> int:
     )
     _log(
         "Episode diagnostics are not the return of a fully executed overlay portfolio. "
-        "PCEA v2.1 corrects censoring and label availability; the estimator and "
-        "decision indifference point remain unchanged."
+        "PCEA v2.1.1 keeps the v2.1 censoring/label contract and adds a writable "
+        "scoring mask for pandas Copy-on-Write compatibility."
     )
     _log(f"Result directory: {output_dir}")
     return 0

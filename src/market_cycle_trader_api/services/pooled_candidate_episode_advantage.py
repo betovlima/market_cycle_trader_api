@@ -350,7 +350,10 @@ def score_episode_samples(
             frame[column], utc=True, format="mixed", errors="coerce"
         )
 
-    finite = frame["timestamp"].notna().to_numpy(dtype=bool)
+    # Pandas Copy-on-Write may expose read-only NumPy views. Own the mutable mask
+    # explicitly before applying in-place boolean conjunctions.
+    finite = np.ones(len(frame), dtype=bool)
+    finite &= frame["timestamp"].notna().to_numpy(dtype=bool)
     finite &= frame["episode_start"].notna().to_numpy(dtype=bool)
     for column in feature_names:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")

@@ -198,6 +198,32 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions.iloc[0]["chosen_candidate"], "X")
 
+    def test_scoring_owns_mutable_mask_under_copy_on_write(self) -> None:
+        start = pd.Timestamp("2026-01-05", tz="UTC")
+        samples = pd.DataFrame(
+            [
+                {
+                    "fold": 2,
+                    "timestamp": start,
+                    "candidate": "X",
+                    "episode_start": start,
+                    "signal": 0.02,
+                },
+                {
+                    "fold": 2,
+                    "timestamp": start + pd.Timedelta(days=1),
+                    "candidate": "Y",
+                    "episode_start": start + pd.Timedelta(days=1),
+                    "signal": np.nan,
+                },
+            ]
+        )
+        with pd.option_context("mode.copy_on_write", True):
+            scored = score_episode_samples(_DummyEpisodeModel(), samples)
+        self.assertEqual(len(scored), 1)
+        self.assertEqual(scored.iloc[0]["candidate"], "X")
+        self.assertAlmostEqual(float(scored.iloc[0]["predicted_marginal_advantage"]), 0.02)
+
     def test_pooled_bayesian_weights_keep_positive_precision(self) -> None:
         rng = np.random.default_rng(7)
         feature_names = [f"f_{index}" for index in range(20)]
