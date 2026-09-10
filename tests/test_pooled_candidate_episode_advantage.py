@@ -16,10 +16,20 @@ from market_cycle_trader_api.services.pooled_candidate_episode_advantage import 
     TARGET_COLUMN,
     choose_non_overlapping_episode_overrides,
     extract_candidate_divergence_episodes,
+    score_episode_samples,
 )
 from market_cycle_trader_api.services.pooled_candidate_marginal_advantage import (
     fit_pooled_candidate_marginal_model,
 )
+
+
+class _DummyEpisodeModel:
+    feature_names = ["signal"]
+
+    def predict(self, frame: pd.DataFrame):
+        mean = frame["signal"].to_numpy(dtype=float)
+        std = np.full(len(frame), 0.01, dtype=float)
+        return mean, std
 
 
 class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
@@ -122,6 +132,33 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
         decisions = choose_non_overlapping_episode_overrides(scored)
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions.iloc[0]["chosen_candidate"], "A")
+
+    def test_scoring_preserves_episode_bounds_for_chronological_selector(self) -> None:
+        start = pd.Timestamp("2026-01-05", tz="UTC")
+        end = pd.Timestamp("2026-01-08", tz="UTC")
+        samples = pd.DataFrame(
+            [
+                {
+                    "fold": 2,
+                    "timestamp": start,
+                    "candidate": "X",
+                    "episode_start": start,
+                    "episode_end": end,
+                    TARGET_COLUMN: 0.04,
+                    "signal": 0.02,
+                }
+            ]
+        )
+
+        scored = score_episode_samples(_DummyEpisodeModel(), samples)
+        self.assertIn("episode_start", scored.columns)
+        self.assertIn("episode_end", scored.columns)
+        self.assertEqual(pd.Timestamp(scored.iloc[0]["episode_start"]), start)
+        self.assertEqual(pd.Timestamp(scored.iloc[0]["episode_end"]), end)
+
+        decisions = choose_non_overlapping_episode_overrides(scored)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions.iloc[0]["chosen_candidate"], "X")
 
     def test_pooled_bayesian_weights_keep_positive_precision(self) -> None:
         rng = np.random.default_rng(7)
