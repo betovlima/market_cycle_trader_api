@@ -34,6 +34,7 @@ class _DummyEpisodeModel:
 
 def _with_min_hold(frame: pd.DataFrame, value: int = 2) -> pd.DataFrame:
     frame.attrs["rotation_min_holding_days"] = int(value)
+    frame["execution_timestamp"] = frame["timestamp"] + pd.Timedelta(days=1)
     return frame
 
 
@@ -119,6 +120,8 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
                 "net_log_return": [0.0, 0.0],
             }
         )
+        baseline["execution_timestamp"] = timestamps + pd.Timedelta(days=1)
+        expanded["execution_timestamp"] = timestamps + pd.Timedelta(days=1)
         with self.assertRaisesRegex(RuntimeError, "rotation_min_holding_days metadata"):
             extract_candidate_divergence_episodes(
                 baseline_daily=baseline,
@@ -162,6 +165,7 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
                 },
             ]
         )
+        scored["right_censored"] = False
         decisions = choose_non_overlapping_episode_overrides(scored)
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions.iloc[0]["chosen_candidate"], "A")
@@ -177,6 +181,7 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
                     "candidate": "X",
                     "episode_start": start,
                     "episode_end": end,
+                    "right_censored": False,
                     TARGET_COLUMN: 0.04,
                     "signal": 0.02,
                 }

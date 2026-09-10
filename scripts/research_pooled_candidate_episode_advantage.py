@@ -24,6 +24,7 @@ import research_asset_rotation_independent_then_validate as independent  # noqa:
 import research_asset_marginal_rotation_validation as validation  # noqa: E402
 import research_pooled_candidate_marginal_advantage as pcma  # noqa: E402
 import research_windows_file_io as file_io  # noqa: E402
+from research_marginal_reproducibility import code_identity, market_data_hashes  # noqa: E402
 from research_asset_timing_vs_buyhold_execution import _immutable_model_snapshot  # noqa: E402
 from market_cycle_trader_api.engine.capital_rotation import (  # noqa: E402
     _build_walk_forward_folds,
@@ -36,15 +37,20 @@ from market_cycle_trader_api.services.asset_marginal_score_replay import (  # no
 )
 from market_cycle_trader_api.services.pooled_candidate_episode_advantage import (  # noqa: E402
     TARGET_COLUMN,
+    EPISODE_COLUMNS,
+    EPISODE_DEFINITION_VERSION,
+    LABEL_AVAILABLE_COLUMN,
+    OBSERVED_TARGET_COLUMN,
     build_episode_samples,
     choose_non_overlapping_episode_overrides,
     extract_candidate_divergence_episodes,
     fit_episode_model,
     score_episode_samples,
     summarize_episode_decisions,
+    training_episode_samples,
 )
 
-SCRIPT_VERSION = "pooled-candidate-episode-advantage-v2.0.0"
+SCRIPT_VERSION = "pooled-candidate-episode-advantage-v2.1.0"
 EXPERIMENT = "pooled_asset_agnostic_stateful_divergence_episode_advantage"
 DEFAULT_VALIDATION_SESSIONS = 252
 MODEL_FEATURES = list(pcma.MODEL_FEATURES)
@@ -157,6 +163,7 @@ def _episode_samples_for_period(
         effective_margin=effective_margin,
         calibrated_margin=calibrated_margin,
         phase_label=phase_label,
+        include_future_targets=False,
     )
 
     all_models = {**baseline_models, **candidate_models}
@@ -201,7 +208,7 @@ def _episode_samples_for_period(
     episodes = (
         pd.concat(episode_frames, ignore_index=True)
         if episode_frames
-        else pd.DataFrame()
+        else pd.DataFrame(columns=EPISODE_COLUMNS)
     )
     samples = build_episode_samples(
         daily_features=daily_features,
@@ -219,14 +226,15 @@ def _episode_samples_for_period(
             if not episodes.empty
             else 0
         ),
-        "usable_episode_count": int(len(samples)),
+        "scoring_episode_count": int(len(samples)),
+        "usable_episode_count": int((~samples["right_censored"]).sum()) if not samples.empty else 0,
         "baseline_replay_ending_capital": float(baseline_replay.ending_capital),
         "baseline_replay_net_log_growth": float(baseline_replay.net_log_growth),
         "effective_switch_margin": float(effective_margin),
     }
     _log(
-        f"{phase_label}: stateful replay produced {len(samples)} usable divergence "
-        f"episodes ({diagnostics['right_censored_episode_count']} right-censored excluded) "
+        f"{phase_label}: stateful replay produced {len(samples)} scorable divergence "
+        f"episodes ({diagnostics['right_censored_episode_count']} right-censored; training only excludes them) "
         f"from {len(complete_candidates)} candidates."
     )
     return samples, episodes, diagnostics
@@ -253,14 +261,15 @@ def _synthetic_holdout_fold(
 
 
 def _candidate_summary(decisions: pd.DataFrame, phase: str) -> pd.DataFrame:
+    columns = [
+        "phase", "candidate", "chosen_episode_count", "predicted_episode_advantage_mean",
+        *summarize_episode_decisions(pd.DataFrame()).keys(),
+    ]
     if decisions.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=columns)
     chosen = decisions.loc[decisions["override_baseline"].astype(bool)].copy()
     rows: list[dict[str, Any]] = []
     for candidate, group in chosen.groupby("chosen_candidate"):
-        realized = pd.to_numeric(
-            group["realized_marginal_episode_net_log_return"], errors="coerce"
-        ).dropna()
         predicted = pd.to_numeric(
             group["predicted_marginal_advantage"], errors="coerce"
         ).dropna()
@@ -272,18 +281,10 @@ def _candidate_summary(decisions: pd.DataFrame, phase: str) -> pd.DataFrame:
                 "predicted_episode_advantage_mean": (
                     float(predicted.mean()) if not predicted.empty else None
                 ),
-                "realized_episode_log_sum": (
-                    float(realized.sum()) if not realized.empty else None
-                ),
-                "realized_episode_log_mean": (
-                    float(realized.mean()) if not realized.empty else None
-                ),
-                "positive_realized_episode_rate": (
-                    float((realized > 0.0).mean()) if not realized.empty else None
-                ),
+                **summarize_episode_decisions(group),
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def main() -> int:
@@ -306,7 +307,7 @@ def main() -> int:
         or PROJECT_ROOT
         / "research_output"
         / (
-            f"pooled_candidate_episode_advantage_strategy_{args.strategy_sequence}_"
+            f"pooled_candidate_episode_advantage_strategy_{args.strategy_sequence}_v2_1_"
             f"{validation_start.date().isoformat()}_to_{validation_end.date().isoformat()}"
         )
     ).resolve()
@@ -547,7 +548,7 @@ def main() -> int:
     crossfit_scored: list[pd.DataFrame] = []
     crossfit_decisions: list[pd.DataFrame] = []
     crossfit_stages: list[dict[str, Any]] = []
-    fold_ids = sorted(int(x) for x in prevalidation_samples["fold"].unique())
+    fold_ids = sorted(int(fold["fold_id"]) for fold in folds)
     for test_fold in fold_ids[1:]:
         train = prevalidation_samples.loc[
             prevalidation_samples["fold"] < test_fold
@@ -557,7 +558,12 @@ def main() -> int:
         ].copy()
         if train.empty or test.empty:
             continue
-        model = fit_episode_model(train, MODEL_FEATURES)
+        cutoff = next(
+            pd.DatetimeIndex(fold["decision_dates"]).min()
+            for fold in folds if int(fold["fold_id"]) == test_fold
+        )
+        mature_train = training_episode_samples(train, available_before=cutoff)
+        model = fit_episode_model(train, MODEL_FEATURES, available_before=cutoff)
         scored = score_episode_samples(model, test)
         decisions = choose_non_overlapping_episode_overrides(scored)
         summary = summarize_episode_decisions(decisions)
@@ -565,8 +571,11 @@ def main() -> int:
             {
                 "test_fold": int(test_fold),
                 "training_folds": sorted(
-                    int(x) for x in train["fold"].unique()
+                    int(x) for x in mature_train["fold"].unique()
                 ),
+                "training_cutoff_exclusive": str(cutoff),
+                "training_last_label_available_at": str(mature_train[LABEL_AVAILABLE_COLUMN].max()),
+                "excluded_training_episode_count": int(len(train) - len(mature_train)),
                 **model.diagnostics(),
                 **summary,
             }
@@ -578,7 +587,8 @@ def main() -> int:
         _log(
             f"CROSSFIT fold {test_fold}: episode_overrides="
             f"{summary['override_count']}/{summary['decision_episode_starts']}, "
-            f"realized_marginal_log_sum={summary['realized_marginal_log_sum']:+.6f}."
+            f"observed_marginal_log_sum={summary['observed_marginal_log_sum']:+.6f}, "
+            f"open_overrides={summary['right_censored_override_count']}."
         )
 
     crossfit_scored_frame = (
@@ -699,10 +709,8 @@ def main() -> int:
         maximum_label_horizon=max(
             int(h) for h in holdout_config.rotation_target_horizons
         ),
-        phase_label="untouched_holdout",
+        phase_label="retrospective_holdout",
     )
-    if holdout_samples.empty:
-        raise RuntimeError("Untouched holdout produced no usable divergence episodes.")
 
     file_io.write_csv(
         output_dir / "pcea_holdout_episode_samples.csv",
@@ -716,6 +724,7 @@ def main() -> int:
     final_model = fit_episode_model(
         prevalidation_samples,
         MODEL_FEATURES,
+        available_before=holdout_decision_dates.min(),
     )
     holdout_scored = score_episode_samples(final_model, holdout_samples)
     holdout_decisions = choose_non_overlapping_episode_overrides(holdout_scored)
@@ -729,34 +738,32 @@ def main() -> int:
         holdout_decisions,
     )
 
-    candidate_summary = pd.concat(
-        [
-            _candidate_summary(
-                crossfit_decisions_frame,
-                "prevalidation_crossfit",
-            ),
-            _candidate_summary(
-                holdout_decisions,
-                "untouched_holdout",
-            ),
-        ],
-        ignore_index=True,
+    candidate_frames = [
+        _candidate_summary(crossfit_decisions_frame, "prevalidation_crossfit"),
+        _candidate_summary(holdout_decisions, "retrospective_holdout"),
+    ]
+    nonempty_candidate_frames = [frame for frame in candidate_frames if not frame.empty]
+    candidate_summary = (
+        pd.concat(nonempty_candidate_frames, ignore_index=True)
+        if nonempty_candidate_frames else candidate_frames[0]
     )
     file_io.write_csv(
         output_dir / "pcea_candidate_summary.csv",
         candidate_summary,
     )
 
-    crossfit_total = float(
-        sum(
-            float(stage["realized_marginal_log_sum"])
-            for stage in crossfit_stages
-        )
+    crossfit_summary = summarize_episode_decisions(crossfit_decisions_frame)
+    crossfit_total = crossfit_summary["realized_marginal_log_sum"]
+    holdout_total = holdout_summary["realized_marginal_log_sum"]
+    source_identity = code_identity()
+    final_training = training_episode_samples(
+        prevalidation_samples, available_before=holdout_decision_dates.min()
     )
-    holdout_total = float(holdout_summary["realized_marginal_log_sum"])
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "script_version": SCRIPT_VERSION,
+        "episode_definition_version": EPISODE_DEFINITION_VERSION,
+        "code_identity": source_identity,
         "experiment": EXPERIMENT,
         "strategy_sequence": int(args.strategy_sequence),
         "strategy_id": str(strategy.get("_id") or ""),
@@ -779,6 +786,9 @@ def main() -> int:
             "episode, ending when policy state reconverges"
         ),
         "right_censored_episodes_used_for_training": False,
+        "right_censored_episodes_excluded_from_evaluation": False,
+        "inference_requires_future_labels": False,
+        "episode_factors_are_portfolio_capital_returns": False,
         "decision_threshold": 0.0,
         "decision_threshold_basis": (
             "economic indifference; no manual confidence or score margin"
@@ -788,10 +798,11 @@ def main() -> int:
         "features": MODEL_FEATURES,
         "prevalidation_fold_count": len(folds),
         "prevalidation_crossfit_stages": crossfit_stages,
+        "prevalidation_crossfit_summary": crossfit_summary,
         "prevalidation_crossfit_realized_marginal_log_sum": crossfit_total,
         "prevalidation_crossfit_incremental_factor": float(
-            math.exp(crossfit_total) - 1.0
-        ),
+            math.expm1(crossfit_total)
+        ) if crossfit_total is not None else None,
         "validation_start": validation_start.date().isoformat(),
         "validation_end": validation_end.date().isoformat(),
         "validation_sessions": int(len(holdout_decision_dates) - 1),
@@ -803,9 +814,13 @@ def main() -> int:
         ),
         "holdout_episode_diagnostics": holdout_diag,
         "holdout_model_diagnostics": final_model.diagnostics(),
+        "holdout_training_cutoff_exclusive": str(holdout_decision_dates.min()),
+        "holdout_training_last_label_available_at": str(final_training[LABEL_AVAILABLE_COLUMN].max()),
+        "holdout_excluded_training_episode_count": int(len(prevalidation_samples) - len(final_training)),
         "holdout_summary": holdout_summary,
-        "holdout_incremental_factor": float(math.exp(holdout_total) - 1.0),
-        "untouched_holdout_signal_positive": bool(holdout_total > 0.0),
+        "holdout_incremental_factor": float(math.expm1(holdout_total)) if holdout_total is not None else None,
+        "holdout_is_untouched": False,
+        "holdout_interpretation": "retrospective correctness comparison; period already inspected in prior experiments",
         "selection_used_holdout_period": False,
         "training_used_holdout_period": False,
         "full_stateful_overlay_backtest_run": False,
@@ -818,8 +833,12 @@ def main() -> int:
     file_io.write_json(
         output_dir / "experiment_manifest.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "script_version": SCRIPT_VERSION,
+            "episode_definition_version": EPISODE_DEFINITION_VERSION,
+            "code_identity": source_identity,
+            "selection_market_data_sha256_by_asset": market_data_hashes(raw_selection),
+            "holdout_market_data_sha256_by_asset": market_data_hashes(raw_holdout),
             "experiment": EXPERIMENT,
             "fresh_run": bool(args.fresh_run),
             "prior_research_artifacts_read": False,
@@ -833,24 +852,31 @@ def main() -> int:
             "model": "BayesianRidge",
             "score_replay_engine": "asset_marginal_score_replay v2",
             "non_overlapping_episode_evaluation": True,
-            "right_censored_episode_exclusion": True,
+            "right_censored_episode_exclusion_from_training": True,
+            "right_censored_episode_exclusion_from_evaluation": False,
+            "label_available_at_basis": "last execution session of a completed episode",
+            "pooled_training_rule": "completed labels available strictly before the scoring session",
+            "holdout_is_untouched": False,
+            "observed_target_column": OBSERVED_TARGET_COLUMN,
         },
     )
 
-    _log("=== POOLED CANDIDATE EPISODE ADVANTAGE V2 RESULT ===")
+    _log("=== POOLED CANDIDATE EPISODE ADVANTAGE V2.1 RESULT ===")
     _log(
-        f"Prevalidation cross-fit episode marginal log sum: {crossfit_total:+.6f} "
-        f"(factor={math.exp(crossfit_total)-1.0:+.2%})."
+        f"Prevalidation cross-fit observed episode log sum: "
+        f"{crossfit_summary['observed_marginal_log_sum']:+.6f}; "
+        f"open overrides={crossfit_summary['right_censored_override_count']}."
     )
     _log(
-        f"Untouched holdout: episode_overrides={holdout_summary['override_count']}/"
+        f"Retrospective holdout: episode_overrides={holdout_summary['override_count']}/"
         f"{holdout_summary['decision_episode_starts']}, "
-        f"marginal_log_sum={holdout_total:+.6f}, "
-        f"incremental_factor={math.exp(holdout_total)-1.0:+.2%}."
+        f"observed_log_sum={holdout_summary['observed_marginal_log_sum']:+.6f}, "
+        f"open_overrides={holdout_summary['right_censored_override_count']}."
     )
     _log(
-        "PCEA v2 changes only the target/sampling unit relative to PCMA v1: "
-        "the pooled estimator and decision indifference point remain unchanged."
+        "Episode diagnostics are not the return of a fully executed overlay portfolio. "
+        "PCEA v2.1 corrects censoring and label availability; the estimator and "
+        "decision indifference point remain unchanged."
     )
     _log(f"Result directory: {output_dir}")
     return 0

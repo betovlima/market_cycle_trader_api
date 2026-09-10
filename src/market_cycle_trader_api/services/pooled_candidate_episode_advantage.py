@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Iterable
 
 import numpy as np
@@ -12,7 +11,28 @@ from .pooled_candidate_marginal_advantage import (
 )
 
 TARGET_COLUMN = "marginal_episode_net_log_return"
-EPISODE_DEFINITION_VERSION = "pcea-2.0.4-policy-sufficient-holding-state"
+OBSERVED_TARGET_COLUMN = "observed_marginal_episode_net_log_return"
+LABEL_AVAILABLE_COLUMN = "label_available_at"
+EPISODE_DEFINITION_VERSION = "pcea-2.1.0-censor-aware-evaluation"
+EPISODE_COLUMNS = [
+    "fold", "candidate", "episode_id", "episode_start", "episode_end",
+    "episode_observed_through", LABEL_AVAILABLE_COLUMN, "episode_sessions",
+    "right_censored", "baseline_asset_at_start", "expanded_asset_at_start",
+    "baseline_holding_days_at_start", "expanded_holding_days_at_start",
+    "policy_min_holding_days", "episode_definition_version", OBSERVED_TARGET_COLUMN,
+    TARGET_COLUMN, "positive_episode", "changed_position_sessions",
+]
+
+
+def _censored(frame: pd.DataFrame) -> pd.Series:
+    if "right_censored" not in frame:
+        raise RuntimeError("Episode censoring metadata is missing; recompute the samples.")
+    values = frame["right_censored"].astype(str).str.lower().map(
+        {"true": True, "false": False, "1": True, "0": False}
+    )
+    if values.isna().any():
+        raise RuntimeError("Invalid right_censored flag in episode samples.")
+    return values.astype(bool)
 
 
 def _holding_days(selected: pd.Series) -> pd.Series:
@@ -76,7 +96,7 @@ def extract_candidate_divergence_episodes(
     candidate: str,
     fold_id: int,
 ) -> pd.DataFrame:
-    required = {"timestamp", "selected_asset", "net_log_return"}
+    required = {"timestamp", "execution_timestamp", "selected_asset", "net_log_return"}
     for label, frame in (("baseline", baseline_daily), ("expanded", expanded_daily)):
         missing = sorted(required.difference(frame.columns))
         if missing:
@@ -98,6 +118,19 @@ def extract_candidate_divergence_episodes(
     )
     if not baseline["timestamp"].equals(expanded["timestamp"]):
         raise RuntimeError("Baseline and expanded replay calendars differ.")
+    for label, frame in (("baseline", baseline), ("expanded", expanded)):
+        frame["execution_timestamp"] = pd.to_datetime(
+            frame["execution_timestamp"], utc=True, format="mixed", errors="raise"
+        )
+        if (
+            frame[["timestamp", "execution_timestamp"]].isna().any().any()
+            or frame["timestamp"].duplicated().any()
+            or not frame["timestamp"].is_monotonic_increasing
+            or (frame["execution_timestamp"] <= frame["timestamp"]).any()
+        ):
+            raise RuntimeError(f"Invalid {label} replay decision/execution calendar.")
+    if not baseline["execution_timestamp"].equals(expanded["execution_timestamp"]):
+        raise RuntimeError("Baseline and expanded execution calendars differ.")
 
     baseline_asset = baseline["selected_asset"].astype(str).str.upper()
     expanded_asset = expanded["selected_asset"].astype(str).str.upper()
@@ -112,7 +145,7 @@ def extract_candidate_divergence_episodes(
 
     baseline_log = pd.to_numeric(baseline["net_log_return"], errors="coerce")
     expanded_log = pd.to_numeric(expanded["net_log_return"], errors="coerce")
-    if baseline_log.isna().any() or expanded_log.isna().any():
+    if not np.isfinite(baseline_log).all() or not np.isfinite(expanded_log).all():
         raise RuntimeError("Replay contains non-finite daily log returns.")
 
     delta = expanded_log - baseline_log
@@ -156,6 +189,10 @@ def extract_candidate_divergence_episodes(
                 "episode_id": int(episode_id),
                 "episode_start": baseline["timestamp"].iloc[start],
                 "episode_end": baseline["timestamp"].iloc[end],
+                "episode_observed_through": baseline["execution_timestamp"].iloc[end],
+                LABEL_AVAILABLE_COLUMN: (
+                    pd.NaT if right_censored else baseline["execution_timestamp"].iloc[end]
+                ),
                 "episode_sessions": int(end - start + 1),
                 "right_censored": bool(right_censored),
                 "baseline_asset_at_start": baseline_asset.iloc[start],
@@ -164,8 +201,9 @@ def extract_candidate_divergence_episodes(
                 "expanded_holding_days_at_start": int(expanded_holding.iloc[start]),
                 "policy_min_holding_days": int(min_holding_days),
                 "episode_definition_version": EPISODE_DEFINITION_VERSION,
-                TARGET_COLUMN: marginal,
-                "positive_episode": bool(marginal > 0.0),
+                OBSERVED_TARGET_COLUMN: marginal,
+                TARGET_COLUMN: np.nan if right_censored else marginal,
+                "positive_episode": None if right_censored else bool(marginal > 0.0),
                 "changed_position_sessions": int(
                     (~baseline_asset.iloc[window].eq(expanded_asset.iloc[window])).sum()
                 ),
@@ -174,7 +212,7 @@ def extract_candidate_divergence_episodes(
 
         i = end + 1
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=EPISODE_COLUMNS)
 
 
 def build_episode_samples(
@@ -183,15 +221,21 @@ def build_episode_samples(
     episodes: pd.DataFrame,
 ) -> pd.DataFrame:
     if episodes.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=list(dict.fromkeys([
+            *EPISODE_COLUMNS, *daily_features.columns, "timestamp",
+        ])))
 
     features = daily_features.copy()
     features["timestamp"] = pd.to_datetime(
         features["timestamp"], utc=True, format="mixed", errors="raise"
     )
-    ep = episodes.loc[~episodes["right_censored"].astype(bool)].copy()
-    if ep.empty:
-        return pd.DataFrame()
+    # Censoring is an outcome, not information available at admission time.
+    # Retain every start here; only the training path may exclude open labels.
+    ep = episodes.copy()
+    censored = _censored(ep)
+    if OBSERVED_TARGET_COLUMN not in ep:
+        raise RuntimeError("Observed episode outcomes are missing; recompute the samples.")
+    ep.loc[censored, TARGET_COLUMN] = np.nan
     ep["episode_start"] = pd.to_datetime(
         ep["episode_start"], utc=True, format="mixed", errors="raise"
     )
@@ -230,12 +274,42 @@ def build_episode_samples(
     return merged.sort_values(["fold", "episode_start", "candidate"]).reset_index(drop=True)
 
 
+def training_episode_samples(
+    samples: pd.DataFrame,
+    *,
+    available_before: Any,
+) -> pd.DataFrame:
+    """Select completed labels observed strictly before the scoring session.
+
+    Fold numbers alone do not establish label maturity. Daily replay timestamps
+    refer to decisions; the associated return is observed on the next execution
+    session. Open episodes never supply a completed-episode target.
+    """
+    if LABEL_AVAILABLE_COLUMN not in samples:
+        raise RuntimeError("Episode label availability is missing; recompute the samples.")
+    cutoff = pd.to_datetime(available_before, utc=True, errors="raise")
+    if pd.isna(cutoff):
+        raise RuntimeError("A finite training cutoff is required.")
+    censored = _censored(samples)
+    available = pd.to_datetime(
+        samples[LABEL_AVAILABLE_COLUMN], utc=True, format="mixed", errors="raise"
+    )
+    if available.loc[~censored].isna().any():
+        raise RuntimeError("Completed episodes must declare when their labels became available.")
+    return samples.loc[~censored & available.lt(cutoff)].copy()
+
+
 def fit_episode_model(
     samples: pd.DataFrame,
     feature_names: Iterable[str],
+    *,
+    available_before: Any,
 ) -> PooledCandidateMarginalModel:
+    training = training_episode_samples(samples, available_before=available_before)
+    if training.empty:
+        raise RuntimeError("No completed episode labels are available before the scoring session.")
     return fit_pooled_candidate_marginal_model(
-        samples,
+        training,
         feature_names,
         target_column=TARGET_COLUMN,
     )
@@ -245,21 +319,22 @@ def score_episode_samples(
     model: PooledCandidateMarginalModel,
     samples: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Score PCEA samples without discarding stateful episode metadata.
+    """Predict using decision-time columns only, preserving optional audit metadata.
 
-    The generic PCMA scorer intentionally narrows its frame to model columns. PCEA
-    needs episode_start/episode_end after scoring so the non-overlap selector can
-    enforce one realizable chronological path. Keep the original episode columns,
-    filter only invalid model rows, then attach posterior predictions in place.
+    Neither episode completion nor an observed future return is required to make
+    a prediction. Those columns must never decide which candidates get scored.
     """
+    if samples.empty:
+        return samples.assign(
+            predicted_marginal_advantage=pd.Series(dtype=float),
+            predicted_marginal_std=pd.Series(dtype=float),
+        )
     feature_names = list(model.feature_names)
     required = {
         "fold",
         "timestamp",
         "candidate",
         "episode_start",
-        "episode_end",
-        TARGET_COLUMN,
         *feature_names,
     }
     missing = sorted(required.difference(samples.columns))
@@ -270,27 +345,27 @@ def score_episode_samples(
         )
 
     frame = samples.copy()
-    for column in ("timestamp", "episode_start", "episode_end"):
+    for column in ("timestamp", "episode_start"):
         frame[column] = pd.to_datetime(
             frame[column], utc=True, format="mixed", errors="coerce"
         )
 
-    frame[TARGET_COLUMN] = pd.to_numeric(frame[TARGET_COLUMN], errors="coerce")
-    finite = np.isfinite(frame[TARGET_COLUMN].to_numpy(dtype=float))
-    finite &= frame["timestamp"].notna().to_numpy(dtype=bool)
+    finite = frame["timestamp"].notna().to_numpy(dtype=bool)
     finite &= frame["episode_start"].notna().to_numpy(dtype=bool)
-    finite &= frame["episode_end"].notna().to_numpy(dtype=bool)
     for column in feature_names:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
         finite &= np.isfinite(frame[column].to_numpy(dtype=float))
 
     frame = frame.loc[finite].copy().reset_index(drop=True)
     if frame.empty:
-        raise RuntimeError("No finite PCEA episode samples remain for scoring.")
-    if (frame["episode_end"] < frame["episode_start"]).any():
-        raise RuntimeError("PCEA episode_end precedes episode_start.")
+        return frame.assign(
+            predicted_marginal_advantage=pd.Series(dtype=float),
+            predicted_marginal_std=pd.Series(dtype=float),
+        )
 
     mean, std = model.predict(frame)
+    if not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise RuntimeError("PCEA model produced non-finite posterior predictions.")
     frame["predicted_marginal_advantage"] = np.asarray(mean, dtype=float)
     frame["predicted_marginal_std"] = np.asarray(std, dtype=float)
     return frame
@@ -299,12 +374,26 @@ def score_episode_samples(
 def choose_non_overlapping_episode_overrides(
     scored_samples: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Retrospective episode diagnostic, not a full portfolio execution engine.
+
+    Rank exclusively by predictions. Inspect the chosen outcome afterwards to
+    advance the retrospective clock. A still-open chosen episode occupies the
+    rest of its fold; its observed prefix must not become a completed target.
+    """
+    columns = [
+        "fold", "episode_start", "episode_end", "chosen_candidate",
+        "override_baseline", "predicted_marginal_advantage", "predicted_marginal_std",
+        "right_censored", "realized_marginal_episode_net_log_return",
+        OBSERVED_TARGET_COLUMN, "candidate_count_at_start",
+    ]
+    if scored_samples.empty:
+        return pd.DataFrame(columns=columns)
     required = {
         "fold",
         "candidate",
         "episode_start",
         "episode_end",
-        TARGET_COLUMN,
+        "right_censored",
         "predicted_marginal_advantage",
         "predicted_marginal_std",
     }
@@ -322,75 +411,95 @@ def choose_non_overlapping_episode_overrides(
     frame["episode_end"] = pd.to_datetime(
         frame["episode_end"], utc=True, format="mixed", errors="raise"
     )
+    frame["right_censored"] = _censored(frame)
+    if (
+        frame[["episode_start", "episode_end"]].isna().any().any()
+        or (frame["episode_end"] < frame["episode_start"]).any()
+    ):
+        raise RuntimeError("Retrospective episode bounds are invalid.")
+    if frame.duplicated(["fold", "episode_start", "candidate"]).any():
+        raise RuntimeError("Duplicate candidate at an episode start.")
 
     rows: list[dict[str, Any]] = []
-    blocked_until: pd.Timestamp | None = None
+    for fold_id, fold in frame.groupby("fold", sort=True):
+        blocked_until: pd.Timestamp | None = None
+        open_episode = False
+        for start, group in fold.groupby("episode_start", sort=True):
+            start = pd.Timestamp(start)
+            if open_episode or (blocked_until is not None and start <= blocked_until):
+                continue
+            ordered = group.sort_values(
+                ["predicted_marginal_advantage", "candidate"],
+                ascending=[False, True],
+            )
+            best = ordered.iloc[0]
+            predicted = float(best["predicted_marginal_advantage"])
+            override = bool(np.isfinite(predicted) and predicted > 0.0)
+            censored = bool(override and best["right_censored"])
+            if override:
+                chosen_candidate = str(best["candidate"])
+                realized = np.nan if censored else float(best.get(TARGET_COLUMN, np.nan))
+                observed = float(best.get(OBSERVED_TARGET_COLUMN, realized))
+                end = pd.Timestamp(best["episode_end"])
+                blocked_until = end
+                open_episode = censored
+            else:
+                chosen_candidate, realized, observed, end = "BASELINE", 0.0, 0.0, start
+            rows.append(
+                {
+                    "fold": int(fold_id),
+                    "episode_start": start,
+                    "episode_end": end,
+                    "chosen_candidate": chosen_candidate,
+                    "override_baseline": override,
+                    "predicted_marginal_advantage": predicted,
+                    "predicted_marginal_std": float(best["predicted_marginal_std"]),
+                    "right_censored": censored,
+                    "realized_marginal_episode_net_log_return": realized,
+                    OBSERVED_TARGET_COLUMN: observed,
+                    "candidate_count_at_start": int(len(group)),
+                }
+            )
 
-    for start, group in frame.groupby("episode_start", sort=True):
-        start = pd.Timestamp(start)
-        if blocked_until is not None and start <= blocked_until:
-            continue
-
-        ordered = group.sort_values(
-            ["predicted_marginal_advantage", "candidate"],
-            ascending=[False, True],
-        )
-        best = ordered.iloc[0]
-        predicted = float(best["predicted_marginal_advantage"])
-        override = bool(np.isfinite(predicted) and predicted > 0.0)
-
-        if override:
-            chosen_candidate = str(best["candidate"])
-            realized = float(best[TARGET_COLUMN])
-            end = pd.Timestamp(best["episode_end"])
-            blocked_until = end
-        else:
-            chosen_candidate = "BASELINE"
-            realized = 0.0
-            end = start
-
-        rows.append(
-            {
-                "fold": int(best["fold"]),
-                "episode_start": start,
-                "episode_end": end,
-                "chosen_candidate": chosen_candidate,
-                "override_baseline": override,
-                "predicted_marginal_advantage": predicted,
-                "predicted_marginal_std": float(best["predicted_marginal_std"]),
-                "realized_marginal_episode_net_log_return": realized,
-                "candidate_count_at_start": int(len(group)),
-            }
-        )
-
-    return pd.DataFrame(rows).sort_values(["fold", "episode_start"]).reset_index(drop=True)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["fold", "episode_start"]
+    ).reset_index(drop=True)
 
 
 def summarize_episode_decisions(decisions: pd.DataFrame) -> dict[str, Any]:
-    if decisions.empty:
-        return {
-            "decision_episode_starts": 0,
-            "override_count": 0,
-            "override_rate": 0.0,
-            "realized_marginal_log_sum": 0.0,
-            "realized_marginal_log_mean_when_overridden": None,
-            "positive_realized_override_rate": None,
-        }
-
-    override = decisions["override_baseline"].astype(bool)
-    realized = pd.to_numeric(
-        decisions["realized_marginal_episode_net_log_return"], errors="coerce"
-    ).fillna(0.0)
-    chosen = realized.loc[override]
+    chosen = decisions.loc[decisions["override_baseline"].astype(bool)] if not decisions.empty else decisions
+    if chosen.empty:
+        censored = pd.Series(dtype=bool)
+        realized = observed = pd.Series(dtype=float)
+    else:
+        censored = _censored(chosen)
+        realized = pd.to_numeric(
+            chosen["realized_marginal_episode_net_log_return"], errors="coerce"
+        )
+        observed = pd.to_numeric(chosen[OBSERVED_TARGET_COLUMN], errors="coerce")
+    complete = realized.loc[~censored]
+    complete_finite = complete.loc[np.isfinite(complete)]
+    missing_complete = int((~np.isfinite(complete)).sum())
+    missing_observed = int((~np.isfinite(observed)).sum())
+    has_pending = bool(censored.any() or missing_complete)
     return {
         "decision_episode_starts": int(len(decisions)),
-        "override_count": int(override.sum()),
-        "override_rate": float(override.mean()),
-        "realized_marginal_log_sum": float(realized.sum()),
+        "override_count": int(len(chosen)),
+        "override_rate": float(len(chosen) / len(decisions)) if len(decisions) else 0.0,
+        "completed_override_count": int(len(complete_finite)),
+        "right_censored_override_count": int(censored.sum()),
+        "missing_completed_outcome_count": missing_complete,
+        "missing_observed_outcome_count": missing_observed,
+        "completed_override_marginal_log_sum": float(complete_finite.sum()),
+        "observed_marginal_log_sum": None if missing_observed else float(observed.sum()),
+        # A missing or still-open outcome is never silently treated as zero.
+        "realized_marginal_log_sum": None if has_pending else float(complete.sum()),
         "realized_marginal_log_mean_when_overridden": (
-            float(chosen.mean()) if not chosen.empty else None
+            float(complete_finite.mean()) if not complete_finite.empty else None
         ),
         "positive_realized_override_rate": (
-            float((chosen > 0.0).mean()) if not chosen.empty else None
+            float((complete_finite > 0.0).mean()) if not complete_finite.empty else None
         ),
+        "realized_rate_basis": "completed overrides only; open outcomes reported separately",
+        "is_portfolio_capital_return": False,
     }

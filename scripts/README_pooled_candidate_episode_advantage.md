@@ -1,6 +1,10 @@
 # Pooled Candidate Episode Advantage v2
 
-Research-only experiment. Current patch: `pooled-candidate-episode-advantage-v2.0.4`.
+Research-only experiment. Current version: `pooled-candidate-episode-advantage-v2.1.0`, API/package `10.8.42`.
+
+Current branch: `research/pooled-candidate-episode-advantage-v2-1`, based on commit `9dbd0f1fa06493c68e730df61e78589e3951174e` of `research/pooled-candidate-episode-advantage-v2`.
+
+For the supplied ZIP diagnosis and Windows commands, see [AUDITORIA_PCEA_V2_1.md](AUDITORIA_PCEA_V2_1.md).
 
 Base branch: `research/pooled-candidate-marginal-advantage-v1`, itself based on `research/asset-marginal-rotation-contribution-v2`.
 
@@ -16,7 +20,28 @@ That target/model combination failed to generalize. PCEA v2 isolates one hypothe
 
 The pooled estimator, candidate-identity exclusion, features, LightGBM snapshot, transaction costs, baseline policy and zero economic indifference point remain unchanged.
 
-## v2.0.4 correctness patch — policy-sufficient reconvergence
+## v2.1.0 correctness patch: inference without future outcomes
+
+In v2.0.4, `build_episode_samples` excluded all right-censored episodes before both training and evaluation. A candidate could disappear from a historical decision solely because its episode had not ended by the future evaluation boundary. The scorer also required a finite future target, and feature construction calculated next-session returns even though PCEA did not use those daily labels.
+
+This version corrects that evaluation contract:
+
+- retain every episode start, including open episodes, for prediction;
+- build PCEA features without calling the next-session return calculation;
+- score from decision-time columns without requiring an episode end or future return;
+- reserve `marginal_episode_net_log_return` for completed outcomes; an open episode has a missing complete target and a separate `observed_marginal_episode_net_log_return`;
+- record `label_available_at` from the final execution session, not its preceding decision session;
+- train only on completed labels observed strictly before the first scoring session of each fold or final evaluation period;
+- retain an admitted open episode through the rest of its fold and report it separately;
+- report a missing complete aggregate as JSON `null`, never a zero return;
+- export source, environment and market snapshot hashes;
+- write to a new `...strategy_10_v2_1_...` output directory by default, preserving the earlier run.
+
+The estimator, 64 features, candidate admission rule and baseline policy are unchanged. The code still produces retrospective episode diagnostics. It does not execute a single complete portfolio with the learned admission policy, and its episode factors must not be reported as portfolio capital returns.
+
+The inherited leadership script now uses `research_windows_file_io` for reads, writes, existence checks and directory creation, including the read of `intrinsic_timing_summary.csv` from the reported Windows traceback.
+
+## Historical v2.0.4 correctness patch: policy-sufficient reconvergence
 
 The first PCEA v2 implementation compared the **exact** holding-day counters of the baseline and expanded paths when deciding whether they had reconverged. That was stricter than the actual Utility policy.
 
@@ -50,7 +75,7 @@ For each fold and each trainable external candidate:
 
 over that complete divergence episode.
 
-Right-censored episodes that have not reconverged before the end of a fold/holdout are excluded rather than assigned an incomplete future label.
+Right-censored episodes that have not reconverged before the end of a fold/holdout remain eligible for scoring. They are excluded from completed-label training. Their observed returns through the final available execution session are exported separately and include the replay's terminal liquidation costs; this prefix is not an estimate of the eventual completed episode.
 
 ## Model
 
@@ -71,24 +96,28 @@ Pre-validation:
 - train on fold 1 episode samples -> evaluate fold 2;
 - train on folds 1+2 -> evaluate fold 3.
 
-At evaluation time, if several candidate episodes start on the same session, the model chooses the largest positive predicted episode advantage. Once one episode is chosen, later episode starts are ignored until its replay-defined stateful episode ends. This prevents overlapping realized targets from being added as if they were independent capital paths.
+At evaluation time, if several candidate episodes start on the same session, the model chooses the largest positive predicted episode advantage. The retrospective evaluator inspects the chosen outcome after ranking to advance its clock. Later episode starts are ignored until its replay-defined stateful episode ends, or through the rest of the fold if it remains open. Fold boundaries reset the diagnostic schedule.
+
+This removes overlap within the diagnostic. It does not make the sum an exact executable portfolio: isolated candidate accounts can have different cash balances, quantities and costs. A full stateful overlay remains a separate experiment.
 
 Final holdout:
 
-- fit the pooled episode model on all pre-validation episode samples;
+- fit the pooled episode model on completed pre-validation labels available before the first holdout decision;
 - evaluate on the final 252 XNYS sessions used by the experiment;
 - no holdout target is used in model fitting, candidate discovery or margin calibration.
 
-The 2025-09-05 to 2026-09-04 holdout has already been observed in prior research iterations, so a rerun after v2.0.4 is a retrospective correctness comparison, not a new untouched performance claim.
+The 2025-09-05 to 2026-09-04 holdout has already been observed in prior research iterations. Reruns are retrospective correctness comparisons. New result files explicitly declare `holdout_is_untouched=false`.
 
 ## Run from zero
 
 ```bash
 git fetch origin
-git switch research/pooled-candidate-episode-advantage-v2
-git pull --ff-only origin research/pooled-candidate-episode-advantage-v2
+git switch research/pooled-candidate-episode-advantage-v2-1
+git pull --ff-only origin research/pooled-candidate-episode-advantage-v2-1
 
 python -m unittest discover -s tests -p "test_pooled_candidate_episode_advantage.py" -v
+python -m unittest discover -s tests -p "test_pcea_v21.py" -v
+python -m unittest discover -s tests -p "test_pcea_pipeline_integration.py" -v
 
 python scripts/research_pooled_candidate_episode_advantage.py \
   --strategy-sequence 10 \
@@ -117,4 +146,4 @@ No prior PCMA, PCEA or marginal research output is reused. The only persisted so
 - `pcea_result.json`
 - `experiment_manifest.json`
 
-Each newly extracted episode also carries `policy_min_holding_days` and `episode_definition_version=pcea-2.0.4-policy-sufficient-holding-state` so exported results can be distinguished from the invalid pre-patch episode definition.
+Each newly extracted episode carries `policy_min_holding_days`, `episode_definition_version=pcea-2.1.0-censor-aware-evaluation`, `episode_observed_through`, and `label_available_at`. Open targets remain missing. `realized_marginal_log_sum` and the complete episode factor are `null` whenever a selected episode remains open; `observed_marginal_log_sum` reports the available prefix separately. Completed-only subtotals and win rates are explicitly identified.

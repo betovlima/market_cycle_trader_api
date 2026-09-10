@@ -270,6 +270,7 @@ def _build_samples(
     effective_margin: float,
     calibrated_margin: float,
     phase_label: str,
+    include_future_targets: bool = True,
 ) -> pd.DataFrame:
     baseline_frames = {symbol: frames[symbol] for symbol in baseline_symbols}
     policy = _utility_policy(
@@ -330,18 +331,14 @@ def _build_samples(
             else 0
         )
         base_to_combined = combined_position[target_symbol] if target_symbol else 0
-        base_return = _training_transition_log_return(
-            frames,
-            combined_symbols,
-            timestamp,
-            next_timestamp,
-            from_combined,
-            base_to_combined,
-            config,
-        )
-        if not np.isfinite(base_return):
-            current_position, holding_days = _state_update(current_position, holding_days, int(target_position))
-            continue
+        if include_future_targets:
+            base_return = _training_transition_log_return(
+                frames, combined_symbols, timestamp, next_timestamp,
+                from_combined, base_to_combined, config,
+            )
+            if not np.isfinite(base_return):
+                current_position, holding_days = _state_update(current_position, holding_days, int(target_position))
+                continue
 
         for candidate in candidate_symbols:
             model = candidate_models.get(candidate)
@@ -354,17 +351,13 @@ def _build_samples(
             candidate_features = candidate_frame.loc[timestamp, ROTATION_FEATURES]
             if candidate_features.isna().any():
                 continue
-            candidate_return = _training_transition_log_return(
-                frames,
-                combined_symbols,
-                timestamp,
-                next_timestamp,
-                from_combined,
-                combined_position[candidate],
-                config,
-            )
-            if not np.isfinite(candidate_return):
-                continue
+            if include_future_targets:
+                candidate_return = _training_transition_log_return(
+                    frames, combined_symbols, timestamp, next_timestamp,
+                    from_combined, combined_position[candidate], config,
+                )
+                if not np.isfinite(candidate_return):
+                    continue
 
             mean, std, reference = candidate_references[candidate]
             row: dict[str, Any] = {
@@ -387,10 +380,13 @@ def _build_samples(
                 "baseline_positive_score_fraction": positive_fraction,
                 "baseline_holding_days": int(holding_days),
                 "baseline_target_is_cash": int(target_symbol is None),
-                "baseline_next_session_net_log_return": float(base_return),
-                "candidate_next_session_net_log_return": float(candidate_return),
-                TARGET_COLUMN: float(candidate_return - base_return),
             }
+            if include_future_targets:
+                row.update({
+                    "baseline_next_session_net_log_return": float(base_return),
+                    "candidate_next_session_net_log_return": float(candidate_return),
+                    TARGET_COLUMN: float(candidate_return - base_return),
+                })
             delta = candidate_features.astype(float) - target_features.astype(float)
             for feature in ROTATION_FEATURES:
                 row[f"delta_{feature}"] = float(delta[feature])

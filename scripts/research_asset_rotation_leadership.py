@@ -24,6 +24,7 @@ for path in (SRC_ROOT, SCRIPT_ROOT):
 
 import research_asset_signature_leave_one_out as common  # noqa: E402
 import research_asset_timing_vs_buyhold as timing  # noqa: E402
+import research_windows_file_io as file_io  # noqa: E402
 from research_asset_timing_vs_buyhold_execution import _immutable_model_snapshot  # noqa: E402
 from market_cycle_trader_api.engine.absolute_utility_cash_gate import (  # noqa: E402
     absolute_utility_cash_gate_enabled,
@@ -50,20 +51,11 @@ def _log(message: str) -> None:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    file_io.write_json(path, value)
 
 
 def _write_csv(path: Path, frame: pd.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    frame.to_csv(temporary, index=False)
-    temporary.replace(path)
+    file_io.write_csv(path, frame)
 
 
 def _sha256_json(value: Any) -> str:
@@ -570,7 +562,7 @@ def main() -> int:
         / "research_output"
         / f"asset_rotation_leadership_strategy_{strategy_sequence}_{snapshot_end.date().isoformat()}"
     ).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    file_io.ensure_dir(output_dir)
     _write_csv(output_dir / "asset_history_integrity.csv", pd.DataFrame(history_rows))
 
     client.close()
@@ -595,11 +587,11 @@ def main() -> int:
     prediction_rows: list[dict[str, Any]] = []
     completed: set[str] = set()
 
-    if not args.no_resume and intrinsic_path.exists() and raw_prediction_path.exists():
-        intrinsic_existing = pd.read_csv(intrinsic_path)
-        prediction_existing = pd.read_csv(raw_prediction_path)
+    if not args.no_resume and file_io.exists(intrinsic_path) and file_io.exists(raw_prediction_path):
+        intrinsic_existing = file_io.read_csv(intrinsic_path)
+        prediction_existing = file_io.read_csv(raw_prediction_path)
         fold_existing = (
-            pd.read_csv(fold_path) if fold_path.exists() else pd.DataFrame()
+            file_io.read_csv(fold_path) if file_io.exists(fold_path) else pd.DataFrame()
         )
         if not intrinsic_existing.empty:
             intrinsic_existing["symbol"] = (
@@ -700,7 +692,7 @@ def main() -> int:
                 f"excess={float(aggregate['compound_oos_excess_return']):.2%}."
             )
 
-    intrinsic = pd.read_csv(intrinsic_path)
+    intrinsic = file_io.read_csv(intrinsic_path)
     intrinsic["symbol"] = intrinsic["symbol"].astype(str).str.upper()
     intrinsic_records: list[dict[str, Any]] = []
     for row in intrinsic.to_dict(orient="records"):
@@ -711,7 +703,7 @@ def main() -> int:
     intrinsic = pd.DataFrame(intrinsic_records)
     _write_csv(intrinsic_path, intrinsic)
 
-    raw_predictions = pd.read_csv(raw_prediction_path)
+    raw_predictions = file_io.read_csv(raw_prediction_path)
     ranked = _rank_predictions(raw_predictions)
     _write_csv(output_dir / "leadership_ranked_predictions.csv", ranked)
 
