@@ -9,7 +9,6 @@ import pandas as pd
 from .pooled_candidate_marginal_advantage import (
     PooledCandidateMarginalModel,
     fit_pooled_candidate_marginal_model,
-    score_candidate_samples,
 )
 
 TARGET_COLUMN = "marginal_episode_net_log_return"
@@ -197,11 +196,55 @@ def score_episode_samples(
     model: PooledCandidateMarginalModel,
     samples: pd.DataFrame,
 ) -> pd.DataFrame:
-    return score_candidate_samples(
-        model,
-        samples,
-        target_column=TARGET_COLUMN,
-    )
+    """Score PCEA samples without discarding stateful episode metadata.
+
+    The generic PCMA scorer intentionally narrows its frame to model columns. PCEA
+    needs episode_start/episode_end after scoring so the non-overlap selector can
+    enforce one realizable chronological path. Keep the original episode columns,
+    filter only invalid model rows, then attach posterior predictions in place.
+    """
+    feature_names = list(model.feature_names)
+    required = {
+        "fold",
+        "timestamp",
+        "candidate",
+        "episode_start",
+        "episode_end",
+        TARGET_COLUMN,
+        *feature_names,
+    }
+    missing = sorted(required.difference(samples.columns))
+    if missing:
+        raise RuntimeError(
+            "PCEA episode samples are missing required scoring columns: "
+            + ", ".join(missing)
+        )
+
+    frame = samples.copy()
+    for column in ("timestamp", "episode_start", "episode_end"):
+        frame[column] = pd.to_datetime(
+            frame[column], utc=True, format="mixed", errors="coerce"
+        )
+
+    frame[TARGET_COLUMN] = pd.to_numeric(frame[TARGET_COLUMN], errors="coerce")
+    finite = np.isfinite(frame[TARGET_COLUMN].to_numpy(dtype=float))
+    finite &= frame["timestamp"].notna().to_numpy(dtype=bool)
+    finite &= frame["episode_start"].notna().to_numpy(dtype=bool)
+    finite &= frame["episode_end"].notna().to_numpy(dtype=bool)
+    for column in feature_names:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        finite &= np.isfinite(frame[column].to_numpy(dtype=float))
+
+    frame = frame.loc[finite].copy().reset_index(drop=True)
+    if frame.empty:
+        raise RuntimeError("No finite PCEA episode samples remain for scoring.")
+    if (frame["episode_end"] < frame["episode_start"]).any():
+        raise RuntimeError("PCEA episode_end precedes episode_start.")
+
+    mean, std = model.predict(frame)
+    frame["predicted_marginal_advantage"] = np.asarray(mean, dtype=float)
+    frame["predicted_marginal_std"] = np.asarray(std, dtype=float)
+    return frame
 
 
 def choose_non_overlapping_episode_overrides(
