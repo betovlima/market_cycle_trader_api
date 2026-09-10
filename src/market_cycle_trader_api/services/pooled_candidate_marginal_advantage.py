@@ -69,6 +69,25 @@ def _finite_training_frame(
     return frame.reset_index(drop=True)
 
 
+def _normalized_date_weights(frame: pd.DataFrame) -> np.ndarray:
+    """Preserve equal relative weight per decision date without shrinking sample mass.
+
+    BayesianRidge uses sum(sample_weight) as the effective sample count in its
+    precision update. Raw 1/group_size date weights can make that effective count
+    much smaller than the design rank, which can drive the inferred noise
+    precision negative. Rescaling all weights by one common positive constant
+    preserves every relative date/candidate weight while restoring total weight
+    mass to the actual number of training rows.
+    """
+    group_sizes = frame.groupby(["fold", "timestamp"])["candidate"].transform("count")
+    raw = 1.0 / group_sizes.astype(float).clip(lower=1.0)
+    values = raw.to_numpy(dtype=float)
+    total = float(values.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise RuntimeError("Pooled candidate-advantage sample weights are invalid.")
+    return values * (float(len(values)) / total)
+
+
 def fit_pooled_candidate_marginal_model(
     samples: pd.DataFrame,
     feature_names: Iterable[str],
@@ -82,18 +101,24 @@ def fit_pooled_candidate_marginal_model(
         target_column=target_column,
     )
 
-    group_sizes = frame.groupby(["fold", "timestamp"])["candidate"].transform("count")
-    weights = 1.0 / group_sizes.astype(float).clip(lower=1.0)
-
     matrix = frame[features].to_numpy(dtype=float)
     target = frame[target_column].to_numpy(dtype=float)
-    sample_weight = weights.to_numpy(dtype=float)
+    sample_weight = _normalized_date_weights(frame)
 
     scaler = StandardScaler()
     scaler.fit(matrix, sample_weight=sample_weight)
     scaled = scaler.transform(matrix)
     regressor = BayesianRidge(compute_score=True)
     regressor.fit(scaled, target, sample_weight=sample_weight)
+
+    if not np.isfinite(float(regressor.alpha_)) or float(regressor.alpha_) <= 0.0:
+        raise RuntimeError(
+            "Bayesian pooled candidate model produced a non-positive posterior noise precision."
+        )
+    if not np.isfinite(float(regressor.lambda_)) or float(regressor.lambda_) <= 0.0:
+        raise RuntimeError(
+            "Bayesian pooled candidate model produced a non-positive posterior weight precision."
+        )
 
     return PooledCandidateMarginalModel(
         feature_names=features,
