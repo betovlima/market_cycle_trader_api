@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,9 @@ from market_cycle_trader_api.services.pooled_candidate_episode_advantage import 
     TARGET_COLUMN,
     choose_non_overlapping_episode_overrides,
     extract_candidate_divergence_episodes,
+)
+from market_cycle_trader_api.services.pooled_candidate_marginal_advantage import (
+    fit_pooled_candidate_marginal_model,
 )
 
 
@@ -118,6 +122,33 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
         decisions = choose_non_overlapping_episode_overrides(scored)
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions.iloc[0]["chosen_candidate"], "A")
+
+    def test_pooled_bayesian_weights_keep_positive_precision(self) -> None:
+        rng = np.random.default_rng(7)
+        feature_names = [f"f_{index}" for index in range(20)]
+        timestamps = pd.date_range("2026-01-01", periods=3, freq="D", tz="UTC")
+        rows = []
+        for timestamp in timestamps:
+            for candidate_index in range(10):
+                values = rng.normal(size=len(feature_names))
+                row = {
+                    "fold": 1,
+                    "timestamp": timestamp,
+                    "candidate": f"C{candidate_index:02d}",
+                    "synthetic_target": float(rng.normal(scale=0.02)),
+                }
+                row.update(
+                    {name: float(value) for name, value in zip(feature_names, values, strict=True)}
+                )
+                rows.append(row)
+
+        model = fit_pooled_candidate_marginal_model(
+            pd.DataFrame(rows),
+            feature_names,
+            target_column="synthetic_target",
+        )
+        self.assertGreater(float(model.regressor.alpha_), 0.0)
+        self.assertGreater(float(model.regressor.lambda_), 0.0)
 
 
 if __name__ == "__main__":
