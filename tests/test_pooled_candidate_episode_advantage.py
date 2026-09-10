@@ -32,23 +32,28 @@ class _DummyEpisodeModel:
         return mean, std
 
 
+def _with_min_hold(frame: pd.DataFrame, value: int = 2) -> pd.DataFrame:
+    frame.attrs["rotation_min_holding_days"] = int(value)
+    return frame
+
+
 class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
-    def test_extracts_stateful_episode_until_policy_state_reconverges(self) -> None:
+    def test_extracts_episode_until_policy_sufficient_state_reconverges(self) -> None:
         timestamps = pd.date_range("2026-01-01", periods=6, freq="D", tz="UTC")
-        baseline = pd.DataFrame(
+        baseline = _with_min_hold(pd.DataFrame(
             {
                 "timestamp": timestamps,
                 "selected_asset": ["A", "A", "B", "B", "B", "C"],
                 "net_log_return": [0.01, 0.01, 0.02, 0.01, 0.00, 0.01],
             }
-        )
-        expanded = pd.DataFrame(
+        ))
+        expanded = _with_min_hold(pd.DataFrame(
             {
                 "timestamp": timestamps,
                 "selected_asset": ["A", "X", "X", "B", "B", "C"],
                 "net_log_return": [0.01, 0.03, -0.01, 0.02, 0.00, 0.01],
             }
-        )
+        ))
         episodes = extract_candidate_divergence_episodes(
             baseline_daily=baseline,
             expanded_daily=expanded,
@@ -58,33 +63,37 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
         self.assertEqual(len(episodes), 1)
         row = episodes.iloc[0]
         self.assertEqual(pd.Timestamp(row["episode_start"]), timestamps[1])
-        self.assertEqual(pd.Timestamp(row["episode_end"]), timestamps[5])
+        # At timestamps[4], both paths hold B and both have already satisfied
+        # min_holding_days=2. Their exact ages are 3 vs 2, but future policy
+        # decisions see those states as equivalent, so the episode must end here.
+        self.assertEqual(pd.Timestamp(row["episode_end"]), timestamps[4])
+        self.assertEqual(int(row["episode_sessions"]), 4)
+        self.assertEqual(int(row["policy_min_holding_days"]), 2)
         expected = (
             (0.03 - 0.01)
             + (-0.01 - 0.02)
             + (0.02 - 0.01)
             + (0.00 - 0.00)
-            + (0.01 - 0.01)
         )
         self.assertAlmostEqual(float(row[TARGET_COLUMN]), expected)
         self.assertFalse(bool(row["right_censored"]))
 
     def test_right_censored_episode_is_marked(self) -> None:
         timestamps = pd.date_range("2026-01-01", periods=3, freq="D", tz="UTC")
-        baseline = pd.DataFrame(
+        baseline = _with_min_hold(pd.DataFrame(
             {
                 "timestamp": timestamps,
                 "selected_asset": ["A", "A", "A"],
                 "net_log_return": [0.0, 0.0, 0.0],
             }
-        )
-        expanded = pd.DataFrame(
+        ))
+        expanded = _with_min_hold(pd.DataFrame(
             {
                 "timestamp": timestamps,
                 "selected_asset": ["A", "X", "X"],
                 "net_log_return": [0.0, 0.01, 0.01],
             }
-        )
+        ))
         episodes = extract_candidate_divergence_episodes(
             baseline_daily=baseline,
             expanded_daily=expanded,
@@ -93,6 +102,30 @@ class PooledCandidateEpisodeAdvantageTests(unittest.TestCase):
         )
         self.assertEqual(len(episodes), 1)
         self.assertTrue(bool(episodes.iloc[0]["right_censored"]))
+
+    def test_missing_min_hold_metadata_is_rejected(self) -> None:
+        timestamps = pd.date_range("2026-01-01", periods=2, freq="D", tz="UTC")
+        baseline = pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "selected_asset": ["A", "A"],
+                "net_log_return": [0.0, 0.0],
+            }
+        )
+        expanded = pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "selected_asset": ["X", "A"],
+                "net_log_return": [0.0, 0.0],
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "rotation_min_holding_days metadata"):
+            extract_candidate_divergence_episodes(
+                baseline_daily=baseline,
+                expanded_daily=expanded,
+                candidate="X",
+                fold_id=1,
+            )
 
     def test_episode_choice_blocks_overlapping_starts(self) -> None:
         timestamps = pd.to_datetime(

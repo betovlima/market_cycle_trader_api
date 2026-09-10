@@ -212,6 +212,10 @@ class ScoreReplayPanel:
         daily["decision_reason"] = reasons
         daily["strategy_equity"] = equities
         daily["net_log_return"] = np.diff(np.log(np.r_[config.initial_capital, equities]))
+        # PCEA needs the policy-sufficient holding state to know when two paths
+        # have truly reconverged. Exact holding counts above this threshold do not
+        # affect future decisions, so export the configured threshold as metadata.
+        daily.attrs["rotation_min_holding_days"] = int(config.rotation_min_holding_days)
         return ReplayResult(daily, float(cash), math.log(cash / config.initial_capital), rotations, fees_total)
 
 

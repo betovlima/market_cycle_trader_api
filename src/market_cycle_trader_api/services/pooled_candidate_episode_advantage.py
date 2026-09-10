@@ -12,6 +12,7 @@ from .pooled_candidate_marginal_advantage import (
 )
 
 TARGET_COLUMN = "marginal_episode_net_log_return"
+EPISODE_DEFINITION_VERSION = "pcea-2.0.4-policy-sufficient-holding-state"
 
 
 def _holding_days(selected: pd.Series) -> pd.Series:
@@ -31,6 +32,43 @@ def _holding_days(selected: pd.Series) -> pd.Series:
     return pd.Series(result, index=selected.index, dtype=int)
 
 
+def _replay_min_holding_days(
+    baseline_daily: pd.DataFrame,
+    expanded_daily: pd.DataFrame,
+) -> int:
+    baseline_value = baseline_daily.attrs.get("rotation_min_holding_days")
+    expanded_value = expanded_daily.attrs.get("rotation_min_holding_days")
+    if baseline_value is None or expanded_value is None:
+        raise RuntimeError(
+            "PCEA replay is missing rotation_min_holding_days metadata. "
+            "Recompute from the current cached-score replay; do not reuse older artifacts."
+        )
+    baseline_min = int(baseline_value)
+    expanded_min = int(expanded_value)
+    if baseline_min != expanded_min:
+        raise RuntimeError(
+            "Baseline and expanded replays disagree on rotation_min_holding_days."
+        )
+    if baseline_min < 0:
+        raise RuntimeError("rotation_min_holding_days cannot be negative.")
+    return baseline_min
+
+
+def _policy_holding_state(holding: pd.Series, min_holding_days: int) -> pd.Series:
+    """Collapse exact holding age to the state actually observed by the policy.
+
+    The Utility policy only asks whether holding < rotation_min_holding_days. Once
+    the threshold has been reached, 2, 3, 20, ... holding days are behaviorally
+    equivalent for future decisions. Keeping the exact age would falsely prolong
+    divergence episodes after both paths have already returned to the same policy
+    state.
+    """
+    threshold = int(min_holding_days)
+    if threshold <= 0:
+        return pd.Series(0, index=holding.index, dtype=int)
+    return holding.astype(int).clip(upper=threshold)
+
+
 def extract_candidate_divergence_episodes(
     *,
     baseline_daily: pd.DataFrame,
@@ -46,6 +84,7 @@ def extract_candidate_divergence_episodes(
                 f"{label} replay is missing required columns: " + ", ".join(missing)
             )
 
+    min_holding_days = _replay_min_holding_days(baseline_daily, expanded_daily)
     baseline = baseline_daily.reset_index(drop=True).copy()
     expanded = expanded_daily.reset_index(drop=True).copy()
     if len(baseline) != len(expanded):
@@ -64,6 +103,12 @@ def extract_candidate_divergence_episodes(
     expanded_asset = expanded["selected_asset"].astype(str).str.upper()
     baseline_holding = _holding_days(baseline_asset)
     expanded_holding = _holding_days(expanded_asset)
+    baseline_policy_holding = _policy_holding_state(
+        baseline_holding, min_holding_days
+    )
+    expanded_policy_holding = _policy_holding_state(
+        expanded_holding, min_holding_days
+    )
 
     baseline_log = pd.to_numeric(baseline["net_log_return"], errors="coerce")
     expanded_log = pd.to_numeric(expanded["net_log_return"], errors="coerce")
@@ -71,13 +116,14 @@ def extract_candidate_divergence_episodes(
         raise RuntimeError("Replay contains non-finite daily log returns.")
 
     delta = expanded_log - baseline_log
-    # Policy-state reconvergence is defined by the observable state that controls
-    # future decisions: selected asset plus holding-days state. The account-level
-    # log-return delta on the reconvergence session is still included in the target.
-    # We deliberately do not impose an economic tolerance/gate here.
+    # Reconvergence must use the minimal sufficient state of the actual policy.
+    # Exact holding age only matters while it is below the minimum-holding guard;
+    # after the threshold, both paths are behaviorally identical if the selected
+    # asset is the same. The reconvergence session itself remains in the target so
+    # switch-back costs are accounted for.
     state_equal = (
         baseline_asset.eq(expanded_asset)
-        & baseline_holding.eq(expanded_holding)
+        & baseline_policy_holding.eq(expanded_policy_holding)
     )
     direct_candidate_divergence = (
         expanded_asset.eq(str(candidate).upper())
@@ -101,6 +147,7 @@ def extract_candidate_divergence_episodes(
         end = len(baseline) - 1 if right_censored else j
         window = slice(start, end + 1)
         episode_id += 1
+        marginal = float(delta.iloc[window].sum())
 
         rows.append(
             {
@@ -115,8 +162,10 @@ def extract_candidate_divergence_episodes(
                 "expanded_asset_at_start": expanded_asset.iloc[start],
                 "baseline_holding_days_at_start": int(baseline_holding.iloc[start]),
                 "expanded_holding_days_at_start": int(expanded_holding.iloc[start]),
-                TARGET_COLUMN: float(delta.iloc[window].sum()),
-                "positive_episode": bool(float(delta.iloc[window].sum()) > 0.0),
+                "policy_min_holding_days": int(min_holding_days),
+                "episode_definition_version": EPISODE_DEFINITION_VERSION,
+                TARGET_COLUMN: marginal,
+                "positive_episode": bool(marginal > 0.0),
                 "changed_position_sessions": int(
                     (~baseline_asset.iloc[window].eq(expanded_asset.iloc[window])).sum()
                 ),
