@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -55,7 +56,6 @@ class ContextualMarginalSignatureV104Tests(unittest.TestCase):
                     row[feature] = float(date_index + candidate_index)
                 rows.append(row)
         frame = pd.DataFrame(rows)
-        # Make one validation value extreme. It must not influence train means/stds.
         frame.loc[frame["decision_date"] == "2024-01-02", research.MODEL_FEATURES[0]] = 10000.0
         train, test, train_z, test_z, *_ = research._prepare_split(frame, pd.Timestamp("2024-01-01", tz="UTC"))
         self.assertTrue((train["decision_date"] < "2024-01-01").all())
@@ -73,6 +73,71 @@ class ContextualMarginalSignatureV104Tests(unittest.TestCase):
         counts, _ = research._zero_regime_report(pd.DataFrame(rows))
         observed = dict(zip(counts["effect_regime"], counts["rows"]))
         self.assertEqual(observed, {"negative": 1, "positive": 1, "zero": 1})
+
+    def test_alpha_selection_prioritizes_chronological_rank_signal(self) -> None:
+        dates = [f"2023-{month:02d}-01" for month in range(1, 7)]
+        rows = []
+        x_rows = []
+        y_values = []
+        for date in dates:
+            for position, candidate in enumerate(["A", "B", "C"]):
+                rows.append({"decision_date": date, "candidate": candidate})
+                x_rows.append([float(position - 1)])
+                y_values.append(float(position - 1) * 0.01)
+        train = pd.DataFrame(rows)
+        train_z = pd.DataFrame(x_rows, index=train.index, columns=["x"])
+        y_train = pd.Series(y_values, index=train.index)
+
+        class FakeModel:
+            def __init__(self, alpha: float):
+                self.alpha = float(alpha)
+                self.coef_ = np.asarray([1.0 if self.alpha < 1.0 else 0.0])
+
+            def predict(self, values: np.ndarray) -> np.ndarray:
+                if self.alpha < 1.0:
+                    return values[:, 0] * 100.0
+                return np.zeros(len(values), dtype=float)
+
+        def fake_fit(_kind: str, alpha: float, _x: np.ndarray, _y: np.ndarray) -> FakeModel:
+            return FakeModel(alpha)
+
+        with patch.object(research, "_fit_regularized", side_effect=fake_fit):
+            alpha, report, metric = research._inner_cv_select_alpha(
+                kind="ridge",
+                alphas=[0.1, 10.0],
+                train=train,
+                train_z=train_z,
+                y_train=y_train,
+            )
+
+        self.assertEqual(metric, "mean_within_date_spearman")
+        self.assertEqual(alpha, 0.1)
+        selected = report.loc[report["alpha"] == 0.1].iloc[0]
+        constant = report.loc[report["alpha"] == 10.0].iloc[0]
+        self.assertGreater(float(selected["mean_within_date_spearman"]), 0.99)
+        self.assertEqual(int(constant["rank_valid_folds"]), 0)
+
+    def test_constant_predictions_do_not_create_artificial_top1(self) -> None:
+        test = pd.DataFrame({
+            "decision_date": ["2024-01-02"] * 3,
+            "candidate": ["A", "B", "C"],
+            "ending_capital_delta_rate": [0.0, 0.1, -0.1],
+            "delta_log_capital": [0.0, 0.095, -0.105],
+        })
+        test.index = pd.Index([10, 11, 12])
+        y_test = pd.Series(test["delta_log_capital"].to_numpy(), index=test.index)
+        y_train = pd.Series([0.0, 0.01, -0.01])
+        _, summary, per_date = research._prediction_report(
+            model_name="constant",
+            prediction=np.zeros(3, dtype=float),
+            test=test,
+            y_test=y_test,
+            y_train=y_train,
+        )
+        self.assertEqual(summary["ranking_eligible_dates"], 0)
+        self.assertIsNone(summary["mean_top1_actual_delta_log"])
+        self.assertFalse(bool(per_date.iloc[0]["ranking_eligible"]))
+        self.assertTrue(pd.isna(per_date.iloc[0]["chosen_candidate"]))
 
 
 if __name__ == "__main__":
