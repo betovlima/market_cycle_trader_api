@@ -1,0 +1,31 @@
+{
+  "experiment": "contextual-marginal-signature-v1.0.9-adm-adi-interaction-decomposition",
+  "base_universe": "Original25",
+  "hypothesis": "ADM is the primary sign-state enabler, ADI modulates effect magnitude, and the remaining HD/ADC/ADEA contribution can be isolated after jointly removing ADM and ADI.",
+  "universes": [
+    {
+      "name": "Original25",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADI", "ADM"]
+    },
+    {
+      "name": "Original24_MinusADM",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADI"]
+    },
+    {
+      "name": "Original24_MinusADI",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADM"]
+    },
+    {
+      "name": "Original23_MinusADM_ADI",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA"]
+    },
+    {
+      "name": "Original20_DropLast5",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V"]
+    }
+  ],
+  "recommended_candidates": ["MKSI", "XSD", "VNCE", "APD", "CORT", "GKOS", "CLMT", "CCK"],
+  "recommended_decision_dates": ["2026-01-02", "2026-03-02", "2026-05-01", "2026-07-01"],
+  "decomposition": "total_drop5 = ADM_main + ADI_main + ADM_x_ADI_interaction + residual_HD_ADC_ADEA_given_ADM_ADI_removed",
+  "design_note": "Uses the same four approximately non-overlapping anchors and eight mechanism-localization candidates as v1.0.8. This is a focused mechanistic decomposition, not a virgin confirmation set."
+}
