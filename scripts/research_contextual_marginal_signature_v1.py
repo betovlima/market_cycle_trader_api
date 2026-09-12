@@ -31,7 +31,7 @@ from market_cycle_trader_api.engine.market_data import validate_and_clean_bars  
 from market_cycle_trader_api.schemas.requests import BacktestRequest  # noqa: E402
 from market_cycle_trader_api.services import asset_discovery as discovery  # noqa: E402
 
-SCRIPT_VERSION = "contextual-marginal-signature-v1.0.0"
+SCRIPT_VERSION = "contextual-marginal-signature-v1.0.2"
 EXPERIMENT_NAME = "contextual_marginal_signature"
 DEFAULT_WORKERS = 4
 
@@ -132,6 +132,10 @@ def _utc_timestamp(value: Any) -> pd.Timestamp:
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
+def _utc_index(values: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(pd.to_datetime(pd.DatetimeIndex(values), utc=True)).sort_values()
+
+
 def select_decision_sessions(
     sessions: pd.DatetimeIndex,
     start: pd.Timestamp,
@@ -139,7 +143,7 @@ def select_decision_sessions(
     count: int,
     horizon_sessions: int,
 ) -> list[pd.Timestamp]:
-    ordered = pd.DatetimeIndex(sessions).sort_values()
+    ordered = _utc_index(sessions)
     start = _utc_timestamp(start)
     end = _utc_timestamp(end)
     count = max(1, int(count))
@@ -184,15 +188,15 @@ def _horizon_end(
     decision_session: pd.Timestamp,
     horizon_sessions: int,
 ) -> pd.Timestamp:
-    ordered = pd.DatetimeIndex(sessions).sort_values()
+    ordered = _utc_index(sessions)
     decision = _utc_timestamp(decision_session)
     position = int(ordered.searchsorted(decision, side="left"))
-    if position >= len(ordered) or _utc_timestamp(ordered[position]) != decision:
+    if position >= len(ordered) or pd.Timestamp(ordered[position]) != decision:
         raise RuntimeError(f"Decision session is not in the expected calendar: {decision.date()}")
     end_position = position + max(1, int(horizon_sessions)) - 1
     if end_position >= len(ordered):
         raise RuntimeError(f"Horizon exceeds snapshot for decision session {decision.date()}")
-    return _utc_timestamp(ordered[end_position])
+    return pd.Timestamp(ordered[end_position])
 
 
 def panel_completeness_issues(
@@ -230,7 +234,10 @@ def panel_completeness_issues(
 
 def _asof_rotation_row(frame: pd.DataFrame, decision: pd.Timestamp) -> pd.Series:
     decision = _utc_timestamp(decision)
-    eligible = frame.loc[frame.index <= decision]
+    index = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
+    normalized = frame.copy()
+    normalized.index = index
+    eligible = normalized.loc[normalized.index <= decision]
     if eligible.empty:
         raise RuntimeError(f"No point-in-time feature row is available at {decision.date()}")
     return eligible.iloc[-1]
@@ -241,9 +248,12 @@ def _equal_weight_return_series(
     symbols: list[str],
     decision: pd.Timestamp,
 ) -> pd.Series:
+    decision = _utc_timestamp(decision)
     columns: dict[str, pd.Series] = {}
     for symbol in symbols:
-        frame = raw_frames[symbol].loc[raw_frames[symbol].index <= decision]
+        frame = raw_frames[symbol].copy()
+        frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
+        frame = frame.loc[frame.index <= decision]
         close = pd.to_numeric(frame["close"], errors="coerce")
         columns[symbol] = close.pct_change()
     return pd.DataFrame(columns).mean(axis=1, skipna=True)
@@ -256,8 +266,11 @@ def _candidate_correlation(
     decision: pd.Timestamp,
     window: int,
 ) -> float:
+    decision = _utc_timestamp(decision)
     market = _equal_weight_return_series(raw_frames, seed_assets, decision)
-    candidate_frame = raw_frames[candidate].loc[raw_frames[candidate].index <= decision]
+    candidate_frame = raw_frames[candidate].copy()
+    candidate_frame.index = pd.DatetimeIndex(pd.to_datetime(candidate_frame.index, utc=True))
+    candidate_frame = candidate_frame.loc[candidate_frame.index <= decision]
     candidate_return = pd.to_numeric(candidate_frame["close"], errors="coerce").pct_change()
     aligned = pd.concat([candidate_return.rename("candidate"), market.rename("universe")], axis=1).dropna().tail(window)
     if len(aligned) < max(10, window // 2):
@@ -388,12 +401,7 @@ def _evaluate_candidate_window(
         context = discovery._research_context_compatibility(baseline_sessions, sessions)
         row.update(context)
         if not bool(context.get("research_context_compatible")):
-            row.update(
-                {
-                    "evaluation_status": "context_rejected",
-                    "error": "research_context_incomplete",
-                }
-            )
+            row.update({"evaluation_status": "context_rejected", "error": "research_context_incomplete"})
         else:
             baseline_capital = discovery._finite_number(baseline_metrics.get("ending_capital"))
             candidate_capital = discovery._finite_number(metrics.get("ending_capital"))
@@ -490,12 +498,7 @@ def temporal_ols_validation(
     predictions["predicted_positive"] = prediction > 0
     predictions["actual_positive"] = y_test > 0
 
-    coefficients = pd.DataFrame(
-        {
-            "feature": ["intercept", *active],
-            "standardized_ols_coefficient": beta,
-        }
-    )
+    coefficients = pd.DataFrame({"feature": ["intercept", *active], "standardized_ols_coefficient": beta})
 
     mae = float(np.mean(np.abs(prediction - y_test)))
     pearson = float(pd.Series(prediction).corr(pd.Series(y_test), method="pearson")) if len(test) > 1 else float("nan")
@@ -517,9 +520,7 @@ def temporal_ols_validation(
                 "mean_candidate_delta_log": float(group["delta_log_capital"].mean()),
                 "oracle_candidate": oracle["candidate"],
                 "oracle_delta_log": float(oracle["delta_log_capital"]),
-                "rank_spearman": float(
-                    group["predicted_delta_log_capital"].corr(group["delta_log_capital"], method="spearman")
-                ),
+                "rank_spearman": float(group["predicted_delta_log_capital"].corr(group["delta_log_capital"], method="spearman")),
             }
         )
     per_date = pd.DataFrame(per_date_rows)
@@ -615,7 +616,7 @@ def main() -> int:
         )
         identity = common._market_identity(stored_configuration)
         collection = db[common.ALPACA_MARKET_BARS_COLLECTION]
-        expected_sessions = common._expected_sessions(history_start, snapshot_end)
+        expected_sessions = _utc_index(common._expected_sessions(history_start, snapshot_end))
         decision_sessions = select_decision_sessions(
             expected_sessions,
             decision_start,
@@ -663,7 +664,7 @@ def main() -> int:
         _write_json(output_dir / "contextual_signature_manifest.json", manifest)
 
         _log(
-            f"Contextual Marginal Signature v1: seed={len(seed_assets)}, candidates={len(candidates)}, "
+            f"Contextual Marginal Signature v1.0.2: seed={len(seed_assets)}, candidates={len(candidates)}, "
             f"dates={len(decision_sessions)}, horizon={horizon_sessions} sessions."
         )
         _log("Loading one frozen local MongoDB market panel; no transient Alpaca candidate fetch is used.")
