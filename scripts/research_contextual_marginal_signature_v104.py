@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +12,9 @@ from sklearn.linear_model import Lasso, Ridge
 SCRIPT_VERSION = "contextual-marginal-signature-v1.0.4"
 EXPERIMENT_NAME = "contextual_marginal_signature_regularized_structure_test"
 
-# Keep the exact feature space from v1.0.3 except for the one algebraically
-# redundant feature documented below. The experiment consumes only the frozen
-# counterfactual dataset; it performs no market-data fetch and no replay.
+# Same contextual feature family as v1.0.3, except for the exact algebraic
+# redundancy below. This processor consumes only the frozen counterfactual CSV:
+# it performs no replay and fetches no market data.
 MODEL_FEATURES = [
     "relative__return_5",
     "relative__return_20",
@@ -41,6 +40,7 @@ REMOVED_EXACT_REDUNDANCY = {
 
 RIDGE_ALPHAS = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
 LASSO_ALPHAS = [0.00001, 0.00003, 0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03, 0.1]
+RANK_TOLERANCE = 1e-12
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -73,7 +73,14 @@ def _write_frame(path: Path, frame: pd.DataFrame) -> None:
 
 def _load_dataset(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
-    required = {"decision_date", "candidate", "evaluation_status", "delta_log_capital", *MODEL_FEATURES}
+    required = {
+        "decision_date",
+        "candidate",
+        "evaluation_status",
+        "ending_capital_delta_rate",
+        "delta_log_capital",
+        *MODEL_FEATURES,
+    }
     missing = sorted(required.difference(frame.columns))
     if missing:
         raise RuntimeError("Dataset is missing required columns: " + ", ".join(missing))
@@ -81,8 +88,7 @@ def _load_dataset(path: Path) -> pd.DataFrame:
     if completed.empty:
         raise RuntimeError("Dataset contains no completed counterfactual rows.")
     completed["decision_ts"] = pd.to_datetime(completed["decision_date"], utc=True, errors="raise")
-    completed = completed.sort_values(["decision_ts", "candidate"]).reset_index(drop=True)
-    return completed
+    return completed.sort_values(["decision_ts", "candidate"]).reset_index(drop=True)
 
 
 def _prepare_split(
@@ -129,11 +135,15 @@ def _date_forward_folds(train: pd.DataFrame, min_train_dates: int = 4) -> list[t
     return folds
 
 
-def _fit_predict_ols(x_train: np.ndarray, y_train: np.ndarray, x_test: np.ndarray) -> tuple[np.ndarray, np.ndarray, float | None]:
+def _fit_predict_ols(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     design_train = np.column_stack([np.ones(len(x_train)), x_train])
     design_test = np.column_stack([np.ones(len(x_test)), x_test])
     beta, *_ = np.linalg.lstsq(design_train, y_train, rcond=None)
-    return design_test @ beta, beta, None
+    return design_test @ beta, beta
 
 
 def _fit_regularized(kind: str, alpha: float, x_train: np.ndarray, y_train: np.ndarray):
@@ -154,7 +164,7 @@ def _inner_cv_select_alpha(
     train: pd.DataFrame,
     train_z: pd.DataFrame,
     y_train: pd.Series,
-) -> tuple[float, pd.DataFrame]:
+) -> tuple[float, pd.DataFrame, str]:
     folds = _date_forward_folds(train)
     if not folds:
         raise RuntimeError("Not enough distinct training dates for chronological inner validation.")
@@ -171,24 +181,45 @@ def _inner_cv_select_alpha(
             model = _fit_regularized(kind, alpha, x_fit, y_fit)
             prediction = np.asarray(model.predict(x_valid), dtype=float)
             fold_mae.append(float(np.mean(np.abs(prediction - y_valid))))
-            if len(prediction) >= 3:
+
+            # Whole-date ranking is the primary scientific target. Dates where
+            # either predictions or outcomes are constant carry no rank information.
+            if (
+                len(prediction) >= 3
+                and float(np.ptp(prediction)) > RANK_TOLERANCE
+                and float(np.ptp(y_valid)) > RANK_TOLERANCE
+            ):
                 value = pd.Series(prediction).corr(pd.Series(y_valid), method="spearman")
                 if pd.notna(value):
                     fold_spearman.append(float(value))
+
+        full_model = _fit_regularized(kind, alpha, train_z.to_numpy(dtype=float), y_train.to_numpy(dtype=float))
+        nonzero = int(np.sum(np.abs(np.asarray(full_model.coef_, dtype=float)) > 1e-12))
         rows.append({
             "model": kind,
             "alpha": float(alpha),
             "folds": int(len(folds)),
+            "rank_valid_folds": int(len(fold_spearman)),
             "mean_mae": float(np.mean(fold_mae)) if fold_mae else None,
             "mean_within_date_spearman": float(np.mean(fold_spearman)) if fold_spearman else None,
+            "full_train_nonzero_features": nonzero,
         })
 
     frame = pd.DataFrame(rows)
-    # Selection is intentionally based on MAE only. The final OOS ranking metrics remain untouched.
-    valid = frame.dropna(subset=["mean_mae"]).sort_values(["mean_mae", "alpha"], ascending=[True, True])
-    if valid.empty:
+    ranking = frame.loc[frame["rank_valid_folds"] >= 2].dropna(subset=["mean_within_date_spearman"])
+    if not ranking.empty:
+        # Maximize chronological within-date ranking; use lower MAE only to
+        # break equal/near-equal ranking performance, then prefer smaller alpha.
+        ranking = ranking.sort_values(
+            ["mean_within_date_spearman", "mean_mae", "alpha"],
+            ascending=[False, True, True],
+        )
+        return float(ranking.iloc[0]["alpha"]), frame, "mean_within_date_spearman"
+
+    fallback = frame.dropna(subset=["mean_mae"]).sort_values(["mean_mae", "alpha"], ascending=[True, True])
+    if fallback.empty:
         raise RuntimeError(f"Chronological alpha selection failed for {kind}.")
-    return float(valid.iloc[0]["alpha"]), frame
+    return float(fallback.iloc[0]["alpha"]), frame, "mean_mae_fallback_no_rank_signal"
 
 
 def _prediction_report(
@@ -207,42 +238,71 @@ def _prediction_report(
 
     per_date: list[dict[str, Any]] = []
     for decision_date, group in predictions.groupby("decision_date", sort=True):
-        chosen = group.sort_values(["predicted_delta_log_capital", "candidate"], ascending=[False, True]).iloc[0]
+        prediction_range = float(group["predicted_delta_log_capital"].max() - group["predicted_delta_log_capital"].min())
+        actual_range = float(group["delta_log_capital"].max() - group["delta_log_capital"].min())
+        ranking_eligible = prediction_range > RANK_TOLERANCE and actual_range > RANK_TOLERANCE
         oracle = group.sort_values(["delta_log_capital", "candidate"], ascending=[False, True]).iloc[0]
-        spearman = group["predicted_delta_log_capital"].corr(group["delta_log_capital"], method="spearman")
+
+        chosen_candidate = None
+        chosen_actual_delta_log = None
+        chosen_actual_delta_rate = None
+        rank_spearman = None
+        if ranking_eligible:
+            chosen = group.sort_values(["predicted_delta_log_capital", "candidate"], ascending=[False, True]).iloc[0]
+            chosen_candidate = str(chosen["candidate"])
+            chosen_actual_delta_log = float(chosen["delta_log_capital"])
+            chosen_actual_delta_rate = float(chosen["ending_capital_delta_rate"])
+            value = group["predicted_delta_log_capital"].corr(group["delta_log_capital"], method="spearman")
+            rank_spearman = None if pd.isna(value) else float(value)
+
         per_date.append({
             "model": model_name,
             "decision_date": decision_date,
-            "chosen_candidate": chosen["candidate"],
-            "chosen_actual_delta_log": float(chosen["delta_log_capital"]),
-            "chosen_actual_delta_rate": float(chosen["ending_capital_delta_rate"]),
+            "ranking_eligible": bool(ranking_eligible),
+            "prediction_range": prediction_range,
+            "actual_range": actual_range,
+            "chosen_candidate": chosen_candidate,
+            "chosen_actual_delta_log": chosen_actual_delta_log,
+            "chosen_actual_delta_rate": chosen_actual_delta_rate,
             "mean_candidate_delta_log": float(group["delta_log_capital"].mean()),
-            "oracle_candidate": oracle["candidate"],
+            "oracle_candidate": str(oracle["candidate"]),
             "oracle_delta_log": float(oracle["delta_log_capital"]),
-            "rank_spearman": None if pd.isna(spearman) else float(spearman),
+            "rank_spearman": rank_spearman,
         })
-    per_date_frame = pd.DataFrame(per_date)
 
+    per_date_frame = pd.DataFrame(per_date)
     pred_series = pd.Series(np.asarray(prediction, dtype=float), index=test.index)
     actual_series = pd.Series(y_test.to_numpy(dtype=float), index=test.index)
     majority_positive = bool(np.mean(y_train.to_numpy(dtype=float) > 0) >= 0.5)
-    pearson = pred_series.corr(actual_series, method="pearson")
-    spearman = pred_series.corr(actual_series, method="spearman")
+
+    pearson = None
+    spearman = None
+    if float(np.ptp(pred_series.to_numpy())) > RANK_TOLERANCE and float(np.ptp(actual_series.to_numpy())) > RANK_TOLERANCE:
+        p = pred_series.corr(actual_series, method="pearson")
+        s = pred_series.corr(actual_series, method="spearman")
+        pearson = None if pd.isna(p) else float(p)
+        spearman = None if pd.isna(s) else float(s)
+
+    eligible_dates = per_date_frame.loc[per_date_frame["ranking_eligible"]].copy()
+    chosen_values = pd.to_numeric(eligible_dates["chosen_actual_delta_log"], errors="coerce").dropna()
+    rank_values = pd.to_numeric(eligible_dates["rank_spearman"], errors="coerce").dropna()
     summary = {
         "model": model_name,
         "test_rows": int(len(test)),
         "test_dates": int(test["decision_date"].nunique()),
+        "ranking_eligible_dates": int(len(eligible_dates)),
+        "ranking_date_coverage": float(len(eligible_dates) / max(1, test["decision_date"].nunique())),
         "mae_delta_log_capital": float(np.mean(np.abs(pred_series.to_numpy() - actual_series.to_numpy()))),
-        "pearson_prediction_vs_actual": None if pd.isna(pearson) else float(pearson),
-        "spearman_prediction_vs_actual": None if pd.isna(spearman) else float(spearman),
+        "pearson_prediction_vs_actual": pearson,
+        "spearman_prediction_vs_actual": spearman,
         "sign_accuracy": float(np.mean((pred_series.to_numpy() > 0) == (actual_series.to_numpy() > 0))),
         "majority_sign_baseline_accuracy": float(np.mean((actual_series.to_numpy() > 0) == majority_positive)),
-        "mean_cross_sectional_rank_spearman": float(per_date_frame["rank_spearman"].dropna().mean()) if not per_date_frame.empty else None,
-        "top1_positive_rate": float((per_date_frame["chosen_actual_delta_log"] > 0).mean()) if not per_date_frame.empty else None,
-        "top1_negative_rate": float((per_date_frame["chosen_actual_delta_log"] < 0).mean()) if not per_date_frame.empty else None,
-        "mean_top1_actual_delta_log": float(per_date_frame["chosen_actual_delta_log"].mean()) if not per_date_frame.empty else None,
-        "mean_candidate_delta_log": float(per_date_frame["mean_candidate_delta_log"].mean()) if not per_date_frame.empty else None,
-        "mean_oracle_delta_log": float(per_date_frame["oracle_delta_log"].mean()) if not per_date_frame.empty else None,
+        "mean_cross_sectional_rank_spearman": float(rank_values.mean()) if len(rank_values) else None,
+        "top1_positive_rate": float((chosen_values > 0).mean()) if len(chosen_values) else None,
+        "top1_negative_rate": float((chosen_values < 0).mean()) if len(chosen_values) else None,
+        "mean_top1_actual_delta_log": float(chosen_values.mean()) if len(chosen_values) else None,
+        "mean_candidate_delta_log": float(per_date_frame["mean_candidate_delta_log"].mean()),
+        "mean_oracle_delta_log": float(per_date_frame["oracle_delta_log"].mean()),
     }
     return predictions, summary, per_date_frame
 
@@ -297,30 +357,33 @@ def main() -> int:
     x_test = test_z.to_numpy(dtype=float)
     y_train_np = y_train.to_numpy(dtype=float)
 
-    ols_prediction, ols_beta, _ = _fit_predict_ols(x_train, y_train_np, x_test)
-    ridge_alpha, ridge_cv = _inner_cv_select_alpha(
+    ols_prediction, ols_beta = _fit_predict_ols(x_train, y_train_np, x_test)
+    ridge_alpha, ridge_cv, ridge_selection_metric = _inner_cv_select_alpha(
         kind="ridge", alphas=RIDGE_ALPHAS, train=train, train_z=train_z, y_train=y_train
     )
-    lasso_alpha, lasso_cv = _inner_cv_select_alpha(
+    lasso_alpha, lasso_cv, lasso_selection_metric = _inner_cv_select_alpha(
         kind="lasso", alphas=LASSO_ALPHAS, train=train, train_z=train_z, y_train=y_train
     )
 
     ridge_model = _fit_regularized("ridge", ridge_alpha, x_train, y_train_np)
     lasso_model = _fit_regularized("lasso", lasso_alpha, x_train, y_train_np)
-    ridge_prediction = ridge_model.predict(x_test)
-    lasso_prediction = lasso_model.predict(x_test)
+    ridge_prediction = np.asarray(ridge_model.predict(x_test), dtype=float)
+    lasso_prediction = np.asarray(lasso_model.predict(x_test), dtype=float)
 
     prediction_frames: list[pd.DataFrame] = []
     per_date_frames: list[pd.DataFrame] = []
     summaries: list[dict[str, Any]] = []
-
     for name, prediction in [
         ("ols", ols_prediction),
         ("ridge", ridge_prediction),
         ("lasso", lasso_prediction),
     ]:
         pred_frame, summary, per_date = _prediction_report(
-            model_name=name, prediction=np.asarray(prediction, dtype=float), test=test, y_test=y_test, y_train=y_train
+            model_name=name,
+            prediction=np.asarray(prediction, dtype=float),
+            test=test,
+            y_test=y_test,
+            y_train=y_train,
         )
         prediction_frames.append(pred_frame)
         per_date_frames.append(per_date)
@@ -332,13 +395,20 @@ def main() -> int:
         _coefficient_frame("lasso", active, np.asarray(lasso_model.coef_, dtype=float), float(lasso_model.intercept_)),
     ]
 
-    zero_counts, zero_features = _zero_regime_report(dataset)
+    train_zero_counts, train_zero_features = _zero_regime_report(train)
+    test_zero_counts, test_zero_features = _zero_regime_report(test)
+    all_zero_counts, all_zero_features = _zero_regime_report(dataset)
+
     _write_frame(output_dir / "regularized_structure_predictions.csv", pd.concat(prediction_frames, ignore_index=True))
     _write_frame(output_dir / "regularized_structure_per_date.csv", pd.concat(per_date_frames, ignore_index=True))
     _write_frame(output_dir / "regularized_structure_coefficients.csv", pd.concat(coefficient_frames, ignore_index=True))
     _write_frame(output_dir / "regularized_structure_inner_cv.csv", pd.concat([ridge_cv, lasso_cv], ignore_index=True))
-    _write_frame(output_dir / "zero_regime_counts.csv", zero_counts)
-    _write_frame(output_dir / "zero_regime_feature_summary.csv", zero_features)
+    _write_frame(output_dir / "zero_regime_counts_train.csv", train_zero_counts)
+    _write_frame(output_dir / "zero_regime_feature_summary_train.csv", train_zero_features)
+    _write_frame(output_dir / "zero_regime_counts_validation.csv", test_zero_counts)
+    _write_frame(output_dir / "zero_regime_feature_summary_validation.csv", test_zero_features)
+    _write_frame(output_dir / "zero_regime_counts_all_descriptive.csv", all_zero_counts)
+    _write_frame(output_dir / "zero_regime_feature_summary_all_descriptive.csv", all_zero_features)
 
     matrix = np.column_stack([np.ones(len(x_train)), x_train])
     matrix_rank = int(np.linalg.matrix_rank(matrix))
@@ -361,18 +431,23 @@ def main() -> int:
         "train_design_columns": int(matrix.shape[1]),
         "train_design_condition_number": condition_number,
         "ridge_selected_alpha": ridge_alpha,
+        "ridge_alpha_selection_metric": ridge_selection_metric,
         "lasso_selected_alpha": lasso_alpha,
+        "lasso_alpha_selection_metric": lasso_selection_metric,
         "lasso_selected_features": [
-            feature for feature, value in zip(active, np.asarray(lasso_model.coef_, dtype=float)) if abs(float(value)) > 1e-12
+            feature
+            for feature, value in zip(active, np.asarray(lasso_model.coef_, dtype=float))
+            if abs(float(value)) > 1e-12
         ],
         "models": summaries,
         "decision_rule": (
-            "Regularized evidence is considered interesting only if OOS ranking remains positive and top-1 actual "
-            "delta improves over the candidate mean; sign accuracy is descriptive because the target is zero-inflated."
+            "Evidence is interesting only if chronological pre-2024 inner validation preserves within-date ranking and "
+            "the untouched 2024-2025 test also keeps positive ranking with top-1 actual delta above the candidate mean. "
+            "Sign accuracy is descriptive because the target is strongly zero-inflated."
         ),
         "research_policy": (
             "No replay, no market-data fetch, no tuning on 2024-2025. Ridge/Lasso alpha is selected only by "
-            "chronological, whole-decision-date validation inside the pre-2024 training period."
+            "chronological whole-decision-date validation inside the pre-2024 training period."
         ),
     }
     _write_json(output_dir / "regularized_structure_summary.json", summary)
@@ -381,7 +456,9 @@ def main() -> int:
         "status": "completed",
         "script_version": SCRIPT_VERSION,
         "ridge_alpha": ridge_alpha,
+        "ridge_selection_metric": ridge_selection_metric,
         "lasso_alpha": lasso_alpha,
+        "lasso_selection_metric": lasso_selection_metric,
         "lasso_selected_features": summary["lasso_selected_features"],
         "output_dir": str(output_dir),
     }, indent=2))
