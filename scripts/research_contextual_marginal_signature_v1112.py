@@ -60,6 +60,7 @@ def main() -> int:
     # This version changes observability only: replay inputs, outputs and ordering
     # remain unchanged.
     base.SCRIPT_VERSION = SCRIPT_VERSION
+    storage.SCRIPT_VERSION = SCRIPT_VERSION
     base._save_capture = storage._compact_save_capture
     base._log = _progress_log
     base._run_with_capture = _run_with_heartbeat
