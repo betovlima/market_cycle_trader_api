@@ -1,0 +1,26 @@
+{
+  "universes": [
+    {
+      "name": "Original25",
+      "assets": [
+        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY",
+        "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V",
+        "HD", "ADC", "ADEA", "ADI", "ADM"
+      ]
+    },
+    {
+      "name": "Original20_DropFirst5",
+      "assets": [
+        "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST",
+        "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADI", "ADM"
+      ]
+    },
+    {
+      "name": "Original20_DropLast5",
+      "assets": [
+        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY",
+        "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V"
+      ]
+    }
+  ]
+}
