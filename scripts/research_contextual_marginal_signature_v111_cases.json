@@ -4,7 +4,8 @@
     "Original25",
     "Original24_MinusADM",
     "Original24_MinusADI",
-    "Original23_MinusADM_ADI"
+    "Original23_MinusADM_ADI",
+    "Original20_DropLast5"
   ],
   "cases": [
     {"decision_date": "2026-01-02", "candidates": ["APD", "VNCE", "XSD"]},
@@ -12,5 +13,5 @@
     {"decision_date": "2026-05-01", "candidates": ["APD", "VNCE"]},
     {"decision_date": "2026-07-01", "candidates": ["APD", "VNCE"]}
   ],
-  "purpose": "Explain where the simulator path first diverges for the nine candidate/date cases that account for the observed ADM/ADI state changes. This is a mechanism audit, not a predictive-model fit."
+  "purpose": "Explain where the simulator path first diverges for the nine candidate/date cases that account for the observed ADM/ADI state changes, and verify whether MinusADM_ADI and DropLast5 are path-identical or only endpoint-identical. This is a mechanism audit, not a predictive-model fit."
 }
