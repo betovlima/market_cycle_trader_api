@@ -1,0 +1,34 @@
+{
+  "experiment": "contextual-marginal-signature-v1.0.8-leave-one-out-enabler-attribution",
+  "base_universe": "Original25",
+  "hypothesis": "The monotone loss of candidate marginal contribution observed when HD/ADC/ADEA/ADI/ADM are removed is driven by one or a small subset of those incumbent assets rather than by universe-size reduction alone.",
+  "universes": [
+    {
+      "name": "Original25",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADI", "ADM"]
+    },
+    {
+      "name": "Original24_MinusHD",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "ADC", "ADEA", "ADI", "ADM"]
+    },
+    {
+      "name": "Original24_MinusADC",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADEA", "ADI", "ADM"]
+    },
+    {
+      "name": "Original24_MinusADEA",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADI", "ADM"]
+    },
+    {
+      "name": "Original24_MinusADI",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADM"]
+    },
+    {
+      "name": "Original24_MinusADM",
+      "assets": ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "JPM", "SPY", "AVGO", "NFLX", "CRM", "ORCL", "COST", "LLY", "XOM", "CAT", "WMT", "V", "HD", "ADC", "ADEA", "ADI"]
+    }
+  ],
+  "recommended_candidates": ["MKSI", "XSD", "VNCE", "APD", "CORT", "GKOS", "CLMT", "CCK"],
+  "recommended_decision_dates": ["2026-01-02", "2026-03-02", "2026-05-01", "2026-07-01"],
+  "design_note": "The four recommended dates are the non-overlapping 40-session anchor dates identified by the cluster-aware v1.0.7 analysis. Candidate selection deliberately includes highly universe-sensitive cases plus stable/near-stable controls. This is mechanism localization, not a virgin confirmation set."
+}
