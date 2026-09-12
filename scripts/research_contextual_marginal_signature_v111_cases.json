@@ -1,0 +1,16 @@
+{
+  "experiment": "contextual-marginal-signature-v1.0.11-path-attribution",
+  "universes": [
+    "Original25",
+    "Original24_MinusADM",
+    "Original24_MinusADI",
+    "Original23_MinusADM_ADI"
+  ],
+  "cases": [
+    {"decision_date": "2026-01-02", "candidates": ["APD", "VNCE", "XSD"]},
+    {"decision_date": "2026-03-02", "candidates": ["APD", "VNCE"]},
+    {"decision_date": "2026-05-01", "candidates": ["APD", "VNCE"]},
+    {"decision_date": "2026-07-01", "candidates": ["APD", "VNCE"]}
+  ],
+  "purpose": "Explain where the simulator path first diverges for the nine candidate/date cases that account for the observed ADM/ADI state changes. This is a mechanism audit, not a predictive-model fit."
+}
