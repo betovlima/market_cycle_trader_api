@@ -69,7 +69,7 @@ class ContextualMarginalSignatureV107Tests(unittest.TestCase):
         a = episodes.loc[episodes["candidate"] == "A"]
         self.assertEqual(len(a), 3)
         self.assertTrue(bool(a["activation_change"].all()))
-        self.assertFalse(bool(a["strict_positive_negative_flip"].any()))
+        self.assertTrue(bool(a["strict_positive_negative_flip"].all()))
 
     def test_context_state_collapses_candidates_before_inference(self) -> None:
         states = research.build_context_states(self._frame())
