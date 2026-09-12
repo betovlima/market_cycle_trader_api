@@ -60,9 +60,21 @@ class ContextualMarginalSignatureV105Tests(unittest.TestCase):
         cv = research._inner_cv(frame)
         selected = research._select_depth(cv)
         self.assertIn(selected, (2, 3))
+
         depth1 = float(cv.loc[cv["max_depth"] == 1, "mean_within_date_spearman"].iloc[0])
+        depth1_rank_folds = int(cv.loc[cv["max_depth"] == 1, "rank_valid_folds"].iloc[0])
         selected_score = float(cv.loc[cv["max_depth"] == selected, "mean_within_date_spearman"].iloc[0])
-        self.assertGreater(selected_score, depth1)
+        selected_rank_folds = int(cv.loc[cv["max_depth"] == selected, "rank_valid_folds"].iloc[0])
+
+        # Depth 1 can legitimately collapse to tied predictions in every
+        # chronological validation date. In that case Spearman is undefined
+        # (NaN), so it must be treated as non-rankable rather than compared as
+        # a numeric score. _select_depth intentionally drops such rows.
+        self.assertTrue(np.isnan(depth1))
+        self.assertEqual(depth1_rank_folds, 0)
+        self.assertTrue(np.isfinite(selected_score))
+        self.assertGreater(selected_score, 0.0)
+        self.assertGreater(selected_rank_folds, 0)
 
     def test_tied_predictions_are_not_reported_as_top1(self) -> None:
         rows = [
