@@ -60,6 +60,13 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
 
 
+def _utc_timestamp(value: Any) -> pd.Timestamp:
+    stamp = pd.Timestamp(value)
+    if stamp.tzinfo is None:
+        return stamp.tz_localize("UTC")
+    return stamp.tz_convert("UTC")
+
+
 def _model(alpha: float):
     return make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), Ridge(alpha=float(alpha)))
 
@@ -112,17 +119,20 @@ def _tune(development: pd.DataFrame, features: list[str]) -> tuple[float, list[d
         oof = pd.concat(folds, ignore_index=True)
         metrics = _metrics(oof, "prediction")
         rows.append({"alpha": alpha, **{k: metrics[k] for k in ("pooled_spearman", "mean_context_spearman", "mae", "rmse")}})
+
     def key(row: dict[str, Any]) -> tuple[float, float, float]:
         return (
             float(row["pooled_spearman"] if row["pooled_spearman"] is not None else -999.0),
             float(row["mean_context_spearman"] if row["mean_context_spearman"] is not None else -999.0),
             -float(row["mae"]),
         )
+
     return float(max(rows, key=key)["alpha"]), rows
 
 
 def _baseline_state(frozen: Path, decision_date: pd.Timestamp, universe: str) -> dict[str, Any]:
-    case = pd.Timestamp(decision_date).date().isoformat()
+    execution_start = _utc_timestamp(decision_date).normalize()
+    case = execution_start.date().isoformat()
     path = frozen / "traces" / case / universe / "BASELINE" / "b00_p.csv"
     if not path.exists():
         raise RuntimeError(f"Missing baseline prediction trace: {path}")
@@ -130,11 +140,8 @@ def _baseline_state(frozen: Path, decision_date: pd.Timestamp, universe: str) ->
     if predictions.empty or "decision_date" not in predictions.columns:
         raise RuntimeError(f"Baseline trace has no causal decision row: {path}")
     first = predictions.iloc[0]
-    feature_asof = pd.Timestamp(first["decision_date"])
-    if feature_asof.tzinfo is not None:
-        feature_asof = feature_asof.tz_convert("UTC").tz_localize(None)
-    feature_asof = feature_asof.normalize()
-    if feature_asof >= pd.Timestamp(decision_date).normalize():
+    feature_asof = _utc_timestamp(first["decision_date"]).normalize()
+    if feature_asof >= execution_start:
         raise RuntimeError(
             f"Causal cutoff must precede first execution session: cutoff={feature_asof.date()}, execution={case}."
         )
@@ -154,7 +161,7 @@ def _baseline_state(frozen: Path, decision_date: pd.Timestamp, universe: str) ->
 def _load_dataset(frozen: Path, window: int, proxy: str) -> tuple[pd.DataFrame, dict[str, Any]]:
     manifest = json.loads((frozen / "trace_manifest.json").read_text(encoding="utf-8"))
     aggregate = pd.read_csv(frozen / "trace_aggregate_dataset.csv")
-    aggregate["decision_date"] = pd.to_datetime(aggregate["decision_date"])
+    aggregate["decision_date"] = pd.to_datetime(aggregate["decision_date"], utc=True)
     aggregate["candidate"] = aggregate["candidate"].astype(str).str.upper()
     aggregate["delta_log_capital"] = pd.to_numeric(aggregate["delta_log_capital"], errors="raise")
     nonzero = aggregate[aggregate["delta_log_capital"].abs() > TOLERANCE]
@@ -185,10 +192,10 @@ def _load_dataset(frozen: Path, window: int, proxy: str) -> tuple[pd.DataFrame, 
     for item in aggregate.to_dict(orient="records"):
         universe = str(item["universe_name"])
         candidate = str(item["candidate"])
-        execution_start = pd.Timestamp(item["decision_date"])
+        execution_start = _utc_timestamp(item["decision_date"]).normalize()
         key = (execution_start.date().isoformat(), universe)
         state = state_cache.setdefault(key, _baseline_state(frozen, execution_start, universe))
-        feature_asof = pd.Timestamp(state["feature_asof_date"])
+        feature_asof = _utc_timestamp(state["feature_asof_date"]).normalize()
         static = v103.build_feature_snapshot(
             candidate=candidate,
             seed_assets=universe_map[universe],
@@ -244,7 +251,7 @@ def main() -> int:
         _fresh(output)
     output.mkdir(parents=True, exist_ok=True)
     dataset, source = _load_dataset(frozen, int(args.window_sessions), str(args.market_proxy).upper())
-    boundary = pd.Timestamp(args.validation_start)
+    boundary = _utc_timestamp(args.validation_start).normalize()
     development = dataset[dataset["decision_date"] < boundary].copy()
     validation = dataset[dataset["decision_date"] >= boundary].copy()
     if development["decision_date"].nunique() < 3 or validation.empty:
