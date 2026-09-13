@@ -15,7 +15,7 @@ for _export_name in dir(_impl):
     if not _export_name.startswith("_"):
         globals().setdefault(_export_name, getattr(_impl, _export_name))
 
-SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.4"
+SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.5"
 _impl.SCRIPT_VERSION = SCRIPT_VERSION
 _impl.prev.SCRIPT_VERSION = SCRIPT_VERSION
 
@@ -61,6 +61,15 @@ def _render_candidate_ranking(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def _validation_text(result: dict[str, Any]) -> str:
+    return (
+        f"capital relative error={result['capital_relative_error']:.3e} | "
+        f"sessions={'YES' if result['sessions_identical'] else 'NO'} | "
+        f"predictions={'YES' if result['predictions_identical'] else 'NO'} | "
+        f"trades={'YES' if result['trades_identical'] else 'NO'}"
+    )
+
+
 def main() -> int:
     from market_cycle_trader_api.engine import (
         capital_rotation,
@@ -75,6 +84,7 @@ def main() -> int:
         capital_rotation,
     )
     cache.install()
+    cache_disabled_reason: str | None = None
 
     original_run_replay = _impl._run_replay
     original_load_market_frames = protocol._load_market_frames
@@ -83,14 +93,17 @@ def main() -> int:
     original_partial_analysis = live.partial_analysis
 
     def cached_run_replay(**kwargs: Any):
+        nonlocal cache_disabled_reason
+
         cache.ensure_state(kwargs["decision"])
         candidate = str(
             kwargs.get("candidate") or ""
         ).strip().upper()
         forced = bool(kwargs.get("forced"))
+        config = kwargs.get("config")
         mode = str(
             getattr(
-                kwargs.get("config"),
+                config,
                 "strategy_mode",
                 "",
             )
@@ -101,6 +114,10 @@ def main() -> int:
         )
         if not eligible:
             return original_run_replay(**kwargs)
+
+        if cache_disabled_reason is not None:
+            with cache.suspended_cache():
+                return original_run_replay(**kwargs)
 
         key = _pair_key(kwargs)
         if not forced:
@@ -127,21 +144,76 @@ def main() -> int:
                 cache.record_validation(validation)
                 live.console_log(
                     "    [cache-validation] "
-                    f"capital relative error="
-                    f"{validation['capital_relative_error']:.3e} | "
-                    f"sessions="
-                    f"{'YES' if validation['sessions_identical'] else 'NO'} | "
-                    f"predictions="
-                    f"{'YES' if validation['predictions_identical'] else 'NO'} | "
-                    f"trades="
-                    f"{'YES' if validation['trades_identical'] else 'NO'}"
+                    + _validation_text(validation)
                 )
                 if not bool(validation["passed"]):
                     cache.abort_pair()
-                    raise RuntimeError(
-                        "RAM acceleration equivalence validation failed; "
-                        "campaign stopped before trusting cached results."
+                    live.console_log(
+                        "    [cache-validation] accelerated replay diverged; "
+                        "running one second uncached replay to separate a cache "
+                        "defect from underlying replay nondeterminism"
                     )
+                    with cache.suspended_cache():
+                        uncached_repeat = original_run_replay(**kwargs)
+                    uncached_validation = compare_replay_outputs(
+                        reference,
+                        uncached_repeat,
+                        tolerance=1e-12,
+                    )
+                    live.console_log(
+                        "    [cache-validation-uncached] "
+                        + _validation_text(uncached_validation)
+                    )
+
+                    if bool(uncached_validation["passed"]):
+                        cache_disabled_reason = (
+                            "accelerated replay differed while two uncached "
+                            "replays were equivalent"
+                        )
+                        cache.record_validation(
+                            {
+                                **validation,
+                                "cache_disabled": True,
+                                "cache_disabled_reason": cache_disabled_reason,
+                                "uncached_repeat_validation": uncached_validation,
+                            }
+                        )
+                        live.console_log(
+                            "    [cache-validation] SAFE FALLBACK | RAM acceleration "
+                            "disabled for this process; campaign continues with the "
+                            "trusted uncached protocol"
+                        )
+                        return reference
+
+                    deterministic = bool(
+                        getattr(config, "deterministic_execution", False)
+                    )
+                    xgb_n_jobs = getattr(config, "xgb_n_jobs", None)
+                    numeric_thread_limit = getattr(
+                        config,
+                        "numeric_thread_limit",
+                        None,
+                    )
+                    cache.record_validation(
+                        {
+                            **validation,
+                            "cache_disabled": True,
+                            "underlying_replay_deterministic": False,
+                            "uncached_repeat_validation": uncached_validation,
+                            "deterministic_execution": deterministic,
+                            "xgb_n_jobs": xgb_n_jobs,
+                            "numeric_thread_limit": numeric_thread_limit,
+                        }
+                    )
+                    raise RuntimeError(
+                        "Underlying uncached replay is not exactly reproducible; "
+                        "RAM cache is not the only source of divergence. "
+                        f"uncached check: {_validation_text(uncached_validation)} | "
+                        f"deterministic_execution={deterministic}, "
+                        f"xgb_n_jobs={xgb_n_jobs}, "
+                        f"numeric_thread_limit={numeric_thread_limit}."
+                    )
+
                 live.console_log(
                     "    [cache-validation] PASS | invariant RAM "
                     "cache is numerically equivalent to uncached replay"
@@ -245,7 +317,9 @@ def main() -> int:
                 universe_count,
             )
         )
-        result["runtime_memory_cache"] = cache.summary()
+        runtime = cache.summary()
+        runtime["cache_disabled_reason"] = cache_disabled_reason
+        result["runtime_memory_cache"] = runtime
         return result
 
     def log_partial_with_runtime(
@@ -268,11 +342,14 @@ def main() -> int:
         validation = (
             stats.get("equivalence_validation") or {}
         )
-        validation_text = (
-            "PASS"
-            if validation.get("passed")
-            else "pending"
-        )
+        if cache_disabled_reason is not None:
+            validation_text = "SAFE_FALLBACK_UNCACHED"
+        else:
+            validation_text = (
+                "PASS"
+                if validation.get("passed")
+                else "pending"
+            )
         live.console_log(
             f"[cache] cumulative | "
             f"pairs={stats['completed_pairs']} | "
@@ -322,7 +399,7 @@ def main() -> int:
 
     live.console_log(
         f"[runtime] {SCRIPT_VERSION} | "
-        "guarded RAM acceleration enabled"
+        "guarded RAM acceleration with safe uncached fallback enabled"
     )
     live.console_log(
         "[memory] reusable=invariant market feature frames + "
@@ -332,8 +409,9 @@ def main() -> int:
         "holding days"
     )
     live.console_log(
-        "[memory] first eligible candidate performs an automatic "
-        "uncached-vs-cached equivalence check before continuing"
+        "[memory] first eligible candidate validates uncached-vs-cached; "
+        "on mismatch a second uncached replay distinguishes cache divergence "
+        "from underlying nondeterminism"
     )
 
     try:
