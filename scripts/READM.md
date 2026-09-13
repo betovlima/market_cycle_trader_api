@@ -2,7 +2,7 @@
 
 Branch permanente: `research/contextual-marginal-signature-v1`
 
-Runtime científico atual: `contextual-marginal-signature-v1.0.17.4`
+Runtime científico atual: `contextual-marginal-signature-v1.0.17.5`
 
 Este é o único documento vivo da linha Contextual Marginal Signature. Não criar READMEs por versão. O histórico do Git preserva implementações e documentos antigos.
 
@@ -153,6 +153,20 @@ O primeiro par elegível executa uma referência sem cache e uma execução acel
 
 Nesta mesma versão técnica, a implementação incremental histórica foi achatada. O código ativo deixou de depender de aliases `v111`, `v1144`, `v116`, `v117`, `v1172` ou wrappers equivalentes. Os scripts de pesquisas anteriores foram removidos desta branch; o histórico permanece no Git.
 
+### v1.0.17.5 — diagnóstico de divergência e fallback seguro
+
+O primeiro teste real da v1.0.17.4 detectou divergência entre a referência sem cache e a execução acelerada e abortou corretamente antes de confiar no cache.
+
+A v1.0.17.5 mantém o mesmo protocolo científico e torna esse guard mais informativo e resiliente:
+
+- primeiro compara `uncached reference` contra `accelerated`;
+- se houver divergência, executa uma segunda repetição sem cache;
+- se as duas execuções sem cache forem equivalentes, a divergência é atribuída à aceleração, o cache é desativado para o processo e a campanha continua pela execução sem cache confiável;
+- se as duas execuções sem cache também divergirem, a campanha para com diagnóstico explícito de não determinismo subjacente, incluindo `deterministic_execution`, `xgb_n_jobs` e `numeric_thread_limit`;
+- nenhum resultado acelerado divergente é persistido como observação científica.
+
+Assim, uma otimização de performance não pode bloquear a pesquisa quando o caminho sem cache é estável, nem mascarar um problema real de reprodutibilidade quando o próprio replay sem cache diverge.
+
 ## Estrutura atual
 
 A pasta `scripts` desta branch contém somente a linha ativa:
@@ -221,4 +235,5 @@ Não adicionar modelos indefinidamente para fabricar um vencedor.
 - Não apagar as coleções Mongo ao atualizar o código.
 - Uma falha técnica pode parar o processo, mas observações concluídas devem permanecer recuperáveis.
 - Antes de confiar em uma nova otimização, exigir equivalência determinística.
+- Se o cache falhar e o replay sem cache for estável, continuar sem cache em vez de sacrificar a campanha.
 - Os logs devem continuar permitindo análise parcial durante a campanha.
