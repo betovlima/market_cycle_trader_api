@@ -50,6 +50,37 @@ def _campaign(path_universe: Path, path_cases: Path):
     return symbols, universes, cases
 
 
+def _load_alpaca_origin(symbol: str, config: Any, snapshot_end: pd.Timestamp, market_data: Any):
+    try:
+        frame = market_data.load_market_bars(symbol, config)
+        frame = market_data.validate_and_clean_bars(frame, config)
+        return frame, "mongo_cache"
+    except RuntimeError as exc:
+        text = str(exc).lower()
+        recoverable = (
+            "marketdatamissinginmongodb" in text
+            or "marketdataincomplete" in text
+            or "incomplete mongodb market history" in text
+        )
+        if not recoverable:
+            raise
+        base._log(f"  {symbol}: cache unavailable/incomplete; downloading locked range from Alpaca")
+        frame = market_data._download_alpaca_bars(
+            symbol,
+            config,
+            config.start_date,
+            snapshot_end.date().isoformat(),
+        )
+        if frame is None or frame.empty:
+            raise RuntimeError(f"Alpaca returned no history for {symbol}.") from exc
+        frame = market_data.validate_and_clean_bars(frame, config)
+        if not market_data._end_is_complete(frame, config):
+            raise RuntimeError(
+                f"Alpaca history for {symbol} does not reach {snapshot_end.date().isoformat()}."
+            )
+        return frame, "alpaca_download"
+
+
 def main() -> int:
     args = _parser().parse_args()
     base.load_project_environment(args.env_file)
@@ -79,7 +110,7 @@ def main() -> int:
 
         config = BacktestRequest.model_validate(stored).model_copy(update={
             "end_date": snapshot_end.date().isoformat(),
-            "research_market_data_mode": "backtest_bootstrap_missing",
+            "research_market_data_mode": "database_only",
             "mongo_cache_enabled": True,
             "market_data_require_complete_history": True,
         })
@@ -87,16 +118,16 @@ def main() -> int:
         sources = []
         for index, symbol in enumerate(symbols, 1):
             base._log(f"[{index}/{len(symbols)}] Alpaca-origin market data: {symbol}")
-            frame = market_data.validate_and_clean_bars(market_data.load_market_bars(symbol, config), config)
+            frame, source = _load_alpaca_origin(symbol, config, snapshot_end, market_data)
             frames[symbol] = frame
             provenance = dict(frame.attrs.get("market_data_provenance") or {})
             sources.append({
                 "symbol": symbol,
+                "source": source,
                 "rows": len(frame),
                 "first": pd.Timestamp(frame.index.min()).isoformat(),
                 "last": pd.Timestamp(frame.index.max()).isoformat(),
                 "access": provenance.get("research_access_path"),
-                "bootstrap_rows": int(provenance.get("cache_bootstrap_rows") or 0),
             })
 
         snapshot = base._snapshot_table(frames)
