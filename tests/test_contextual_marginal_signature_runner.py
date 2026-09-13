@@ -60,7 +60,9 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
 
     def test_readiness_requires_temporal_diversity_and_intervention_abstention(self) -> None:
         rows = []
-        for date_index, date in enumerate(runner.DECISION_DATES[:20]):
+        # Exercise the complete planned campaign because readiness intentionally
+        # requires the full seven-year temporal span, not merely the first 20 states.
+        for date_index, date in enumerate(runner.DECISION_DATES):
             for universe in ("U1", "U2"):
                 for candidate_index, candidate in enumerate(runner.CANDIDATES):
                     if date_index % 5 == 0:
@@ -80,6 +82,7 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertTrue(result["both_signs"])
         self.assertTrue(result["intervention_and_abstention"])
         self.assertTrue(result["temporal_states"])
+        self.assertTrue(result["year_diversity"])
 
     def test_partial_analysis_identifies_policy_abstention_context(self) -> None:
         frame = pd.DataFrame(
