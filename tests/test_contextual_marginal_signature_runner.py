@@ -16,6 +16,7 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
 import research_contextual_marginal_signature as runner  # noqa: E402
+import research_contextual_marginal_signature_v1172 as implementation  # noqa: E402
 import research_contextual_signature_analysis as analysis  # noqa: E402
 import research_contextual_signature_storage as storage  # noqa: E402
 
@@ -84,11 +85,12 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
             "universe_name": "Original25",
             "candidate": "XSD",
         }
+        expected = (runner.DECISION_DATES[0], "Original25", "XSD")
+        self.assertEqual(implementation._observation_key(row), expected)
         self.assertEqual(
-            runner._observation_key(row),
-            (runner.DECISION_DATES[0], "Original25", "XSD"),
+            implementation._observation_key(row),
+            implementation._observation_key(dict(row)),
         )
-        self.assertEqual(runner._observation_key(row), runner._observation_key(dict(row)))
 
     def test_readiness_requires_temporal_diversity_and_intervention_abstention(self) -> None:
         rows = []
