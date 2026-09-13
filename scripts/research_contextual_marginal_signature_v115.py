@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import make_pipeline
@@ -22,6 +23,14 @@ EXPERIMENT_NAME = "contextual_marginal_signature_predictive_screen"
 TOLERANCE = 1e-12
 ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0)
 STATIC_FEATURES = tuple(v103.MODEL_FEATURES)
+POLICY_FEATURES = (
+    "baseline_best_score",
+    "baseline_universe_score_mean",
+    "baseline_universe_score_std",
+    "baseline_positive_score_ratio",
+    "baseline_effective_switch_margin",
+)
+M0_FEATURES = (*STATIC_FEATURES, *POLICY_FEATURES)
 LEVEL2_FEATURES = tuple(
     f"logsig2__{v113.CHANNELS[i]}__{v113.CHANNELS[j]}"
     for i, j in combinations(range(len(v113.CHANNELS)), 2)
@@ -29,7 +38,7 @@ LEVEL2_FEATURES = tuple(
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Chronological M0 versus M0+LogSig2 predictive screen.")
+    p = argparse.ArgumentParser(description="Chronological causal M0 versus M0+LogSig2 predictive screen.")
     p.add_argument("--frozen-dir", required=True)
     p.add_argument("--window-sessions", type=int, default=60)
     p.add_argument("--validation-start", default="2026-01-01")
@@ -49,6 +58,10 @@ def _fresh(path: Path) -> None:
 
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+
+
+def _model(alpha: float):
+    return make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), Ridge(alpha=float(alpha)))
 
 
 def _spearman(frame: pd.DataFrame, pred: str) -> float | None:
@@ -92,7 +105,7 @@ def _tune(development: pd.DataFrame, features: list[str]) -> tuple[float, list[d
         for date in sorted(development["decision_date"].unique()):
             train = development[development["decision_date"] != date]
             test = development[development["decision_date"] == date].copy()
-            model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
+            model = _model(alpha)
             model.fit(train[features], train["delta_log_capital"])
             test["prediction"] = model.predict(test[features])
             folds.append(test)
@@ -106,6 +119,36 @@ def _tune(development: pd.DataFrame, features: list[str]) -> tuple[float, list[d
             -float(row["mae"]),
         )
     return float(max(rows, key=key)["alpha"]), rows
+
+
+def _baseline_state(frozen: Path, decision_date: pd.Timestamp, universe: str) -> dict[str, Any]:
+    case = pd.Timestamp(decision_date).date().isoformat()
+    path = frozen / "traces" / case / universe / "BASELINE" / "b00_p.csv"
+    if not path.exists():
+        raise RuntimeError(f"Missing baseline prediction trace: {path}")
+    predictions = pd.read_csv(path)
+    if predictions.empty or "decision_date" not in predictions.columns:
+        raise RuntimeError(f"Baseline trace has no causal decision row: {path}")
+    first = predictions.iloc[0]
+    feature_asof = pd.Timestamp(first["decision_date"])
+    if feature_asof.tzinfo is not None:
+        feature_asof = feature_asof.tz_convert("UTC").tz_localize(None)
+    feature_asof = feature_asof.normalize()
+    if feature_asof >= pd.Timestamp(decision_date).normalize():
+        raise RuntimeError(
+            f"Causal cutoff must precede first execution session: cutoff={feature_asof.date()}, execution={case}."
+        )
+    positive = float(first.get("positive_score_count", np.nan))
+    finite = float(first.get("finite_score_count", np.nan))
+    ratio = positive / finite if np.isfinite(positive) and np.isfinite(finite) and finite > 0 else np.nan
+    return {
+        "feature_asof_date": feature_asof,
+        "baseline_best_score": float(first.get("best_score", np.nan)),
+        "baseline_universe_score_mean": float(first.get("universe_score_mean", np.nan)),
+        "baseline_universe_score_std": float(first.get("universe_score_std", np.nan)),
+        "baseline_positive_score_ratio": float(ratio),
+        "baseline_effective_switch_margin": float(first.get("effective_switch_margin", np.nan)),
+    }
 
 
 def _load_dataset(frozen: Path, window: int, proxy: str) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -138,35 +181,44 @@ def _load_dataset(frozen: Path, window: int, proxy: str) -> tuple[pd.DataFrame, 
     close = v113._load_close_panel(frozen)
 
     rows = []
+    state_cache: dict[tuple[str, str], dict[str, Any]] = {}
     for item in aggregate.to_dict(orient="records"):
         universe = str(item["universe_name"])
         candidate = str(item["candidate"])
-        decision = pd.Timestamp(item["decision_date"])
+        execution_start = pd.Timestamp(item["decision_date"])
+        key = (execution_start.date().isoformat(), universe)
+        state = state_cache.setdefault(key, _baseline_state(frozen, execution_start, universe))
+        feature_asof = pd.Timestamp(state["feature_asof_date"])
         static = v103.build_feature_snapshot(
             candidate=candidate,
             seed_assets=universe_map[universe],
             rotation_frames=rotation,
             raw_frames=raw,
-            decision=decision,
+            decision=feature_asof,
             market_proxy=proxy,
         )
         path, _ = v113._joint_path(
             close,
             candidate=candidate,
             universe_assets=universe_map[universe],
-            decision_date=decision.date().isoformat(),
+            decision_date=feature_asof.date().isoformat(),
             window_sessions=window,
         )
         logsig = v113._level2_logsignature(path)
         rows.append({
-            "decision_date": decision,
+            "decision_date": execution_start,
+            "feature_asof_date": feature_asof,
             "universe_name": universe,
             "candidate": candidate,
             "delta_log_capital": float(item["delta_log_capital"]),
             **{name: float(static[name]) for name in STATIC_FEATURES},
+            **{name: float(state[name]) for name in POLICY_FEATURES},
             **{name: float(logsig[name]) for name in LEVEL2_FEATURES},
         })
-    return pd.DataFrame(rows), {"manifest": manifest, "readiness": readiness, "nonzero": len(nonzero)}
+    dataset = pd.DataFrame(rows)
+    if not bool((dataset["feature_asof_date"] < dataset["decision_date"]).all()):
+        raise RuntimeError("Predictive dataset contains non-causal feature cutoffs.")
+    return dataset, {"manifest": manifest, "readiness": readiness, "nonzero": len(nonzero)}
 
 
 def _passes(m0: dict[str, Any], m1: dict[str, Any]) -> bool:
@@ -199,16 +251,16 @@ def main() -> int:
         raise RuntimeError("Chronological split is too small.")
 
     model_features = {
-        "M0_static_context": list(STATIC_FEATURES),
-        "M1_static_plus_logsig2": [*STATIC_FEATURES, *LEVEL2_FEATURES],
+        "M0_static_context": list(M0_FEATURES),
+        "M1_static_plus_logsig2": [*M0_FEATURES, *LEVEL2_FEATURES],
     }
     summaries = {}
-    predictions = validation[["decision_date", "universe_name", "candidate", "delta_log_capital"]].copy()
+    predictions = validation[["decision_date", "feature_asof_date", "universe_name", "candidate", "delta_log_capital"]].copy()
     cv_rows = []
     for name, features in model_features.items():
         alpha, cv = _tune(development, features)
         cv_rows.extend({"model": name, **row} for row in cv)
-        model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
+        model = _model(alpha)
         model.fit(development[features], development["delta_log_capital"])
         predictions[name] = model.predict(validation[features])
         summaries[name] = {"feature_count": len(features), "alpha": alpha, "validation": _metrics(predictions, name)}
@@ -225,10 +277,14 @@ def main() -> int:
         "strategy_configuration_hash": source["manifest"].get("strategy_configuration_hash"),
         "window_sessions": int(args.window_sessions),
         "validation_start": boundary.date().isoformat(),
+        "causal_feature_cutoff": "first baseline decision_date strictly before first execution session",
         "development_rows": len(development),
         "validation_rows": len(validation),
         "nonzero_direct_rows": source["nonzero"],
         "readiness": source["readiness"],
+        "static_feature_count": len(STATIC_FEATURES),
+        "policy_state_feature_count": len(POLICY_FEATURES),
+        "level2_feature_count": len(LEVEL2_FEATURES),
         "models": summaries,
         "incremental": {
             "pooled_spearman_gain": None if m0["pooled_spearman"] is None or m1["pooled_spearman"] is None else m1["pooled_spearman"] - m0["pooled_spearman"],
@@ -238,7 +294,7 @@ def main() -> int:
             "mean_top1_direct_log_gain": m1["mean_top1_direct_log"] - m0["mean_top1_direct_log"],
         },
         "incremental_path_signal_screen_passed": _passes(m0, m1),
-        "decision_rule": "M1 must be positive and improve on M0 in pooled and within-context Spearman, without worsening Top-1 sign quality or mean Top-1 direct contribution. This is a screen, not an independent blinded replication.",
+        "decision_rule": "M1 must be positive and improve on M0 in pooled and within-context Spearman, without worsening Top-1 sign quality or mean Top-1 direct contribution. All predictors are cut off before the first execution session. This is a screen, not an independent blinded replication.",
     }
     dataset.to_csv(output / "predictive_screen_dataset.csv", index=False)
     predictions.to_csv(output / "predictive_screen_predictions.csv", index=False)
