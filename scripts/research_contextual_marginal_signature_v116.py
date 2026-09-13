@@ -140,7 +140,7 @@ def _forced_first_action_simulator(
                 diag["final_action_score"] = None
                 diag["decision_reason"] = "RESEARCH_FORCE_CANDIDATE_FIRST_ACTION"
 
-            # The score is diagnostic only in _simulate_exact.  The capital path is
+            # The score is diagnostic only in _simulate_exact. The capital path is
             # determined by the forced target position and subsequent policy calls.
             return candidate_position, 0.0
         return policy(timestamp, current_position, holding_days)
@@ -190,6 +190,10 @@ def _validate_source(source: Path, output: Path) -> tuple[dict[str, Any], dict[s
                 f"Paired rollout source mismatch for {key}: "
                 f"source={source_manifest.get(key)}, forced={output_manifest.get(key)}"
             )
+    if source_manifest.get("universes") != output_manifest.get("universes"):
+        raise RuntimeError("Paired rollout universe definitions differ from the v1.0.14.4 control.")
+    if source_manifest.get("cases") != output_manifest.get("cases"):
+        raise RuntimeError("Paired rollout cases differ from the v1.0.14.4 control.")
     return source_manifest, output_manifest
 
 
@@ -206,7 +210,7 @@ def _postprocess(source: Path, output: Path) -> None:
         "baseline_ending_capital",
         "horizon_end",
     ]
-    forced_columns = keys + ["candidate_ending_capital"]
+    forced_columns = keys + ["candidate_ending_capital", "baseline_ending_capital"]
     merged = source_frame[source_columns].merge(
         forced_frame[forced_columns],
         on=keys,
@@ -221,14 +225,26 @@ def _postprocess(source: Path, output: Path) -> None:
     merged = merged.drop(columns=["_merge"])
 
     rows: list[dict[str, Any]] = []
+    max_baseline_relative_error = 0.0
     for record in merged.to_dict(orient="records"):
         date = str(record["decision_date"])
         universe = str(record["universe_name"])
         candidate = str(record["candidate"]).strip().upper()
         policy_capital = float(record["candidate_ending_capital_policy"])
         forced_capital = float(record["candidate_ending_capital_forced"])
-        if policy_capital <= 0 or forced_capital <= 0:
+        source_baseline = float(record["baseline_ending_capital_policy"])
+        forced_baseline = float(record["baseline_ending_capital_forced"])
+        if min(policy_capital, forced_capital, source_baseline, forced_baseline) <= 0:
             raise RuntimeError(f"Non-positive paired ending capital for {date}/{universe}/{candidate}.")
+
+        baseline_relative_error = abs(forced_baseline / source_baseline - 1.0)
+        max_baseline_relative_error = max(max_baseline_relative_error, baseline_relative_error)
+        if baseline_relative_error > 1e-10:
+            raise RuntimeError(
+                f"Paired baseline reproducibility failed for {date}/{universe}/{candidate}: "
+                f"source={source_baseline:.12f}, rerun={forced_baseline:.12f}, "
+                f"relative_error={baseline_relative_error:.3e}."
+            )
 
         normal_first, normal_execution_rows = _first_selected_asset(source, date, universe, candidate)
         forced_first, forced_execution_rows = _first_selected_asset(output, date, universe, candidate)
@@ -258,9 +274,8 @@ def _postprocess(source: Path, output: Path) -> None:
                 "forced_first_selected_asset": forced_first,
                 "execution_transitions": int(forced_execution_rows),
                 "decision_points": int(forced_execution_rows + 1),
-                "source_direct_delta_log_capital": float(
-                    math.log(policy_capital / float(record["baseline_ending_capital"]))
-                ),
+                "source_direct_delta_log_capital": float(math.log(policy_capital / source_baseline)),
+                "baseline_reproducibility_relative_error": float(baseline_relative_error),
             }
         )
 
@@ -268,6 +283,20 @@ def _postprocess(source: Path, output: Path) -> None:
     dataset.to_csv(output / "action_advantage_dataset.csv", index=False)
 
     nonzero = dataset[dataset["action_advantage_log"].abs() > TOLERANCE]
+    positive = dataset[dataset["action_advantage_log"] > TOLERANCE]
+    negative = dataset[dataset["action_advantage_log"] < -TOLERANCE]
+    nonzero_dates = int(nonzero["decision_date"].nunique())
+    nonzero_candidates = int(nonzero["candidate"].nunique())
+    has_both_signs = bool(len(positive) > 0 and len(negative) > 0)
+    has_2026 = bool(pd.to_datetime(nonzero["decision_date"]).dt.year.ge(2026).any()) if len(nonzero) else False
+    benchmark_ready = bool(
+        len(nonzero) >= 12
+        and nonzero_dates >= 3
+        and nonzero_candidates >= 3
+        and has_both_signs
+        and has_2026
+    )
+
     summary = {
         "schema_version": 1,
         "script_version": SCRIPT_VERSION,
@@ -281,11 +310,22 @@ def _postprocess(source: Path, output: Path) -> None:
         "universes": int(dataset["universe_name"].nunique()),
         "candidates": int(dataset["candidate"].nunique()),
         "nonzero_action_advantage_rows": int(len(nonzero)),
-        "positive_action_advantage_rows": int((dataset["action_advantage_log"] > TOLERANCE).sum()),
-        "negative_action_advantage_rows": int((dataset["action_advantage_log"] < -TOLERANCE).sum()),
+        "positive_action_advantage_rows": int(len(positive)),
+        "negative_action_advantage_rows": int(len(negative)),
+        "nonzero_action_advantage_dates": nonzero_dates,
+        "nonzero_action_advantage_candidates": nonzero_candidates,
         "policy_already_selected_candidate_rows": int(dataset["policy_first_selected_candidate"].sum()),
+        "max_baseline_reproducibility_relative_error": float(max_baseline_relative_error),
         "execution_transitions_values": sorted(int(value) for value in dataset["execution_transitions"].unique()),
         "decision_points_values": sorted(int(value) for value in dataset["decision_points"].unique()),
+        "model_capacity_benchmark_ready": benchmark_ready,
+        "readiness_checks": {
+            "at_least_12_nonzero_rows": bool(len(nonzero) >= 12),
+            "at_least_3_nonzero_dates": bool(nonzero_dates >= 3),
+            "at_least_3_nonzero_candidates": bool(nonzero_candidates >= 3),
+            "contains_positive_and_negative_advantage": has_both_signs,
+            "at_least_one_2026_nonzero_advantage": has_2026,
+        },
         "horizon_definition": (
             "decision_points includes the causal decision point and the subsequent execution sessions; "
             "execution_transitions is the number of next-open transitions actually simulated."
@@ -296,9 +336,9 @@ def _postprocess(source: Path, output: Path) -> None:
             "the v1.0.14.4 universe baseline."
         ),
         "next_step": (
-            "Use this paired action-advantage target for a controlled model-capacity benchmark. "
-            "Compare linear, tree and neural estimators under the same chronological split before "
-            "expanding signature depth or architecture complexity."
+            "If model_capacity_benchmark_ready is true, compare linear, tree and neural estimators under "
+            "the same chronological split and target. If false, expand dates/candidates before fitting "
+            "higher-capacity models."
         ),
     }
     (output / "action_advantage_summary.json").write_text(
@@ -310,7 +350,7 @@ def _postprocess(source: Path, output: Path) -> None:
 
 def main() -> int:
     # This version changes the target, not the market data or strategy family.
-    # v1.0.14.4 remains the normal-policy control.  v1.0.16 reruns the same
+    # v1.0.14.4 remains the normal-policy control. v1.0.16 reruns the same
     # challenger contexts with only the first decision forced to the candidate.
     base._parser = _parser
     research_challengers._simulate_exact = _forced_first_action_simulator
