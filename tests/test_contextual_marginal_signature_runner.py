@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 from pathlib import Path
 import unittest
@@ -12,6 +14,7 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
 import research_contextual_marginal_signature as runner  # noqa: E402
+import research_contextual_signature_analysis as analysis  # noqa: E402
 
 
 class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
@@ -20,40 +23,60 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertEqual(runner.EXPORT_ZIP_NAME, "contextual_marginal_signature.zip")
         self.assertNotIn("v1", runner.EXPORT_FOLDER_NAME)
         self.assertNotIn("v1", runner.EXPORT_ZIP_NAME)
+        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17")
         self.assertEqual(runner.HORIZON_SESSIONS, 40)
-        self.assertEqual(len(runner.DECISION_DATES), 6)
+        self.assertEqual(len(runner.DECISION_DATES), 23)
         self.assertEqual(len(runner.CANDIDATES), 7)
         self.assertEqual(len(runner.UNIVERSES), 2)
+        self.assertGreaterEqual(len({pd.Timestamp(x).year for x in runner.DECISION_DATES}), 7)
 
-    def test_readiness_requires_diverse_nonzero_both_signs_and_2026(self) -> None:
+    def test_console_log_does_not_render_iso_calendar_date(self) -> None:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            analysis.console_log("state 2026-07-01 -> 2026-08-25")
+        text = stream.getvalue()
+        self.assertNotIn("2026-07-01", text)
+        self.assertNotIn("2026-08-25", text)
+        self.assertIn("01/07/2026", text)
+        self.assertIn("25/08/2026", text)
+
+    def test_readiness_requires_temporal_diversity_and_intervention_abstention(self) -> None:
         rows = []
-        candidates = ["A", "B", "C"]
-        dates = ["2024-01-02", "2025-01-02", "2026-01-02"]
-        for index in range(12):
-            rows.append(
-                {
-                    "candidate": candidates[index % len(candidates)],
-                    "decision_date": dates[index % len(dates)],
-                    "action_advantage_log": 0.01 if index % 2 == 0 else -0.01,
-                }
-            )
-        result = runner._readiness(pd.DataFrame(rows))
+        for date_index, date in enumerate(runner.DECISION_DATES[:20]):
+            for universe in ("U1", "U2"):
+                for candidate_index, candidate in enumerate(runner.CANDIDATES):
+                    # Some contexts have all-negative advantages (normal policy wins),
+                    # while others contain positive intervention opportunities.
+                    if date_index % 5 == 0:
+                        value = -0.01 - candidate_index * 0.001
+                    else:
+                        value = 0.02 - candidate_index * 0.006
+                    rows.append(
+                        {
+                            "candidate": candidate,
+                            "decision_date": date,
+                            "universe_name": universe,
+                            "action_advantage_log": value,
+                        }
+                    )
+        result = analysis.readiness(pd.DataFrame(rows), len(runner.CANDIDATES), 2)
         self.assertTrue(result["ready"])
         self.assertTrue(result["both_signs"])
-        self.assertTrue(result["validation_2026"])
+        self.assertTrue(result["intervention_and_abstention"])
+        self.assertTrue(result["temporal_states"])
 
-    def test_readiness_rejects_one_sided_targets(self) -> None:
-        rows = [
-            {
-                "candidate": ["A", "B", "C"][index % 3],
-                "decision_date": ["2024-01-02", "2025-01-02", "2026-01-02"][index % 3],
-                "action_advantage_log": 0.01,
-            }
-            for index in range(12)
-        ]
-        result = runner._readiness(pd.DataFrame(rows))
-        self.assertFalse(result["ready"])
-        self.assertFalse(result["both_signs"])
+    def test_partial_analysis_identifies_policy_abstention_context(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"decision_date": "2024-01-02", "universe_name": "U1", "candidate": "A", "action_advantage_log": -0.02},
+                {"decision_date": "2024-01-02", "universe_name": "U1", "candidate": "B", "action_advantage_log": -0.01},
+                {"decision_date": "2024-01-02", "universe_name": "U2", "candidate": "A", "action_advantage_log": 0.03},
+                {"decision_date": "2024-01-02", "universe_name": "U2", "candidate": "B", "action_advantage_log": -0.01},
+            ]
+        )
+        result = analysis.partial_analysis(frame, 2)
+        self.assertEqual(result["normal_policy_preferred_contexts"], 1)
+        self.assertEqual(result["intervention_preferred_contexts"], 1)
 
 
 if __name__ == "__main__":
