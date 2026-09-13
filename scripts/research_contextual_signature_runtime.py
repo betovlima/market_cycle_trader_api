@@ -14,8 +14,7 @@ class PairedReplayMemoryCache:
 
     Safe cache layers:
     - market-derived rotation frames: process scoped;
-    - execution context and fitted models: candidate-pair scoped;
-    - raw model utility predictions: temporal-state scoped.
+    - execution context, fitted models and raw utility predictions: candidate-pair scoped.
 
     Positions, holding days, trades, diagnostics and simulator outputs are never
     cached because they depend on the counterfactual intervention.
@@ -118,12 +117,7 @@ class PairedReplayMemoryCache:
         stamp = pd.Timestamp(value)
         if stamp.tzinfo is not None:
             stamp = stamp.tz_convert("UTC").tz_localize(None)
-        key = stamp.normalize().date().isoformat()
-        if key == self.state_key:
-            return
-        self.state_key = key
-        self.utility_predictions.clear()
-        self.utility_seconds.clear()
+        self.state_key = stamp.normalize().date().isoformat()
 
     def begin_pair(self, key: tuple[Any, ...]) -> None:
         self.clear_pair()
@@ -139,6 +133,8 @@ class PairedReplayMemoryCache:
         self.execution_context = None
         self.models.clear()
         self.fit_seconds.clear()
+        self.utility_predictions.clear()
+        self.utility_seconds.clear()
         self.pair_started = None
         self.pair_start = {}
 
@@ -254,7 +250,7 @@ class PairedReplayMemoryCache:
         return fitted
 
     def _prediction_key(self, model: Any, symbol: str, timestamp: pd.Timestamp) -> tuple[Any, ...]:
-        return (self.state_key, id(model), str(symbol), int(pd.Timestamp(timestamp).value))
+        return (self.active_key, id(model), str(symbol), int(pd.Timestamp(timestamp).value))
 
     def cached_model_utilities(
         self,
@@ -267,7 +263,7 @@ class PairedReplayMemoryCache:
         original = self.original_capital_utilities or self.original_research_utilities
         if original is None:
             raise RuntimeError("RAM cache could not resolve the original model-utility function.")
-        if self.suspended or self.state_key is None:
+        if self.suspended or self.active_key is None:
             return original(models, frames, symbols, timestamp, config)
 
         values = [0.0]
@@ -317,7 +313,7 @@ class PairedReplayMemoryCache:
     def summary(self) -> dict[str, Any]:
         return {
             "enabled": True,
-            "scope": "features_process_pair_context_models_state_predictions",
+            "scope": "features_process_pair_context_models_predictions",
             "completed_pairs": int(self.completed_pairs),
             "execution_context_hits": int(self.context_hits),
             "execution_context_misses": int(self.context_misses),
@@ -328,7 +324,7 @@ class PairedReplayMemoryCache:
             "cached_feature_frames": int(len(self.feature_frames)),
             "utility_prediction_hits": int(self.utility_hits),
             "utility_prediction_misses": int(self.utility_misses),
-            "cached_state_predictions": int(len(self.utility_predictions)),
+            "cached_pair_predictions": int(len(self.utility_predictions)),
             "estimated_compute_seconds_avoided": float(self.avoided_seconds),
             "actual_model_fit_seconds": float(self.actual_fit_seconds),
             "execution_context_build_seconds": float(self.context_build_seconds),
