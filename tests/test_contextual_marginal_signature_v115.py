@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 import unittest
 
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = PROJECT_ROOT / "scripts"
 if str(SCRIPT_ROOT) not in sys.path:
@@ -44,6 +46,14 @@ class ContextualMarginalSignatureV115Tests(unittest.TestCase):
         self.assertTrue(experiment._passes(baseline, improved))
         improved["mean_context_spearman"] = -0.01
         self.assertFalse(experiment._passes(baseline, improved))
+
+    def test_utc_timestamp_normalizes_naive_and_aware_values(self) -> None:
+        naive = experiment._utc_timestamp("2023-12-29")
+        aware = experiment._utc_timestamp(pd.Timestamp("2023-12-29T03:00:00-03:00"))
+        self.assertEqual(str(naive.tz), "UTC")
+        self.assertEqual(str(aware.tz), "UTC")
+        self.assertEqual(naive, pd.Timestamp("2023-12-29T00:00:00Z"))
+        self.assertEqual(aware, pd.Timestamp("2023-12-29T06:00:00Z"))
 
 
 if __name__ == "__main__":
