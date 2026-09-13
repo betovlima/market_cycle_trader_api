@@ -111,7 +111,7 @@ RAM now reuses only invariant computation:
 - market-derived rotation feature frames across the process;
 - prepared execution context inside a candidate pair;
 - fitted LightGBM models inside the policy/forced pair;
-- raw model utility predictions inside one temporal state.
+- raw model utility predictions inside the same policy/forced pair.
 
 The following are deliberately **never cached**:
 
