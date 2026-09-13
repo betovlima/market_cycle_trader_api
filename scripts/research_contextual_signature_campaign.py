@@ -9,12 +9,9 @@ from typing import Any
 import pandas as pd
 from pymongo import MongoClient
 
-import research_contextual_marginal_signature_v117 as prev
+import research_contextual_signature_protocol as prev
 
-# Reuse the scientific protocol from v1.0.17.  This patch changes execution
-# reliability only: preflight validation, NaT-safe/idempotent persistence and
-# automatic resume from MongoDB checkpoints.
-SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.2"
+SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.4"
 EXPERIMENT_NAME = prev.EXPERIMENT_NAME
 HISTORY_START = prev.HISTORY_START
 SNAPSHOT_END = prev.SNAPSHOT_END
@@ -28,19 +25,9 @@ TRACE_ROWS_COLLECTION = prev.TRACE_ROWS_COLLECTION
 ORIGINAL25 = prev.ORIGINAL25
 UNIVERSES = prev.UNIVERSES
 CANDIDATES = prev.CANDIDATES
-DECISION_DATES = (
-    "2020-08-03", "2020-11-02",
-    "2021-02-01", "2021-05-03", "2021-08-02", "2021-11-01",
-    "2022-02-01", "2022-05-02", "2022-08-01", "2022-11-01",
-    "2023-02-01", "2023-05-01", "2023-08-01", "2023-11-01",
-    "2024-02-01", "2024-05-01", "2024-08-01", "2024-11-01",
-    "2025-02-03", "2025-05-01", "2025-08-01",
-    "2026-02-02", "2026-06-01",
-)
+DECISION_DATES = prev.DECISION_DATES
 
-# Keep inherited helpers consistent with the active campaign.
 prev.SCRIPT_VERSION = SCRIPT_VERSION
-prev.DECISION_DATES = DECISION_DATES
 
 base = prev.base
 frozen = prev.frozen
@@ -97,32 +84,42 @@ def _preflight_executable_states(
     config_base: Any,
     capital_rotation: Any,
 ) -> None:
-    """Fail before expensive replays if any planned state cannot execute OOS."""
     expected_sessions = base._expected_sessions(
-        base._normalize_date(HISTORY_START), base._normalize_date(SNAPSHOT_END)
+        base._normalize_date(HISTORY_START),
+        base._normalize_date(SNAPSHOT_END),
     )
     invalid: list[str] = []
     for universe in UNIVERSES:
         universe_name = str(universe["name"])
         reference_assets = list(universe["assets"])
-        config = config_base.model_copy(update={"assets": reference_assets, "end_date": SNAPSHOT_END})
+        config = config_base.model_copy(
+            update={"assets": reference_assets, "end_date": SNAPSHOT_END}
+        )
         seed_frames = {symbol: frames[symbol] for symbol in reference_assets}
         _, common_dates = capital_rotation.prepare_rotation_panel(seed_frames, config)
         folds = capital_rotation._build_walk_forward_folds(common_dates, config)
         if not folds:
             invalid.append(f"{universe_name}: no walk-forward folds")
             continue
+
         oos_start = int(folds[0]["test_start_index"])
         oos_end = int(folds[-1]["test_end_index"])
         for decision_text in DECISION_DATES:
             decision = base._utc_timestamp(decision_text)
-            horizon_end = base._horizon_end(expected_sessions, decision, HORIZON_SESSIONS)
+            horizon_end = base._horizon_end(
+                expected_sessions,
+                decision,
+                HORIZON_SESSIONS,
+            )
             requested_start = int(common_dates.searchsorted(decision, side="left"))
             requested_end = int(common_dates.searchsorted(horizon_end, side="right"))
             execution_start = max(oos_start, requested_start)
             execution_end = min(oos_end, requested_end)
             if execution_start >= execution_end:
-                invalid.append(f"{universe_name}/{live.display_date(decision_text)}")
+                invalid.append(
+                    f"{universe_name}/{live.display_date(decision_text)}"
+                )
+
     if invalid:
         rendered = ", ".join(invalid[:12])
         suffix = " ..." if len(invalid) > 12 else ""
@@ -130,8 +127,10 @@ def _preflight_executable_states(
             "Campaign preflight found non-executable temporal states before any replay: "
             f"{rendered}{suffix}"
         )
+
     live.console_log(
-        f"[preflight] OK | states={len(DECISION_DATES)} | universes={len(UNIVERSES)} | "
+        f"[preflight] OK | states={len(DECISION_DATES)} | "
+        f"universes={len(UNIVERSES)} | "
         "all requested windows intersect executable OOS folds"
     )
 
@@ -154,8 +153,7 @@ def _find_resumable_run(
     )
     if exact is not None:
         return exact
-    # Backward-compatible recovery for a v1.0.17.1 run that failed before the
-    # campaign_hash field existed.
+
     return runs.find_one(
         {
             "experiment": EXPERIMENT_NAME,
@@ -170,7 +168,10 @@ def _find_resumable_run(
     )
 
 
-def _load_observations(collection: Any, run_id: str) -> dict[tuple[str, str, str], dict[str, Any]]:
+def _load_observations(
+    collection: Any,
+    run_id: str,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
     output: dict[tuple[str, str, str], dict[str, Any]] = {}
     for document in collection.find({"run_id": run_id}):
         clean = _clean_observation(dict(document))
@@ -180,12 +181,19 @@ def _load_observations(collection: Any, run_id: str) -> dict[tuple[str, str, str
     return output
 
 
-def _ordered_dataset(observation_map: dict[tuple[str, str, str], dict[str, Any]]) -> pd.DataFrame:
+def _ordered_dataset(
+    observation_map: dict[tuple[str, str, str], dict[str, Any]],
+) -> pd.DataFrame:
     if not observation_map:
         return pd.DataFrame()
+
     date_order = {value: index for index, value in enumerate(DECISION_DATES)}
-    universe_order = {str(item["name"]): index for index, item in enumerate(UNIVERSES)}
-    candidate_order = {value: index for index, value in enumerate(CANDIDATES)}
+    universe_order = {
+        str(item["name"]): index for index, item in enumerate(UNIVERSES)
+    }
+    candidate_order = {
+        value: index for index, value in enumerate(CANDIDATES)
+    }
     rows = list(observation_map.values())
     rows.sort(
         key=lambda row: (
@@ -210,25 +218,38 @@ def main() -> int:
     from market_cycle_trader_api.infrastructure.persistence import mongo_repository
     from market_cycle_trader_api.schemas.requests import BacktestRequest
 
-    mongo_uri, database_name = storage.runtime_mongo_settings(args, mongo_repository, base)
+    mongo_uri, database_name = storage.runtime_mongo_settings(
+        args,
+        mongo_repository,
+        base,
+    )
     client = MongoClient(
         mongo_uri,
         serverSelectionTimeoutMS=3000,
         connectTimeoutMS=3000,
-        retryWrites=True,
+        retryWrites=False,
     )
+
     process_started = pd.Timestamp.now(tz="UTC")
     process_started_monotonic = time.monotonic()
-    total_observations = len(DECISION_DATES) * len(UNIVERSES) * len(CANDIDATES)
-    expected_replays = len(DECISION_DATES) * len(UNIVERSES) * (1 + 2 * len(CANDIDATES))
+    total_observations = (
+        len(DECISION_DATES) * len(UNIVERSES) * len(CANDIDATES)
+    )
+    expected_replays = (
+        len(DECISION_DATES) * len(UNIVERSES) * (1 + 2 * len(CANDIDATES))
+    )
     run_id: str | None = None
 
     live.console_log(
-        f"[study] temporal action-advantage expansion | states={len(DECISION_DATES)} | "
-        f"universes={len(UNIVERSES)} | candidates={len(CANDIDATES)} | "
-        f"observations={total_observations} | expected replays={expected_replays}"
+        f"[study] temporal action-advantage expansion | "
+        f"states={len(DECISION_DATES)} | universes={len(UNIVERSES)} | "
+        f"candidates={len(CANDIDATES)} | observations={total_observations} | "
+        f"expected replays={expected_replays}"
     )
-    live.console_log("[study] MongoDB local is the source of truth; execution supports automatic resume.")
+    live.console_log(
+        "[study] MongoDB local is the source of truth; "
+        "execution supports automatic resume."
+    )
 
     try:
         storage.mongo_retry(lambda: client.admin.command("ping"))
@@ -238,21 +259,37 @@ def main() -> int:
         trace_runs = db[TRACE_RUNS_COLLECTION]
         trace_rows = db[TRACE_ROWS_COLLECTION]
 
-        strategy = base._strategy_document(db, args.strategy_sequence, args.strategy_id)
+        strategy = base._strategy_document(
+            db,
+            args.strategy_sequence,
+            args.strategy_id,
+        )
         stored = base._configuration(strategy)
         strategy_id = str(strategy.get("_id") or "").strip()
-        strategy_sequence = int(strategy.get("strategy_sequence") or args.strategy_sequence)
+        strategy_sequence = int(
+            strategy.get("strategy_sequence") or args.strategy_sequence
+        )
         if not strategy_id:
             raise RuntimeError("Selected Strategy has no _id.")
-        if base._normalize_date(stored.get("start_date")) != base._normalize_date(HISTORY_START):
+
+        if base._normalize_date(stored.get("start_date")) != base._normalize_date(
+            HISTORY_START
+        ):
             raise RuntimeError(
-                f"Strategy start_date must be {live.display_date(HISTORY_START)} for this campaign."
+                f"Strategy start_date must be "
+                f"{live.display_date(HISTORY_START)} for this campaign."
             )
+
         missing = sorted(
-            set(_campaign_symbols()).difference(base._normalize_symbols(list(stored.get("assets") or [])))
+            set(_campaign_symbols()).difference(
+                base._normalize_symbols(list(stored.get("assets") or []))
+            )
         )
         if missing:
-            raise RuntimeError(f"Strategy #{strategy_sequence} is missing campaign symbols: {missing}")
+            raise RuntimeError(
+                f"Strategy #{strategy_sequence} is missing campaign symbols: "
+                f"{missing}"
+            )
 
         config_base = BacktestRequest.model_validate(stored).model_copy(
             update={
@@ -267,8 +304,15 @@ def main() -> int:
 
         frames, provenance = prev._load_market_frames(config_base, market_data)
         snapshot_hash = base._snapshot_hash(base._snapshot_table(frames))
-        live.console_log(f"[market] complete | symbols={len(frames)} | snapshot hash={snapshot_hash[:12]}…")
-        _preflight_executable_states(frames=frames, config_base=config_base, capital_rotation=capital_rotation)
+        live.console_log(
+            f"[market] complete | symbols={len(frames)} | "
+            f"snapshot hash={snapshot_hash[:12]}…"
+        )
+        _preflight_executable_states(
+            frames=frames,
+            config_base=config_base,
+            capital_rotation=capital_rotation,
+        )
 
         campaign_hash = _campaign_hash(
             strategy_id=strategy_id,
@@ -320,11 +364,14 @@ def main() -> int:
             live.console_log(f"[checkpoint] new Mongo run={run_id}")
         else:
             run_id = str(resumable["_id"])
-            run_started = pd.Timestamp(resumable.get("started_utc") or process_started)
+            run_started = pd.Timestamp(
+                resumable.get("started_utc") or process_started
+            )
             if run_started.tzinfo is None:
                 run_started = run_started.tz_localize("UTC")
             else:
                 run_started = run_started.tz_convert("UTC")
+
             previous_error = resumable.get("error")
             storage.mongo_retry(
                 lambda: runs.update_one(
@@ -352,23 +399,36 @@ def main() -> int:
         completed = len(observation_map)
         if completed:
             live.console_log(
-                f"[resume] recovered {completed}/{total_observations} completed observations from MongoDB; "
+                f"[resume] recovered {completed}/{total_observations} "
+                "completed observations from MongoDB; "
                 "completed pairs will not be replayed"
             )
         else:
-            live.console_log("[checkpoint] no completed observations recovered; starting campaign")
+            live.console_log(
+                "[checkpoint] no completed observations recovered; "
+                "starting campaign"
+            )
 
         expected_sessions = base._expected_sessions(
-            base._normalize_date(HISTORY_START), base._normalize_date(SNAPSHOT_END)
+            base._normalize_date(HISTORY_START),
+            base._normalize_date(SNAPSHOT_END),
         )
         frozen._BASELINE_SCHEDULE_BY_KEY.clear()
 
-        for state_index, decision_text in enumerate(DECISION_DATES, start=1):
+        for state_index, decision_text in enumerate(
+            DECISION_DATES,
+            start=1,
+        ):
             decision = base._utc_timestamp(decision_text)
-            horizon_end = base._horizon_end(expected_sessions, decision, HORIZON_SESSIONS)
+            horizon_end = base._horizon_end(
+                expected_sessions,
+                decision,
+                HORIZON_SESSIONS,
+            )
             live.console_log(
                 f"[state {state_index}/{len(DECISION_DATES)}] "
-                f"{live.display_date(decision)} → {live.display_date(horizon_end)}"
+                f"{live.display_date(decision)} → "
+                f"{live.display_date(horizon_end)}"
             )
 
             state_has_pending = False
@@ -377,26 +437,55 @@ def main() -> int:
                 pending = [
                     candidate
                     for candidate in CANDIDATES
-                    if (decision_text, universe_name, candidate) not in observation_map
+                    if (
+                        decision_text,
+                        universe_name,
+                        candidate,
+                    )
+                    not in observation_map
                 ]
+
                 if not pending:
-                    live.console_log(f"  [resume] {universe_name} complete | skipping 7/7 candidate pairs")
+                    live.console_log(
+                        f"  [resume] {universe_name} complete | "
+                        "skipping 7/7 candidate pairs"
+                    )
                     context_rows = [
-                        observation_map[(decision_text, universe_name, candidate)]
+                        observation_map[
+                            (decision_text, universe_name, candidate)
+                        ]
                         for candidate in CANDIDATES
                     ]
-                    prev._log_context_summary(context_rows, decision_text, universe_name)
+                    prev._log_context_summary(
+                        context_rows,
+                        decision_text,
+                        universe_name,
+                    )
                     continue
 
                 state_has_pending = True
                 reference_assets = list(universe["assets"])
-                config = config_base.model_copy(update={"assets": reference_assets, "end_date": SNAPSHOT_END})
-                seed_frames = {symbol: frames[symbol] for symbol in reference_assets}
+                config = config_base.model_copy(
+                    update={
+                        "assets": reference_assets,
+                        "end_date": SNAPSHOT_END,
+                    }
+                )
+                seed_frames = {
+                    symbol: frames[symbol]
+                    for symbol in reference_assets
+                }
+
                 live.console_log(
-                    f"  [baseline] {universe_name} | assets={len(reference_assets)} | "
+                    f"  [baseline] {universe_name} | "
+                    f"assets={len(reference_assets)} | "
                     f"pending candidates={len(pending)}"
                 )
-                baseline_metrics, baseline_sessions, baseline_captured = _run_replay(
+                (
+                    baseline_metrics,
+                    baseline_sessions,
+                    baseline_captured,
+                ) = _run_replay(
                     db=db,
                     config=config,
                     strategy_id=strategy_id,
@@ -408,7 +497,9 @@ def main() -> int:
                     forced=False,
                 )
                 baseline_capital = prev._ending_capital(
-                    baseline_metrics, f"{live.display_date(decision_text)}/{universe_name}/baseline"
+                    baseline_metrics,
+                    f"{live.display_date(decision_text)}/"
+                    f"{universe_name}/baseline",
                 )
                 storage.persist_capture(
                     run_id=run_id,
@@ -420,16 +511,25 @@ def main() -> int:
                     trace_runs=trace_runs,
                     trace_rows=trace_rows,
                 )
-                live.console_log(f"  [baseline] {universe_name} complete | capital={baseline_capital:,.2f}")
+                live.console_log(
+                    f"  [baseline] {universe_name} complete | "
+                    f"capital={baseline_capital:,.2f}"
+                )
 
                 for candidate in pending:
                     pair_number = len(observation_map) + 1
                     challenger_frames = dict(seed_frames)
                     challenger_frames[candidate] = frames[candidate]
+
                     live.console_log(
-                        f"  [pair {pair_number}/{total_observations}] {universe_name}/{candidate} | normal policy"
+                        f"  [pair {pair_number}/{total_observations}] "
+                        f"{universe_name}/{candidate} | normal policy"
                     )
-                    policy_metrics, policy_sessions, policy_captured = _run_replay(
+                    (
+                        policy_metrics,
+                        policy_sessions,
+                        policy_captured,
+                    ) = _run_replay(
                         db=db,
                         config=config,
                         strategy_id=strategy_id,
@@ -440,17 +540,31 @@ def main() -> int:
                         horizon_end=horizon_end,
                         forced=False,
                     )
-                    compatibility = base.discovery._research_context_compatibility(
-                        baseline_sessions, policy_sessions
-                    )
-                    if not bool(compatibility.get("research_context_compatible")):
-                        raise RuntimeError(
-                            f"Policy context mismatch for {live.display_date(decision_text)}/{universe_name}/{candidate}"
+
+                    compatibility = (
+                        base.discovery._research_context_compatibility(
+                            baseline_sessions,
+                            policy_sessions,
                         )
-                    policy_capital = prev._ending_capital(
-                        policy_metrics, f"{live.display_date(decision_text)}/{universe_name}/{candidate}/policy"
                     )
-                    policy_first, policy_transitions = prev._first_selected_asset(policy_captured)
+                    if not bool(
+                        compatibility.get("research_context_compatible")
+                    ):
+                        raise RuntimeError(
+                            "Policy context mismatch for "
+                            f"{live.display_date(decision_text)}/"
+                            f"{universe_name}/{candidate}"
+                        )
+
+                    policy_capital = prev._ending_capital(
+                        policy_metrics,
+                        f"{live.display_date(decision_text)}/"
+                        f"{universe_name}/{candidate}/policy",
+                    )
+                    (
+                        policy_first,
+                        policy_transitions,
+                    ) = prev._first_selected_asset(policy_captured)
                     storage.persist_capture(
                         run_id=run_id,
                         decision_date=decision_text,
@@ -463,9 +577,15 @@ def main() -> int:
                     )
 
                     live.console_log(
-                        f"  [pair {pair_number}/{total_observations}] {universe_name}/{candidate} | force candidate once"
+                        f"  [pair {pair_number}/{total_observations}] "
+                        f"{universe_name}/{candidate} | "
+                        "force candidate once"
                     )
-                    forced_metrics, forced_sessions, forced_captured = _run_replay(
+                    (
+                        forced_metrics,
+                        forced_sessions,
+                        forced_captured,
+                    ) = _run_replay(
                         db=db,
                         config=config,
                         strategy_id=strategy_id,
@@ -476,27 +596,50 @@ def main() -> int:
                         horizon_end=horizon_end,
                         forced=True,
                     )
-                    forced_compatibility = base.discovery._research_context_compatibility(
-                        policy_sessions, forced_sessions
-                    )
-                    if not bool(forced_compatibility.get("research_context_compatible")):
-                        raise RuntimeError(
-                            f"Forced context mismatch for {live.display_date(decision_text)}/{universe_name}/{candidate}"
+
+                    forced_compatibility = (
+                        base.discovery._research_context_compatibility(
+                            policy_sessions,
+                            forced_sessions,
                         )
-                    forced_capital = prev._ending_capital(
-                        forced_metrics, f"{live.display_date(decision_text)}/{universe_name}/{candidate}/forced"
                     )
-                    forced_first, forced_transitions = prev._first_selected_asset(forced_captured)
+                    if not bool(
+                        forced_compatibility.get(
+                            "research_context_compatible"
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Forced context mismatch for "
+                            f"{live.display_date(decision_text)}/"
+                            f"{universe_name}/{candidate}"
+                        )
+
+                    forced_capital = prev._ending_capital(
+                        forced_metrics,
+                        f"{live.display_date(decision_text)}/"
+                        f"{universe_name}/{candidate}/forced",
+                    )
+                    (
+                        forced_first,
+                        forced_transitions,
+                    ) = prev._first_selected_asset(forced_captured)
+
                     if forced_first != candidate:
                         raise RuntimeError(
-                            f"Forced-action invariant failed for {live.display_date(decision_text)}/{universe_name}/{candidate}: "
+                            "Forced-action invariant failed for "
+                            f"{live.display_date(decision_text)}/"
+                            f"{universe_name}/{candidate}: "
                             f"first={forced_first}"
                         )
                     if forced_transitions != policy_transitions:
                         raise RuntimeError(
-                            f"Paired transition mismatch for {live.display_date(decision_text)}/{universe_name}/{candidate}: "
-                            f"policy={policy_transitions}, forced={forced_transitions}"
+                            "Paired transition mismatch for "
+                            f"{live.display_date(decision_text)}/"
+                            f"{universe_name}/{candidate}: "
+                            f"policy={policy_transitions}, "
+                            f"forced={forced_transitions}"
                         )
+
                     storage.persist_capture(
                         run_id=run_id,
                         decision_date=decision_text,
@@ -511,91 +654,177 @@ def main() -> int:
                     row = {
                         "run_id": run_id,
                         "decision_date": decision_text,
-                        "horizon_end": pd.Timestamp(horizon_end).date().isoformat(),
+                        "horizon_end": pd.Timestamp(
+                            horizon_end
+                        ).date().isoformat(),
                         "universe_name": universe_name,
                         "candidate": candidate,
                         "baseline_ending_capital": baseline_capital,
                         "policy_ending_capital": policy_capital,
                         "forced_action_ending_capital": forced_capital,
-                        "source_direct_delta_log_capital": float(math.log(policy_capital / baseline_capital)),
-                        "action_advantage_log": float(math.log(forced_capital / policy_capital)),
-                        "action_advantage_rate": float(forced_capital / policy_capital - 1.0),
+                        "source_direct_delta_log_capital": float(
+                            math.log(
+                                policy_capital / baseline_capital
+                            )
+                        ),
+                        "action_advantage_log": float(
+                            math.log(
+                                forced_capital / policy_capital
+                            )
+                        ),
+                        "action_advantage_rate": float(
+                            forced_capital / policy_capital - 1.0
+                        ),
                         "policy_first_selected_asset": policy_first,
-                        "policy_first_selected_candidate": bool(policy_first == candidate),
+                        "policy_first_selected_candidate": bool(
+                            policy_first == candidate
+                        ),
                         "forced_first_selected_asset": forced_first,
-                        "execution_transitions": int(forced_transitions),
-                        "decision_points": int(forced_transitions + 1),
+                        "execution_transitions": int(
+                            forced_transitions
+                        ),
+                        "decision_points": int(
+                            forced_transitions + 1
+                        ),
                         "market_snapshot_hash": snapshot_hash,
                         "strategy_configuration_hash": config_hash,
                     }
                     storage.upsert_observation(observations, row)
                     observation_map[_observation_key(row)] = row
+
                     completed = len(observation_map)
-                    elapsed = time.monotonic() - process_started_monotonic
-                    processed_this_process = max(1, completed - int(len(_load_observations(observations, run_id)) - 1))
-                    # ETA is deliberately approximate after resume; checkpoint count is authoritative.
+                    elapsed = (
+                        time.monotonic()
+                        - process_started_monotonic
+                    )
                     progress = completed / total_observations
-                    eta = elapsed * (1.0 - progress) / progress if progress > 0 else None
+                    eta = (
+                        elapsed * (1.0 - progress) / progress
+                        if progress > 0
+                        else None
+                    )
+
                     storage.mongo_retry(
                         lambda: runs.update_one(
                             {"_id": run_id},
                             {
                                 "$set": {
-                                    "updated_utc": pd.Timestamp.now(tz="UTC").to_pydatetime(),
-                                    "current_context": f"{decision_text}/{universe_name}/{candidate}",
+                                    "updated_utc": pd.Timestamp.now(
+                                        tz="UTC"
+                                    ).to_pydatetime(),
+                                    "current_context": (
+                                        f"{decision_text}/"
+                                        f"{universe_name}/{candidate}"
+                                    ),
                                     "completed_observations": completed,
                                     "total_observations": total_observations,
-                                    "elapsed_seconds_current_process": float(elapsed),
-                                    "eta_seconds_live": None if eta is None else float(eta),
+                                    "elapsed_seconds_current_process": float(
+                                        elapsed
+                                    ),
+                                    "eta_seconds_live": (
+                                        None
+                                        if eta is None
+                                        else float(eta)
+                                    ),
                                 }
                             },
                         )
                     )
                     live.console_log(
-                        f"    [result] Y={row['action_advantage_log']:+.6f} ({row['action_advantage_rate']:+.2%}) | "
-                        f"first policy={policy_first} | policy={policy_capital:,.2f} | forced={forced_capital:,.2f} | "
-                        f"checkpoint={completed}/{total_observations} | ETA≈{live.format_duration(eta)}"
+                        f"    [result] "
+                        f"Y={row['action_advantage_log']:+.6f} "
+                        f"({row['action_advantage_rate']:+.2%}) | "
+                        f"first policy={policy_first} | "
+                        f"policy={policy_capital:,.2f} | "
+                        f"forced={forced_capital:,.2f} | "
+                        f"checkpoint={completed}/"
+                        f"{total_observations} | "
+                        f"ETA≈{live.format_duration(eta)}"
                     )
 
                 context_rows = [
-                    observation_map[(decision_text, universe_name, candidate)]
+                    observation_map[
+                        (decision_text, universe_name, candidate)
+                    ]
                     for candidate in CANDIDATES
-                    if (decision_text, universe_name, candidate) in observation_map
+                    if (
+                        decision_text,
+                        universe_name,
+                        candidate,
+                    )
+                    in observation_map
                 ]
                 if len(context_rows) == len(CANDIDATES):
-                    prev._log_context_summary(context_rows, decision_text, universe_name)
+                    prev._log_context_summary(
+                        context_rows,
+                        decision_text,
+                        universe_name,
+                    )
 
-            dataset_so_far = _ordered_dataset(observation_map)
+            dataset_so_far = _ordered_dataset(
+                observation_map
+            )
             if not dataset_so_far.empty:
-                elapsed = time.monotonic() - process_started_monotonic
-                partial = prev._log_partial(dataset_so_far.to_dict(orient="records"), state_index, elapsed)
+                elapsed = (
+                    time.monotonic()
+                    - process_started_monotonic
+                )
+                partial = prev._log_partial(
+                    dataset_so_far.to_dict(orient="records"),
+                    state_index,
+                    elapsed,
+                )
                 storage.mongo_retry(
                     lambda: runs.update_one(
                         {"_id": run_id},
                         {
                             "$set": {
-                                "partial_analysis": storage.mongo_value(partial),
-                                "completed_temporal_states": int(
-                                    dataset_so_far.groupby("decision_date")["candidate"].count().ge(
-                                        len(UNIVERSES) * len(CANDIDATES)
-                                    ).sum()
+                                "partial_analysis": (
+                                    storage.mongo_value(partial)
                                 ),
-                                "updated_utc": pd.Timestamp.now(tz="UTC").to_pydatetime(),
+                                "completed_temporal_states": int(
+                                    dataset_so_far.groupby(
+                                        "decision_date"
+                                    )["candidate"]
+                                    .count()
+                                    .ge(
+                                        len(UNIVERSES)
+                                        * len(CANDIDATES)
+                                    )
+                                    .sum()
+                                ),
+                                "updated_utc": pd.Timestamp.now(
+                                    tz="UTC"
+                                ).to_pydatetime(),
                             }
                         },
                     )
                 )
+
             if not state_has_pending:
-                live.console_log("[resume] state already complete; no replay executed")
+                live.console_log(
+                    "[resume] state already complete; "
+                    "no replay executed"
+                )
 
         dataset = _ordered_dataset(observation_map)
         if len(dataset) != total_observations:
             raise RuntimeError(
-                f"Campaign ended with incomplete checkpoint set: {len(dataset)}/{total_observations} observations."
+                "Campaign ended with incomplete checkpoint set: "
+                f"{len(dataset)}/{total_observations} observations."
             )
-        readiness = live.readiness(dataset, len(CANDIDATES), len(UNIVERSES))
-        final_analysis = live.partial_analysis(dataset, len(UNIVERSES))
+
+        readiness = live.readiness(
+            dataset,
+            len(CANDIDATES),
+            len(UNIVERSES),
+        )
+        final_analysis = live.partial_analysis(
+            dataset,
+            len(UNIVERSES),
+        )
         ended = pd.Timestamp.now(tz="UTC")
+
         summary = {
             "schema_version": 2,
             "script_version": SCRIPT_VERSION,
@@ -612,37 +841,69 @@ def main() -> int:
             "horizon_sessions": HORIZON_SESSIONS,
             "rows": int(len(dataset)),
             "dates": int(dataset["decision_date"].nunique()),
-            "years": int(pd.to_datetime(dataset["decision_date"]).dt.year.nunique()),
-            "universes": int(dataset["universe_name"].nunique()),
-            "candidates": int(dataset["candidate"].nunique()),
+            "years": int(
+                pd.to_datetime(
+                    dataset["decision_date"]
+                ).dt.year.nunique()
+            ),
+            "universes": int(
+                dataset["universe_name"].nunique()
+            ),
+            "candidates": int(
+                dataset["candidate"].nunique()
+            ),
             "final_analysis": final_analysis,
             "readiness": readiness,
-            "temporal_model_benchmark_ready": bool(readiness["ready"]),
+            "temporal_model_benchmark_ready": bool(
+                readiness["ready"]
+            ),
             "resume_supported": True,
             "target_definition": (
-                "action_advantage_log = log(W_forced_candidate_then_same_policy / W_same_policy_without_force). "
-                "Both arms use the same MongoDB market data and fold-aware frozen switch-margin schedule."
+                "action_advantage_log = "
+                "log(W_forced_candidate_then_same_policy / "
+                "W_same_policy_without_force). "
+                "Both arms use the same MongoDB market data and "
+                "fold-aware frozen switch-margin schedule."
             ),
             "next_step_if_ready": (
-                "Run the integrated research tournament over linear, LightGBM, MLP and temporal neural models "
-                "using the same frozen MongoDB observations and chronological validation."
+                "Run the integrated research tournament over "
+                "linear, LightGBM, MLP and temporal neural models "
+                "using the same frozen MongoDB observations and "
+                "chronological validation."
             ),
             "storage": {
                 "source_of_truth": "MongoDB local",
                 "runs_collection": RUNS_COLLECTION,
-                "observations_collection": OBSERVATIONS_COLLECTION,
-                "trace_runs_collection": TRACE_RUNS_COLLECTION,
-                "trace_rows_collection": TRACE_ROWS_COLLECTION,
-                "filesystem": "export only; never required as analysis input",
+                "observations_collection": (
+                    OBSERVATIONS_COLLECTION
+                ),
+                "trace_runs_collection": (
+                    TRACE_RUNS_COLLECTION
+                ),
+                "trace_rows_collection": (
+                    TRACE_ROWS_COLLECTION
+                ),
+                "filesystem": (
+                    "export only; never required as analysis input"
+                ),
             },
             "started_utc": run_started.isoformat(),
             "completed_utc": ended.isoformat(),
-            "elapsed_seconds_wall": float((ended - run_started).total_seconds()),
-            "elapsed_seconds_current_process": float(time.monotonic() - process_started_monotonic),
+            "elapsed_seconds_wall": float(
+                (ended - run_started).total_seconds()
+            ),
+            "elapsed_seconds_current_process": float(
+                time.monotonic()
+                - process_started_monotonic
+            ),
         }
+
         storage.mongo_retry(
             lambda: runs.update_many(
-                {"experiment": EXPERIMENT_NAME, "is_latest": True},
+                {
+                    "experiment": EXPERIMENT_NAME,
+                    "is_latest": True,
+                },
                 {"$set": {"is_latest": False}},
             )
         )
@@ -655,9 +916,16 @@ def main() -> int:
                         "status": "completed",
                         "is_latest": True,
                         "updated_utc": ended.to_pydatetime(),
-                        "completed_observations": total_observations,
+                        "completed_observations": (
+                            total_observations
+                        ),
                     },
-                    "$unset": {"current_context": "", "eta_seconds_live": "", "error": "", "traceback": ""},
+                    "$unset": {
+                        "current_context": "",
+                        "eta_seconds_live": "",
+                        "error": "",
+                        "traceback": "",
+                    },
                 },
             )
         )
@@ -670,14 +938,31 @@ def main() -> int:
             summary=summary,
             export_folder_name=EXPORT_FOLDER_NAME,
             export_zip_name=EXPORT_ZIP_NAME,
-            collections=(RUNS_COLLECTION, OBSERVATIONS_COLLECTION, TRACE_RUNS_COLLECTION, TRACE_ROWS_COLLECTION),
+            collections=(
+                RUNS_COLLECTION,
+                OBSERVATIONS_COLLECTION,
+                TRACE_RUNS_COLLECTION,
+                TRACE_ROWS_COLLECTION,
+            ),
         )
-        live.console_log(f"[complete] Mongo run_id={run_id}")
-        live.console_log(f"[complete] Export folder={export_dir}")
-        live.console_log(f"[complete] ZIP={zip_path}")
-        live.console_log(f"[complete] temporal_model_benchmark_ready={readiness['ready']}")
+
+        live.console_log(
+            f"[complete] Mongo run_id={run_id}"
+        )
+        live.console_log(
+            f"[complete] Export folder={export_dir}"
+        )
+        live.console_log(
+            f"[complete] ZIP={zip_path}"
+        )
+        live.console_log(
+            "[complete] temporal_model_benchmark_ready="
+            f"{readiness['ready']}"
+        )
         sound_mode = frozen.sound._play_completion_sound()
-        live.console_log(f"[complete] Completion sound mode={sound_mode}")
+        live.console_log(
+            f"[complete] Completion sound mode={sound_mode}"
+        )
         return 0
 
     except Exception as exc:
@@ -690,8 +975,15 @@ def main() -> int:
                         {
                             "$set": {
                                 "status": "failed",
-                                "updated_utc": pd.Timestamp.now(tz="UTC").to_pydatetime(),
-                                "error": f"{type(exc).__name__}: {exc}",
+                                "updated_utc": (
+                                    pd.Timestamp.now(
+                                        tz="UTC"
+                                    ).to_pydatetime()
+                                ),
+                                "error": (
+                                    f"{type(exc).__name__}: "
+                                    f"{exc}"
+                                ),
                                 "traceback": traceback.format_exc(),
                                 "resume_supported": True,
                             }
