@@ -10,11 +10,11 @@ import research_contextual_marginal_signature_v1172 as _impl
 from research_contextual_marginal_signature_v1172 import *  # noqa: F401,F403
 from research_contextual_signature_runtime import (
     PairedReplayMemoryCache,
-    frames_memory_mb,
+    compare_replay_outputs,
     process_rss_mb,
 )
 
-SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.3"
+SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.4"
 _impl.SCRIPT_VERSION = SCRIPT_VERSION
 _impl.prev.SCRIPT_VERSION = SCRIPT_VERSION
 
@@ -48,9 +48,9 @@ def _render_candidate_ranking(rows: list[dict[str, Any]]) -> str:
 
 
 def main() -> int:
-    from market_cycle_trader_api.engine import research_challengers
+    from market_cycle_trader_api.engine import capital_rotation, research_challengers
 
-    cache = PairedReplayMemoryCache(research_challengers)
+    cache = PairedReplayMemoryCache(research_challengers, capital_rotation)
     cache.install()
 
     original_run_replay = _impl._run_replay
@@ -60,6 +60,7 @@ def main() -> int:
     original_partial_analysis = _impl.live.partial_analysis
 
     def cached_run_replay(**kwargs: Any):
+        cache.ensure_state(kwargs["decision"])
         candidate = str(kwargs.get("candidate") or "").strip().upper()
         forced = bool(kwargs.get("forced"))
         mode = str(getattr(kwargs.get("config"), "strategy_mode", ""))
@@ -69,6 +70,40 @@ def main() -> int:
 
         key = _pair_key(kwargs)
         if not forced:
+            # The first candidate policy arm is executed once without any cache
+            # and once with RAM acceleration.  The long campaign only continues
+            # if capital, sessions, predictions and trades are equivalent.
+            if cache.validation is None:
+                _impl.live.console_log(
+                    "    [cache-validation] first eligible policy replay | uncached reference"
+                )
+                with cache.suspended_cache():
+                    reference = original_run_replay(**kwargs)
+                cache.begin_pair(key)
+                try:
+                    accelerated = original_run_replay(**kwargs)
+                except BaseException:
+                    cache.abort_pair()
+                    raise
+                validation = compare_replay_outputs(reference, accelerated, tolerance=1e-12)
+                cache.record_validation(validation)
+                _impl.live.console_log(
+                    "    [cache-validation] "
+                    f"capital relative error={validation['capital_relative_error']:.3e} | "
+                    f"sessions={'YES' if validation['sessions_identical'] else 'NO'} | "
+                    f"predictions={'YES' if validation['predictions_identical'] else 'NO'} | "
+                    f"trades={'YES' if validation['trades_identical'] else 'NO'}"
+                )
+                if not bool(validation["passed"]):
+                    cache.abort_pair()
+                    raise RuntimeError(
+                        "RAM acceleration equivalence validation failed; campaign stopped before trusting cached results."
+                    )
+                _impl.live.console_log(
+                    "    [cache-validation] PASS | invariant RAM cache is numerically equivalent to uncached replay"
+                )
+                return accelerated
+
             cache.begin_pair(key)
             try:
                 return original_run_replay(**kwargs)
@@ -81,7 +116,8 @@ def main() -> int:
             _impl.live.console_log(
                 "    [cache] safety fallback: paired cache key unavailable; forced arm will run uncached"
             )
-            return original_run_replay(**kwargs)
+            with cache.suspended_cache():
+                return original_run_replay(**kwargs)
 
         try:
             result = original_run_replay(**kwargs)
@@ -90,8 +126,10 @@ def main() -> int:
             raise
         stats = cache.finish_pair()
         _impl.live.console_log(
-            f"    [cache] pair reuse | panel={stats['context_hits']} hit | "
+            f"    [cache] pair reuse | panel={stats['context_hits']} | "
             f"LightGBM fits={stats['fit_hits']} reused/{stats['fit_misses']} built | "
+            f"feature frames={stats['feature_hits']} hits/{stats['feature_misses']} builds | "
+            f"utility predictions={stats['utility_hits']} hits/{stats['utility_misses']} builds | "
             f"estimated compute avoided≈{stats['avoided_seconds']:.1f}s | "
             f"pair elapsed={stats['pair_elapsed_seconds']:.1f}s"
         )
@@ -99,7 +137,7 @@ def main() -> int:
 
     def load_market_frames_with_memory(config: Any, market_data: Any):
         frames, provenance = original_load_market_frames(config, market_data)
-        cache.market_frames_mb = frames_memory_mb(frames)
+        cache.set_market_frames(frames)
         rss = process_rss_mb()
         rss_text = "n/a" if rss is None else f"{rss:.1f} MB"
         _impl.live.console_log(
@@ -126,15 +164,21 @@ def main() -> int:
         stats = cache.summary()
         rss = stats.get("process_rss_mb")
         rss_text = "n/a" if rss is None else f"{float(rss):.1f} MB"
+        validation = stats.get("equivalence_validation") or {}
+        validation_text = "PASS" if validation.get("passed") else "pending"
         _impl.live.console_log(
             f"[cache] cumulative | pairs={stats['completed_pairs']} | "
             f"LightGBM fits reused={stats['model_fit_hits']} | panel reuse={stats['execution_context_hits']} | "
-            f"estimated compute avoided≈{stats['estimated_compute_seconds_avoided']:.0f}s | RSS={rss_text}"
+            f"feature hits={stats['feature_frame_hits']} | utility hits={stats['utility_prediction_hits']} | "
+            f"estimated compute avoided≈{stats['estimated_compute_seconds_avoided']:.0f}s | "
+            f"validation={validation_text} | RSS={rss_text}"
         )
         frame = pd.DataFrame(rows)
         if not frame.empty:
             means = frame.groupby("candidate")["action_advantage_log"].mean().sort_values(ascending=False)
-            leaders = ", ".join(f"{candidate} {float(value):+.4f}" for candidate, value in means.head(3).items())
+            leaders = ", ".join(
+                f"{candidate} {float(value):+.4f}" for candidate, value in means.head(3).items()
+            )
             _impl.live.console_log(f"[candidate] cumulative mean Y leaders | {leaders}")
         return result
 
@@ -144,10 +188,13 @@ def main() -> int:
     _impl.prev._log_partial = log_partial_with_runtime
     _impl.live.partial_analysis = partial_analysis_with_runtime
 
-    _impl.live.console_log(f"[runtime] {SCRIPT_VERSION} | paired RAM acceleration enabled")
+    _impl.live.console_log(f"[runtime] {SCRIPT_VERSION} | guarded RAM acceleration enabled")
     _impl.live.console_log(
-        "[memory] cache scope=one candidate pair | reusable=prepared panel + fitted LightGBM models | "
-        "simulator state/trades/positions are never cached"
+        "[memory] reusable=invariant market feature frames + pair execution context + fitted LightGBM models + "
+        "state-level raw utility predictions | never cached=portfolio state/trades/positions/holding days"
+    )
+    _impl.live.console_log(
+        "[memory] first eligible candidate performs an automatic uncached-vs-cached equivalence check before continuing"
     )
 
     try:
