@@ -7,6 +7,7 @@ from pathlib import Path
 import unittest
 
 import exchange_calendars as xcals
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import research_contextual_marginal_signature as runner  # noqa: E402
 import research_contextual_signature_analysis as analysis  # noqa: E402
+import research_contextual_signature_storage as storage  # noqa: E402
 
 
 class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
@@ -24,7 +26,7 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertEqual(runner.EXPORT_ZIP_NAME, "contextual_marginal_signature.zip")
         self.assertNotIn("v1", runner.EXPORT_FOLDER_NAME)
         self.assertNotIn("v1", runner.EXPORT_ZIP_NAME)
-        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.1")
+        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.2")
         self.assertEqual(runner.HORIZON_SESSIONS, 40)
         self.assertEqual(len(runner.DECISION_DATES), 23)
         self.assertEqual(len(runner.CANDIDATES), 7)
@@ -57,6 +59,36 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertNotIn("2026-08-25", text)
         self.assertIn("01/07/2026", text)
         self.assertIn("25/08/2026", text)
+
+    def test_mongo_value_normalizes_nat_and_nonfinite_scalars(self) -> None:
+        payload = storage.mongo_value(
+            {
+                "pandas_nat": pd.NaT,
+                "numpy_nat": np.datetime64("NaT"),
+                "pandas_na": pd.NA,
+                "nan": np.nan,
+                "positive_infinity": np.inf,
+                "nested": [pd.NaT, np.float64("nan")],
+            }
+        )
+        self.assertIsNone(payload["pandas_nat"])
+        self.assertIsNone(payload["numpy_nat"])
+        self.assertIsNone(payload["pandas_na"])
+        self.assertIsNone(payload["nan"])
+        self.assertIsNone(payload["positive_infinity"])
+        self.assertEqual(payload["nested"], [None, None])
+
+    def test_resume_observation_identity_is_deterministic(self) -> None:
+        row = {
+            "decision_date": runner.DECISION_DATES[0],
+            "universe_name": "Original25",
+            "candidate": "XSD",
+        }
+        self.assertEqual(
+            runner._observation_key(row),
+            (runner.DECISION_DATES[0], "Original25", "XSD"),
+        )
+        self.assertEqual(runner._observation_key(row), runner._observation_key(dict(row)))
 
     def test_readiness_requires_temporal_diversity_and_intervention_abstention(self) -> None:
         rows = []
