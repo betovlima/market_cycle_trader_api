@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 import unittest
 
+import exchange_calendars as xcals
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,12 +24,29 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertEqual(runner.EXPORT_ZIP_NAME, "contextual_marginal_signature.zip")
         self.assertNotIn("v1", runner.EXPORT_FOLDER_NAME)
         self.assertNotIn("v1", runner.EXPORT_ZIP_NAME)
-        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17")
+        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.1")
         self.assertEqual(runner.HORIZON_SESSIONS, 40)
         self.assertEqual(len(runner.DECISION_DATES), 23)
         self.assertEqual(len(runner.CANDIDATES), 7)
         self.assertEqual(len(runner.UNIVERSES), 2)
         self.assertGreaterEqual(len({pd.Timestamp(x).year for x in runner.DECISION_DATES}), 7)
+
+    def test_temporal_states_are_real_xnys_sessions_and_after_locked_oos_warmup(self) -> None:
+        calendar = xcals.get_calendar("XNYS")
+        self.assertGreaterEqual(pd.Timestamp(runner.DECISION_DATES[0]), pd.Timestamp("2020-08-03"))
+        for value in runner.DECISION_DATES:
+            resolved = calendar.date_to_session(pd.Timestamp(value), direction="none")
+            self.assertEqual(pd.Timestamp(resolved).date(), pd.Timestamp(value).date())
+
+    def test_temporal_states_are_spread_beyond_the_40_session_target_horizon(self) -> None:
+        calendar = xcals.get_calendar("XNYS")
+        sessions = calendar.sessions_in_range(
+            pd.Timestamp(runner.DECISION_DATES[0]),
+            pd.Timestamp(runner.DECISION_DATES[-1]),
+        )
+        positions = [int(sessions.searchsorted(pd.Timestamp(value))) for value in runner.DECISION_DATES]
+        gaps = [right - left for left, right in zip(positions, positions[1:])]
+        self.assertGreaterEqual(min(gaps), runner.HORIZON_SESSIONS)
 
     def test_console_log_does_not_render_iso_calendar_date(self) -> None:
         stream = io.StringIO()
@@ -45,8 +63,6 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         for date_index, date in enumerate(runner.DECISION_DATES[:20]):
             for universe in ("U1", "U2"):
                 for candidate_index, candidate in enumerate(runner.CANDIDATES):
-                    # Some contexts have all-negative advantages (normal policy wins),
-                    # while others contain positive intervention opportunities.
                     if date_index % 5 == 0:
                         value = -0.01 - candidate_index * 0.001
                     else:
