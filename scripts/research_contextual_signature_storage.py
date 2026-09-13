@@ -5,12 +5,18 @@ import json
 import math
 import os
 import shutil
+import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import pandas as pd
+from pymongo import ReplaceOne
+from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
+
+T = TypeVar("T")
+_TRANSIENT_MONGO_ERRORS = (AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError)
 
 
 def canonical_hash(value: Any) -> str:
@@ -25,24 +31,62 @@ def canonical_hash(value: Any) -> str:
 
 
 def mongo_value(value: Any) -> Any:
+    """Convert pandas/numpy values into BSON-safe Python values.
+
+    Research traces contain nullable timestamps.  pandas.NaT cannot be encoded by
+    PyMongo because its utcoffset implementation raises ValueError, so missing
+    temporal values must be normalized to None before any MongoDB write.
+    """
+    if value is None or value is pd.NaT or value is pd.NA:
+        return None
     if isinstance(value, dict):
         return {str(k): mongo_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, set)):
         return [mongo_value(v) for v in value]
-    if isinstance(value, pd.Timestamp):
-        stamp = value
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        stamp = pd.Timestamp(value)
+        if pd.isna(stamp):
+            return None
         if stamp.tzinfo is None:
             stamp = stamp.tz_localize("UTC")
         else:
             stamp = stamp.tz_convert("UTC")
         return stamp.to_pydatetime()
-    if isinstance(value, np.datetime64):
-        return mongo_value(pd.Timestamp(value))
     if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
+        return mongo_value(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    # Catch scalar pandas missing values that are not pd.NaT/pd.NA while avoiding
+    # array-like pd.isna() results with ambiguous truth values.
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and bool(missing):
+            return None
+    except (TypeError, ValueError):
+        pass
     return value
+
+
+def mongo_retry(
+    operation: Callable[[], T],
+    *,
+    attempts: int = 5,
+    initial_delay_seconds: float = 0.25,
+) -> T:
+    """Retry only transient local-Mongo failures with bounded exponential backoff."""
+    last_error: BaseException | None = None
+    delay = float(initial_delay_seconds)
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            return operation()
+        except _TRANSIENT_MONGO_ERRORS as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, 4.0)
+    assert last_error is not None
+    raise last_error
 
 
 def runtime_mongo_settings(args: Any, mongo_repository: Any, base: Any) -> tuple[str, str]:
@@ -74,10 +118,16 @@ def persist_capture(
     trace_runs: Any,
     trace_rows: Any,
 ) -> None:
+    """Persist one replay capture idempotently.
+
+    Every document has a deterministic id. Re-running the same arm after a crash
+    replaces/upserts the same records instead of creating duplicates, making a
+    long campaign safe to resume from the last completed observation.
+    """
     for result_index, result in enumerate(captured, start=1):
         trace_id = f"{run_id}:{decision_date}:{universe_name}:{candidate or 'BASELINE'}:{arm}:{result_index}"
         metrics = dict(getattr(result, "metrics", {}) or {})
-        trace_runs.insert_one(
+        trace_document = mongo_value(
             {
                 "_id": trace_id,
                 "run_id": run_id,
@@ -87,39 +137,63 @@ def persist_capture(
                 "arm": arm,
                 "result_index": result_index,
                 "backend": str(getattr(result, "backend", "")),
-                "metrics": mongo_value(metrics),
+                "metrics": metrics,
                 "summary": str(getattr(result, "summary", "") or ""),
             }
         )
+        mongo_retry(lambda: trace_runs.replace_one({"_id": trace_id}, trace_document, upsert=True))
 
         rows: list[dict[str, Any]] = []
         predictions = getattr(result, "predictions", None)
         if isinstance(predictions, pd.DataFrame) and not predictions.empty:
             frame = predictions.reset_index()
             for row_index, record in enumerate(frame.to_dict(orient="records")):
+                row_id = f"{trace_id}:prediction:{row_index}"
                 rows.append(
-                    {
-                        "run_id": run_id,
-                        "trace_id": trace_id,
-                        "row_type": "prediction",
-                        "row_index": row_index,
-                        "payload": mongo_value(record),
-                    }
+                    mongo_value(
+                        {
+                            "_id": row_id,
+                            "run_id": run_id,
+                            "trace_id": trace_id,
+                            "row_type": "prediction",
+                            "row_index": row_index,
+                            "payload": record,
+                        }
+                    )
                 )
         trades = getattr(result, "trades", None)
         if isinstance(trades, pd.DataFrame) and not trades.empty:
             for row_index, record in enumerate(trades.to_dict(orient="records")):
+                row_id = f"{trace_id}:trade:{row_index}"
                 rows.append(
-                    {
-                        "run_id": run_id,
-                        "trace_id": trace_id,
-                        "row_type": "trade",
-                        "row_index": row_index,
-                        "payload": mongo_value(record),
-                    }
+                    mongo_value(
+                        {
+                            "_id": row_id,
+                            "run_id": run_id,
+                            "trace_id": trace_id,
+                            "row_type": "trade",
+                            "row_index": row_index,
+                            "payload": record,
+                        }
+                    )
                 )
         if rows:
-            trace_rows.insert_many(rows, ordered=True)
+            operations = [ReplaceOne({"_id": row["_id"]}, row, upsert=True) for row in rows]
+            # Keep batches modest so one large trace cannot exceed MongoDB message limits.
+            for start in range(0, len(operations), 200):
+                batch = operations[start:start + 200]
+                mongo_retry(lambda batch=batch: trace_rows.bulk_write(batch, ordered=False))
+
+
+def upsert_observation(collection: Any, document: dict[str, Any]) -> None:
+    payload = mongo_value(document)
+    identity = {
+        "run_id": payload["run_id"],
+        "decision_date": payload["decision_date"],
+        "universe_name": payload["universe_name"],
+        "candidate": payload["candidate"],
+    }
+    mongo_retry(lambda: collection.replace_one(identity, payload, upsert=True))
 
 
 def export_result(
