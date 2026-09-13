@@ -33,7 +33,7 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertEqual(runner.EXPORT_ZIP_NAME, "contextual_marginal_signature.zip")
         self.assertNotIn("v1", runner.EXPORT_FOLDER_NAME)
         self.assertNotIn("v1", runner.EXPORT_ZIP_NAME)
-        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.4")
+        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.5")
         self.assertEqual(runner.HORIZON_SESSIONS, 40)
         self.assertEqual(len(runner.DECISION_DATES), 23)
         self.assertEqual(len(runner.CANDIDATES), 7)
@@ -214,6 +214,31 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertTrue(result["sessions_identical"])
         self.assertTrue(result["predictions_identical"])
         self.assertTrue(result["trades_identical"])
+
+    def test_replay_equivalence_guard_rejects_semantic_divergence(self) -> None:
+        sessions = pd.date_range("2025-01-01", periods=2, tz="UTC")
+        ref_predictions = pd.DataFrame(
+            {"selected_asset": ["A", "A"], "strategy_equity": [100.0, 101.0]},
+            index=sessions,
+        )
+        alt_predictions = pd.DataFrame(
+            {"selected_asset": ["A", "B"], "strategy_equity": [100.0, 100.5]},
+            index=sessions,
+        )
+        ref = (
+            {"ending_capital": 101.0},
+            sessions,
+            [SimpleNamespace(predictions=ref_predictions, trades=pd.DataFrame())],
+        )
+        alt = (
+            {"ending_capital": 100.5},
+            sessions,
+            [SimpleNamespace(predictions=alt_predictions, trades=pd.DataFrame())],
+        )
+        result = compare_replay_outputs(ref, alt)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["predictions_identical"])
+        self.assertGreater(result["capital_relative_error"], 0.0)
 
     def test_readiness_requires_temporal_diversity_and_intervention_abstention(self) -> None:
         rows = []
