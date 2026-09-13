@@ -4,6 +4,7 @@ import contextlib
 import io
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 import exchange_calendars as xcals
@@ -19,7 +20,10 @@ import research_contextual_marginal_signature as runner  # noqa: E402
 import research_contextual_marginal_signature_v1172 as implementation  # noqa: E402
 import research_contextual_signature_analysis as analysis  # noqa: E402
 import research_contextual_signature_storage as storage  # noqa: E402
-from research_contextual_signature_runtime import PairedReplayMemoryCache  # noqa: E402
+from research_contextual_signature_runtime import (  # noqa: E402
+    PairedReplayMemoryCache,
+    compare_replay_outputs,
+)
 
 
 class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
@@ -28,7 +32,7 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertEqual(runner.EXPORT_ZIP_NAME, "contextual_marginal_signature.zip")
         self.assertNotIn("v1", runner.EXPORT_FOLDER_NAME)
         self.assertNotIn("v1", runner.EXPORT_ZIP_NAME)
-        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.3")
+        self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.4")
         self.assertEqual(runner.HORIZON_SESSIONS, 40)
         self.assertEqual(len(runner.DECISION_DATES), 23)
         self.assertEqual(len(runner.CANDIDATES), 7)
@@ -93,16 +97,54 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
             implementation._observation_key(dict(row)),
         )
 
-    def test_pair_memory_cache_reuses_context_and_models_only_inside_pair(self) -> None:
+    def test_ram_cache_reuses_only_invariant_work(self) -> None:
         class Config:
             random_state = 42
+            rotation_target_horizons = [5, 20]
+            rotation_target_horizon_weights = [0.5, 0.5]
+            slippage_bps = 0.0
+            commission_rate = 0.0
+            rotation_downside_penalty = 1.0
+            rotation_drawdown_penalty = 1.0
+            rotation_movement_capture_weight = 0.0
+            rotation_trend_persistence_weight = 0.0
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.predict_calls = 0
+
+            def predict(self, frame):
+                self.predict_calls += 1
+                return np.asarray([0.25])
+
+        class FakeCapital:
+            ROTATION_FEATURES = ["feature"]
+
+            def __init__(self) -> None:
+                self.frame_build_calls = 0
+                self.utility_calls = 0
+                self.build_rotation_frame = self.build_frame
+                self._model_utilities = self.utilities
+
+            def build_frame(self, bars, config):
+                self.frame_build_calls += 1
+                return bars.copy()
+
+            def utilities(self, models, frames, symbols, timestamp, config):
+                self.utility_calls += 1
+                values = [0.0]
+                for symbol in symbols:
+                    model = models.get(symbol)
+                    values.append(float(model.predict(frames[symbol].loc[[timestamp], ["feature"]])[0]))
+                return np.asarray(values)
 
         class FakeModule:
-            def __init__(self) -> None:
+            def __init__(self, capital) -> None:
                 self.build_calls = 0
                 self.fit_calls = 0
                 self._build_execution_context = self.build
                 self._lightgbm_fit_models = self.fit
+                self._model_utilities = capital._model_utilities
 
             def build(self, bars_by_symbol, config):
                 self.build_calls += 1
@@ -110,37 +152,67 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
 
             def fit(self, frames, symbols, train_dates, config, **kwargs):
                 self.fit_calls += 1
-                return {symbol: object() for symbol in symbols}
+                return {symbol: FakeModel() for symbol in symbols}
 
-        fake = FakeModule()
-        cache = PairedReplayMemoryCache(fake)
+        capital = FakeCapital()
+        fake = FakeModule(capital)
+        cache = PairedReplayMemoryCache(fake, capital)
+        bars = {
+            "A": pd.DataFrame(
+                {"feature": [1.0, 2.0], "open": [1.0, 1.0], "close": [1.0, 1.0]},
+                index=pd.date_range("2025-01-01", periods=2, tz="UTC"),
+            )
+        }
         cache.install()
+        cache.set_market_frames(bars)
+        cache.ensure_state("2025-01-01")
         try:
-            cache.begin_pair(("state", "universe", "candidate"))
-            bars = {"A": pd.DataFrame({"close": [1.0]})}
+            first_frame = capital.build_rotation_frame(bars["A"], Config())
+            second_frame = capital.build_rotation_frame(bars["A"], Config())
+            self.assertIs(first_frame, second_frame)
+            self.assertEqual(capital.frame_build_calls, 1)
+
+            cache.begin_pair(("2025-01-01", "U", "A"))
             first_context = fake._build_execution_context(bars, Config())
             second_context = fake._build_execution_context(bars, Config())
             self.assertIs(first_context, second_context)
-            dates = pd.date_range("2025-01-01", periods=3, tz="UTC")
-            first_models = fake._lightgbm_fit_models(
-                bars, ["A"], dates, Config(), phase="fold_1_final"
-            )
-            second_models = fake._lightgbm_fit_models(
-                bars, ["A"], dates, Config(), phase="fold_1_final"
-            )
-            self.assertEqual(set(first_models), set(second_models))
-            stats = cache.finish_pair()
-            self.assertEqual(fake.build_calls, 1)
+
+            dates = pd.date_range("2025-01-01", periods=2, tz="UTC")
+            first_models = fake._lightgbm_fit_models(bars, ["A"], dates, Config(), phase="fold_1_final")
+            second_models = fake._lightgbm_fit_models(bars, ["A"], dates, Config(), phase="fold_1_final")
             self.assertEqual(fake.fit_calls, 1)
+            self.assertEqual(set(first_models), set(second_models))
+
+            timestamp = bars["A"].index[0]
+            first_utility = capital._model_utilities(first_models, bars, ["A"], timestamp, Config())
+            second_utility = capital._model_utilities(first_models, bars, ["A"], timestamp, Config())
+            np.testing.assert_allclose(first_utility, second_utility)
+            self.assertEqual(capital.utility_calls, 1)
+
+            stats = cache.finish_pair()
             self.assertEqual(stats["context_hits"], 1)
             self.assertEqual(stats["fit_hits"], 1)
-
-            fake._build_execution_context(bars, Config())
-            fake._lightgbm_fit_models(bars, ["A"], dates, Config(), phase="fold_1_final")
-            self.assertEqual(fake.build_calls, 2)
-            self.assertEqual(fake.fit_calls, 2)
+            self.assertEqual(stats["feature_hits"], 0)
+            self.assertEqual(stats["utility_hits"], 1)
+            self.assertEqual(cache.feature_hits, 1)
         finally:
             cache.uninstall()
+
+    def test_replay_equivalence_guard_accepts_identical_results(self) -> None:
+        sessions = pd.date_range("2025-01-01", periods=2, tz="UTC")
+        predictions = pd.DataFrame(
+            {"selected_asset": ["A", "A"], "strategy_equity": [100.0, 101.0]},
+            index=sessions,
+        )
+        trades = pd.DataFrame({"action": ["BUY"], "price": [10.0]})
+        captured = [SimpleNamespace(predictions=predictions, trades=trades)]
+        replay = ({"ending_capital": 101.0}, sessions, captured)
+        result = compare_replay_outputs(replay, replay)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["capital_relative_error"], 0.0)
+        self.assertTrue(result["sessions_identical"])
+        self.assertTrue(result["predictions_identical"])
+        self.assertTrue(result["trades_identical"])
 
     def test_readiness_requires_temporal_diversity_and_intervention_abstention(self) -> None:
         rows = []
