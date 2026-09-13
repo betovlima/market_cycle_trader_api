@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "experiment": "contextual_marginal_signature_direct_effect_prevalence_v114",
+  "universes": [
+    "Original25",
+    "Original24_MinusADM"
+  ],
+  "cases": [
+    {
+      "decision_date": "2024-01-02",
+      "candidates": ["XSD", "MKSI", "GKOS", "CLMT", "CORT", "APD", "CCK"]
+    },
+    {
+      "decision_date": "2024-07-01",
+      "candidates": ["XSD", "MKSI", "GKOS", "CLMT", "CORT", "APD", "CCK"]
+    },
+    {
+      "decision_date": "2025-01-02",
+      "candidates": ["XSD", "MKSI", "GKOS", "CLMT", "CORT", "APD", "CCK"]
+    },
+    {
+      "decision_date": "2025-07-01",
+      "candidates": ["XSD", "MKSI", "GKOS", "CLMT", "CORT", "APD", "CCK"]
+    },
+    {
+      "decision_date": "2026-01-02",
+      "candidates": ["XSD", "MKSI", "GKOS", "CLMT", "CORT", "APD", "CCK"]
+    },
+    {
+      "decision_date": "2026-07-01",
+      "candidates": ["XSD", "MKSI", "GKOS", "CLMT", "CORT", "APD", "CCK"]
+    }
+  ],
+  "design": {
+    "horizon_sessions": 40,
+    "approximately_non_overlapping": true,
+    "purpose": "Estimate prevalence and diversity of direct frozen-margin marginal effects before fitting a path-signature predictive model.",
+    "candidate_roles": {
+      "XSD": "known direct-effect positive control from v1.0.12",
+      "APD": "known policy-recalibration control from v1.0.12",
+      "MKSI": "high prior universe sensitivity",
+      "GKOS": "prior universe sensitivity",
+      "CLMT": "prior universe sensitivity",
+      "CORT": "prior state sensitivity",
+      "CCK": "low-sensitivity contrast"
+    }
+  }
+}
