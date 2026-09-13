@@ -6,13 +6,17 @@ from typing import Any
 
 import pandas as pd
 
-import research_contextual_marginal_signature_v1172 as _impl
-from research_contextual_marginal_signature_v1172 import *  # noqa: F401,F403
+from research_contextual_signature_bootstrap import load_campaign_module
 from research_contextual_signature_runtime import (
     PairedReplayMemoryCache,
     compare_replay_outputs,
     process_rss_mb,
 )
+
+_impl = load_campaign_module()
+for _export_name in dir(_impl):
+    if not _export_name.startswith("_"):
+        globals().setdefault(_export_name, getattr(_impl, _export_name))
 
 SCRIPT_VERSION = "contextual-marginal-signature-v1.0.17.4"
 _impl.SCRIPT_VERSION = SCRIPT_VERSION
@@ -70,9 +74,6 @@ def main() -> int:
 
         key = _pair_key(kwargs)
         if not forced:
-            # The first candidate policy arm is executed once without any cache
-            # and once with RAM acceleration.  The long campaign only continues
-            # if capital, sessions, predictions and trades are equivalent.
             if cache.validation is None:
                 _impl.live.console_log(
                     "    [cache-validation] first eligible policy replay | uncached reference"

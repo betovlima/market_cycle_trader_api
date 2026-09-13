@@ -17,13 +17,14 @@ if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
 import research_contextual_marginal_signature as runner  # noqa: E402
-import research_contextual_marginal_signature_v1172 as implementation  # noqa: E402
 import research_contextual_signature_analysis as analysis  # noqa: E402
 import research_contextual_signature_storage as storage  # noqa: E402
 from research_contextual_signature_runtime import (  # noqa: E402
     PairedReplayMemoryCache,
     compare_replay_outputs,
 )
+
+implementation = runner._impl
 
 
 class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
