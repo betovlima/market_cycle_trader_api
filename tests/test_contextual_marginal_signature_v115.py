@@ -16,6 +16,12 @@ class ContextualMarginalSignatureV115Tests(unittest.TestCase):
     def test_identity_and_feature_contract(self) -> None:
         self.assertEqual(experiment.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.15")
         self.assertEqual(tuple(experiment.STATIC_FEATURES), tuple(experiment.v103.MODEL_FEATURES))
+        self.assertEqual(len(experiment.POLICY_FEATURES), 5)
+        self.assertIn("baseline_effective_switch_margin", experiment.POLICY_FEATURES)
+        self.assertEqual(
+            len(experiment.M0_FEATURES),
+            len(experiment.STATIC_FEATURES) + len(experiment.POLICY_FEATURES),
+        )
         self.assertEqual(len(experiment.LEVEL2_FEATURES), 6)
         self.assertIn("logsig2__candidate__universe", experiment.LEVEL2_FEATURES)
         self.assertNotIn("logsig1__candidate", experiment.LEVEL2_FEATURES)
