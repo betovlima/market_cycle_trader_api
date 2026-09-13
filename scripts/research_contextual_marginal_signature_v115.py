@@ -174,9 +174,9 @@ def _passes(m0: dict[str, Any], m1: dict[str, Any]) -> bool:
     if any(m0[k] is None or m1[k] is None for k in keys):
         return False
     return bool(
-        m1["pooled_spearman"] > 0 > min(0.0, m0["pooled_spearman"])
+        m1["pooled_spearman"] > 0.0
         and m1["pooled_spearman"] > m0["pooled_spearman"]
-        and m1["mean_context_spearman"] > 0
+        and m1["mean_context_spearman"] > 0.0
         and m1["mean_context_spearman"] > m0["mean_context_spearman"]
         and m1["top1_negative_contexts"] <= m0["top1_negative_contexts"]
         and m1["top1_positive_contexts"] >= m0["top1_positive_contexts"]
