@@ -2,13 +2,116 @@
 
 Branch permanente: `research/contextual-marginal-signature-v1`
 
-Runtime científico atual: `contextual-marginal-signature-v1.0.17.5`
+Coleta contrafactual congelada: `contextual-marginal-signature-v1.0.17.5`
 
-Este é o único documento vivo da linha Contextual Marginal Signature. Não criar READMEs por versão. O histórico do Git preserva implementações e documentos antigos.
+Research Tournament atual: `contextual-marginal-signature-v1.0.18.0`
 
-## Comando atual
+Este é o único documento vivo desta linha de pesquisa. O histórico do Git preserva versões anteriores; não criar READMEs por versão.
 
-Na raiz do repositório:
+## Objetivo científico
+
+O objetivo final continua sendo aumentar o capital composto do Market Cycle Trader.
+
+A pergunta específica desta linha é:
+
+> Entre ativos externos que já passaram pela pré-seleção, conseguimos aprender uma função que diga qual ativo deve ser inserido agora no universo para aumentar o capital futuro da estratégia?
+
+O target principal volta a ser o efeito marginal direto da inserção:
+
+`Y_direct(t,a,H) = log(W_policy_with_candidate_added / W_baseline_policy_without_candidate)`
+
+A política continua decidindo normalmente depois que o candidato é adicionado. Não usamos identidade fixa do candidato como feature do modelo principal; a fórmula deve generalizar para um novo ativo pré-selecionado.
+
+O antigo `action_advantage_log` permanece armazenado como diagnóstico secundário, mas não é mais o target principal do Tournament.
+
+## Resultado da campanha v1.0.17.5
+
+A coleta terminou com:
+
+- 322 observações
+- 23 estados temporais entre 2020 e 2026
+- 2 universos: `Original25` e `Original24_MinusADM`
+- 7 candidatos: `XSD`, `MKSI`, `GKOS`, `CLMT`, `CORT`, `APD`, `CCK`
+- horizonte de 40 decision points / 39 transições
+- Strategy #10 congelada
+- MongoDB local como fonte de verdade
+- switch margin congelada fold a fold
+- traces e observações persistidos no MongoDB
+
+No target correto `source_direct_delta_log_capital`:
+
+- 73 inserções aumentaram o capital
+- 65 reduziram o capital
+- 184 não alteraram o capital
+- em 23 dos 46 contextos havia pelo menos um candidato com efeito positivo
+- em 23 dos 46 contextos a melhor decisão era não inserir nenhum candidato
+
+No `Original25`:
+
+- 161 observações
+- 44 positivas
+- 31 negativas
+- 86 neutras
+- 12 das 23 datas possuíam pelo menos uma inserção positiva
+- 11 das 23 datas não possuíam inserção positiva
+
+Isso demonstra oportunidade econômica retrospectiva, mas ainda não demonstra previsibilidade ex ante.
+
+## v1.0.18.0 — Direct Marginal Capital Tournament
+
+A v1.0.18.0 não repete os caros rollouts contrafactuais. Ela reutiliza exclusivamente as observações congeladas no MongoDB e reconstrói features disponíveis antes da decisão a partir do histórico de mercado local.
+
+O Tournament usa como features:
+
+- estado atual do candidato
+- diferença candidato versus média do universo
+- z-score do candidato dentro do universo
+- percentil/rank relativo do candidato
+- média e dispersão do universo
+- estado de SPY como contexto de mercado
+
+As features são derivadas das `ROTATION_FEATURES` já usadas pelo motor. A identidade do candidato não entra no modelo principal.
+
+Modelos comparados com parâmetros fixos e modestos:
+
+- Ridge
+- Elastic Net
+- LightGBM, quando disponível
+- MLP compacto
+
+Também existe um baseline simples de média histórica por candidato. O modelo contextual precisa superá-lo; caso contrário, não demonstrou que aprendeu contexto.
+
+### Validação
+
+Para evitar pseudo-replicação, `Original25` é o universo primário. Os 23 estados temporais, e não as 322 linhas, são tratados como a unidade temporal relevante.
+
+- desenvolvimento: expanding chronological walk-forward até 2025
+- mínimo de 8 estados anteriores antes da primeira previsão
+- abstenção: inserir somente se a maior previsão de `Y_direct` for maior que zero
+- seleção de modelo: somente pelo desenvolvimento cronológico
+- confirmação reservada: estados de 2026
+- `Original24_MinusADM`: apenas teste de robustez, não conta como novo estado temporal independente
+
+Métrica econômica principal:
+
+`capital_multiplier_vs_no_insert = exp(sum(realized_direct_log))`
+
+Ela representa o multiplicador de capital marginal obtido pelas decisões do seletor em relação a não inserir candidato nos contextos avaliados.
+
+### Regra terminal
+
+O Tournament produz um dos quatro estados:
+
+- `NO_CONTEXTUAL_SIGNAL`: o melhor modelo contextual não supera o baseline histórico; encerrar esta família de features/modelos.
+- `DEVELOPMENT_SIGNAL_NOT_CONFIRMED`: houve sinal em desenvolvimento, mas ele falhou nos estados reservados de 2026; não promover.
+- `HOLDOUT_SIGNAL_NOT_ROBUST`: passou no `Original25` de 2026, mas não sobreviveu ao universo perturbado; não promover.
+- `CONFIRMED_LIMITED_NEXT_SYSTEM_BACKTEST`: passou pelos três níveis; congelar o vencedor e executar um único backtest sequencial final do sistema completo.
+
+Não adicionar modelos indefinidamente para fabricar um vencedor.
+
+## Como executar
+
+A coleta antiga continua disponível pelo mesmo entrypoint:
 
 ```bat
 python scripts\research_contextual_marginal_signature.py ^
@@ -16,224 +119,62 @@ python scripts\research_contextual_marginal_signature.py ^
   --env-file .env
 ```
 
-Contrato estável:
+Para o Tournament v1.0.18.0, sem repetir os rollouts:
 
-- entrypoint: `scripts/research_contextual_marginal_signature.py`
-- saída: `research_output/contextual_marginal_signature/`
-- ZIP: `research_output/contextual_marginal_signature.zip`
-- fonte persistente de verdade: MongoDB local
-- filesystem: somente exportação, nunca entrada obrigatória para análises futuras
+```bat
+python scripts\research_contextual_marginal_signature.py ^
+  --phase tournament ^
+  --strategy-sequence 10 ^
+  --env-file .env
+```
 
-Coleções:
+O Tournament exige uma campanha 23 × 2 × 7 concluída no MongoDB local para a Strategy selecionada.
+
+## Persistência
+
+Coleções da campanha:
 
 - `research_contextual_signature_runs`
 - `research_contextual_signature_observations`
 - `research_contextual_signature_trace_runs`
 - `research_contextual_signature_trace_rows`
 
-## Pergunta científica
+Coleção do Tournament:
 
-A pesquisa deixou de perguntar se um ativo possui uma assinatura marginal fixa e passou a formular uma decisão causal:
+- `research_contextual_signature_tournaments`
 
-> Dado o estado observado antes da decisão, vale a pena forçar o candidato `a` agora ou é melhor deixar a política normal decidir?
+Contrato de artefatos permanece estável:
 
-Target atual:
+- entrypoint: `scripts/research_contextual_marginal_signature.py`
+- pasta: `research_output/contextual_marginal_signature/`
+- ZIP: `research_output/contextual_marginal_signature.zip`
+- filesystem: somente exportação
+- MongoDB local: fonte persistente de verdade
 
-`Y(t,a,H) = log(W_forced_candidate_then_policy / W_normal_policy)`
-
-Os dois braços contêm o candidato. O braço forçado altera somente a primeira decisão causal e depois retorna à mesma política a partir do estado resultante do simulador.
-
-A política normal é uma ação válida com vantagem zero. Portanto, o problema final inclui abstenção:
-
-`max(0, Y_candidate_1, ..., Y_candidate_k)`
-
-## Campanha temporal atual
-
-- 23 estados temporais executáveis XNYS entre 2020 e 2026
-- 2 universos: `Original25` e `Original24_MinusADM`
-- 7 candidatos: `XSD`, `MKSI`, `GKOS`, `CLMT`, `CORT`, `APD`, `CCK`
-- horizonte de 40 decision points / 39 transições
-- 322 observações de vantagem de ação pareada
-- Strategy #10 congelada
-- market data exclusivamente do MongoDB local durante a campanha
-- switch margin congelada fold a fold a partir do baseline
-- checkpoint idempotente e resume automático
-
-Datas:
-
-- 03/08/2020
-- 02/11/2020
-- 01/02/2021
-- 03/05/2021
-- 02/08/2021
-- 01/11/2021
-- 01/02/2022
-- 02/05/2022
-- 01/08/2022
-- 01/11/2022
-- 01/02/2023
-- 01/05/2023
-- 01/08/2023
-- 01/11/2023
-- 01/02/2024
-- 01/05/2024
-- 01/08/2024
-- 01/11/2024
-- 03/02/2025
-- 01/05/2025
-- 01/08/2025
-- 02/02/2026
-- 01/06/2026
-
-## Evolução científica
-
-### v1.0.0–v1.0.5 — primeiras assinaturas contextuais
-
-Os primeiros experimentos usaram capital marginal exato como target e conjuntos pequenos de features retrospectivas. Modelos lineares e árvores rasas mostraram ranking fraco e instável fora do tempo. Isso eliminou a hipótese simples de uma assinatura fixa do ativo.
-
-### v1.0.6–v1.0.9 — contexto e composição do universo
-
-Experimentos leave-one-out e universos reduzidos mostraram que a contribuição aparente de um candidato podia mudar com o universo ao redor. ADM e ADI foram casos diagnósticos importantes. O target relativo foi corrigido para impedir que mudanças no baseline fossem confundidas com efeito próprio do candidato.
-
-### v1.0.11–v1.0.14.4 — atribuição de caminho e calibração congelada
-
-Os traces completos revelaram que a simples presença de um candidato podia alterar a calibração da switch margin mesmo quando o candidato não era negociado. A pesquisa separou participação direta de recalibração da política e passou a congelar fold a fold a margem escolhida pelo baseline.
-
-Na campanha de prevalência do efeito direto, 27 de 84 observações tiveram efeito direto não nulo, distribuídas entre sinais positivos e negativos e associadas à participação real do candidato.
-
-### v1.0.13–v1.0.15 — representação do caminho
-
-A Log-Signature de nível 2 mostrou que interações candidato × universo podem ser representadas sem cancelamento simples. Porém, o primeiro benchmark Ridge com todos os termos LogSig não produziu ranking temporal robusto. A conclusão foi de capacidade representacional, não de previsibilidade demonstrada.
-
-### v1.0.16 — Paired Action Advantage
-
-O target passou a comparar diretamente:
-
-`log(W_force_candidate_once_then_policy / W_policy)`
-
-A vantagem de ação ficou densa: 82 de 84 observações foram não nulas. A data/contexto explicou muito mais variação que a identidade do candidato. A pergunta seguinte ficou definida:
-
-> Conseguimos prever essa vantagem antes da decisão?
-
-### v1.0.17 — expansão temporal
-
-A campanha aumentou de 6 para 23 estados independentes, mantendo os dois universos e os sete candidatos. O objetivo é obter diversidade temporal suficiente para avaliar previsão cronológica e ranking dentro de cada contexto.
-
-### v1.0.17.1–v1.0.17.3 — execução resiliente
-
-Foram incorporados:
-
-- preflight das janelas walk-forward OOS
-- serialização BSON segura para `NaT`, `NaN` e infinitos
-- checkpoints idempotentes
-- resume automático pelo MongoDB
-- persistência de traces no MongoDB
-- logs para análise científica parcial
-- cache de RAM limitado ao par policy/forced
-
-### v1.0.17.4 — aceleração guardada e refatoração final
-
-A aceleração reutiliza apenas trabalho invariável:
-
-- frames de features derivados do mercado
-- contexto preparado do replay dentro do par
-- modelos LightGBM ajustados dentro do par
-- utilities/predições brutas dentro do par
-
-Nunca são reutilizados:
-
-- posição
-- holding days
-- trades
-- estado do simulador
-- trajetória de capital
-- diagnósticos dependentes da intervenção
-
-O primeiro par elegível executa uma referência sem cache e uma execução acelerada. A campanha só continua se capital, sessões, predictions e trades forem equivalentes com tolerância `1e-12`.
-
-Nesta mesma versão técnica, a implementação incremental histórica foi achatada. O código ativo deixou de depender de aliases `v111`, `v1144`, `v116`, `v117`, `v1172` ou wrappers equivalentes. Os scripts de pesquisas anteriores foram removidos desta branch; o histórico permanece no Git.
-
-### v1.0.17.5 — diagnóstico de divergência e fallback seguro
-
-O primeiro teste real da v1.0.17.4 detectou divergência entre a referência sem cache e a execução acelerada e abortou corretamente antes de confiar no cache.
-
-A v1.0.17.5 mantém o mesmo protocolo científico e torna esse guard mais informativo e resiliente:
-
-- primeiro compara `uncached reference` contra `accelerated`;
-- se houver divergência, executa uma segunda repetição sem cache;
-- se as duas execuções sem cache forem equivalentes, a divergência é atribuída à aceleração, o cache é desativado para o processo e a campanha continua pela execução sem cache confiável;
-- se as duas execuções sem cache também divergirem, a campanha para com diagnóstico explícito de não determinismo subjacente, incluindo `deterministic_execution`, `xgb_n_jobs` e `numeric_thread_limit`;
-- nenhum resultado acelerado divergente é persistido como observação científica.
-
-Assim, uma otimização de performance não pode bloquear a pesquisa quando o caminho sem cache é estável, nem mascarar um problema real de reprodutibilidade quando o próprio replay sem cache diverge.
-
-## Estrutura atual
-
-A pasta `scripts` desta branch contém somente a linha ativa:
+## Estrutura ativa
 
 ```text
-READM.md
-research_contextual_marginal_signature.py
-research_contextual_signature_protocol.py
-research_contextual_signature_campaign.py
-research_contextual_signature_runtime.py
-research_contextual_signature_storage.py
-research_contextual_signature_analysis.py
+scripts/
+  READM.md
+  research_contextual_marginal_signature.py
+  research_contextual_signature_campaign_runner.py
+  research_contextual_signature_campaign.py
+  research_contextual_signature_protocol.py
+  research_contextual_signature_runtime.py
+  research_contextual_signature_storage.py
+  research_contextual_signature_analysis.py
+  research_contextual_signature_tournament.py
 ```
 
-Responsabilidades:
-
-- `research_contextual_marginal_signature.py`: entrypoint estável, cache e validação de equivalência
-- `research_contextual_signature_protocol.py`: protocolo contrafactual, calendário, frozen margin, forced action, captura e helpers de replay
-- `research_contextual_signature_campaign.py`: campanha 23 × 2 × 7, preflight, checkpoints, resume, dataset final e export
-- `research_contextual_signature_runtime.py`: cache de RAM e observabilidade da aceleração
-- `research_contextual_signature_storage.py`: MongoDB, serialização, retry, traces, observações e export
-- `research_contextual_signature_analysis.py`: análise parcial/final e readiness gate
-
-Não criar novos arquivos com versão no nome. Evoluções futuras modificam estes módulos estáveis.
-
-## Gate para benchmark
-
-O dataset fica pronto para o Research Tournament somente quando houver:
-
-- pelo menos 280 observações
-- pelo menos 20 estados temporais
-- suporte não nulo para todos os 7 candidatos
-- pelo menos 7 anos representados
-- targets positivos e negativos
-- pelo menos 3 contextos onde intervir é melhor
-- pelo menos 3 contextos onde `NORMAL POLICY` é melhor
+O `campaign_runner` preserva a execução científica congelada v1.0.17.5; o entrypoint estável apenas despacha entre `campaign` e `tournament`.
 
 ## Linha de chegada
 
-A pesquisa tem três etapas finais:
+Não estamos autorizados a chamar o resultado de definitivo apenas porque um modelo vence o Tournament. A evidência temporal continua limitada a 23 estados independentes e apenas dois estados reservados em 2026.
 
-1. terminar a coleta contrafactual dos 23 estados;
-2. executar um Research Tournament integrado usando exclusivamente o dataset/traces congelados no MongoDB;
-3. congelar a solução vencedora e fazer uma confirmação cronológica final realmente reservada.
+A pesquisa termina em no máximo duas etapas adicionais:
 
-O tournament deve comparar, sob os mesmos splits cronológicos e métricas:
+1. Direct Marginal Capital Tournament v1.0.18.0.
+2. Somente se o Tournament confirmar sinal: congelar fórmula/modelo/regra de abstenção e executar um único backtest sequencial final do sistema completo, comparando capital composto contra a estratégia atual.
 
-- Ridge / Elastic Net
-- LightGBM
-- MLP
-- modelo neural temporal compacto
-- representações com e sem informação de caminho / Log-Signature
-
-As tarefas incluem regressão da vantagem, classificação de sinal, ranking dentro do contexto, intervenção versus abstenção e utilidade econômica da decisão.
-
-O resultado negativo também é terminal e válido:
-
-> Não encontramos previsibilidade suficientemente robusta antes da decisão.
-
-Não adicionar modelos indefinidamente para fabricar um vencedor.
-
-## Regras de segurança
-
-- Não mudar target, estados, candidatos, universos ou frozen-margin dentro de uma otimização técnica.
-- Não usar arquivos locais como fonte persistente para uma análise posterior.
-- Não apagar as coleções Mongo ao atualizar o código.
-- Uma falha técnica pode parar o processo, mas observações concluídas devem permanecer recuperáveis.
-- Antes de confiar em uma nova otimização, exigir equivalência determinística.
-- Se o cache falhar e o replay sem cache for estável, continuar sem cache em vez de sacrificar a campanha.
-- Os logs devem continuar permitindo análise parcial durante a campanha.
+Se o Tournament não demonstrar sinal robusto, o resultado negativo encerra esta linha com os dados/features atuais. Se passar, o backtest final decide se a fórmula realmente aumenta o capital da estratégia inteira.
