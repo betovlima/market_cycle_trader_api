@@ -5,7 +5,7 @@ import sys
 import research_contextual_signature_campaign_runner as _campaign_runner
 
 CAMPAIGN_VERSION = "contextual-marginal-signature-v1.0.17.5"
-TOURNAMENT_VERSION = "contextual-marginal-signature-v1.0.19.0"
+TOURNAMENT_VERSION = "contextual-marginal-signature-v1.0.20.0"
 SCRIPT_VERSION = CAMPAIGN_VERSION
 
 # Preserve the stable public surface used by tests and research helpers.
