@@ -19,6 +19,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 import research_contextual_marginal_signature as runner  # noqa: E402
 import research_contextual_signature_analysis as analysis  # noqa: E402
 import research_contextual_signature_storage as storage  # noqa: E402
+import research_contextual_signature_tournament as tournament  # noqa: E402
 from research_contextual_signature_runtime import (  # noqa: E402
     PairedReplayMemoryCache,
     compare_replay_outputs,
@@ -34,11 +35,44 @@ class ContextualMarginalSignatureRunnerTests(unittest.TestCase):
         self.assertNotIn("v1", runner.EXPORT_FOLDER_NAME)
         self.assertNotIn("v1", runner.EXPORT_ZIP_NAME)
         self.assertEqual(runner.SCRIPT_VERSION, "contextual-marginal-signature-v1.0.17.5")
+        self.assertEqual(runner.TOURNAMENT_VERSION, "contextual-marginal-signature-v1.0.19.0")
         self.assertEqual(runner.HORIZON_SESSIONS, 40)
         self.assertEqual(len(runner.DECISION_DATES), 23)
         self.assertEqual(len(runner.CANDIDATES), 7)
         self.assertEqual(len(runner.UNIVERSES), 2)
         self.assertGreaterEqual(len({pd.Timestamp(x).year for x in runner.DECISION_DATES}), 7)
+
+    def test_tournament_preserves_direct_marginal_target_and_fixed_trajectory_windows(self) -> None:
+        self.assertEqual(tournament.TARGET, "source_direct_delta_log_capital")
+        self.assertEqual(tournament.TRAJECTORY_LOOKBACKS, (5, 20, 60))
+        self.assertEqual(len(tournament.TRAJECTORY_SOURCE_FEATURES), 10)
+        self.assertNotIn("candidate", tournament.TRAJECTORY_SOURCE_FEATURES)
+
+    def test_trajectory_path_stats_do_not_look_past_decision(self) -> None:
+        index = pd.date_range("2025-01-01", periods=10, tz="UTC")
+        original = pd.Series(np.arange(10, dtype=float), index=index)
+        altered_future = original.copy()
+        altered_future.loc[index[6]:] = 10000.0
+        before = tournament._path_stats(original, index[5], 5)
+        after = tournament._path_stats(altered_future, index[5], 5)
+        self.assertEqual(before, after)
+
+    def test_trajectory_requires_added_development_value(self) -> None:
+        snapshot = {"cumulative_direct_log_gain": 0.20}
+        trajectory = {"cumulative_direct_log_gain": 0.19}
+        baseline = {"cumulative_direct_log_gain": 0.05}
+        holdout = {"cumulative_direct_log_gain": 0.10}
+        robust = {"cumulative_direct_log_gain": 0.10}
+        self.assertEqual(
+            tournament.trajectory_status(
+                trajectory,
+                snapshot,
+                baseline,
+                holdout,
+                robust,
+            ),
+            "TRAJECTORY_ADDED_VALUE_NOT_FOUND",
+        )
 
     def test_temporal_states_are_real_xnys_sessions_and_after_locked_oos_warmup(self) -> None:
         calendar = xcals.get_calendar("XNYS")
