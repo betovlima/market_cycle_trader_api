@@ -4,114 +4,159 @@ Branch permanente: `research/contextual-marginal-signature-v1`
 
 Coleta contrafactual congelada: `contextual-marginal-signature-v1.0.17.5`
 
-Research Tournament atual: `contextual-marginal-signature-v1.0.18.0`
+Research Tournament atual: `contextual-marginal-signature-v1.0.19.0`
 
-Este é o único documento vivo desta linha de pesquisa. O histórico do Git preserva versões anteriores; não criar READMEs por versão.
+Este é o único documento vivo desta linha. Não criar READMEs por versão; o histórico do Git preserva a evolução.
 
 ## Objetivo científico
 
 O objetivo final continua sendo aumentar o capital composto do Market Cycle Trader.
 
-A pergunta específica desta linha é:
+A pergunta desta pesquisa é:
 
 > Entre ativos externos que já passaram pela pré-seleção, conseguimos aprender uma função que diga qual ativo deve ser inserido agora no universo para aumentar o capital futuro da estratégia?
 
-O target principal volta a ser o efeito marginal direto da inserção:
+Target principal:
 
 `Y_direct(t,a,H) = log(W_policy_with_candidate_added / W_baseline_policy_without_candidate)`
 
-A política continua decidindo normalmente depois que o candidato é adicionado. Não usamos identidade fixa do candidato como feature do modelo principal; a fórmula deve generalizar para um novo ativo pré-selecionado.
+A política decide normalmente depois que o candidato é adicionado. A identidade fixa do candidato não entra como feature do modelo principal; a solução deve poder generalizar para um novo ativo pré-selecionado.
 
-O antigo `action_advantage_log` permanece armazenado como diagnóstico secundário, mas não é mais o target principal do Tournament.
+O antigo `action_advantage_log` permanece no MongoDB apenas como diagnóstico secundário e não é o target do Tournament.
 
-## Resultado da campanha v1.0.17.5
+## Campanha congelada v1.0.17.5
 
-A coleta terminou com:
+A coleta terminou com 322 observações, 23 estados temporais entre 2020 e 2026, dois universos (`Original25` e `Original24_MinusADM`) e sete candidatos (`XSD`, `MKSI`, `GKOS`, `CLMT`, `CORT`, `APD`, `CCK`). A Strategy #10, o snapshot de mercado e a switch margin fold a fold permanecem congelados.
 
-- 322 observações
-- 23 estados temporais entre 2020 e 2026
-- 2 universos: `Original25` e `Original24_MinusADM`
-- 7 candidatos: `XSD`, `MKSI`, `GKOS`, `CLMT`, `CORT`, `APD`, `CCK`
-- horizonte de 40 decision points / 39 transições
-- Strategy #10 congelada
-- MongoDB local como fonte de verdade
-- switch margin congelada fold a fold
-- traces e observações persistidos no MongoDB
+No target direto:
 
-No target correto `source_direct_delta_log_capital`:
+- 73 inserções aumentaram o capital;
+- 65 reduziram o capital;
+- 184 não alteraram o capital;
+- em 23 dos 46 contextos havia ao menos um candidato positivo;
+- em 23 dos 46 contextos nenhum candidato melhorava o baseline.
 
-- 73 inserções aumentaram o capital
-- 65 reduziram o capital
-- 184 não alteraram o capital
-- em 23 dos 46 contextos havia pelo menos um candidato com efeito positivo
-- em 23 dos 46 contextos a melhor decisão era não inserir nenhum candidato
+No `Original25`, foram 161 observações: 44 positivas, 31 negativas e 86 neutras. Em 12 das 23 datas existia alguma inserção positiva; em 11 não existia.
 
-No `Original25`:
+Isso comprova oportunidade econômica retrospectiva, não previsibilidade ex ante.
 
-- 161 observações
-- 44 positivas
-- 31 negativas
-- 86 neutras
-- 12 das 23 datas possuíam pelo menos uma inserção positiva
-- 11 das 23 datas não possuíam inserção positiva
+## v1.0.18.1 — resultado do Snapshot Tournament
 
-Isso demonstra oportunidade econômica retrospectiva, mas ainda não demonstra previsibilidade ex ante.
+A v1.0.18.x reutilizou exclusivamente os labels já persistidos no MongoDB e reconstruiu features disponíveis antes da decisão. A representação foi um snapshot transversal em `t`:
 
-## v1.0.18.0 — Direct Marginal Capital Tournament
+- estado atual do candidato;
+- diferença candidato versus média do universo;
+- z-score e percentil/rank relativo;
+- média e dispersão do universo;
+- estado de SPY.
 
-A v1.0.18.0 não repete os caros rollouts contrafactuais. Ela reutiliza exclusivamente as observações congeladas no MongoDB e reconstrói features disponíveis antes da decisão a partir do histórico de mercado local.
+Os mesmos modelos fixos foram usados: Ridge, Elastic Net, LightGBM quando disponível e MLP compacto.
 
-O Tournament usa como features:
+Resultado de desenvolvimento:
 
-- estado atual do candidato
-- diferença candidato versus média do universo
-- z-score do candidato dentro do universo
-- percentil/rank relativo do candidato
-- média e dispersão do universo
-- estado de SPY como contexto de mercado
+- baseline histórico por candidato: `1.1592x`;
+- Ridge: `1.0399x`;
+- Elastic Net: `1.5096x`;
+- LightGBM: `1.4512x`;
+- MLP: `1.2511x`.
 
-As features são derivadas das `ROTATION_FEATURES` já usadas pelo motor. A identidade do candidato não entra no modelo principal.
+O Elastic Net venceu no desenvolvimento, mas falhou no trecho reservado:
 
-Modelos comparados com parâmetros fixos e modestos:
+- `Original25` em 2026: `0.9790x`;
+- `Original24_MinusADM` em 2026: `0.9483x`;
+- decisão: `DEVELOPMENT_SIGNAL_NOT_CONFIRMED`.
 
-- Ridge
-- Elastic Net
-- LightGBM, quando disponível
-- MLP compacto
+Conclusão limitada da v1.0.18.1: o snapshot atual não produziu regra generalizável suficiente. Isso não demonstra que o efeito marginal seja imprevisível; deixa aberta uma única família de falha: o snapshot pode ter perdido a trajetória que levou ao estado atual.
 
-Também existe um baseline simples de média histórica por candidato. O modelo contextual precisa superá-lo; caso contrário, não demonstrou que aprendeu contexto.
+## v1.0.19.0 — Temporal Trajectory Tournament
+
+A v1.0.19.0 testa somente a hipótese seguinte:
+
+> A trajetória anterior à decisão contém informação preditiva adicional que o snapshot em `t` não contém?
+
+Ela não refaz os 322 rollouts. O target, os estados, os universos, os candidatos, o holdout de 2026 e os modelos permanecem iguais. A única mudança científica é a representação da informação pré-decisão.
+
+### Representação
+
+A v1.0.19.0 mantém todas as features do snapshot v1.0.18.1 e adiciona trajetória para dez fontes previamente fixadas:
+
+- `return_5`
+- `return_20`
+- `return_60`
+- `vol_20`
+- `ema_distance_20`
+- `ema_20_vs_50`
+- `rsi_14`
+- `atr_pct_14`
+- `trend_efficiency_20`
+- `momentum_acceleration_5_20`
+
+Janelas pré-decisão fixas: 5, 20 e 60 sessões.
+
+Para cada fonte e janela são derivados, usando somente dados até a data da decisão:
+
+- delta do candidato;
+- inclinação do candidato;
+- delta candidato versus média do universo;
+- inclinação relativa;
+- dispersão da trajetória relativa;
+- mudança de percentil/rank;
+- inclinação do rank;
+- delta de SPY;
+- inclinação de SPY.
+
+A implementação corta explicitamente cada série em `index <= decision` antes de calcular a janela. Nenhuma observação posterior à decisão pode entrar nas features de trajetória.
+
+### Comparação controlada
+
+A pergunta não é se um novo modelo qualquer consegue vencer. A comparação é:
+
+`snapshot v1.0.18.1` versus `snapshot + trajetória v1.0.19.0`
+
+com os mesmos quatro modelos e os mesmos splits cronológicos.
+
+A v1.0.19.0 primeiro reproduz os logs e métricas do snapshot com os prefixos já existentes:
+
+- `[tournament]`
+- `[development]`
+- `[winner]`
+
+Depois acrescenta, sem renomear os anteriores:
+
+- `[trajectory]`
+- `[trajectory-development]`
+- `[trajectory-winner]`
+- `[comparison]`
+- `[decision]`
+- `[complete]`
 
 ### Validação
 
-Para evitar pseudo-replicação, `Original25` é o universo primário. Os 23 estados temporais, e não as 322 linhas, são tratados como a unidade temporal relevante.
-
-- desenvolvimento: expanding chronological walk-forward até 2025
-- mínimo de 8 estados anteriores antes da primeira previsão
-- abstenção: inserir somente se a maior previsão de `Y_direct` for maior que zero
-- seleção de modelo: somente pelo desenvolvimento cronológico
-- confirmação reservada: estados de 2026
-- `Original24_MinusADM`: apenas teste de robustez, não conta como novo estado temporal independente
+- universo primário: `Original25`;
+- desenvolvimento: expanding chronological walk-forward até 2025;
+- mínimo de oito estados anteriores antes da primeira previsão;
+- abstenção: só inserir quando a maior previsão de `Y_direct` for positiva;
+- escolha do modelo somente no desenvolvimento;
+- 2026 permanece reservado;
+- `Original24_MinusADM` permanece apenas como robustez, não como estado independente adicional.
 
 Métrica econômica principal:
 
 `capital_multiplier_vs_no_insert = exp(sum(realized_direct_log))`
 
-Ela representa o multiplicador de capital marginal obtido pelas decisões do seletor em relação a não inserir candidato nos contextos avaliados.
+### Regra terminal da trajetória
 
-### Regra terminal
+- `TRAJECTORY_ADDED_VALUE_NOT_FOUND`: a melhor representação com trajetória não supera a melhor representação snapshot no desenvolvimento.
+- `TRAJECTORY_CONTEXTUAL_SIGNAL_NOT_FOUND`: a trajetória não supera o baseline histórico.
+- `TRAJECTORY_SIGNAL_NOT_CONFIRMED`: melhora no desenvolvimento, mas falha no `Original25` reservado de 2026.
+- `TRAJECTORY_HOLDOUT_NOT_ROBUST`: passa no `Original25` de 2026, mas falha em `Original24_MinusADM`.
+- `TRAJECTORY_CONFIRMED_LIMITED_NEXT_SYSTEM_BACKTEST`: passa pelos níveis acima e ganha direito a um único backtest sequencial final do sistema completo.
 
-O Tournament produz um dos quatro estados:
-
-- `NO_CONTEXTUAL_SIGNAL`: o melhor modelo contextual não supera o baseline histórico; encerrar esta família de features/modelos.
-- `DEVELOPMENT_SIGNAL_NOT_CONFIRMED`: houve sinal em desenvolvimento, mas ele falhou nos estados reservados de 2026; não promover.
-- `HOLDOUT_SIGNAL_NOT_ROBUST`: passou no `Original25` de 2026, mas não sobreviveu ao universo perturbado; não promover.
-- `CONFIRMED_LIMITED_NEXT_SYSTEM_BACKTEST`: passou pelos três níveis; congelar o vencedor e executar um único backtest sequencial final do sistema completo.
-
-Não adicionar modelos indefinidamente para fabricar um vencedor.
+Se a trajetória não for confirmada, não adicionar sucessivamente mais modelos tabulares a este mesmo dataset congelado apenas para fabricar um vencedor.
 
 ## Como executar
 
-A coleta antiga continua disponível pelo mesmo entrypoint:
+A coleta contrafactual antiga continua disponível pelo entrypoint estável:
 
 ```bat
 python scripts\research_contextual_marginal_signature.py ^
@@ -119,7 +164,7 @@ python scripts\research_contextual_marginal_signature.py ^
   --env-file .env
 ```
 
-Para o Tournament v1.0.18.0, sem repetir os rollouts:
+Tournament v1.0.19.0, sem repetir os rollouts:
 
 ```bat
 python scripts\research_contextual_marginal_signature.py ^
@@ -128,9 +173,9 @@ python scripts\research_contextual_marginal_signature.py ^
   --env-file .env
 ```
 
-O Tournament exige uma campanha 23 × 2 × 7 concluída no MongoDB local para a Strategy selecionada.
+## Persistência e artefatos
 
-## Persistência
+MongoDB local é a fonte persistente de verdade.
 
 Coleções da campanha:
 
@@ -139,7 +184,7 @@ Coleções da campanha:
 - `research_contextual_signature_trace_runs`
 - `research_contextual_signature_trace_rows`
 
-Coleção do Tournament:
+Coleção dos Tournaments:
 
 - `research_contextual_signature_tournaments`
 
@@ -148,8 +193,7 @@ Contrato de artefatos permanece estável:
 - entrypoint: `scripts/research_contextual_marginal_signature.py`
 - pasta: `research_output/contextual_marginal_signature/`
 - ZIP: `research_output/contextual_marginal_signature.zip`
-- filesystem: somente exportação
-- MongoDB local: fonte persistente de verdade
+- filesystem: somente exportação, nunca entrada obrigatória para análise posterior.
 
 ## Estrutura ativa
 
@@ -166,15 +210,14 @@ scripts/
   research_contextual_signature_tournament.py
 ```
 
-O `campaign_runner` preserva a execução científica congelada v1.0.17.5; o entrypoint estável apenas despacha entre `campaign` e `tournament`.
+Não adicionar arquivo novo para cada versão.
 
 ## Linha de chegada
 
-Não estamos autorizados a chamar o resultado de definitivo apenas porque um modelo vence o Tournament. A evidência temporal continua limitada a 23 estados independentes e apenas dois estados reservados em 2026.
+A linha atual é curta:
 
-A pesquisa termina em no máximo duas etapas adicionais:
+1. executar a v1.0.19.0 e decidir se a trajetória acrescenta previsibilidade real ao snapshot;
+2. somente se o status for `TRAJECTORY_CONFIRMED_LIMITED_NEXT_SYSTEM_BACKTEST`, congelar representação + modelo + parâmetros + regra de abstenção e executar um único backtest sequencial do sistema completo;
+3. no backtest final, comparar diretamente o capital composto da estratégia atual contra a estratégia atual + seletor aprendido.
 
-1. Direct Marginal Capital Tournament v1.0.18.0.
-2. Somente se o Tournament confirmar sinal: congelar fórmula/modelo/regra de abstenção e executar um único backtest sequencial final do sistema completo, comparando capital composto contra a estratégia atual.
-
-Se o Tournament não demonstrar sinal robusto, o resultado negativo encerra esta linha com os dados/features atuais. Se passar, o backtest final decide se a fórmula realmente aumenta o capital da estratégia inteira.
+Se a v1.0.19.0 falhar, o resultado negativo encerra esta família de representação tabular de trajetória sobre o dataset congelado. Se passar, o capital final do sistema completo decide se a descoberta merece integração no MCT.
