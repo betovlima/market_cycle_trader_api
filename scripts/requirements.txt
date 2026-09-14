@@ -1,0 +1,30 @@
+# Contextual Marginal Signature / Spyder research runtime
+#
+# Install from the repository root:
+#   python -m pip install -r scripts/requirements.txt
+#
+# Or, with scripts/ as the current directory:
+#   python -m pip install -r requirements.txt
+#
+# This file intentionally excludes the FastAPI/uvicorn web stack.
+# It contains the runtime used by scripts/research_contextual_marginal_signature.py
+# and the Market Cycle Trader research modules imported by that entrypoint.
+
+pydantic
+python-dotenv>=1.0,<2
+pymongo
+
+numpy==2.5.1
+pandas==3.0.5
+scipy==1.18.0
+scikit-learn==1.9.0
+threadpoolctl==3.6.0
+exchange-calendars>=4.13,<5
+matplotlib
+
+# Market-data/model dependencies imported by the MCT research engine.
+alpaca-py==0.43.5
+requests>=2.32,<3
+xgboost==3.3.0
+lightgbm>=4.6,<5
+torch>=2.10,<3
