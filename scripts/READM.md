@@ -4,7 +4,7 @@ Branch permanente: `research/contextual-marginal-signature-v1`
 
 Coleta contrafactual congelada: `contextual-marginal-signature-v1.0.17.5`
 
-Research Tournament atual: `contextual-marginal-signature-v1.0.19.0`
+Research Tournament atual: `contextual-marginal-signature-v1.0.20.0`
 
 Este é o único documento vivo desta linha. Não criar READMEs por versão; o histórico do Git preserva a evolução.
 
@@ -12,47 +12,41 @@ Este é o único documento vivo desta linha. Não criar READMEs por versão; o h
 
 O objetivo final continua sendo aumentar o capital composto do Market Cycle Trader.
 
-A pergunta desta pesquisa é:
+A pergunta central é:
 
-> Entre ativos externos que já passaram pela pré-seleção, conseguimos aprender uma função que diga qual ativo deve ser inserido agora no universo para aumentar o capital futuro da estratégia?
+> Entre ativos externos já pré-selecionados, qual candidato deve entrar no universo agora para melhorar o capital futuro sem desorganizar oportunidades que já estavam bem posicionadas?
 
-Target principal:
+A metáfora operacional adotada a partir da v1.0.20 é a mesa de bilhar:
 
-`Y_direct(t,a,H) = log(W_policy_with_candidate_added / W_baseline_policy_without_candidate)`
+- o universo atual é a mesa;
+- os ativos atuais são as bolas já posicionadas;
+- uma oportunidade futura é uma caçapa;
+- um candidato externo é uma nova possibilidade de tacada;
+- uma boa inserção pode criar um ângulo que o universo não possuía;
+- uma inserção ruim pode perturbar a política antes mesmo de o candidato ser escolhido e destruir alinhamentos que já existiam.
 
-A política decide normalmente depois que o candidato é adicionado. A identidade fixa do candidato não entra como feature do modelo principal; a solução deve poder generalizar para um novo ativo pré-selecionado.
-
-O antigo `action_advantage_log` permanece no MongoDB apenas como diagnóstico secundário e não é o target do Tournament.
+O objetivo não é eliminar toda mudança. O objetivo é distinguir mudança produtiva de perturbação inútil.
 
 ## Campanha congelada v1.0.17.5
 
-A coleta terminou com 322 observações, 23 estados temporais entre 2020 e 2026, dois universos (`Original25` e `Original24_MinusADM`) e sete candidatos (`XSD`, `MKSI`, `GKOS`, `CLMT`, `CORT`, `APD`, `CCK`). A Strategy #10, o snapshot de mercado e a switch margin fold a fold permanecem congelados.
+A coleta terminou com 322 observações:
 
-No target direto:
+- 23 estados temporais entre 2020 e 2026;
+- 2 universos: `Original25` e `Original24_MinusADM`;
+- 7 candidatos: `XSD`, `MKSI`, `GKOS`, `CLMT`, `CORT`, `APD`, `CCK`;
+- horizonte contrafactual máximo de 40 sessões;
+- Strategy #10 e snapshot de mercado congelados;
+- MongoDB local como fonte persistente de verdade.
 
-- 73 inserções aumentaram o capital;
-- 65 reduziram o capital;
-- 184 não alteraram o capital;
-- em 23 dos 46 contextos havia ao menos um candidato positivo;
-- em 23 dos 46 contextos nenhum candidato melhorava o baseline.
+Target direto persistido:
 
-No `Original25`, foram 161 observações: 44 positivas, 31 negativas e 86 neutras. Em 12 das 23 datas existia alguma inserção positiva; em 11 não existia.
+`source_direct_delta_log_capital = log(W_policy_with_candidate_added / W_baseline_policy_without_candidate)`
 
-Isso comprova oportunidade econômica retrospectiva, não previsibilidade ex ante.
+O MongoDB também contém as traces de `baseline`, `policy` e `forced`, incluindo o caminho de ativos selecionados e a evolução do capital. A v1.0.20 reutiliza essas traces; não refaz os rollouts caros.
 
-## v1.0.18.1 — resultado do Snapshot Tournament
+## v1.0.18.1 — Snapshot Tournament
 
-A v1.0.18.x reutilizou exclusivamente os labels já persistidos no MongoDB e reconstruiu features disponíveis antes da decisão. A representação foi um snapshot transversal em `t`:
-
-- estado atual do candidato;
-- diferença candidato versus média do universo;
-- z-score e percentil/rank relativo;
-- média e dispersão do universo;
-- estado de SPY.
-
-Os mesmos modelos fixos foram usados: Ridge, Elastic Net, LightGBM quando disponível e MLP compacto.
-
-Resultado de desenvolvimento:
+A representação transversal em `t` produziu:
 
 - baseline histórico por candidato: `1.1592x`;
 - Ridge: `1.0399x`;
@@ -60,103 +54,114 @@ Resultado de desenvolvimento:
 - LightGBM: `1.4512x`;
 - MLP: `1.2511x`.
 
-O Elastic Net venceu no desenvolvimento, mas falhou no trecho reservado:
+O Elastic Net venceu no desenvolvimento, mas falhou no holdout:
 
-- `Original25` em 2026: `0.9790x`;
-- `Original24_MinusADM` em 2026: `0.9483x`;
-- decisão: `DEVELOPMENT_SIGNAL_NOT_CONFIRMED`.
+- `Original25` 2026: `0.9790x`;
+- `Original24_MinusADM` 2026: `0.9483x`;
+- status: `DEVELOPMENT_SIGNAL_NOT_CONFIRMED`.
 
-Conclusão limitada da v1.0.18.1: o snapshot atual não produziu regra generalizável suficiente. Isso não demonstra que o efeito marginal seja imprevisível; deixa aberta uma única família de falha: o snapshot pode ter perdido a trajetória que levou ao estado atual.
+Conclusão: o snapshot não forneceu uma regra generalizável suficiente.
 
 ## v1.0.19.0 — Temporal Trajectory Tournament
 
-A v1.0.19.0 testa somente a hipótese seguinte:
+A trajetória pré-decisão adicionou 270 features sobre o snapshot. O melhor resultado foi LightGBM com cerca de `1.1995x` no desenvolvimento, inferior ao snapshot vencedor `1.5096x`, e o holdout permaneceu negativo.
 
-> A trajetória anterior à decisão contém informação preditiva adicional que o snapshot em `t` não contém?
+Status:
 
-Ela não refaz os 322 rollouts. O target, os estados, os universos, os candidatos, o holdout de 2026 e os modelos permanecem iguais. A única mudança científica é a representação da informação pré-decisão.
+`TRAJECTORY_ADDED_VALUE_NOT_FOUND`
 
-### Representação
+Conclusão: adicionar trajetória tabular à mesma formulação não resolveu o problema. Isso encerra a família snapshot + trajetória tabular como tentativa de previsão direta do efeito marginal.
 
-A v1.0.19.0 mantém todas as features do snapshot v1.0.18.1 e adiciona trajetória para dez fontes previamente fixadas:
+## v1.0.20.0 — Opportunity Hole / Table Geometry Decomposition
 
-- `return_5`
-- `return_20`
-- `return_60`
-- `vol_20`
-- `ema_distance_20`
-- `ema_20_vs_50`
-- `rsi_14`
-- `atr_pct_14`
-- `trend_efficiency_20`
-- `momentum_acceleration_5_20`
+A v1.0.20 não treina um novo modelo. Primeiro testa se o mecanismo que queremos realmente existe nos dados já coletados.
 
-Janelas pré-decisão fixas: 5, 20 e 60 sessões.
+Pergunta:
 
-Para cada fonte e janela são derivados, usando somente dados até a data da decisão:
+> Quando a estratégia perde em uma janela futura, o problema era falta de oportunidade no universo ou falha da política em escolher uma oportunidade que já existia?
 
-- delta do candidato;
-- inclinação do candidato;
-- delta candidato versus média do universo;
-- inclinação relativa;
-- dispersão da trajetória relativa;
-- mudança de percentil/rank;
-- inclinação do rank;
-- delta de SPY;
-- inclinação de SPY.
+A análise é executada nos horizontes:
 
-A implementação corta explicitamente cada série em `index <= decision` antes de calcular a janela. Nenhuma observação posterior à decisão pode entrar nas features de trajetória.
+- 5 sessões;
+- 10 sessões;
+- 20 sessões;
+- 40 sessões.
 
-### Comparação controlada
+O horizonte primário é 20 sessões, aproximadamente um mês de pregão. Os demais funcionam como análise de sensibilidade.
 
-A pergunta não é se um novo modelo qualquer consegue vencer. A comparação é:
+### Classificação de cada estado
 
-`snapshot v1.0.18.1` versus `snapshot + trajetória v1.0.19.0`
+Para cada data e universo:
 
-com os mesmos quatro modelos e os mesmos splits cronológicos.
+`COVERED`
 
-A v1.0.19.0 primeiro reproduz os logs e métricas do snapshot com os prefixos já existentes:
+A estratégia-base terminou positivamente na janela. A mesa conseguiu converter alguma oportunidade em capital.
 
-- `[tournament]`
-- `[development]`
-- `[winner]`
+`POLICY_MISS`
 
-Depois acrescenta, sem renomear os anteriores:
+A estratégia-base não terminou positivamente, mas ao menos um ativo já presente no universo teve retorno futuro líquido positivo. Havia bola com ângulo; a política não aproveitou.
 
-- `[trajectory]`
-- `[trajectory-development]`
-- `[trajectory-winner]`
-- `[comparison]`
-- `[decision]`
-- `[complete]`
+`UNIVERSE_HOLE`
 
-### Validação
+A estratégia-base não terminou positivamente e nenhum incumbente teve retorno futuro líquido positivo. A mesa não continha uma bola com ângulo positivo para aquela janela.
 
-- universo primário: `Original25`;
-- desenvolvimento: expanding chronological walk-forward até 2025;
-- mínimo de oito estados anteriores antes da primeira previsão;
-- abstenção: só inserir quando a maior previsão de `Y_direct` for positiva;
-- escolha do modelo somente no desenvolvimento;
-- 2026 permanece reservado;
-- `Original24_MinusADM` permanece apenas como robustez, não como estado independente adicional.
+Essa classificação é retrospectiva e serve como label de mecanismo, não como previsão.
 
-Métrica econômica principal:
+### Candidato que preenche um buraco
 
-`capital_multiplier_vs_no_insert = exp(sum(realized_direct_log))`
+Em um `UNIVERSE_HOLE`, um candidato é marcado como `fills_universe_hole` quando o próprio ativo possui retorno futuro líquido positivo naquela janela.
 
-### Regra terminal da trajetória
+Isso ainda não é suficiente. Para ser considerado `clean_coverage`, ele precisa simultaneamente:
 
-- `TRAJECTORY_ADDED_VALUE_NOT_FOUND`: a melhor representação com trajetória não supera a melhor representação snapshot no desenvolvimento.
-- `TRAJECTORY_CONTEXTUAL_SIGNAL_NOT_FOUND`: a trajetória não supera o baseline histórico.
-- `TRAJECTORY_SIGNAL_NOT_CONFIRMED`: melhora no desenvolvimento, mas falha no `Original25` reservado de 2026.
-- `TRAJECTORY_HOLDOUT_NOT_ROBUST`: passa no `Original25` de 2026, mas falha em `Original24_MinusADM`.
-- `TRAJECTORY_CONFIRMED_LIMITED_NEXT_SYSTEM_BACKTEST`: passa pelos níveis acima e ganha direito a um único backtest sequencial final do sistema completo.
+1. preencher um `UNIVERSE_HOLE`;
+2. aumentar o capital da política contra o baseline naquela mesma janela;
+3. ser efetivamente selecionado pela política;
+4. não haver divergência do caminho de ativos selecionados antes da primeira seleção do candidato.
 
-Se a trajetória não for confirmada, não adicionar sucessivamente mais modelos tabulares a este mesmo dataset congelado apenas para fabricar um vencedor.
+A condição 4 separa duas situações:
+
+`entrada produtiva`
+
+A trajetória-base permanece intacta até o momento em que o candidato realmente entra.
+
+`perturbação indireta`
+
+A simples presença do candidato altera a política antes de ele próprio ser escolhido.
+
+Isso implementa a metáfora do bilhar: uma nova bola só é considerada cobertura limpa quando abre uma caçapa que estava sem ângulo sem desorganizar a mesa antes de participar da jogada.
+
+### Efeito sobre estados já cobertos
+
+Nos estados `COVERED`, a análise também mede:
+
+- quantas vezes um candidato reduziu o capital;
+- custo logarítmico dessa perturbação;
+- ganho de cobertura limpa em buracos;
+- `table_improvement_log = clean_coverage_log_gain - covered_disruption_cost_log`.
+
+Isso é diagnóstico retrospectivo. Ainda não é uma regra de produção.
+
+### Status possíveis
+
+- `NO_UNIVERSE_HOLES_FOUND`
+- `TESTED_CANDIDATES_DO_NOT_FILL_HOLES`
+- `COVERAGE_FOUND_BUT_NOT_CLEAN`
+- `CLEAN_OPPORTUNITY_COVERAGE_OBSERVED`
+
+Somente o último demonstra que o mecanismo existe retrospectivamente.
+
+Mesmo nesse caso, ainda não há claim preditivo. A etapa seguinte teria de ser pré-registrada separadamente:
+
+1. prever, usando somente informação disponível em `t`, se um `UNIVERSE_HOLE` está se formando;
+2. escolher qual candidato tem maior probabilidade de cobri-lo;
+3. exigir baixo risco de perturbação de estados já cobertos;
+4. confirmar tudo OOS (fora da amostra) antes de qualquer backtest final do sistema completo.
+
+Se `POLICY_MISS` dominar, a prioridade deve voltar para a política de seleção, não para adicionar ativos.
 
 ## Como executar
 
-A coleta contrafactual antiga continua disponível pelo entrypoint estável:
+A coleta antiga continua disponível:
 
 ```bat
 python scripts\research_contextual_marginal_signature.py ^
@@ -164,7 +169,7 @@ python scripts\research_contextual_marginal_signature.py ^
   --env-file .env
 ```
 
-Tournament v1.0.19.0, sem repetir os rollouts:
+A decomposição v1.0.20.0 usa a mesma chamada de Tournament e lê somente MongoDB local:
 
 ```bat
 python scripts\research_contextual_marginal_signature.py ^
@@ -173,18 +178,39 @@ python scripts\research_contextual_marginal_signature.py ^
   --env-file .env
 ```
 
-## Persistência e artefatos
+Não apagar as coleções `research_contextual_signature_*`.
 
-MongoDB local é a fonte persistente de verdade.
+## Logs da v1.0.20
 
-Coleções da campanha:
+A v1.0.20 acrescenta logs próprios sem renomear logs da campanha congelada:
+
+- `[hole]`
+- `[hole-state]`
+- `[hole-candidate]`
+- `[hole-summary]`
+- `[decision]`
+- `[complete]`
+
+Exemplo conceitual:
+
+```text
+[hole-state] ... | Original25 | horizon=20 | class=UNIVERSE_HOLE | ...
+[hole-candidate] ... | GKOS | future=... | direct=... | selected=yes | pre-perturb=no | clean=yes
+[hole-summary] Original25 | horizon=20 | covered=... | policy_miss=... | universe_hole=... | fillable=... | clean=...
+```
+
+## Persistência
+
+Fonte de verdade: MongoDB local.
+
+Coleções consumidas:
 
 - `research_contextual_signature_runs`
 - `research_contextual_signature_observations`
 - `research_contextual_signature_trace_runs`
 - `research_contextual_signature_trace_rows`
 
-Coleção dos Tournaments:
+Coleção de resultado:
 
 - `research_contextual_signature_tournaments`
 
@@ -193,7 +219,7 @@ Contrato de artefatos permanece estável:
 - entrypoint: `scripts/research_contextual_marginal_signature.py`
 - pasta: `research_output/contextual_marginal_signature/`
 - ZIP: `research_output/contextual_marginal_signature.zip`
-- filesystem: somente exportação, nunca entrada obrigatória para análise posterior.
+- filesystem: somente exportação.
 
 ## Estrutura ativa
 
@@ -214,10 +240,16 @@ Não adicionar arquivo novo para cada versão.
 
 ## Linha de chegada
 
-A linha atual é curta:
+A v1.0.20 responde somente se existe retrospectivamente um mecanismo de `Opportunity Hole` e `Clean Coverage`.
 
-1. executar a v1.0.19.0 e decidir se a trajetória acrescenta previsibilidade real ao snapshot;
-2. somente se o status for `TRAJECTORY_CONFIRMED_LIMITED_NEXT_SYSTEM_BACKTEST`, congelar representação + modelo + parâmetros + regra de abstenção e executar um único backtest sequencial do sistema completo;
-3. no backtest final, comparar diretamente o capital composto da estratégia atual contra a estratégia atual + seletor aprendido.
+Ela não autoriza promoção de modelo.
 
-Se a v1.0.19.0 falhar, o resultado negativo encerra esta família de representação tabular de trajetória sobre o dataset congelado. Se passar, o capital final do sistema completo decide se a descoberta merece integração no MCT.
+Se houver `CLEAN_OPPORTUNITY_COVERAGE_OBSERVED`, a próxima hipótese científica passa a ser previsão pré-decisão do buraco e da cobertura.
+
+Se os estados ruins forem majoritariamente `POLICY_MISS`, a evidência aponta para melhorar a política de decisão com o universo atual antes de ampliar Asset Discovery.
+
+A meta final continua inalterada:
+
+`estratégia atual` versus `estratégia atual + seletor aprendido`
+
+e a comparação final continua sendo capital composto robusto OOS.
