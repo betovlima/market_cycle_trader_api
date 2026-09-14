@@ -55,6 +55,15 @@ def build_matrix(obs,frames,features):
 def feature_columns(df):
     skip={"run_id","decision_date","universe_name","candidate",TARGET}; return [c for c in df if c not in skip and pd.api.types.is_numeric_dtype(df[c]) and df[c].notna().any()]
 
+def _safe_rank_corr(prediction,target):
+    p=pd.to_numeric(pd.Series(prediction),errors="coerce"); t=pd.to_numeric(pd.Series(target),errors="coerce"); valid=p.notna()&t.notna()
+    if int(valid.sum())<2:return None
+    pr=p[valid].rank(); tr=t[valid].rank()
+    if int(pr.nunique(dropna=True))<2 or int(tr.nunique(dropna=True))<2:return None
+    value=pr.corr(tr)
+    if pd.isna(value):return None
+    value=float(value); return value if math.isfinite(value) else None
+
 def _pick(g):
     b=g.sort_values("prediction",ascending=False).iloc[0]; p=float(b.prediction); oracle=max(0,float(g[TARGET].max())); return (None,0.0,oracle) if p<=0 else (str(b.candidate),float(b[TARGET]),oracle)
 
@@ -65,20 +74,20 @@ def _metrics(rows):
 def walk_forward(df,cols,spec):
     d=df[df.universe_name==PRIMARY].copy(); d.decision_date=pd.to_datetime(d.decision_date); dates=sorted(x for x in d.decision_date.unique() if pd.Timestamp(x).year<HOLDOUT); rows=[]
     for i in range(MIN_STATES,len(dates)):
-        tr=d[d.decision_date.isin(dates[:i])]; te=d[d.decision_date==dates[i]].copy(); m=spec.factory(); m.fit(tr[cols],tr[TARGET]); te["prediction"]=m.predict(te[cols]); s,r,o=_pick(te); rho=te.prediction.rank().corr(te[TARGET].rank()); rows.append({"date":str(pd.Timestamp(dates[i]).date()),"selected":s,"realized":r,"oracle":o,"rho":rho})
+        tr=d[d.decision_date.isin(dates[:i])]; te=d[d.decision_date==dates[i]].copy(); m=spec.factory(); m.fit(tr[cols],tr[TARGET]); te["prediction"]=m.predict(te[cols]); s,r,o=_pick(te); rho=_safe_rank_corr(te.prediction,te[TARGET]); rows.append({"date":str(pd.Timestamp(dates[i]).date()),"selected":s,"realized":r,"oracle":o,"rho":rho})
     return _metrics(rows)
 
 def mean_baseline(df):
     d=df[df.universe_name==PRIMARY].copy(); d.decision_date=pd.to_datetime(d.decision_date); dates=sorted(x for x in d.decision_date.unique() if pd.Timestamp(x).year<HOLDOUT); rows=[]
     for i in range(MIN_STATES,len(dates)):
-        tr=d[d.decision_date.isin(dates[:i])]; te=d[d.decision_date==dates[i]].copy(); means=tr.groupby("candidate")[TARGET].mean(); te["prediction"]=te.candidate.map(means).fillna(0); s,r,o=_pick(te); rho=te.prediction.rank().corr(te[TARGET].rank()); rows.append({"selected":s,"realized":r,"oracle":o,"rho":rho})
+        tr=d[d.decision_date.isin(dates[:i])]; te=d[d.decision_date==dates[i]].copy(); means=tr.groupby("candidate")[TARGET].mean(); te["prediction"]=te.candidate.map(means).fillna(0); s,r,o=_pick(te); rho=_safe_rank_corr(te.prediction,te[TARGET]); rows.append({"selected":s,"realized":r,"oracle":o,"rho":rho})
     return _metrics(rows)
 
 def holdout(df,cols,spec,universe):
     d=df.copy(); d.decision_date=pd.to_datetime(d.decision_date); tr=d[(d.universe_name==PRIMARY)&(d.decision_date.dt.year<HOLDOUT)]; te=d[(d.universe_name==universe)&(d.decision_date.dt.year>=HOLDOUT)].copy(); rows=[]
     if te.empty:return _metrics(rows)
     m=spec.factory(); m.fit(tr[cols],tr[TARGET]); te["prediction"]=m.predict(te[cols])
-    for _,g in te.groupby("decision_date"): s,r,o=_pick(g); rho=g.prediction.rank().corr(g[TARGET].rank()); rows.append({"selected":s,"realized":r,"oracle":o,"rho":rho})
+    for _,g in te.groupby("decision_date"): s,r,o=_pick(g); rho=_safe_rank_corr(g.prediction,g[TARGET]); rows.append({"selected":s,"realized":r,"oracle":o,"rho":rho})
     return _metrics(rows)
 
 def status(dev,base,hold,robust):
