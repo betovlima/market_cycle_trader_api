@@ -9,13 +9,17 @@
 # This file intentionally excludes the FastAPI/uvicorn web stack.
 # It contains the runtime used by scripts/research_contextual_marginal_signature.py
 # and the Market Cycle Trader research modules imported by that entrypoint.
+#
+# NumPy/pandas intentionally use compatible ranges instead of exact pins here.
+# Spyder commonly runs inside a Conda environment, where forcing pip to replace
+# Conda-managed numerical packages can fail when wheel RECORD metadata is absent.
 
 pydantic
 python-dotenv>=1.0,<2
 pymongo
 
-numpy==2.5.1
-pandas==3.0.5
+numpy>=2.2,<3
+pandas>=2.2,<4
 scipy==1.18.0
 scikit-learn==1.9.0
 threadpoolctl==3.6.0
