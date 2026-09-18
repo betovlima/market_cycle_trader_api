@@ -17,6 +17,7 @@ from ..core.environment import load_project_environment
 
 load_project_environment()
 
+from ..infrastructure.market_data.tiingo import TiingoRateLimitError
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     bson_value,
@@ -316,11 +317,15 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
                 or config.market_data_provider
             )
             access_path = str(provenance.get("research_access_path") or "mongodb_only")
+            short_history = bool(
+                cleaned.attrs.get("short_history_allowed", False)
+            )
             print(
                 "MARKET_DATA|"
                 f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
                 f"source={source_label}|access={access_path}|backfill_rows={backfill_rows}|"
-                f"complete={bool(provenance.get('history_complete', True))}",
+                f"complete={bool(provenance.get('history_complete', True))}|"
+                f"short_history_allowed={short_history}",
                 flush=True,
             )
             emit_progress(
@@ -330,6 +335,23 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
                     f"({first_session} → {last_session}, {source_label})"
                 ),
             )
+        except TiingoRateLimitError as exc:
+            failures.append(
+                {"symbol": symbol, "backend": "data_load", "error": str(exc)}
+            )
+            remaining = list(config.assets[asset_position - 1 :])
+            print(
+                f"ERROR loading {symbol}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise RuntimeError(
+                "TiingoRateLimitReached: the hourly Tiingo request quota was "
+                f"exhausted while loading {symbol}. "
+                f"Remaining uncached/configured symbols from this point: "
+                f"{', '.join(remaining)}. Already downloaded symbols remain "
+                "persisted in tiingo_market_bars; retry after the hourly quota resets."
+            ) from exc
         except Exception as exc:
             failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
             print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
