@@ -11,11 +11,11 @@ from .model_research import ResearchModelFamily
 
 StrategyMode = Literal["COMPOUND_ROTATION_SWING_XGBOOST", "COMPOUND_ROTATION_SWING_RISK_OFF", "COMPOUND_ROTATION_SWING_SELECTIVE", "COMPOUND_ROTATION_SWING_OPPORTUNITY_CASH_GATE", "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE", "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION", "COMPOUND_ROTATION_SWING_CONCENTRATED_ALLOCATION", "COMPOUND_ROTATION_SWING_COMPOUND_RISK_OVERLAY"]
 Timeframe = Literal["1Day"]
-MarketDataProvider = Literal["alpaca"]
+MarketDataProvider = Literal["alpaca", "tiingo"]
 AlpacaHistoricalFeed = Literal["sip", "iex"]
 AlpacaLiveFeed = Literal["iex", "sip"]
 AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
-HistoryBackfillProvider = Literal["alpaca"]
+HistoryBackfillProvider = Literal["alpaca", "tiingo"]
 ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
