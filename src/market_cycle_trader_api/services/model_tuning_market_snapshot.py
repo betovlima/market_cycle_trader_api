@@ -3,7 +3,12 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from ..engine.market_data import load_market_bars, validate_and_clean_bars
+from ..engine.market_data import (
+    effective_market_data_provider,
+    load_market_bars,
+    market_data_feed_label,
+    validate_and_clean_bars,
+)
 from ..engine.market_data_snapshot import (
     TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
     encode_market_frame,
@@ -106,7 +111,8 @@ def freeze_tuning_market_snapshot(
                 "schema_version": TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
                 "symbol": symbol,
                 "interval": config.timeframe,
-                "feed": config.alpaca_historical_feed,
+                "provider": effective_market_data_provider(config),
+                "feed": market_data_feed_label(config),
                 "adjustment": config.alpaca_adjustment,
                 "columns": columns,
                 "payload": encoded,
@@ -133,7 +139,8 @@ def freeze_tuning_market_snapshot(
         "end_date": config.analysis_end_date or config.end_date,
         "research_snapshot_cutoff": config.analysis_end_date or config.end_date,
         "interval": config.timeframe,
-        "feed": config.alpaca_historical_feed,
+        "provider": effective_market_data_provider(config),
+        "feed": market_data_feed_label(config),
         "adjustment": config.alpaca_adjustment,
         "market_data_manifests": bson_value(manifests),
         "created_at": now,
