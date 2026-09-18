@@ -174,7 +174,7 @@ def _market_data_identity(symbol: str, config: Any) -> dict[str, Any]:
     }
 
 
-def _cache_has_sessiondef _cache_has_session(collection: Any, identity: dict[str, Any], session: pd.Timestamp) -> bool:
+def _cache_has_session(collection: Any, identity: dict[str, Any], session: pd.Timestamp) -> bool:
     start = pd.Timestamp(session.date(), tz="UTC")
     end = start + pd.Timedelta(days=1)
     return collection.find_one(
@@ -441,7 +441,7 @@ def refresh_market_data_to_live_cutoff(
     }
 
 
-def _utc_timestampdef _utc_timestamp(value: Any) -> pd.Timestamp:
+def _utc_timestamp(value: Any) -> pd.Timestamp:
     stamp = pd.Timestamp(value)
     if pd.isna(stamp):
         raise ValueError(f"Invalid timestamp: {value}")
@@ -984,7 +984,7 @@ def load_market_bars(symbol: str, config: Any) -> pd.DataFrame:
     return load_mongo_market_bars(symbol, config)
 
 
-def validate_and_clean_barsdef validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
+def validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     source_attrs = dict(getattr(bars, "attrs", {}))
     bars = filter_non_trading_rows(bars, config.timeframe)
     if bars.empty:
