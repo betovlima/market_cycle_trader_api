@@ -13,8 +13,10 @@ from pymongo import ReturnDocument
 from ..core.config import RESEARCH_ONLY_SWING_STRATEGY_MODES, SWING_STRATEGY_MODES
 from ..engine.live_model_signal import build_live_model_decision
 from ..engine.market_data import (
+    effective_market_data_provider,
     latest_safe_completed_xnys_session,
     load_market_bars,
+    market_data_safe_delay_minutes,
     refresh_market_data_to_live_cutoff,
     validate_and_clean_bars,
 )
@@ -168,8 +170,8 @@ def _validated_context(
         raise RuntimeError(
             f"Trader Winner model {winner_model['family']!r} does not have a protected live engine."
         )
-    if strategy.market_data_provider != "alpaca":
-        raise RuntimeError("Paper trading requires market_data_provider='alpaca'.")
+    if effective_market_data_provider(strategy) not in {"alpaca", "tiingo"}:
+        raise RuntimeError("Paper trading market data must resolve to Alpaca or Tiingo.")
     if strategy.end_date is not None:
         raise RuntimeError(
             "Paper trading requires the locked historical end_date to be empty so the latest completed session is loaded."
@@ -197,7 +199,15 @@ def refresh_trader_live_market_data(
     now: datetime | pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     """Keep the operational Winner market data current without mutating the Winner snapshot."""
-    target = latest_safe_completed_xnys_session(now).date().isoformat()
+    target_configuration, _ = get_trader_winner_context(db)
+    target_configuration = apply_training_runtime_settings(
+        db,
+        target_configuration,
+    )
+    target = latest_safe_completed_xnys_session(
+        now,
+        data_delay_minutes=market_data_safe_delay_minutes(target_configuration),
+    ).date().isoformat()
     control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}) or {}
     current_cutoff = str(control.get("live_market_cutoff") or "").strip()
     current_winner = str(control.get("live_market_cutoff_winner_strategy_id") or "").strip()
@@ -264,8 +274,10 @@ def refresh_trader_live_market_data(
             winner_model["family"],
             winner_model.get("settings_snapshot") or {},
         )
-        if strategy.market_data_provider != "alpaca":
-            raise RuntimeError("Trader live market refresh requires market_data_provider='alpaca'.")
+        if effective_market_data_provider(strategy) not in {"alpaca", "tiingo"}:
+            raise RuntimeError(
+                "Trader live market refresh requires market data from Alpaca or Tiingo."
+            )
         if strategy.end_date is not None:
             raise RuntimeError(
                 "Trader live market refresh requires end_date=None; the certified cutoff belongs to certification metadata, not the live Strategy window."
