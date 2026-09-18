@@ -2842,7 +2842,7 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
         if not snapshot_end:
             snapshot_end = pd.Timestamp(
             latest_safe_completed_xnys_session(
-                data_delay_minutes=market_data_safe_delay_minutes(config),
+                data_delay_minutes=market_data_safe_delay_minutes(source_config),
             )
         ).date().isoformat()
         research_window = validation.get("research_window") if isinstance(validation.get("research_window"), dict) else {}
@@ -3057,7 +3057,7 @@ def start_full_strategy_validation(
         if not snapshot_end:
             snapshot_end = pd.Timestamp(
             latest_safe_completed_xnys_session(
-                data_delay_minutes=market_data_safe_delay_minutes(config),
+                data_delay_minutes=market_data_safe_delay_minutes(source_config),
             )
         ).date().isoformat()
         validation_id = f"asset-full-{uuid4().hex[:12]}"
@@ -3181,7 +3181,7 @@ def append_selected_assets_to_research_strategy(
     if not snapshot_end:
         snapshot_end = pd.Timestamp(
             latest_safe_completed_xnys_session(
-                data_delay_minutes=market_data_safe_delay_minutes(config),
+                data_delay_minutes=market_data_safe_delay_minutes(source_config),
             )
         ).date().isoformat()
 
@@ -3326,7 +3326,7 @@ def create_research_strategy_from_discovery(
     if not snapshot_end:
         snapshot_end = pd.Timestamp(
             latest_safe_completed_xnys_session(
-                data_delay_minutes=market_data_safe_delay_minutes(config),
+                data_delay_minutes=market_data_safe_delay_minutes(source_config),
             )
         ).date().isoformat()
 
