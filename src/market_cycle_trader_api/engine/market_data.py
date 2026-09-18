@@ -1009,13 +1009,26 @@ def validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
         + max(int(item) for item in config.rotation_target_horizons)
         + int(config.rotation_purge_days)
     )
-    if len(result) < minimum:
+    strict_history = bool(
+        getattr(config, "market_data_require_complete_history", True)
+    )
+    result.attrs["model_training_minimum_rows"] = int(minimum)
+    result.attrs["model_training_minimum_ready"] = bool(len(result) >= minimum)
+    result.attrs["short_history_allowed"] = bool(
+        not strict_history and len(result) < minimum
+    )
+
+    if len(result) < minimum and strict_history:
+        first = pd.Timestamp(result.index.min()).date().isoformat()
+        last = pd.Timestamp(result.index.max()).date().isoformat()
         raise ValueError(
-            f"Only {len(result)} valid {config.timeframe} bars were loaded; "
-            f"at least {minimum} are required by the locked training, horizon and purge settings."
+            f"Only {len(result)} valid {config.timeframe} bars were loaded "
+            f"({first} -> {last}); at least {minimum} are required by the "
+            "locked training, horizon and purge settings for a calendar-anchor "
+            "or strict-history asset."
         )
 
-    if bool(getattr(config, "market_data_require_complete_history", True)) and not _history_is_complete(result, config):
+    if strict_history and not _history_is_complete(result, config):
         provenance = result.attrs.get("market_data_provenance", {})
         raise ValueError(
             "The cleaned market data does not reach the locked historical start. "
