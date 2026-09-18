@@ -10,8 +10,14 @@ import numpy as np
 import pandas as pd
 import requests
 
-from ..engine.market_data import REQUIRED_BAR_COLUMNS, load_market_bars
-from ..infrastructure.market_data.alpaca import download_stock_bars
+from ..engine.market_data import (
+    REQUIRED_BAR_COLUMNS,
+    _download_provider_bars,
+    effective_market_data_provider,
+    latest_safe_completed_xnys_session,
+    load_market_bars,
+    market_data_safe_delay_minutes,
+)
 from ..infrastructure.persistence.mongo_repository import get_alpaca_credentials
 from .asset_discovery_behavior import behavior_risk_profile
 
@@ -97,6 +103,7 @@ def _raise_if_global_market_data_error(exc: Exception) -> None:
     global_markers = (
         "subscription does not permit querying recent sip data",
         "alpaca api credentials are not configured",
+        "tiingo api credentials are not configured",
         "unauthorized",
         "forbidden",
         "status code 401",
@@ -136,29 +143,28 @@ def discover_alpaca_symbols() -> list[str]:
     return sorted(set(symbols))
 
 
-def resolve_completed_market_data_end() -> datetime:
-    credentials = get_alpaca_credentials()
+def resolve_completed_market_data_end(config: Any) -> datetime:
     try:
-        return _latest_safe_completed_session_end(credentials)
+        session = latest_safe_completed_xnys_session(
+            data_delay_minutes=market_data_safe_delay_minutes(config),
+        )
+        calendar = __import__("exchange_calendars").get_calendar("XNYS")
+        return pd.Timestamp(calendar.session_close(session)).to_pydatetime()
     except Exception as exc:
         raise MarketDataAccessBlocked(
-            f"Unable to resolve a completed Alpaca trading session: {exc}"
+            "Unable to resolve a completed provider-safe trading session "
+            f"for {effective_market_data_provider(config)}: {exc}"
         ) from exc
 
 
 def _recent_market_frame(symbol: str, config: Any, *, end: datetime) -> pd.DataFrame:
-    credentials = get_alpaca_credentials()
     start = end - timedelta(days=RECENT_PREFILTER_DAYS)
     try:
-        return download_stock_bars(
-            api_key_id=credentials["api_key_id"],
-            secret_key=credentials["secret_key"],
-            symbol=symbol,
-            timeframe="1Day",
-            start=start,
-            end=end,
-            feed=config.alpaca_historical_feed,
-            adjustment=config.alpaca_adjustment,
+        return _download_provider_bars(
+            symbol,
+            config,
+            pd.Timestamp(start).date().isoformat(),
+            pd.Timestamp(end).date().isoformat(),
         )
     except Exception as exc:
         _raise_if_global_market_data_error(exc)
@@ -170,19 +176,14 @@ def _recent_market_frame(symbol: str, config: Any, *, end: datetime) -> pd.DataF
 def _behavior_market_frame(symbol: str, config: Any, *, end: datetime, settings: dict[str, Any]) -> pd.DataFrame:
     
 
-    credentials = get_alpaca_credentials()
     lookback_days = int(settings.get("behavior_lookback_days", BEHAVIOR_PREFILTER_DAYS))
     start = end - timedelta(days=lookback_days)
     try:
-        frame = download_stock_bars(
-            api_key_id=credentials["api_key_id"],
-            secret_key=credentials["secret_key"],
-            symbol=symbol,
-            timeframe="1Day",
-            start=start,
-            end=end,
-            feed=config.alpaca_historical_feed,
-            adjustment=config.alpaca_adjustment,
+        frame = _download_provider_bars(
+            symbol,
+            config,
+            pd.Timestamp(start).date().isoformat(),
+            pd.Timestamp(end).date().isoformat(),
         )
     except Exception as exc:
         _raise_if_global_market_data_error(exc)
