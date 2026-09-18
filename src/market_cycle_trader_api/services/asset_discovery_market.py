@@ -6,6 +6,7 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 import requests
@@ -148,7 +149,7 @@ def resolve_completed_market_data_end(config: Any) -> datetime:
         session = latest_safe_completed_xnys_session(
             data_delay_minutes=market_data_safe_delay_minutes(config),
         )
-        calendar = __import__("exchange_calendars").get_calendar("XNYS")
+        calendar = xcals.get_calendar("XNYS")
         return pd.Timestamp(calendar.session_close(session)).to_pydatetime()
     except Exception as exc:
         raise MarketDataAccessBlocked(
