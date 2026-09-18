@@ -257,7 +257,10 @@ def resolve_backtest_analysis_end_date(
     now: datetime | pd.Timestamp | None = None,
 ) -> str:
     calendar = xcals.get_calendar("XNYS")
-    latest_closed = latest_completed_xnys_session(now)
+    latest_closed = latest_safe_completed_xnys_session(
+        now,
+        data_delay_minutes=market_data_safe_delay_minutes(config),
+    )
     requested = normalize_end_date(getattr(config, "end_date", None))
     if requested:
         requested_session = pd.Timestamp(
@@ -295,7 +298,7 @@ def resolve_live_market_cutoff(
     )
     client = create_client()
     try:
-        collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
+        collection = get_database(client)[_market_data_collection_name(config)]
         target = _latest_common_cached_session(collection, config, target, calendar)
     finally:
         client.close()
