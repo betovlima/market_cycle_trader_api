@@ -23,6 +23,11 @@ class TiingoSettings:
     base_url: str
     timeout_seconds: float
     max_retries: int
+    max_rate_limit_wait_seconds: float
+
+
+class TiingoRateLimitError(RuntimeError):
+    """Raised when the account-wide Tiingo request quota is exhausted."""
 
 
 def _env_float(name: str, default: float, *, minimum: float) -> float:
@@ -71,6 +76,11 @@ def get_tiingo_settings() -> TiingoSettings:
         base_url=base_url,
         timeout_seconds=_env_float("TIINGO_TIMEOUT_SECONDS", 30.0, minimum=1.0),
         max_retries=_env_int("TIINGO_MAX_RETRIES", 3, minimum=1),
+        max_rate_limit_wait_seconds=_env_float(
+            "TIINGO_MAX_RATE_LIMIT_WAIT_SECONDS",
+            120.0,
+            minimum=0.0,
+        ),
     )
 
 
@@ -107,15 +117,33 @@ def _request_json(
                 timeout=settings.timeout_seconds,
             )
             if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                delay = (
-                    float(retry_after)
-                    if retry_after and str(retry_after).replace(".", "", 1).isdigit()
-                    else float(2**attempt)
-                )
-                if attempt + 1 < settings.max_retries:
-                    time.sleep(max(1.0, delay))
+                retry_after_raw = response.headers.get("Retry-After")
+                retry_after: float | None = None
+                if retry_after_raw:
+                    try:
+                        retry_after = float(retry_after_raw)
+                    except (TypeError, ValueError):
+                        retry_after = None
+
+                if (
+                    retry_after is not None
+                    and retry_after <= settings.max_rate_limit_wait_seconds
+                    and attempt + 1 < settings.max_retries
+                ):
+                    time.sleep(max(1.0, retry_after))
                     continue
+
+                detail = (
+                    f" Retry-After={retry_after:.0f}s."
+                    if retry_after is not None
+                    else ""
+                )
+                raise TiingoRateLimitError(
+                    "Tiingo hourly request limit reached (HTTP 429)."
+                    + detail
+                    + " Successfully downloaded symbols remain cached in MongoDB; "
+                    "retry the backtest after the Tiingo hourly quota resets."
+                )
             response.raise_for_status()
             return response.json()
         except (requests.RequestException, ValueError) as exc:
