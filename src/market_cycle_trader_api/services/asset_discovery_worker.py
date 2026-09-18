@@ -146,7 +146,7 @@ def run_asset_discovery_worker(db: Any, run_id: str, stop_event: Any) -> None:
         cleanup_non_analytical_candidate_records(db)
         config, _ = get_research_strategy_context(db)
         market_config = config.model_copy(update={"end_date": None, "mongo_cache_enabled": True})
-        recent_end = resolve_completed_market_data_end()
+        recent_end = resolve_completed_market_data_end(market_config)
         batch_target = int(settings["batch_size"])
         max_attempts = max(batch_target, int(settings["max_scan_attempts"]))
         append_run_update(
@@ -195,7 +195,7 @@ def run_asset_discovery_worker(db: Any, run_id: str, stop_event: Any) -> None:
                     run_id,
                     status="failed",
                     message=(
-                        "Asset Discovery stopped because Alpaca market-data access is unavailable for "
+                        "Asset Discovery stopped because primary market-data access is unavailable for "
                         f"the configured feed: {str(exc)[:700]}"
                     ),
                 )
