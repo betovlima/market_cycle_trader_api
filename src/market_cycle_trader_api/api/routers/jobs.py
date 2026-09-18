@@ -18,7 +18,10 @@ from ...infrastructure.persistence.mongo_repository import (
     utc_now,
 )
 from ...schemas.requests import BacktestExecutionRequest
-from ...engine.market_data import resolve_backtest_analysis_end_date
+from ...engine.market_data import (
+    effective_market_data_provider,
+    resolve_backtest_analysis_end_date,
+)
 from ...services.jobs import public_job, require_job, run_job
 from ...services.system_settings import apply_training_runtime_settings, get_system_settings
 from ...services.strategy_lab import (
@@ -172,9 +175,12 @@ def queue_backtest_job(
             research_reference_set = set(research_reference_assets)
             research_candidate_assets = [symbol for symbol in locked_configuration.assets if symbol not in research_reference_set]
             resolved_analysis_end = resolve_backtest_analysis_end_date(locked_configuration)
+            effective_provider = effective_market_data_provider(locked_configuration)
             request = BacktestExecutionRequest.model_validate(
                 {
                     **locked_configuration.model_dump(mode="python"),
+                    "market_data_provider": effective_provider,
+                    "market_data_history_backfill_provider": effective_provider,
                     "analysis_start_date": locked_configuration.start_date,
                     "analysis_end_date": resolved_analysis_end,
                     "calendar_anchor_assets": calendar_anchor_assets,
