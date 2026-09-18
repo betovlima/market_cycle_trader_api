@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import os
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -8,13 +9,20 @@ import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 
-from ..infrastructure.market_data.alpaca import download_stock_bars
+from ..core.environment import load_project_environment
+from ..infrastructure.market_data.alpaca import (
+    download_stock_bars as download_alpaca_stock_bars,
+)
+from ..infrastructure.market_data.tiingo import (
+    download_stock_bars as download_tiingo_stock_bars,
+)
 from .market_data_snapshot import (
     TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
     decode_market_frame,
 )
 from ..infrastructure.persistence.mongo_repository import (
     ALPACA_MARKET_BARS_COLLECTION,
+    TIINGO_MARKET_BARS_COLLECTION,
     MODEL_TUNING_MARKET_SNAPSHOTS_COLLECTION,
     create_client,
     get_alpaca_credentials,
@@ -100,16 +108,73 @@ def latest_safe_completed_xnys_session(
     return pd.Timestamp(calendar.date_to_session(local_day, direction="previous"))
 
 
+def effective_market_data_provider(config: Any) -> str:
+    """Resolve the active data source.
+
+    The isolated test branch allows the provider to be switched without changing
+    the locked MongoDB strategy. Set MCT_MARKET_DATA_PROVIDER=tiingo in .env.
+    """
+    load_project_environment()
+    configured = str(
+        os.getenv("MCT_MARKET_DATA_PROVIDER")
+        or os.getenv("MARKET_DATA_PROVIDER")
+        or getattr(config, "market_data_provider", "alpaca")
+        or "alpaca"
+    ).strip().lower()
+    if configured not in {"alpaca", "tiingo"}:
+        raise ValueError(
+            "Unsupported market-data provider. Use 'alpaca' or 'tiingo'. "
+            f"Received: {configured}."
+        )
+    return configured
+
+
+def market_data_feed_label(config: Any) -> str:
+    provider = effective_market_data_provider(config)
+    return "eod" if provider == "tiingo" else str(config.alpaca_historical_feed)
+
+
+def market_data_safe_delay_minutes(config: Any) -> int:
+    provider = effective_market_data_provider(config)
+    if provider != "tiingo":
+        return SAFE_DAILY_BAR_DELAY_MINUTES
+    load_project_environment()
+    raw = str(os.getenv("TIINGO_DAILY_BAR_DELAY_MINUTES") or "240").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("TIINGO_DAILY_BAR_DELAY_MINUTES must be an integer.") from exc
+    if value < 0:
+        raise RuntimeError("TIINGO_DAILY_BAR_DELAY_MINUTES must be >= 0.")
+    return value
+
+
+def _market_data_collection_name(config: Any) -> str:
+    return (
+        TIINGO_MARKET_BARS_COLLECTION
+        if effective_market_data_provider(config) == "tiingo"
+        else ALPACA_MARKET_BARS_COLLECTION
+    )
+
+
+def _market_data_index_name(config: Any) -> str:
+    return (
+        "uq_tiingo_market_bar"
+        if effective_market_data_provider(config) == "tiingo"
+        else "uq_alpaca_market_bar"
+    )
+
+
 def _market_data_identity(symbol: str, config: Any) -> dict[str, Any]:
     return {
         "symbol": str(symbol).strip().upper(),
         "interval": config.timeframe,
-        "feed": config.alpaca_historical_feed,
-        "adjustment": config.alpaca_adjustment,
+        "feed": market_data_feed_label(config),
+        "adjustment": str(config.alpaca_adjustment),
     }
 
 
-def _cache_has_session(collection: Any, identity: dict[str, Any], session: pd.Timestamp) -> bool:
+def _cache_has_sessiondef _cache_has_session(collection: Any, identity: dict[str, Any], session: pd.Timestamp) -> bool:
     start = pd.Timestamp(session.date(), tz="UTC")
     end = start + pd.Timedelta(days=1)
     return collection.find_one(
@@ -204,7 +269,7 @@ def resolve_backtest_analysis_end_date(
 
     client = create_client()
     try:
-        collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
+        collection = get_database(client)[_market_data_collection_name(config)]
         target = _latest_common_cached_session(collection, config, target, calendar)
     finally:
         client.close()
@@ -224,7 +289,10 @@ def resolve_live_market_cutoff(
     remain immutable.
     """
     calendar = xcals.get_calendar("XNYS")
-    target = latest_safe_completed_xnys_session(now)
+    target = latest_safe_completed_xnys_session(
+        now,
+        data_delay_minutes=market_data_safe_delay_minutes(config),
+    )
     client = create_client()
     try:
         collection = get_database(client)[ALPACA_MARKET_BARS_COLLECTION]
@@ -239,15 +307,25 @@ def refresh_market_data_to_live_cutoff(
     *,
     now: datetime | pd.Timestamp | None = None,
 ) -> dict[str, Any]:
-    """Refresh the Winner universe through the latest SIP-safe XNYS session.
+    """Refresh the Winner universe through the latest provider-safe XNYS session.
 
-    This function is intentionally called only at operational/research boundaries.
-    Model tuning continues to use a frozen MongoDB snapshot and never reaches Alpaca.
+    Tiingo and Alpaca use separate MongoDB cache collections in this isolated
+    branch, so the comparison cannot silently mix candles from both providers.
+    Model tuning still freezes a MongoDB snapshot before candidate evaluation.
     """
+    provider = effective_market_data_provider(config)
+    delay_minutes = market_data_safe_delay_minutes(config)
     calendar = xcals.get_calendar("XNYS")
-    target = latest_safe_completed_xnys_session(now)
+    target = latest_safe_completed_xnys_session(
+        now,
+        data_delay_minutes=delay_minutes,
+    )
     target_date = target.date().isoformat()
-    assets = [str(item).strip().upper() for item in list(getattr(config, "assets", []) or []) if str(item).strip()]
+    assets = [
+        str(item).strip().upper()
+        for item in list(getattr(config, "assets", []) or [])
+        if str(item).strip()
+    ]
     if not assets:
         raise RuntimeError("The live Winner has no assets to refresh.")
 
@@ -255,7 +333,7 @@ def refresh_market_data_to_live_cutoff(
     rows_by_symbol: dict[str, int] = {}
     try:
         db = get_database(client)
-        collection = db[ALPACA_MARKET_BARS_COLLECTION]
+        collection = db[_market_data_collection_name(config)]
         from pymongo import ASCENDING
 
         collection.create_index(
@@ -267,34 +345,61 @@ def refresh_market_data_to_live_cutoff(
                 ("timestamp", ASCENDING),
             ],
             unique=True,
-            name="uq_alpaca_market_bar",
+            name=_market_data_index_name(config),
         )
 
         for symbol in assets:
             identity = _market_data_identity(symbol, config)
-            latest = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", -1)])
+            latest = collection.find_one(
+                identity,
+                {"timestamp": 1, "_id": 0},
+                sort=[("timestamp", -1)],
+            )
             latest_session = None
             if latest and latest.get("timestamp") is not None:
                 latest_stamp = _utc_timestamp(latest["timestamp"])
                 latest_session = pd.Timestamp(
-                    calendar.date_to_session(pd.Timestamp(latest_stamp.date()), direction="previous")
+                    calendar.date_to_session(
+                        pd.Timestamp(latest_stamp.date()),
+                        direction="previous",
+                    )
                 )
-            if latest_session is not None and latest_session >= target and _cache_has_session(collection, identity, target):
+            if (
+                latest_session is not None
+                and latest_session >= target
+                and _cache_has_session(collection, identity, target)
+            ):
                 rows_by_symbol[symbol] = 0
                 continue
 
             if latest_session is None:
-                refresh_start = str(getattr(config, "start_date", None) or target_date)
+                refresh_start = str(
+                    getattr(config, "start_date", None) or target_date
+                )
             else:
-                # Re-fetch a small tail so the latest daily bar can be safely replaced
-                # if the provider revised it after the first observation.
                 refresh_start = max(
-                    pd.Timestamp(str(getattr(config, "start_date", None) or latest_session.date().isoformat())),
+                    pd.Timestamp(
+                        str(
+                            getattr(config, "start_date", None)
+                            or latest_session.date().isoformat()
+                        )
+                    ),
                     latest_session - pd.Timedelta(days=7),
                 ).date().isoformat()
-            downloaded = _download_alpaca_bars(symbol, config, refresh_start, target_date)
+
+            downloaded = _download_provider_bars(
+                symbol,
+                config,
+                refresh_start,
+                target_date,
+            )
             if downloaded is not None and not downloaded.empty:
-                _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
+                _upsert_frame(
+                    collection,
+                    downloaded,
+                    identity,
+                    config.mongo_write_batch_size,
+                )
                 rows_by_symbol[symbol] = int(len(downloaded))
             else:
                 rows_by_symbol[symbol] = 0
@@ -302,30 +407,41 @@ def refresh_market_data_to_live_cutoff(
         missing = [
             symbol
             for symbol in assets
-            if not _cache_has_session(collection, _market_data_identity(symbol, config), target)
+            if not _cache_has_session(
+                collection,
+                _market_data_identity(symbol, config),
+                target,
+            )
         ]
         if missing:
             raise RuntimeError(
-                "LiveMarketDataIncomplete: latest completed XNYS session "
+                "LiveMarketDataIncomplete: latest provider-safe XNYS session "
                 f"{target_date} is missing for: {', '.join(missing)}."
             )
-        common = _latest_common_cached_session(collection, config, target, calendar)
+        common = _latest_common_cached_session(
+            collection,
+            config,
+            target,
+            calendar,
+        )
         if common != target:
             raise RuntimeError(
-                f"LiveMarketDataIncomplete: common market cutoff is {common.date().isoformat()}, expected {target_date}."
+                "LiveMarketDataIncomplete: common market cutoff is "
+                f"{common.date().isoformat()}, expected {target_date}."
             )
     finally:
         client.close()
 
     return {
+        "provider": provider,
         "live_market_cutoff": target_date,
         "target_session": target_date,
         "rows_refreshed": rows_by_symbol,
-        "data_delay_minutes": SAFE_DAILY_BAR_DELAY_MINUTES,
+        "data_delay_minutes": delay_minutes,
     }
 
 
-def _utc_timestamp(value: Any) -> pd.Timestamp:
+def _utc_timestampdef _utc_timestamp(value: Any) -> pd.Timestamp:
     stamp = pd.Timestamp(value)
     if pd.isna(stamp):
         raise ValueError(f"Invalid timestamp: {value}")
@@ -520,8 +636,12 @@ def _market_data_provenance(
         "history_complete": _history_is_complete(frame, config),
         "provider": provider,
         "effective_provider": provider,
-        "historical_feed": str(config.alpaca_historical_feed),
-        "live_feed": str(config.alpaca_live_feed),
+        "historical_feed": market_data_feed_label(config),
+        "live_feed": (
+            "eod"
+            if provider == "tiingo"
+            else str(config.alpaca_live_feed)
+        ),
         "adjustment": str(config.alpaca_adjustment),
         "initial_rows": int(initial_rows),
         "history_backfill_provider": provider if history_backfill_rows > 0 else None,
@@ -574,8 +694,8 @@ def complete_market_history(
             f"Incomplete MongoDB market history for {symbol}: requested "
             f"{config.start_date}, but the earliest available session is "
             f"{provenance['actual_start'] or 'unavailable'}. "
-            f"Historical feed={config.alpaca_historical_feed}; adjustment={config.alpaca_adjustment}. "
-            "Existing cached assets are not backfilled from Alpaca by research executions."
+            f"Historical feed={market_data_feed_label(config)}; adjustment={config.alpaca_adjustment}. "
+            f"Existing cached assets are not backfilled from {provider} by database-only research executions."
         )
     return effective_frame
 
@@ -615,7 +735,7 @@ def _download_alpaca_bars(
     cursor = requested_start
     while cursor < requested_end:
         chunk_end = min(cursor + pd.Timedelta(days=chunk_days), requested_end)
-        frame = download_stock_bars(
+        frame = download_alpaca_stock_bars(
             api_key_id=credentials["api_key_id"],
             secret_key=credentials["secret_key"],
             symbol=symbol,
@@ -639,6 +759,45 @@ def _download_alpaca_bars(
         end_date,
         config.timeframe,
     )
+
+
+def _download_tiingo_bars(
+    symbol: str,
+    config: Any,
+    start_date: str,
+    end_date: str | None,
+) -> pd.DataFrame:
+    normalized_end = normalize_end_date(end_date)
+    if normalized_end is None:
+        normalized_end = latest_completed_xnys_session().date().isoformat()
+
+    frame = download_tiingo_stock_bars(
+        symbol=symbol,
+        timeframe=config.timeframe,
+        start=start_date,
+        end=normalized_end,
+        adjustment=str(config.alpaca_adjustment),
+    )
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    return trim_downloaded_range(
+        frame,
+        start_date,
+        normalized_end,
+        config.timeframe,
+    )
+
+
+def _download_provider_bars(
+    symbol: str,
+    config: Any,
+    start_date: str,
+    end_date: str | None,
+) -> pd.DataFrame:
+    provider = effective_market_data_provider(config)
+    if provider == "tiingo":
+        return _download_tiingo_bars(symbol, config, start_date, end_date)
+    return _download_alpaca_bars(symbol, config, start_date, end_date)
 
 
 def _end_is_complete(frame: pd.DataFrame, config: Any) -> bool:
@@ -670,7 +829,7 @@ def _load_frozen_tuning_snapshot_bars(symbol: str, config: Any) -> pd.DataFrame:
                 "schema_version": TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
                 "symbol": str(symbol).strip().upper(),
                 "interval": config.timeframe,
-                "feed": config.alpaca_historical_feed,
+                "feed": market_data_feed_label(config),
                 "adjustment": config.alpaca_adjustment,
             },
             {"_id": 0},
@@ -700,26 +859,31 @@ def _load_frozen_tuning_snapshot_bars(symbol: str, config: Any) -> pd.DataFrame:
         client.close()
 
 def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
-    
+    provider = effective_market_data_provider(config)
 
-    if str(getattr(config, "research_market_data_snapshot_id", None) or "").strip():
+    if str(
+        getattr(config, "research_market_data_snapshot_id", None) or ""
+    ).strip():
         return _load_frozen_tuning_snapshot_bars(symbol, config)
 
     if not bool(getattr(config, "mongo_cache_enabled", True)):
         raise RuntimeError(
-            "Research market data is MongoDB-only. Enable the MongoDB market-data cache for backtests and tuning."
+            "Research market data is MongoDB-only after bootstrap. "
+            "Enable the MongoDB market-data cache for backtests and tuning."
         )
 
     execution_end = effective_execution_end_date(config)
     start = pd.Timestamp(config.start_date, tz="UTC")
     end = inclusive_end_exclusive_boundary(execution_end)
-    access_mode = str(getattr(config, "research_market_data_mode", "database_only"))
+    access_mode = str(
+        getattr(config, "research_market_data_mode", "database_only")
+    )
     allow_bootstrap = access_mode == "backtest_bootstrap_missing"
 
     client = create_client()
     try:
         db = get_database(client)
-        collection = db[ALPACA_MARKET_BARS_COLLECTION]
+        collection = db[_market_data_collection_name(config)]
         from pymongo import ASCENDING
 
         collection.create_index(
@@ -731,20 +895,27 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
                 ("timestamp", ASCENDING),
             ],
             unique=True,
-            name="uq_alpaca_market_bar",
+            name=_market_data_index_name(config),
         )
         identity = _market_data_identity(symbol, config)
-        first = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", 1)])
+        first = collection.find_one(
+            identity,
+            {"timestamp": 1, "_id": 0},
+            sort=[("timestamp", 1)],
+        )
         bootstrapped_rows = 0
 
         if first is None:
             if not allow_bootstrap:
                 raise RuntimeError(
-                    f"MarketDataMissingInMongoDB: {symbol} has no cached {config.timeframe} "
-                    f"bars for feed={config.alpaca_historical_feed}, adjustment={config.alpaca_adjustment}. "
-                    "Model tuning and parameter optimization are database-only and never download market data."
+                    f"MarketDataMissingInMongoDB: {symbol} has no cached "
+                    f"{config.timeframe} bars for provider={provider}, "
+                    f"feed={market_data_feed_label(config)}, "
+                    f"adjustment={config.alpaca_adjustment}. "
+                    "Model tuning and parameter optimization are database-only "
+                    "and never download market data."
                 )
-            downloaded = _download_alpaca_bars(
+            downloaded = _download_provider_bars(
                 symbol,
                 config,
                 config.start_date,
@@ -752,29 +923,42 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             )
             if downloaded.empty:
                 raise RuntimeError(
-                    f"MarketDataBootstrapFailed: Alpaca returned no historical bars for missing asset {symbol}."
+                    "MarketDataBootstrapFailed: "
+                    f"{provider} returned no historical bars for missing asset "
+                    f"{symbol}."
                 )
-            _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
+            _upsert_frame(
+                collection,
+                downloaded,
+                identity,
+                config.mongo_write_batch_size,
+            )
             bootstrapped_rows = len(downloaded)
 
         cached = _read_frame(collection, identity, start, end)
         if cached.empty:
             raise RuntimeError(
-                f"MarketDataMissingInMongoDB: no cached bars for {symbol} inside the locked research window."
+                "MarketDataMissingInMongoDB: no cached bars for "
+                f"{symbol} inside the locked research window."
             )
 
         result = complete_market_history(
             symbol,
             cached,
             config,
-            provider="alpaca",
+            provider=provider,
             initial_rows=len(cached),
             history_backfill_rows=0,
         )
-        provenance = dict(result.attrs.get("market_data_provenance", {}))
-        provenance["research_access_path"] = (
-            "alpaca_bootstrap_then_mongodb" if bootstrapped_rows else "mongodb_only"
+        provenance = dict(
+            result.attrs.get("market_data_provenance", {})
         )
+        provenance["research_access_path"] = (
+            f"{provider}_bootstrap_then_mongodb"
+            if bootstrapped_rows
+            else "mongodb_only"
+        )
+        provenance["cache_collection"] = _market_data_collection_name(config)
         provenance["cache_bootstrap_rows"] = int(bootstrapped_rows)
         provenance["requested_end"] = normalize_end_date(execution_end)
         provenance["end_complete"] = _end_is_complete(result, config)
@@ -782,9 +966,11 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         if not provenance["end_complete"]:
             last = provenance.get("actual_end") or "unavailable"
             raise RuntimeError(
-                f"MarketDataIncomplete: MongoDB market data for {symbol} ends at {last}; "
-                f"the frozen research cutoff is {provenance.get('requested_end')}. "
-                "Existing cached assets are never refreshed from Alpaca by a backtest or tuning run."
+                "MarketDataIncomplete: MongoDB market data for "
+                f"{symbol} ends at {last}; the frozen research cutoff is "
+                f"{provenance.get('requested_end')}. Existing cached assets "
+                f"are never refreshed from {provider} by a database-only "
+                "backtest or tuning run."
             )
         return result
     finally:
@@ -792,12 +978,13 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
 
 
 def load_market_bars(symbol: str, config: Any) -> pd.DataFrame:
-    if config.market_data_provider != "alpaca":
-        raise ValueError("This release supports Alpaca-origin market data stored in MongoDB.")
+    provider = effective_market_data_provider(config)
+    if provider not in {"alpaca", "tiingo"}:
+        raise ValueError(f"Unsupported market-data provider: {provider}.")
     return load_mongo_market_bars(symbol, config)
 
 
-def validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
+def validate_and_clean_barsdef validate_and_clean_bars(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     source_attrs = dict(getattr(bars, "attrs", {}))
     bars = filter_non_trading_rows(bars, config.timeframe)
     if bars.empty:
