@@ -21,10 +21,6 @@ from market_cycle_trader_api.core.environment import load_project_environment
 load_project_environment()
 
 from market_cycle_trader_api.engine.capital_rotation import run_rotation_models
-from market_cycle_trader_api.engine.compound_rotation_backtest import (
-    apply_slippage,
-    calculate_reference_fees,
-)
 from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
     ALPACA_MARKET_BARS_COLLECTION,
     JOBS_COLLECTION,
@@ -32,11 +28,71 @@ from market_cycle_trader_api.infrastructure.persistence.mongo_repository import 
     create_client,
     get_database,
 )
-from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest
+from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest, BacktestRequest
 
 
 OHLCV = ("open", "high", "low", "close", "volume")
 PRICE_COLUMNS = ("open", "high", "low", "close")
+
+
+def _round_fee_to_cent(value: float) -> float:
+    if not np.isfinite(value) or value <= 0:
+        return 0.0
+    return math.ceil((value - 1e-12) * 100.0) / 100.0
+
+
+def _calculate_reference_fees(
+    side: str,
+    quantity: float,
+    price: float,
+    config: BacktestRequest,
+) -> dict[str, float]:
+    """Exact fee contract used by the normal compound-rotation backtest.
+
+    Kept local to this standalone audit to avoid importing the backtest CLI
+    module, which initializes service packages and creates a circular import
+    through Asset Discovery.
+    """
+    if quantity <= 0 or price <= 0:
+        return {
+            "commission_fee": 0.0,
+            "sec_fee": 0.0,
+            "taf_fee": 0.0,
+            "cat_fee": 0.0,
+            "total_fee": 0.0,
+        }
+
+    normalized_side = side.upper()
+    trade_value = quantity * price
+    commission = _round_fee_to_cent(trade_value * config.commission_rate)
+    cat = _round_fee_to_cent(quantity * config.cat_fee_per_share)
+    sec = 0.0
+    taf = 0.0
+
+    if normalized_side == "SELL":
+        sec = _round_fee_to_cent(trade_value * config.sec_fee_rate)
+        taf = _round_fee_to_cent(
+            min(quantity * config.taf_fee_per_share, config.taf_fee_cap)
+        )
+    elif normalized_side != "BUY":
+        raise ValueError(f"Unsupported side: {side}")
+
+    return {
+        "commission_fee": commission,
+        "sec_fee": sec,
+        "taf_fee": taf,
+        "cat_fee": cat,
+        "total_fee": commission + sec + taf + cat,
+    }
+
+
+def _apply_slippage(
+    price: float,
+    side: str,
+    config: BacktestRequest,
+) -> float:
+    adjustment = config.slippage_bps / 10_000
+    return price * (1 + adjustment if side == "BUY" else 1 - adjustment)
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -364,8 +420,8 @@ def _run_source(
     results = run_rotation_models(
         frames,
         config,
-        calculate_reference_fees,
-        apply_slippage,
+        _calculate_reference_fees,
+        _apply_slippage,
         progress_callback=progress,
     )
     if not results:
