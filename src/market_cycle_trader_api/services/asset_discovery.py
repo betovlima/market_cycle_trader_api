@@ -20,18 +20,19 @@ from pymongo.database import Database
 from ..core.config import API_VERSION
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
 from ..engine.market_data import (
-    _download_alpaca_bars,
+    _download_provider_bars,
+    _market_data_collection_name,
     _market_data_identity,
     _upsert_frame,
     complete_market_history,
+    effective_market_data_provider,
     latest_safe_completed_xnys_session,
+    market_data_safe_delay_minutes,
     refresh_market_data_to_live_cutoff,
     load_market_bars,
     validate_and_clean_bars,
 )
-from ..infrastructure.market_data.alpaca import download_stock_bars
 from ..infrastructure.persistence.mongo_repository import (
-    ALPACA_MARKET_BARS_COLLECTION,
     ASSET_DISCOVERY_CATALOG_COLLECTION,
     ASSET_DISCOVERY_RESEARCH_COLLECTION,
     STRATEGY_PROFILES_COLLECTION,
@@ -793,7 +794,7 @@ def _candidate_history_coverage(
             "market_data_history_backfill_enabled": False,
         }
     )
-    frame = _download_alpaca_bars(
+    frame = _download_provider_bars(
         symbol,
         candidate_config,
         candidate_config.start_date,
@@ -822,7 +823,7 @@ def _persist_selected_asset_history(
             "market_data_history_backfill_enabled": False,
         }
     )
-    downloaded = _download_alpaca_bars(
+    downloaded = _download_provider_bars(
         symbol,
         selected_config,
         selected_config.start_date,
@@ -835,7 +836,12 @@ def _persist_selected_asset_history(
     try:
         cleaned_downloaded = validate_and_clean_bars(downloaded, selected_config)
         _history_coverage_against_baseline(symbol, cleaned_downloaded, selected_config, required_sessions)
-        complete_market_history(symbol, cleaned_downloaded, selected_config, provider="alpaca")
+        complete_market_history(
+            symbol,
+            cleaned_downloaded,
+            selected_config,
+            provider=effective_market_data_provider(selected_config),
+        )
     except Exception as exc:
         reason = str(exc).strip().lower()
         if reason == "ticker_identity_discontinuity":
@@ -849,7 +855,7 @@ def _persist_selected_asset_history(
         raise AssetDiscoveryConflict(
             f"{symbol} does not provide a complete clean historical window for the source Strategy: {str(exc)}"
         ) from exc
-    collection = db[ALPACA_MARKET_BARS_COLLECTION]
+    collection = db[_market_data_collection_name(selected_config)]
     identity = _market_data_identity(symbol, selected_config)
     collection.delete_many(identity)
     _upsert_frame(collection, cleaned_downloaded, identity, selected_config.mongo_write_batch_size)
@@ -878,20 +884,23 @@ def _candidate_frame(
     *,
     credentials: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    credentials = credentials or get_alpaca_credentials(db)
+    # credentials is retained for API compatibility with the parallel scanner.
+    # Tiingo credentials come exclusively from .env; Alpaca credentials remain
+    # available for the legacy provider and non-price metadata calls.
+    del db, credentials
     session = pd.Timestamp(end_session)
-    end = session.tz_localize("UTC") if session.tzinfo is None else session.tz_convert("UTC")
+    end = (
+        session.tz_localize("UTC")
+        if session.tzinfo is None
+        else session.tz_convert("UTC")
+    )
     end = end + pd.Timedelta(days=1)
     start = end - pd.Timedelta(days=CANDIDATE_HISTORY_DAYS)
-    return download_stock_bars(
-        api_key_id=credentials["api_key_id"],
-        secret_key=credentials["secret_key"],
-        symbol=symbol,
-        timeframe="1Day",
-        start=start.to_pydatetime(),
-        end=end.to_pydatetime(),
-        feed=config.alpaca_historical_feed,
-        adjustment=config.alpaca_adjustment,
+    return _download_provider_bars(
+        symbol,
+        config,
+        start.date().isoformat(),
+        (end - pd.Timedelta(days=1)).date().isoformat(),
     )
 
 
@@ -2062,7 +2071,11 @@ def _run_worker(db: Database, run_id: str, worker_id: str) -> None:
                 f"Fast-scanning batch {batch_index} with up to {len(batch)} concurrent market-data requests.",
                 changes={"current_batch": batch_index, "current_symbol": None},
             )
-            scan_credentials = get_alpaca_credentials(db)
+            scan_credentials = (
+                get_alpaca_credentials(db)
+                if effective_market_data_provider(config) == "alpaca"
+                else None
+            )
             with ThreadPoolExecutor(
                 max_workers=max(1, min(scan_workers, len(batch))),
                 thread_name_prefix="mct-asset-discovery-scan",
@@ -2464,7 +2477,11 @@ def _marginal_campaign_context(
 
     end_session = str(baseline.get("market_snapshot_end") or "").strip()
     if not end_session:
-        end_session = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+        end_session = pd.Timestamp(
+            latest_safe_completed_xnys_session(
+                data_delay_minutes=market_data_safe_delay_minutes(config),
+            )
+        ).date().isoformat()
     baseline_frames = _baseline_frames(config, end_session)
     required_sessions = _baseline_required_sessions(baseline_frames, config, end_session)
     return config, strategy, winner_config, end_session, baseline_frames, required_sessions
@@ -2823,7 +2840,11 @@ def _run_full_strategy_validation_worker(db: Database, run_id: str, validation_i
 
         snapshot_end = str(validation.get("snapshot_end") or "").strip()
         if not snapshot_end:
-            snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+            snapshot_end = pd.Timestamp(
+            latest_safe_completed_xnys_session(
+                data_delay_minutes=market_data_safe_delay_minutes(config),
+            )
+        ).date().isoformat()
         research_window = validation.get("research_window") if isinstance(validation.get("research_window"), dict) else {}
         if str(research_window.get("method") or "") != "full_strategy_history_replay":
             raise AssetDiscoveryConflict("Run a new Asset Discovery campaign using full-history replay before validating the selected universe.")
@@ -3034,7 +3055,11 @@ def start_full_strategy_validation(
         baseline = document.get("baseline") if isinstance(document.get("baseline"), dict) else {}
         snapshot_end = str(baseline.get("market_snapshot_end") or "").strip()
         if not snapshot_end:
-            snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+            snapshot_end = pd.Timestamp(
+            latest_safe_completed_xnys_session(
+                data_delay_minutes=market_data_safe_delay_minutes(config),
+            )
+        ).date().isoformat()
         validation_id = f"asset-full-{uuid4().hex[:12]}"
         worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         now = utc_now()
@@ -3154,7 +3179,11 @@ def append_selected_assets_to_research_strategy(
 
     snapshot_end = str(validation.get("snapshot_end") or "").strip()
     if not snapshot_end:
-        snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+        snapshot_end = pd.Timestamp(
+            latest_safe_completed_xnys_session(
+                data_delay_minutes=market_data_safe_delay_minutes(config),
+            )
+        ).date().isoformat()
 
     source_baseline_frames = _baseline_frames(source_config, snapshot_end)
     required_sessions = _baseline_required_sessions(source_baseline_frames, source_config, snapshot_end)
@@ -3295,7 +3324,11 @@ def create_research_strategy_from_discovery(
 
     snapshot_end = str(validation.get("snapshot_end") or "").strip()
     if not snapshot_end:
-        snapshot_end = pd.Timestamp(latest_safe_completed_xnys_session()).date().isoformat()
+        snapshot_end = pd.Timestamp(
+            latest_safe_completed_xnys_session(
+                data_delay_minutes=market_data_safe_delay_minutes(config),
+            )
+        ).date().isoformat()
 
     source_baseline_frames = _baseline_frames(source_config, snapshot_end)
     required_sessions = _baseline_required_sessions(source_baseline_frames, source_config, snapshot_end)
