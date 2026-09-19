@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.60 provides the isolated provider-audit workflow. It does not change the normal
+API v10.8.61 provides the isolated provider-audit workflow. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -127,3 +127,34 @@ python scripts/audit_alpaca_tiingo_equivalence.py \
   --job-id 20260918T234903-52bd06f3 \
   --alpaca-collection alpaca_market_bars_fresh_20260919
 ```
+
+
+## Fresh Alpaca split-only snapshot (API v10.8.61)
+
+To isolate dividend adjustments while preserving split continuity, download a new Alpaca snapshot with `adjustment=split`:
+
+```bash
+python scripts/download_fresh_alpaca_snapshot.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --adjustment split
+```
+
+Default destination:
+
+```text
+alpaca_market_bars_split_20260919
+```
+
+The legacy `alpaca_market_bars` collection remains protected and is never overwritten.
+
+Run the controlled replay using the split-only Alpaca snapshot:
+
+```bash
+python scripts/audit_alpaca_tiingo_equivalence.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --alpaca-collection alpaca_market_bars_split_20260919 \
+  --alpaca-adjustment split \
+  --output-dir output/alpaca_split_tiingo_equivalence_audit
+```
+
+The Alpaca replay metadata records `split`; the Tiingo control keeps the adjustment stored by the original Tiingo job. Raw candle-equivalence statistics between these two legs should therefore be treated as diagnostic only because their adjustment semantics differ. The main objective of this run is the controlled Alpaca split-only model result.
