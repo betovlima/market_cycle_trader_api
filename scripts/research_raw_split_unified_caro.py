@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import csv
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -306,6 +307,24 @@ def main() -> int:
         baseline_result.predictions.to_csv(output_dir / "control_predictions.csv", index=True)
         baseline_result.trades.to_csv(output_dir / "control_trades.csv", index=False)
 
+        control_settings_hash = hashlib.sha256(
+            json.dumps(
+                base_tuning_values,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        control_observation = {
+            "candidate_id": 0,
+            "kind": "control",
+            "is_control": True,
+            "settings": deepcopy(base_tuning_values),
+            "settings_hash": control_settings_hash,
+            "status": "completed",
+            "metrics": deepcopy(baseline_metrics),
+            "champion_gate_passed": True,
+        }
+
         document: dict[str, Any] = {
             "method": "champion_probability",
             "candidate_count": int(args.candidate_count),
@@ -313,7 +332,7 @@ def main() -> int:
             "search_space": [dict(item) for item in _SEARCH_SPACE],
             "base_tuning_values": base_tuning_values,
             "base_model_values": base_tuning_values,
-            "prior_observations": [],
+            "prior_observations": [control_observation],
             "candidates": [],
             "probability_config": {
                 "minimum_exploration_trials": min(24, len(_SEARCH_SPACE) + 2),
@@ -327,8 +346,14 @@ def main() -> int:
                 "minimum_exploration_fraction": 0.20,
                 "stagnation_recovery_trials": 4,
             },
-            "probability_state": initial_probability_state(),
-            "probability_anchor": None,
+            "probability_state": initial_probability_state([control_observation]),
+            "probability_anchor": {
+                "source": "control",
+                "candidate_id": 0,
+                "settings_hash": control_settings_hash,
+                "settings": deepcopy(base_tuning_values),
+                "metrics": deepcopy(baseline_metrics),
+            },
             "baseline_execution": {
                 "metrics": baseline_metrics,
                 "settings": base_tuning_values,
@@ -337,7 +362,7 @@ def main() -> int:
 
         checkpoint = {
             "schema_version": 1,
-            "api_version": "10.8.63",
+            "api_version": "10.8.64",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -345,6 +370,8 @@ def main() -> int:
             "excluded_assets": exclusions,
             "baseline_metrics": baseline_metrics,
             "baseline_settings": base_tuning_values,
+            "control_observation_in_surrogate": True,
+            "control_settings_hash": control_settings_hash,
             "candidates": [],
         }
         _checkpoint(checkpoint_path, checkpoint)
@@ -441,8 +468,8 @@ def main() -> int:
 
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.63",
-            "experiment": "raw-split-unified-caro-v1",
+            "api_version": "10.8.64",
+            "experiment": "raw-split-unified-caro-v2",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -472,6 +499,8 @@ def main() -> int:
                 "dividend_features": False,
                 "structural_identity_guard": True,
                 "tuning": "existing Unified CARO space-filling + probabilistic refinement",
+                "control_in_surrogate_training": True,
+                "control_as_initial_probability_anchor": True,
                 "hyperparameter_search_only": True,
             },
         }
