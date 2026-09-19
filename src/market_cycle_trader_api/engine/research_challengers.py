@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import math
 import os
+import platform
 import time
 from typing import Any, Callable
 
@@ -76,6 +77,106 @@ def _lightgbm_settings(config: Any) -> dict[str, Any]:
     if missing:
         raise ValueError("LightGBM research settings are incomplete: " + ", ".join(missing))
     return dict(lightgbm)
+
+
+_LIGHTGBM_DEVICE_PROBE_CACHE: dict[tuple[str, str], tuple[bool, str | None]] = {}
+
+
+def _requested_rotation_accelerator(config: Any) -> str:
+    persisted = str(getattr(config, "rotation_accelerator", "") or "").strip().lower()
+    if persisted in {"auto", "cpu", "cuda"}:
+        return persisted
+    fallback = str(os.getenv("MCT_ROTATION_ACCELERATOR") or "auto").strip().lower()
+    return fallback if fallback in {"auto", "cpu", "cuda"} else "auto"
+
+
+def _rotation_allow_cpu_fallback(config: Any) -> bool:
+    persisted = getattr(config, "rotation_allow_cpu_fallback", None)
+    if persisted is not None:
+        return bool(persisted)
+    raw = str(os.getenv("MCT_ROTATION_ALLOW_CPU_FALLBACK") or "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _probe_lightgbm_device(device_type: str) -> tuple[bool, str | None]:
+    normalized = str(device_type).strip().lower()
+    if normalized == "cpu":
+        return True, None
+    key = (platform.system().lower(), normalized)
+    cached = _LIGHTGBM_DEVICE_PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from lightgbm import LGBMRegressor
+
+        x_probe = np.asarray(
+            [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]] * 8,
+            dtype=np.float32,
+        )
+        y_probe = np.asarray([0.0, 1.0, 1.0, 2.0] * 8, dtype=np.float32)
+        probe = LGBMRegressor(
+            objective="regression",
+            boosting_type="gbdt",
+            n_estimators=1,
+            max_depth=2,
+            num_leaves=4,
+            max_bin=31,
+            min_child_samples=1,
+            device_type=normalized,
+            verbosity=-1,
+        )
+        probe.fit(x_probe, y_probe)
+        result = (True, None)
+    except Exception as exc:
+        result = (False, f"{type(exc).__name__}: {exc}")
+    _LIGHTGBM_DEVICE_PROBE_CACHE[key] = result
+    return result
+
+
+def _resolve_lightgbm_device(config: Any) -> tuple[str, str, list[str]]:
+    requested = _requested_rotation_accelerator(config)
+    allow_cpu_fallback = _rotation_allow_cpu_fallback(config)
+    system = platform.system().lower()
+
+    if bool(getattr(config, "deterministic_execution", False)):
+        if requested == "cuda":
+            raise RuntimeError(
+                "LightGBM GPU execution is incompatible with deterministic_execution=true. "
+                "Disable deterministic execution for the GPU tuning campaign or select CPU."
+            )
+        return requested, "cpu", []
+
+    if requested == "cpu":
+        return requested, "cpu", []
+
+    if system == "windows":
+        gpu_candidates = ["gpu"]
+    elif system == "linux":
+        gpu_candidates = ["cuda", "gpu"]
+    else:
+        gpu_candidates = []
+
+    candidates = list(gpu_candidates)
+    if requested == "auto" or allow_cpu_fallback:
+        candidates.append("cpu")
+
+    probe_errors: list[str] = []
+    for candidate in candidates:
+        ok, error = _probe_lightgbm_device(candidate)
+        if ok:
+            return requested, candidate, probe_errors
+        probe_errors.append(f"{candidate}: {error}")
+
+    if requested == "auto":
+        return requested, "cpu", probe_errors
+
+    details = "; ".join(probe_errors) if probe_errors else "no supported GPU backend for this OS"
+    raise RuntimeError(
+        "LightGBM GPU acceleration was requested but no GPU backend could be initialized. "
+        f"requested={requested}, os={platform.system()}, details={details}. "
+        "Enable rotation_allow_cpu_fallback or MCT_ROTATION_ALLOW_CPU_FALLBACK=true "
+        "to permit CPU fallback."
+    )
 
 
 def _build_execution_context(
@@ -214,6 +315,7 @@ def _lightgbm_fit_models(
     progress_callback: Callable[[int, int, str], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
     target_column: str = "forward_risk_adjusted_utility",
+    device_type: str | None = None,
 ) -> dict[str, Any]:
     try:
         from lightgbm import LGBMRegressor
@@ -223,6 +325,7 @@ def _lightgbm_fit_models(
     anchor_assets = set(getattr(config, "calendar_anchor_assets", []) or [])
     minimum_rows = int(config.rotation_minimum_training_rows)
     settings = _lightgbm_settings(config)
+    active_device = str(device_type or _resolve_lightgbm_device(config)[1]).strip().lower()
     fitted: dict[str, Any] = {}
     started = time.perf_counter()
 
@@ -231,7 +334,7 @@ def _lightgbm_fit_models(
             technical_log_callback(message)
 
     technical(
-        f"model=lightgbm phase={phase} event=fit_start device=cpu "
+        f"model=lightgbm phase={phase} event=fit_start device={active_device} "
         f"models={len(symbols)} train_sessions={len(train_dates)} "
         f"estimators={int(settings['n_estimators'])} seed={int(config.random_state)}"
     )
@@ -246,7 +349,7 @@ def _lightgbm_fit_models(
                     f"{minimum_rows} are required for an anchor asset."
                 )
             if progress_callback is not None:
-                progress_callback(position, len(symbols), "cpu")
+                progress_callback(position, len(symbols), active_device)
             continue
         model = LGBMRegressor(
             objective="regression",
@@ -265,16 +368,17 @@ def _lightgbm_fit_models(
             max_bin=int(settings["max_bin"]),
             random_state=int(config.random_state),
             n_jobs=_effective_n_jobs(int(settings["n_jobs"])),
-            deterministic=bool(config.deterministic_execution),
-            force_col_wise=bool(config.deterministic_execution),
+            device_type=active_device,
+            deterministic=bool(config.deterministic_execution) if active_device == "cpu" else False,
+            force_col_wise=bool(config.deterministic_execution) if active_device == "cpu" else False,
             verbosity=-1,
         )
         model.fit(frame[ROTATION_FEATURES], frame[target_column])
         fitted[symbol] = model
         if progress_callback is not None:
-            progress_callback(position, len(symbols), "cpu")
+            progress_callback(position, len(symbols), active_device)
     technical(
-        f"model=lightgbm phase={phase} event=fit_complete device=cpu "
+        f"model=lightgbm phase={phase} event=fit_complete device={active_device} "
         f"models={len(fitted)} duration_seconds={time.perf_counter() - started:.3f}"
     )
     return fitted
@@ -305,6 +409,7 @@ def _run_lightgbm(
     seed_step = int(config.rotation_seed_step)
     total_folds = len(folds)
     total_models = len(symbols)
+    requested_device, lightgbm_device, device_probe_errors = _resolve_lightgbm_device(config)
 
     def report(fraction: float, stage: str, completed: int) -> None:
         if progress_callback is not None:
@@ -317,7 +422,7 @@ def _run_lightgbm(
     if progress_callback is not None:
         progress_callback(
             18.0,
-            f"Prepared {len(symbols)} assets and {len(folds)} folds — LightGBM=CPU",
+            f"Prepared {len(symbols)} assets and {len(folds)} folds — LightGBM={lightgbm_device.upper()}",
             0,
         )
 
@@ -377,7 +482,7 @@ def _run_lightgbm(
                 phase="Calibration training",
                 trained_models=0,
                 total_models=total_models,
-                device="CPU",
+                device=lightgbm_device.upper(),
             )
             calibration_models = _lightgbm_fit_models(
                 frames,
@@ -387,6 +492,7 @@ def _run_lightgbm(
                 phase=f"run_{run_index}_fold_{fold_position}_calibration",
                 progress_callback=phase_progress("calibration training", 0.02, 0.38),
                 technical_log_callback=technical_log_callback,
+                device_type=lightgbm_device,
             )
             calibration_cash_edge_models = None
             if _risk_off_enabled(rep_config):
@@ -398,6 +504,7 @@ def _run_lightgbm(
                     phase=f"run_{run_index}_fold_{fold_position}_calibration_cash_edge",
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
+                    device_type=lightgbm_device,
                 )
             opportunity_gate = None
             expected_return_calibrator = None
@@ -458,7 +565,7 @@ def _run_lightgbm(
                 phase="Final training",
                 trained_models=0,
                 total_models=total_models,
-                device="CPU",
+                device=lightgbm_device.upper(),
             )
             final_models = _lightgbm_fit_models(
                 frames,
@@ -468,6 +575,7 @@ def _run_lightgbm(
                 phase=f"run_{run_index}_fold_{fold_position}_final",
                 progress_callback=phase_progress("final training", 0.50, 0.90),
                 technical_log_callback=technical_log_callback,
+                device_type=lightgbm_device,
             )
             latest_final_models = final_models
             latest_final_fold_id = fold_id
@@ -483,6 +591,7 @@ def _run_lightgbm(
                     phase=f"run_{run_index}_fold_{fold_position}_final_cash_edge",
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
+                    device_type=lightgbm_device,
                 )
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             if opportunity_cash_gate_enabled(rep_config):
@@ -687,7 +796,10 @@ def _run_lightgbm(
                 "effective_switch_margin": float(np.mean([item["effective_switch_margin"] for item in margin_details])),
                 "effective_switch_margin_mean": float(np.mean([item["effective_switch_margin"] for item in margin_details])),
                 "calibrated_switch_margin": float(np.mean([item["calibrated_candidate_margin"] for item in margin_details])),
-                "effective_compute_device": "cpu",
+                "requested_compute_device": requested_device,
+                "effective_compute_device": lightgbm_device,
+                "compute_device_probe_errors": device_probe_errors,
+                "rotation_allow_cpu_fallback": _rotation_allow_cpu_fallback(rep_config),
                 "deterministic_execution": bool(rep_config.deterministic_execution),
                 "numeric_thread_limit": int(rep_config.numeric_thread_limit),
                 "decision_diagnostics_schema_version": (
