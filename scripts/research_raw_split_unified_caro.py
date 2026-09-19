@@ -125,6 +125,9 @@ def _metrics(
         "cagr": float(result.metrics.get("strategy_cagr") or 0.0),
         "worst_fold_return": worst_fold_return,
         "folds": fold_rows,
+        "requested_compute_device": result.metrics.get("requested_compute_device"),
+        "effective_compute_device": result.metrics.get("effective_compute_device"),
+        "compute_device_probe_errors": result.metrics.get("compute_device_probe_errors"),
         "eligible": True,
     }
 
@@ -362,7 +365,7 @@ def main() -> int:
 
         checkpoint = {
             "schema_version": 1,
-            "api_version": "10.8.64",
+            "api_version": "10.8.65",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -468,8 +471,8 @@ def main() -> int:
 
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.64",
-            "experiment": "raw-split-unified-caro-v2",
+            "api_version": "10.8.65",
+            "experiment": "raw-split-unified-caro-v3",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
