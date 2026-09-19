@@ -339,3 +339,50 @@ Expected checkpoint fields:
 ```
 
 The v10.8.63 campaign should not be interpreted as evidence that the old hyperparameters are globally optimal because its adaptive surrogate did not include the control outcome.
+
+
+## LightGBM GPU accelerator support (API v10.8.65)
+
+LightGBM now consumes the existing rotation accelerator configuration instead of always forcing CPU.
+
+Configuration precedence:
+
+```text
+persisted Backtest/MongoDB rotation_accelerator
+        ↓ if absent
+MCT_ROTATION_ACCELERATOR from .env
+        ↓ if absent
+auto
+```
+
+The same fallback rule applies to `rotation_allow_cpu_fallback` using `MCT_ROTATION_ALLOW_CPU_FALLBACK`.
+
+Supported values remain:
+
+```text
+auto
+cpu
+cuda
+```
+
+LightGBM backend mapping:
+- Windows: GPU acceleration uses `device_type=gpu` (OpenCL).
+- Linux: `cuda` is tried first, then `gpu`.
+- `auto` probes GPU support and falls back to CPU.
+- explicit `cuda` follows `rotation_allow_cpu_fallback` before falling back to CPU.
+
+The campaign output records:
+- `requested_compute_device`
+- `effective_compute_device`
+- `compute_device_probe_errors`
+
+This allows every CARO result to prove whether training actually used GPU or CPU.
+
+For a local fallback when the persisted request does not contain accelerator fields:
+
+```env
+MCT_ROTATION_ACCELERATOR=cuda
+MCT_ROTATION_ALLOW_CPU_FALLBACK=false
+```
+
+If the persisted MongoDB/job request already contains `rotation_accelerator`, that value remains authoritative.
