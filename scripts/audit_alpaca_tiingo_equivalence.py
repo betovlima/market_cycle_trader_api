@@ -723,6 +723,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--alpaca-adjustment",
+        default=None,
+        choices=["raw", "split", "dividend", "all"],
+        help=(
+            "Adjustment stored in the selected Alpaca collection. "
+            "If omitted, inherit the adjustment from the source Backtest job."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default="output/alpaca_tiingo_equivalence_audit",
     )
@@ -754,6 +763,9 @@ def main() -> int:
         alpaca_collection_name = str(args.alpaca_collection).strip()
         if not alpaca_collection_name:
             raise ValueError("--alpaca-collection cannot be empty.")
+        alpaca_adjustment = str(
+            args.alpaca_adjustment or request.alpaca_adjustment
+        ).strip().lower()
         alpaca_collection = db[alpaca_collection_name]
         tiingo_collection = db[TIINGO_MARKET_BARS_COLLECTION]
 
@@ -780,7 +792,7 @@ def main() -> int:
                 symbol=symbol,
                 interval=request.timeframe,
                 feed=request.alpaca_historical_feed,
-                adjustment=request.alpaca_adjustment,
+                adjustment=alpaca_adjustment,
                 start=start,
                 end_exclusive=end_exclusive,
             )
@@ -1017,8 +1029,9 @@ def main() -> int:
             "comparison_end": common_end.date().isoformat(),
             "alpaca_collection": alpaca_collection_name,
             "alpaca_feed": request.alpaca_historical_feed,
+            "alpaca_adjustment": alpaca_adjustment,
             "tiingo_feed": "eod",
-            "adjustment": request.alpaca_adjustment,
+            "tiingo_adjustment": request.alpaca_adjustment,
             "candle_comparison": {
                 "assets_with_any_non_exact_rows": int(
                     sum(
@@ -1081,7 +1094,14 @@ def main() -> int:
         }
 
         if not args.skip_model_replay:
-            alpaca_result = _run_source("ALPACA", alpaca_frames, controlled_request)
+            alpaca_replay_request = controlled_request.model_copy(
+                update={"alpaca_adjustment": alpaca_adjustment}
+            )
+            alpaca_result = _run_source(
+                "ALPACA",
+                alpaca_frames,
+                alpaca_replay_request,
+            )
             tiingo_result = _run_source("TIINGO", tiingo_frames, controlled_request)
 
             alpaca_result.predictions.to_csv(
