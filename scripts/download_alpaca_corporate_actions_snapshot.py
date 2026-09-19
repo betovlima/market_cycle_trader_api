@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -180,10 +181,14 @@ def main() -> int:
         if not symbols:
             raise RuntimeError("Selected job contains no assets.")
 
-        start = str(request.get("start_date"))
+        research_start = str(request.get("start_date"))
         end = str(request.get("analysis_end_date") or request.get("end_date"))
-        if not start or not end:
+        if not research_start or not end:
             raise RuntimeError("Selected job must contain a closed research date range.")
+        # Corporate actions are filtered by process_date. Include a one-year
+        # lookback so an event processed/announced before the first market bar
+        # but effective inside the research window is not lost.
+        start = (date.fromisoformat(research_start) - timedelta(days=366)).isoformat()
 
         target = db[collection_name]
         existing = target.estimated_document_count()
@@ -251,7 +256,8 @@ def main() -> int:
             "source": "alpaca_corporate_actions_api",
             "source_job_id": job.get("id"),
             "target_collection": collection_name,
-            "requested_start": start,
+            "corporate_action_query_start": start,
+            "research_start": research_start,
             "requested_end": end,
             "asset_count": len(symbols),
             "assets": symbols,
