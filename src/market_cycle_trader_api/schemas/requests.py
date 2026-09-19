@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from datetime import date, datetime
 from typing import Literal
@@ -19,6 +20,16 @@ HistoryBackfillProvider = Literal["alpaca", "tiingo"]
 ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
+
+
+def _default_rotation_accelerator() -> str:
+    value = str(os.getenv("MCT_ROTATION_ACCELERATOR") or "auto").strip().lower()
+    return value if value in {"auto", "cpu", "cuda"} else "auto"
+
+
+def _default_rotation_allow_cpu_fallback() -> bool:
+    value = str(os.getenv("MCT_ROTATION_ALLOW_CPU_FALLBACK") or "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def normalize_asset_metadata(value: list[str]) -> list[str]:
@@ -115,8 +126,8 @@ class BacktestRequest(BaseModel):
     rotation_xgb_n_estimators: int = Field(ge=10, le=100_000)
     rotation_xgb_learning_rate: float = Field(gt=0, le=1)
     rotation_xgb_max_depth: int = Field(ge=1, le=20)
-    rotation_accelerator: RotationAccelerator
-    rotation_allow_cpu_fallback: bool
+    rotation_accelerator: RotationAccelerator = Field(default_factory=_default_rotation_accelerator)
+    rotation_allow_cpu_fallback: bool = Field(default_factory=_default_rotation_allow_cpu_fallback)
     rotation_xgb_repetitions: int = Field(ge=1, le=100)
     rotation_seed_step: int = Field(ge=1, le=10_000_000)
 
