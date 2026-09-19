@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.56 provides an isolated research script. It does not change the normal
+API v10.8.57 provides an isolated research script. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -78,6 +78,10 @@ Files:
 - `first_divergence_model_inputs.csv`: Alpaca vs Tiingo model inputs for the assets involved in the first divergent decision.
 - `fold1_pretest_model_input_equivalence.csv`: feature/target equivalence restricted to sessions before the first out-of-sample test session.
 - `fold1_pretest_model_input_anomalies.csv`: largest pre-test feature/target deltas by asset and column.
+- `fold1_initial_training_input_equivalence.csv`: exact first-fold calibration-model training window.
+- `fold1_calibration_input_equivalence.csv`: exact first-fold policy calibration window.
+- `fold1_final_fit_input_equivalence.csv`: exact first-fold final LightGBM fit window used for OOS scores.
+- `fold1_phase_input_anomalies.csv`: top feature/target deltas tagged by training phase.
 - `alpaca_trades.csv` / `tiingo_trades.csv`: controlled trade sequences.
 
 Material-difference flags are descriptive only: price differences above 1 bp
