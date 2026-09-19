@@ -386,3 +386,26 @@ MCT_ROTATION_ALLOW_CPU_FALLBACK=false
 ```
 
 If the persisted MongoDB/job request already contains `rotation_accelerator`, that value remains authoritative.
+
+
+## LightGBM GPU cache-signature compatibility (API v10.8.66)
+
+API v10.8.65 added LightGBM GPU selection, but the accelerated research path can replace `_lightgbm_fit_models` at runtime with a cached wrapper that still exposes the older call signature.
+
+The v10.8.65 caller passed `device_type=...` explicitly, causing:
+
+```text
+TypeError: _cached_lightgbm_fit_models() got an unexpected keyword argument 'device_type'
+```
+
+API v10.8.66 keeps the cached wrapper contract unchanged. GPU selection is resolved inside the underlying LightGBM fit function from the existing request / environment configuration, so callers no longer pass a new keyword argument through the cache boundary.
+
+The precedence remains unchanged:
+
+```text
+MongoDB/job rotation_accelerator
+  -> .env MCT_ROTATION_ACCELERATOR if absent
+  -> auto if both are absent
+```
+
+GPU diagnostics remain persisted in campaign results.
