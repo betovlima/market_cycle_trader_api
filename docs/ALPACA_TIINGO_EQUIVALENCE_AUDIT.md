@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.57 provides an isolated research script. It does not change the normal
+API v10.8.58 provides an isolated research script. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -89,3 +89,6 @@ Material-difference flags are descriptive only: price differences above 1 bp
 the replay.
 
 No parameter optimization is performed by this audit.
+
+
+API v10.8.58 note: fold-phase timestamps are normalized to UTC session dates before intersecting Alpaca and Tiingo model-input panels. This prevents 04:00/05:00 Alpaca daily timestamps from producing empty phase-equivalence outputs against 00:00 Tiingo EOD timestamps.
