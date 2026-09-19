@@ -181,7 +181,7 @@ def main() -> int:
         "--include-dividend-features",
         action="store_true",
         help=(
-            "Reserved for a later controlled campaign. v10.8.63 defaults to "
+            "Reserved for a later controlled campaign. v10.8.64 defaults to "
             "RAW+split price features only."
         ),
     )
@@ -189,7 +189,7 @@ def main() -> int:
 
     if args.include_dividend_features:
         raise ValueError(
-            "v10.8.63 calibrates the canonical RAW+split price architecture only. "
+            "v10.8.64 calibrates the canonical RAW+split price architecture only. "
             "Dividend-feature tuning must be run as a separate campaign."
         )
     if int(args.candidate_count) < 4:
