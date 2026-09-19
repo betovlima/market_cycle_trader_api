@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.58 provides an isolated research script. It does not change the normal
+API v10.8.60 provides the isolated provider-audit workflow. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -92,3 +92,38 @@ No parameter optimization is performed by this audit.
 
 
 API v10.8.58 note: fold-phase timestamps are normalized to UTC session dates before intersecting Alpaca and Tiingo model-input panels. This prevents 04:00/05:00 Alpaca daily timestamps from producing empty phase-equivalence outputs against 00:00 Tiingo EOD timestamps.
+
+
+## Fresh Alpaca snapshot verification (API v10.8.60)
+
+The preserved collection `alpaca_market_bars` is read-only for this experiment.
+
+Download a new snapshot directly from the Alpaca API into a separate collection:
+
+```bash
+python scripts/download_fresh_alpaca_snapshot.py \
+  --job-id 20260918T234903-52bd06f3
+```
+
+Default destination:
+
+```text
+alpaca_market_bars_fresh_20260919
+```
+
+The downloader refuses to use `alpaca_market_bars` as a target. It stores a snapshot manifest and SHA-256 in `market_data_snapshot_manifests`.
+
+Compare the preserved Alpaca cache against the fresh API snapshot without running the model:
+
+```bash
+python scripts/compare_alpaca_snapshots.py \
+  --job-id 20260918T234903-52bd06f3
+```
+
+The equivalence audit can also use the fresh snapshot explicitly:
+
+```bash
+python scripts/audit_alpaca_tiingo_equivalence.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --alpaca-collection alpaca_market_bars_fresh_20260919
+```
