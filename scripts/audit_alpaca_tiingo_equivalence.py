@@ -675,6 +675,39 @@ def _compare_predictions(
     }, pd.DataFrame(rows)
 
 
+def _build_price_volume_hybrid(
+    price_frames: dict[str, pd.DataFrame],
+    volume_frames: dict[str, pd.DataFrame],
+    *,
+    price_source: str,
+    volume_source: str,
+) -> dict[str, pd.DataFrame]:
+    hybrids: dict[str, pd.DataFrame] = {}
+    symbols = sorted(set(price_frames).intersection(volume_frames))
+    for symbol in symbols:
+        price_frame = price_frames[symbol].copy().sort_index()
+        volume_frame = _normalize_session_index(volume_frames[symbol])
+        price_sessions = pd.DatetimeIndex(price_frame.index)
+        price_sessions = pd.to_datetime(price_sessions, utc=True).normalize()
+
+        volume_by_session = pd.to_numeric(
+            volume_frame["volume"],
+            errors="coerce",
+        )
+        aligned_volume = volume_by_session.reindex(price_sessions)
+        if aligned_volume.isna().any():
+            missing = price_sessions[aligned_volume.isna()]
+            raise RuntimeError(
+                "PriceVolumeAttributionMissingVolume: "
+                f"symbol={symbol} price_source={price_source} "
+                f"volume_source={volume_source} missing_sessions={len(missing)}"
+            )
+
+        price_frame["volume"] = aligned_volume.to_numpy(dtype=float)
+        hybrids[symbol] = price_frame
+    return hybrids
+
+
 def _run_source(
     label: str,
     frames: dict[str, pd.DataFrame],
@@ -1072,6 +1105,29 @@ def main() -> int:
             alpaca_result = _run_source("ALPACA", alpaca_frames, controlled_request)
             tiingo_result = _run_source("TIINGO", tiingo_frames, controlled_request)
 
+            alpaca_price_tiingo_volume_frames = _build_price_volume_hybrid(
+                alpaca_frames,
+                tiingo_frames,
+                price_source="alpaca",
+                volume_source="tiingo",
+            )
+            tiingo_price_alpaca_volume_frames = _build_price_volume_hybrid(
+                tiingo_frames,
+                alpaca_frames,
+                price_source="tiingo",
+                volume_source="alpaca",
+            )
+            alpaca_price_tiingo_volume_result = _run_source(
+                "ALPACA_PRICE_TIINGO_VOLUME",
+                alpaca_price_tiingo_volume_frames,
+                controlled_request,
+            )
+            tiingo_price_alpaca_volume_result = _run_source(
+                "TIINGO_PRICE_ALPACA_VOLUME",
+                tiingo_price_alpaca_volume_frames,
+                controlled_request,
+            )
+
             alpaca_result.predictions.to_csv(
                 output_dir / "alpaca_predictions.csv",
                 index=True,
@@ -1082,6 +1138,23 @@ def main() -> int:
             )
             alpaca_result.trades.to_csv(output_dir / "alpaca_trades.csv", index=False)
             tiingo_result.trades.to_csv(output_dir / "tiingo_trades.csv", index=False)
+
+            alpaca_price_tiingo_volume_result.predictions.to_csv(
+                output_dir / "alpaca_price_tiingo_volume_predictions.csv",
+                index=True,
+            )
+            tiingo_price_alpaca_volume_result.predictions.to_csv(
+                output_dir / "tiingo_price_alpaca_volume_predictions.csv",
+                index=True,
+            )
+            alpaca_price_tiingo_volume_result.trades.to_csv(
+                output_dir / "alpaca_price_tiingo_volume_trades.csv",
+                index=False,
+            )
+            tiingo_price_alpaca_volume_result.trades.to_csv(
+                output_dir / "tiingo_price_alpaca_volume_trades.csv",
+                index=False,
+            )
 
             decision_summary, decision_rows = _compare_predictions(
                 alpaca_result.predictions,
@@ -1142,6 +1215,19 @@ def main() -> int:
             tiingo_capital = float(
                 tiingo_result.metrics.get("strategy_ending_capital") or 0.0
             )
+
+            alpaca_price_tiingo_volume_capital = float(
+                alpaca_price_tiingo_volume_result.metrics.get(
+                    "strategy_ending_capital"
+                )
+                or 0.0
+            )
+            tiingo_price_alpaca_volume_capital = float(
+                tiingo_price_alpaca_volume_result.metrics.get(
+                    "strategy_ending_capital"
+                )
+                or 0.0
+            )
             summary["controlled_replay"] = {
                 "alpaca": {
                     "ending_capital": alpaca_capital,
@@ -1160,6 +1246,40 @@ def main() -> int:
                         "strategy_maximum_drawdown"
                     ),
                     "switches": tiingo_result.metrics.get("switches"),
+                },
+                "source_component_attribution": {
+                    "alpaca_price_alpaca_volume": {
+                        "ending_capital": alpaca_capital,
+                    },
+                    "alpaca_price_tiingo_volume": {
+                        "ending_capital": alpaca_price_tiingo_volume_capital,
+                        "delta_vs_alpaca_full": (
+                            alpaca_price_tiingo_volume_capital - alpaca_capital
+                        ),
+                        "ratio_vs_alpaca_full": (
+                            alpaca_price_tiingo_volume_capital / alpaca_capital
+                            if alpaca_capital > 0
+                            else None
+                        ),
+                    },
+                    "tiingo_price_tiingo_volume": {
+                        "ending_capital": tiingo_capital,
+                    },
+                    "tiingo_price_alpaca_volume": {
+                        "ending_capital": tiingo_price_alpaca_volume_capital,
+                        "delta_vs_tiingo_full": (
+                            tiingo_price_alpaca_volume_capital - tiingo_capital
+                        ),
+                        "ratio_vs_tiingo_full": (
+                            tiingo_price_alpaca_volume_capital / tiingo_capital
+                            if tiingo_capital > 0
+                            else None
+                        ),
+                    },
+                    "interpretation": (
+                        "Hybrid replays are diagnostic interventions only. "
+                        "They are not valid market-data candidates for production."
+                    ),
                 },
                 "alpaca_minus_tiingo_ending_capital": alpaca_capital - tiingo_capital,
                 "alpaca_to_tiingo_capital_ratio": (
