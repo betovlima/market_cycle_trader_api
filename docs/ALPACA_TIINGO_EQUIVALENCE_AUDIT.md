@@ -244,3 +244,60 @@ ca_dividend_yield_trailing_60
 The script also compares the locally reconstructed split series with the previously downloaded Alpaca `adjustment=split` snapshot when that collection is available. This validates the split reconstruction independently of the model result.
 
 This version intentionally does not add dividend cash to simulated portfolio equity and does not change the forward target. Those are separate hypotheses and should only be tested after this input-context experiment is evaluated.
+
+
+## RAW + split Unified CARO recalibration (API v10.8.63)
+
+This campaign recalibrates LightGBM hyperparameters after the market-data representation changed from provider-adjusted history to immutable RAW bars with local split normalization.
+
+A full corporate-action snapshot is required because structural identity events (for example mergers and ticker lineage changes) must be detected before tuning. The DOC/PEAK 2024 merger is the first observed case motivating this guard.
+
+### 1. Refresh the full corporate-action snapshot
+
+```bash
+python scripts/download_alpaca_corporate_actions_snapshot.py \
+  --job-id 20260918T234903-52bd06f3
+```
+
+Default destination:
+
+```text
+alpaca_corporate_actions_full_20260919
+```
+
+### 2. Run Unified CARO on RAW + local split normalization
+
+```bash
+python scripts/research_raw_split_unified_caro.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 20
+```
+
+The campaign uses the existing Unified CARO implementation:
+- initial space-filling exploration;
+- Gaussian-process probabilistic refinement;
+- trust-region adaptation;
+- stagnation recovery;
+- champion gate against the current RAW+split Control.
+
+This campaign deliberately excludes dividend features. It recalibrates only the canonical price architecture established by v10.8.62.
+
+Outputs:
+
+```text
+output/raw_split_unified_caro/
+  summary.json
+  campaign_checkpoint.json
+  candidates.csv
+  data_diagnostics.csv
+  excluded_assets.csv
+  control_predictions.csv
+  control_trades.csv
+  champion_predictions.csv
+  champion_trades.csv
+```
+
+Structural lineage guard:
+- forward/reverse splits are normalized locally;
+- a symbol acting as the acquiree in a merger into a different ticker is excluded from this tuning campaign until point-in-time lineage reconstruction is implemented;
+- this is deterministic corporate-action handling, not a performance heuristic.
