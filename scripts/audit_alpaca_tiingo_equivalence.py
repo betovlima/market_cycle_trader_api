@@ -443,6 +443,73 @@ def _first_divergence_input_snapshot(
     return pd.DataFrame(rows)
 
 
+def _compare_pretest_inputs(
+    alpaca_inputs: dict[str, pd.DataFrame],
+    tiingo_inputs: dict[str, pd.DataFrame],
+    first_test_session: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summaries: list[dict[str, Any]] = []
+    anomalies: list[dict[str, Any]] = []
+    cutoff = _utc(first_test_session).normalize()
+
+    for symbol in sorted(set(alpaca_inputs).intersection(tiingo_inputs)):
+        left = alpaca_inputs[symbol]
+        right = tiingo_inputs[symbol]
+        common = left.index.intersection(right.index)
+        common = common[common < cutoff].sort_values()
+        if common.empty:
+            continue
+
+        for column in [*ROTATION_FEATURES, *TARGET_COLUMNS]:
+            if column not in left.columns or column not in right.columns:
+                continue
+            a = pd.to_numeric(left.loc[common, column], errors="coerce")
+            t = pd.to_numeric(right.loc[common, column], errors="coerce")
+            valid = pd.DataFrame({"alpaca": a, "tiingo": t}).replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            if valid.empty:
+                continue
+
+            delta = valid["tiingo"] - valid["alpaca"]
+            abs_delta = delta.abs()
+            corr = (
+                float(valid["alpaca"].corr(valid["tiingo"]))
+                if len(valid) >= 2
+                else None
+            )
+            kind = "target" if column in TARGET_COLUMNS else "feature"
+            summaries.append(
+                {
+                    "symbol": symbol,
+                    "column": column,
+                    "kind": kind,
+                    "common_rows": int(len(valid)),
+                    "first_session": pd.Timestamp(valid.index.min()).isoformat(),
+                    "last_session": pd.Timestamp(valid.index.max()).isoformat(),
+                    "mean_abs_diff": float(abs_delta.mean()),
+                    "p95_abs_diff": float(abs_delta.quantile(0.95)),
+                    "max_abs_diff": float(abs_delta.max()),
+                    "correlation": corr,
+                }
+            )
+
+            for timestamp in abs_delta.nlargest(min(5, len(abs_delta))).index:
+                anomalies.append(
+                    {
+                        "symbol": symbol,
+                        "timestamp": pd.Timestamp(timestamp).isoformat(),
+                        "column": column,
+                        "kind": kind,
+                        "alpaca_value": float(valid.at[timestamp, "alpaca"]),
+                        "tiingo_value": float(valid.at[timestamp, "tiingo"]),
+                        "abs_diff": float(abs_delta.loc[timestamp]),
+                    }
+                )
+
+    return pd.DataFrame(summaries), pd.DataFrame(anomalies)
+
+
 def _decision_column(frame: pd.DataFrame) -> str | None:
     for column in (
         "final_action_asset",
@@ -870,6 +937,24 @@ def main() -> int:
                 index=False,
             )
 
+            first_test_session = min(
+                _normalize_session_index(alpaca_result.predictions).index.min(),
+                _normalize_session_index(tiingo_result.predictions).index.min(),
+            )
+            pretest_summary, pretest_anomalies = _compare_pretest_inputs(
+                alpaca_model_inputs,
+                tiingo_model_inputs,
+                first_test_session,
+            )
+            pretest_summary.to_csv(
+                output_dir / "fold1_pretest_model_input_equivalence.csv",
+                index=False,
+            )
+            pretest_anomalies.to_csv(
+                output_dir / "fold1_pretest_model_input_anomalies.csv",
+                index=False,
+            )
+
             alpaca_capital = float(
                 alpaca_result.metrics.get("strategy_ending_capital") or 0.0
             )
@@ -902,6 +987,11 @@ def main() -> int:
                     else None
                 ),
                 "decision_divergence": decision_summary,
+                "fold1_pretest_input_attribution": {
+                    "first_test_session": pd.Timestamp(first_test_session).isoformat(),
+                    "summary_rows": int(len(pretest_summary)),
+                    "anomaly_rows": int(len(pretest_anomalies)),
+                },
             }
 
         summary_path = output_dir / "summary.json"
