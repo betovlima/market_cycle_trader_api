@@ -715,6 +715,14 @@ def main() -> int:
     )
     parser.add_argument("--job-id", default=None, help="Completed Tiingo Backtest job id.")
     parser.add_argument(
+        "--alpaca-collection",
+        default=ALPACA_MARKET_BARS_COLLECTION,
+        help=(
+            "MongoDB collection used as the Alpaca side of the audit. "
+            "Defaults to the preserved legacy cache."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default="output/alpaca_tiingo_equivalence_audit",
     )
@@ -743,7 +751,10 @@ def main() -> int:
             else None
         )
 
-        alpaca_collection = db[ALPACA_MARKET_BARS_COLLECTION]
+        alpaca_collection_name = str(args.alpaca_collection).strip()
+        if not alpaca_collection_name:
+            raise ValueError("--alpaca-collection cannot be empty.")
+        alpaca_collection = db[alpaca_collection_name]
         tiingo_collection = db[TIINGO_MARKET_BARS_COLLECTION]
 
         minimum_rows = (
@@ -1004,6 +1015,7 @@ def main() -> int:
             "minimum_rows_required": minimum_rows,
             "comparison_start": start.date().isoformat(),
             "comparison_end": common_end.date().isoformat(),
+            "alpaca_collection": alpaca_collection_name,
             "alpaca_feed": request.alpaca_historical_feed,
             "tiingo_feed": "eod",
             "adjustment": request.alpaca_adjustment,
