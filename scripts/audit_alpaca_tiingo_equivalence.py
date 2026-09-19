@@ -937,10 +937,26 @@ def main() -> int:
                 index=False,
             )
 
-            first_test_session = min(
-                _normalize_session_index(alpaca_result.predictions).index.min(),
-                _normalize_session_index(tiingo_result.predictions).index.min(),
-            )
+            first_test_candidates: list[pd.Timestamp] = []
+            for predictions in (
+                alpaca_result.predictions,
+                tiingo_result.predictions,
+            ):
+                if (
+                    "fold_test_start" in predictions.columns
+                    and predictions["fold_test_start"].notna().any()
+                ):
+                    first_test_candidates.append(
+                        pd.to_datetime(
+                            predictions["fold_test_start"].dropna(),
+                            utc=True,
+                        ).min().normalize()
+                    )
+                else:
+                    first_test_candidates.append(
+                        _normalize_session_index(predictions).index.min()
+                    )
+            first_test_session = min(first_test_candidates)
             pretest_summary, pretest_anomalies = _compare_pretest_inputs(
                 alpaca_model_inputs,
                 tiingo_model_inputs,
