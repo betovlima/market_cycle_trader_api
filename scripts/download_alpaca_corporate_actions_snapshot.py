@@ -32,7 +32,7 @@ from market_cycle_trader_api.infrastructure.persistence.mongo_repository import 
 
 
 ENDPOINT = "https://data.alpaca.markets/v1/corporate-actions"
-DEFAULT_COLLECTION = "alpaca_corporate_actions_20260919"
+DEFAULT_COLLECTION = "alpaca_corporate_actions_full_20260919"
 MANIFEST_COLLECTION = "market_data_snapshot_manifests"
 SCRIPT_VERSION = "alpaca-corporate-actions-snapshot-v1.0.0"
 REQUEST_TYPES = (
@@ -42,6 +42,13 @@ REQUEST_TYPES = (
     "cash_dividend",
     "stock_dividend",
     "spin_off",
+    "cash_merger",
+    "stock_merger",
+    "stock_and_cash_merger",
+    "redemption",
+    "name_change",
+    "worthless_removal",
+    "rights_distribution",
 )
 ARRAY_TO_TYPE = {
     "forward_splits": "forward_split",
@@ -50,6 +57,13 @@ ARRAY_TO_TYPE = {
     "cash_dividends": "cash_dividend",
     "stock_dividends": "stock_dividend",
     "spin_offs": "spin_off",
+    "cash_mergers": "cash_merger",
+    "stock_mergers": "stock_merger",
+    "stock_and_cash_mergers": "stock_and_cash_merger",
+    "redemptions": "redemption",
+    "name_changes": "name_change",
+    "worthless_removals": "worthless_removal",
+    "rights_distributions": "rights_distribution",
 }
 
 
