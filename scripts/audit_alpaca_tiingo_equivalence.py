@@ -22,7 +22,9 @@ load_project_environment()
 
 from market_cycle_trader_api.engine.capital_rotation import (
     ROTATION_FEATURES,
+    _build_walk_forward_folds,
     build_rotation_frame,
+    prepare_rotation_panel,
     run_rotation_models,
 )
 from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
@@ -510,6 +512,74 @@ def _compare_pretest_inputs(
     return pd.DataFrame(summaries), pd.DataFrame(anomalies)
 
 
+def _compare_model_input_phase(
+    alpaca_panel: dict[str, pd.DataFrame],
+    tiingo_panel: dict[str, pd.DataFrame],
+    dates: pd.DatetimeIndex,
+    phase: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summaries: list[dict[str, Any]] = []
+    anomalies: list[dict[str, Any]] = []
+
+    for symbol in sorted(set(alpaca_panel).intersection(tiingo_panel)):
+        left = alpaca_panel[symbol]
+        right = tiingo_panel[symbol]
+        common = pd.DatetimeIndex(dates).intersection(left.index).intersection(right.index).sort_values()
+        if common.empty:
+            continue
+
+        for column in [*ROTATION_FEATURES, *TARGET_COLUMNS]:
+            if column not in left.columns or column not in right.columns:
+                continue
+            a = pd.to_numeric(left.loc[common, column], errors="coerce")
+            t = pd.to_numeric(right.loc[common, column], errors="coerce")
+            valid = pd.DataFrame({"alpaca": a, "tiingo": t}).replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            if valid.empty:
+                continue
+
+            delta = valid["tiingo"] - valid["alpaca"]
+            abs_delta = delta.abs()
+            corr = (
+                float(valid["alpaca"].corr(valid["tiingo"]))
+                if len(valid) >= 2
+                else None
+            )
+            kind = "target" if column in TARGET_COLUMNS else "feature"
+            summaries.append(
+                {
+                    "phase": phase,
+                    "symbol": symbol,
+                    "column": column,
+                    "kind": kind,
+                    "common_rows": int(len(valid)),
+                    "first_session": pd.Timestamp(valid.index.min()).isoformat(),
+                    "last_session": pd.Timestamp(valid.index.max()).isoformat(),
+                    "mean_abs_diff": float(abs_delta.mean()),
+                    "p95_abs_diff": float(abs_delta.quantile(0.95)),
+                    "max_abs_diff": float(abs_delta.max()),
+                    "correlation": corr,
+                }
+            )
+
+            for timestamp in abs_delta.nlargest(min(5, len(abs_delta))).index:
+                anomalies.append(
+                    {
+                        "phase": phase,
+                        "symbol": symbol,
+                        "timestamp": pd.Timestamp(timestamp).isoformat(),
+                        "column": column,
+                        "kind": kind,
+                        "alpaca_value": float(valid.at[timestamp, "alpaca"]),
+                        "tiingo_value": float(valid.at[timestamp, "tiingo"]),
+                        "abs_diff": float(abs_delta.loc[timestamp]),
+                    }
+                )
+
+    return pd.DataFrame(summaries), pd.DataFrame(anomalies)
+
+
 def _decision_column(frame: pd.DataFrame) -> str | None:
     for column in (
         "final_action_asset",
@@ -844,6 +914,66 @@ def main() -> int:
             }
         )
 
+        alpaca_panel, alpaca_common_dates = prepare_rotation_panel(
+            alpaca_frames,
+            controlled_request,
+        )
+        tiingo_panel, tiingo_common_dates = prepare_rotation_panel(
+            tiingo_frames,
+            controlled_request,
+        )
+        normalized_alpaca_dates = pd.DatetimeIndex(alpaca_common_dates).normalize()
+        normalized_tiingo_dates = pd.DatetimeIndex(tiingo_common_dates).normalize()
+        if not normalized_alpaca_dates.equals(normalized_tiingo_dates):
+            raise RuntimeError(
+                "FoldPhaseAttributionCalendarMismatch: Alpaca and Tiingo model panels "
+                "do not share the same normalized session calendar."
+            )
+        fold_contract = _build_walk_forward_folds(
+            pd.DatetimeIndex(alpaca_common_dates),
+            controlled_request,
+        )
+        first_fold = fold_contract[0]
+
+        phase_specs = {
+            "initial_training": pd.DatetimeIndex(alpaca_common_dates)[
+                : int(first_fold["train_end_index"])
+            ],
+            "calibration": pd.DatetimeIndex(alpaca_common_dates)[
+                int(first_fold["calibration_start_index"]):
+                int(first_fold["calibration_end_index"])
+            ],
+            "final_fit": pd.DatetimeIndex(alpaca_common_dates)[
+                : int(first_fold["final_fit_end_index"])
+            ],
+        }
+        phase_summaries: dict[str, pd.DataFrame] = {}
+        phase_anomalies: list[pd.DataFrame] = []
+        for phase_name, phase_dates in phase_specs.items():
+            phase_summary, phase_anomaly = _compare_model_input_phase(
+                alpaca_panel,
+                tiingo_panel,
+                phase_dates,
+                phase_name,
+            )
+            phase_summaries[phase_name] = phase_summary
+            if not phase_anomaly.empty:
+                phase_anomalies.append(phase_anomaly)
+            phase_summary.to_csv(
+                output_dir / f"fold1_{phase_name}_input_equivalence.csv",
+                index=False,
+            )
+
+        fold1_phase_anomalies = (
+            pd.concat(phase_anomalies, ignore_index=True)
+            if phase_anomalies
+            else pd.DataFrame()
+        )
+        fold1_phase_anomalies.to_csv(
+            output_dir / "fold1_phase_input_anomalies.csv",
+            index=False,
+        )
+
         excluded = [
             row
             for row in coverage_rows
@@ -899,6 +1029,28 @@ def main() -> int:
                 "target_rows": int(
                     sum(1 for row in model_input_summaries if row.get("kind") == "target")
                 ),
+            },
+            "fold1_phase_attribution": {
+                "initial_training": {
+                    "start": pd.Timestamp(phase_specs["initial_training"][0]).isoformat(),
+                    "end": pd.Timestamp(phase_specs["initial_training"][-1]).isoformat(),
+                    "sessions": int(len(phase_specs["initial_training"])),
+                    "rows": int(len(phase_summaries["initial_training"])),
+                },
+                "calibration": {
+                    "start": pd.Timestamp(phase_specs["calibration"][0]).isoformat(),
+                    "end": pd.Timestamp(phase_specs["calibration"][-1]).isoformat(),
+                    "sessions": int(len(phase_specs["calibration"])),
+                    "rows": int(len(phase_summaries["calibration"])),
+                },
+                "final_fit": {
+                    "start": pd.Timestamp(phase_specs["final_fit"][0]).isoformat(),
+                    "end": pd.Timestamp(phase_specs["final_fit"][-1]).isoformat(),
+                    "sessions": int(len(phase_specs["final_fit"])),
+                    "rows": int(len(phase_summaries["final_fit"])),
+                },
+                "test_start": pd.Timestamp(first_fold["test_start"]).isoformat(),
+                "purge_sessions": int(controlled_request.rotation_purge_days),
             },
             "controlled_request": controlled_request.model_dump(mode="json"),
         }
