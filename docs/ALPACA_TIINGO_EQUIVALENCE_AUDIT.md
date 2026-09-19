@@ -301,3 +301,41 @@ Structural lineage guard:
 - forward/reverse splits are normalized locally;
 - a symbol acting as the acquiree in a merger into a different ticker is excluded from this tuning campaign until point-in-time lineage reconstruction is implemented;
 - this is deterministic corporate-action handling, not a performance heuristic.
+
+
+## Unified CARO control-anchor correction (API v10.8.64)
+
+The v10.8.63 RAW+split campaign revealed that the control execution was used as the champion threshold but was not included in the surrogate training observations. As a result, the Gaussian-process model only learned from weak candidates while trying to beat a much stronger external threshold.
+
+API v10.8.64 corrects this by adding the RAW+split Control as:
+
+- a completed `is_control=true` prior observation;
+- candidate id `0`;
+- the initial probability anchor;
+- an explicit normalized point in space-filling distance calculations;
+- a training observation for Gaussian-process outcome modeling.
+
+The control does not count toward the required exploration-trial floor.
+
+Run:
+
+```bash
+python scripts/research_raw_split_unified_caro.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 20
+```
+
+Expected checkpoint fields:
+
+```json
+{
+  "api_version": "10.8.64",
+  "control_observation_in_surrogate": true,
+  "probability_anchor": {
+    "source": "control",
+    "candidate_id": 0
+  }
+}
+```
+
+The v10.8.63 campaign should not be interpreted as evidence that the old hyperparameters are globally optimal because its adaptive surrogate did not include the control outcome.
