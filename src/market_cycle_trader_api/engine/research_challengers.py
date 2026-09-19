@@ -492,7 +492,6 @@ def _run_lightgbm(
                 phase=f"run_{run_index}_fold_{fold_position}_calibration",
                 progress_callback=phase_progress("calibration training", 0.02, 0.38),
                 technical_log_callback=technical_log_callback,
-                device_type=lightgbm_device,
             )
             calibration_cash_edge_models = None
             if _risk_off_enabled(rep_config):
@@ -504,7 +503,6 @@ def _run_lightgbm(
                     phase=f"run_{run_index}_fold_{fold_position}_calibration_cash_edge",
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
-                    device_type=lightgbm_device,
                 )
             opportunity_gate = None
             expected_return_calibrator = None
@@ -575,7 +573,6 @@ def _run_lightgbm(
                 phase=f"run_{run_index}_fold_{fold_position}_final",
                 progress_callback=phase_progress("final training", 0.50, 0.90),
                 technical_log_callback=technical_log_callback,
-                device_type=lightgbm_device,
             )
             latest_final_models = final_models
             latest_final_fold_id = fold_id
@@ -591,7 +588,6 @@ def _run_lightgbm(
                     phase=f"run_{run_index}_fold_{fold_position}_final_cash_edge",
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
-                    device_type=lightgbm_device,
                 )
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             if opportunity_cash_gate_enabled(rep_config):
