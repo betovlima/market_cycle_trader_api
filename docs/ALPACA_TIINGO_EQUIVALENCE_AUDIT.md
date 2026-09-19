@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.55 provides an isolated research script. It does not change the normal
+API v10.8.56 provides an isolated research script. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -76,6 +76,8 @@ Files:
 - `decision_divergences.csv`: dates where the selected/final action differs.
 - `model_input_equivalence.csv`: per-asset/per-feature and target differences after the exact model preprocessing.
 - `first_divergence_model_inputs.csv`: Alpaca vs Tiingo model inputs for the assets involved in the first divergent decision.
+- `fold1_pretest_model_input_equivalence.csv`: feature/target equivalence restricted to sessions before the first out-of-sample test session.
+- `fold1_pretest_model_input_anomalies.csv`: largest pre-test feature/target deltas by asset and column.
 - `alpaca_trades.csv` / `tiingo_trades.csv`: controlled trade sequences.
 
 Material-difference flags are descriptive only: price differences above 1 bp
