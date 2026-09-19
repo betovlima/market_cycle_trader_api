@@ -521,10 +521,23 @@ def _compare_model_input_phase(
     summaries: list[dict[str, Any]] = []
     anomalies: list[dict[str, Any]] = []
 
+    normalized_phase_dates = (
+        pd.DatetimeIndex(dates)
+        .tz_convert("UTC")
+        .normalize()
+        .unique()
+        .sort_values()
+    )
+
     for symbol in sorted(set(alpaca_panel).intersection(tiingo_panel)):
-        left = alpaca_panel[symbol]
-        right = tiingo_panel[symbol]
-        common = pd.DatetimeIndex(dates).intersection(left.index).intersection(right.index).sort_values()
+        left = _normalize_session_index(alpaca_panel[symbol])
+        right = _normalize_session_index(tiingo_panel[symbol])
+        common = (
+            normalized_phase_dates
+            .intersection(left.index)
+            .intersection(right.index)
+            .sort_values()
+        )
         if common.empty:
             continue
 
