@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.52 adds an isolated research script. It does not change the normal
+API v10.8.54 provides an isolated research script. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -14,6 +14,8 @@ Answer two questions before any new tuning:
    diverge?
 
 ## Data contract
+
+The audit aligns daily bars and model decisions by trading-session date rather than by the provider-specific UTC timestamp. Alpaca daily bars may be stored at 04:00/05:00 UTC while Tiingo EOD bars are stored at 00:00 UTC for the same market session.
 
 The audit reads only from MongoDB:
 
