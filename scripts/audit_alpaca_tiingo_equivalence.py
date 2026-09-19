@@ -210,11 +210,27 @@ def _relative_difference(left: pd.Series, right: pd.Series) -> pd.Series:
     return (right - left).abs() / denominator
 
 
+def _normalize_session_index(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize daily-bar timestamps to the UTC calendar session date.
+
+    Alpaca daily bars are stored at New York midnight converted to UTC
+    (04:00/05:00 depending on daylight saving time), while Tiingo EOD bars are
+    stored at 00:00 UTC. For 1Day equivalence we compare the trading session
+    date, not the provider-specific timestamp representation.
+    """
+    result = frame.copy()
+    result.index = pd.to_datetime(result.index, utc=True).normalize()
+    result = result[~result.index.duplicated(keep="last")].sort_index()
+    return result
+
+
 def _compare_asset(
     symbol: str,
     alpaca: pd.DataFrame,
     tiingo: pd.DataFrame,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    alpaca = _normalize_session_index(alpaca)
+    tiingo = _normalize_session_index(tiingo)
     alpaca_dates = pd.DatetimeIndex(alpaca.index)
     tiingo_dates = pd.DatetimeIndex(tiingo.index)
     common_dates = alpaca_dates.intersection(tiingo_dates).sort_values()
@@ -340,10 +356,8 @@ def _compare_predictions(
     if alpaca is None or tiingo is None or alpaca.empty or tiingo.empty:
         return {"available": False, "reason": "empty_predictions"}, pd.DataFrame()
 
-    left = alpaca.copy()
-    right = tiingo.copy()
-    left.index = pd.to_datetime(left.index, utc=True)
-    right.index = pd.to_datetime(right.index, utc=True)
+    left = _normalize_session_index(alpaca)
+    right = _normalize_session_index(tiingo)
     common = left.index.intersection(right.index).sort_values()
     if common.empty:
         return {"available": False, "reason": "no_common_prediction_dates"}, pd.DataFrame()
