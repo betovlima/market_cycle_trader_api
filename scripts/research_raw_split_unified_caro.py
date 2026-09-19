@@ -365,7 +365,7 @@ def main() -> int:
 
         checkpoint = {
             "schema_version": 1,
-            "api_version": "10.8.65",
+            "api_version": "10.8.66",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -471,8 +471,8 @@ def main() -> int:
 
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.65",
-            "experiment": "raw-split-unified-caro-v3",
+            "api_version": "10.8.66",
+            "experiment": "raw-split-unified-caro-v4",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
