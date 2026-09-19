@@ -32,9 +32,10 @@ from market_cycle_trader_api.infrastructure.persistence.mongo_repository import 
 )
 
 
-DEFAULT_TARGET_COLLECTION = "alpaca_market_bars_fresh_20260919"
+DEFAULT_SNAPSHOT_DATE = "20260919"
+SUPPORTED_ADJUSTMENTS = {"raw", "split", "dividend", "all"}
 MANIFEST_COLLECTION = "market_data_snapshot_manifests"
-SCRIPT_VERSION = "fresh-alpaca-snapshot-v1.0.0"
+SCRIPT_VERSION = "fresh-alpaca-snapshot-v1.1.0"
 
 
 def _latest_job(db: Any, job_id: str | None) -> dict[str, Any]:
@@ -50,6 +51,13 @@ def _latest_job(db: Any, job_id: str | None) -> dict[str, Any]:
     return job
 
 
+def _default_target_collection(adjustment: str) -> str:
+    normalized = str(adjustment).strip().lower()
+    if normalized == "all":
+        return f"alpaca_market_bars_fresh_{DEFAULT_SNAPSHOT_DATE}"
+    return f"alpaca_market_bars_{normalized}_{DEFAULT_SNAPSHOT_DATE}"
+
+
 def _guard_target_collection(name: str) -> str:
     normalized = str(name or "").strip()
     if not normalized:
@@ -59,10 +67,10 @@ def _guard_target_collection(name: str) -> str:
             "Refusing to write to alpaca_market_bars. "
             "The historical Alpaca cache must remain untouched."
         )
-    if not normalized.startswith("alpaca_market_bars_fresh_"):
+    if not normalized.startswith("alpaca_market_bars_"):
         raise ValueError(
             "Fresh Alpaca snapshots must use a collection beginning with "
-            "'alpaca_market_bars_fresh_'."
+            "'alpaca_market_bars_'."
         )
     return normalized
 
@@ -132,9 +140,21 @@ def main() -> int:
     )
     parser.add_argument("--job-id", default=None, help="Backtest job whose immutable request defines the universe.")
     parser.add_argument(
+        "--adjustment",
+        default=None,
+        choices=sorted(SUPPORTED_ADJUSTMENTS),
+        help=(
+            "Override the Alpaca historical adjustment. "
+            "If omitted, inherit the selected Backtest request."
+        ),
+    )
+    parser.add_argument(
         "--target-collection",
-        default=DEFAULT_TARGET_COLLECTION,
-        help="New MongoDB collection for the fresh snapshot.",
+        default=None,
+        help=(
+            "MongoDB destination. If omitted, a dedicated collection is selected "
+            "from the adjustment mode."
+        ),
     )
     parser.add_argument(
         "--replace-target",
@@ -142,9 +162,6 @@ def main() -> int:
         help="Delete only the selected fresh target collection before downloading.",
     )
     args = parser.parse_args()
-
-    target_name = _guard_target_collection(args.target_collection)
-    snapshot_id = target_name.removeprefix("alpaca_market_bars_fresh_")
 
     client = create_client()
     try:
@@ -158,7 +175,15 @@ def main() -> int:
 
         timeframe = str(request.get("timeframe") or "1Day")
         feed = str(request.get("alpaca_historical_feed") or "sip").lower()
-        adjustment = str(request.get("alpaca_adjustment") or "all").lower()
+        adjustment = str(
+            args.adjustment or request.get("alpaca_adjustment") or "all"
+        ).lower()
+        if adjustment not in SUPPORTED_ADJUSTMENTS:
+            raise ValueError(f"Unsupported Alpaca adjustment: {adjustment}")
+        target_name = _guard_target_collection(
+            args.target_collection or _default_target_collection(adjustment)
+        )
+        snapshot_id = target_name.removeprefix("alpaca_market_bars_")
         start = pd.Timestamp(request["start_date"])
         end_text = request.get("analysis_end_date") or request.get("end_date")
         end = pd.Timestamp(end_text) if end_text else pd.Timestamp.utcnow()
