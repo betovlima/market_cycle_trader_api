@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.58 provides an isolated research script. It does not change the normal
+API v10.8.59 provides an isolated research script. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -92,3 +92,6 @@ No parameter optimization is performed by this audit.
 
 
 API v10.8.58 note: fold-phase timestamps are normalized to UTC session dates before intersecting Alpaca and Tiingo model-input panels. This prevents 04:00/05:00 Alpaca daily timestamps from producing empty phase-equivalence outputs against 00:00 Tiingo EOD timestamps.
+
+
+API v10.8.59 adds diagnostic hybrid replays to attribute provider effects between OHLC prices and volume. The audit runs Alpaca OHLC with Tiingo volume and Tiingo OHLC with Alpaca volume, aligned by normalized trading-session date. These hybrids are attribution-only interventions and must not be used as production market data. Outputs include `alpaca_price_tiingo_volume_predictions.csv`, `tiingo_price_alpaca_volume_predictions.csv`, their trade files, and `source_component_attribution` in `summary.json`.
