@@ -20,7 +20,11 @@ from market_cycle_trader_api.core.environment import load_project_environment
 
 load_project_environment()
 
-from market_cycle_trader_api.engine.capital_rotation import run_rotation_models
+from market_cycle_trader_api.engine.capital_rotation import (
+    ROTATION_FEATURES,
+    build_rotation_frame,
+    run_rotation_models,
+)
 from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
     ALPACA_MARKET_BARS_COLLECTION,
     JOBS_COLLECTION,
@@ -336,6 +340,109 @@ def _compare_asset(
     return summary, detail, pd.DataFrame(missing_rows)
 
 
+TARGET_COLUMNS = (
+    "forward_net_log_return",
+    "forward_cash_edge",
+    "forward_movement_capture",
+    "forward_trend_persistence",
+    "forward_risk_adjusted_utility",
+)
+
+
+def _compare_model_inputs(
+    symbol: str,
+    alpaca: pd.DataFrame,
+    tiingo: pd.DataFrame,
+    config: BacktestExecutionRequest,
+) -> tuple[list[dict[str, Any]], pd.DataFrame, pd.DataFrame]:
+    left = build_rotation_frame(_normalize_session_index(alpaca), config)
+    right = build_rotation_frame(_normalize_session_index(tiingo), config)
+    common = left.index.intersection(right.index).sort_values()
+    columns = [
+        column
+        for column in [*ROTATION_FEATURES, *TARGET_COLUMNS]
+        if column in left.columns and column in right.columns
+    ]
+    summaries: list[dict[str, Any]] = []
+    if common.empty:
+        return summaries, left, right
+
+    for column in columns:
+        a = pd.to_numeric(left.loc[common, column], errors="coerce")
+        t = pd.to_numeric(right.loc[common, column], errors="coerce")
+        valid = pd.DataFrame({"alpaca": a, "tiingo": t}).replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if valid.empty:
+            continue
+        delta = valid["tiingo"] - valid["alpaca"]
+        abs_delta = delta.abs()
+        corr = (
+            float(valid["alpaca"].corr(valid["tiingo"]))
+            if len(valid) >= 2
+            else None
+        )
+        summaries.append(
+            {
+                "symbol": symbol,
+                "column": column,
+                "kind": "target" if column in TARGET_COLUMNS else "feature",
+                "common_rows": int(len(valid)),
+                "mean_abs_diff": float(abs_delta.mean()),
+                "p95_abs_diff": float(abs_delta.quantile(0.95)),
+                "max_abs_diff": float(abs_delta.max()),
+                "correlation": corr,
+            }
+        )
+
+    return summaries, left, right
+
+
+def _first_divergence_input_snapshot(
+    first_divergence: dict[str, Any] | None,
+    alpaca_inputs: dict[str, pd.DataFrame],
+    tiingo_inputs: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    if not first_divergence:
+        return pd.DataFrame()
+    timestamp = _utc(first_divergence["timestamp"]).normalize()
+    symbols = list(
+        dict.fromkeys(
+            [
+                str(first_divergence.get("alpaca_asset") or "").strip().upper(),
+                str(first_divergence.get("tiingo_asset") or "").strip().upper(),
+            ]
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    for symbol in symbols:
+        if not symbol:
+            continue
+        left = alpaca_inputs.get(symbol)
+        right = tiingo_inputs.get(symbol)
+        if left is None or right is None or timestamp not in left.index or timestamp not in right.index:
+            continue
+        for column in [*ROTATION_FEATURES, *TARGET_COLUMNS]:
+            if column not in left.columns or column not in right.columns:
+                continue
+            a = left.at[timestamp, column]
+            t = right.at[timestamp, column]
+            if pd.isna(a) or pd.isna(t):
+                continue
+            rows.append(
+                {
+                    "timestamp": timestamp.isoformat(),
+                    "symbol": symbol,
+                    "column": column,
+                    "kind": "target" if column in TARGET_COLUMNS else "feature",
+                    "alpaca_value": float(a),
+                    "tiingo_value": float(t),
+                    "abs_diff": float(abs(float(t) - float(a))),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _decision_column(frame: pd.DataFrame) -> str | None:
     for column in (
         "final_action_asset",
@@ -604,6 +711,20 @@ def main() -> int:
             if not missing.empty:
                 missing_frames.append(missing)
 
+        model_input_summaries: list[dict[str, Any]] = []
+        alpaca_model_inputs: dict[str, pd.DataFrame] = {}
+        tiingo_model_inputs: dict[str, pd.DataFrame] = {}
+        for symbol in eligible_assets:
+            input_summary, left_inputs, right_inputs = _compare_model_inputs(
+                symbol,
+                alpaca_frames[symbol],
+                tiingo_frames[symbol],
+                request,
+            )
+            model_input_summaries.extend(input_summary)
+            alpaca_model_inputs[symbol] = left_inputs
+            tiingo_model_inputs[symbol] = right_inputs
+
         coverage = pd.DataFrame(coverage_rows)
         coverage.to_csv(output_dir / "coverage.csv", index=False)
 
@@ -623,6 +744,12 @@ def main() -> int:
             else pd.DataFrame()
         )
         missing_dates.to_csv(output_dir / "missing_dates.csv", index=False)
+
+        model_input_equivalence = pd.DataFrame(model_input_summaries)
+        model_input_equivalence.to_csv(
+            output_dir / "model_input_equivalence.csv",
+            index=False,
+        )
 
         anchors = [symbol for symbol in request.calendar_anchor_assets if symbol in eligible_assets]
         if len(anchors) < 2:
@@ -697,6 +824,15 @@ def main() -> int:
                     sum(int(row.get("tiingo_only_rows") or 0) for row in asset_summaries)
                 ),
             },
+            "model_input_comparison": {
+                "rows": int(len(model_input_summaries)),
+                "feature_rows": int(
+                    sum(1 for row in model_input_summaries if row.get("kind") == "feature")
+                ),
+                "target_rows": int(
+                    sum(1 for row in model_input_summaries if row.get("kind") == "target")
+                ),
+            },
             "controlled_request": controlled_request.model_dump(mode="json"),
         }
 
@@ -721,6 +857,16 @@ def main() -> int:
             )
             decision_rows.to_csv(
                 output_dir / "decision_divergences.csv",
+                index=False,
+            )
+
+            first_input_snapshot = _first_divergence_input_snapshot(
+                decision_summary.get("first_divergence"),
+                alpaca_model_inputs,
+                tiingo_model_inputs,
+            )
+            first_input_snapshot.to_csv(
+                output_dir / "first_divergence_model_inputs.csv",
                 index=False,
             )
 
