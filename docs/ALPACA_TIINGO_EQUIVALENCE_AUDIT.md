@@ -1,6 +1,6 @@
 # Alpaca × Tiingo Equivalence Audit
 
-API v10.8.61 provides the isolated provider-audit workflow. It does not change the normal
+API v10.8.62 provides the isolated provider-audit workflow. It does not change the normal
 backtest engine or production market-data routing.
 
 ## Goal
@@ -158,3 +158,89 @@ python scripts/audit_alpaca_tiingo_equivalence.py \
 ```
 
 The Alpaca replay metadata records `split`; the Tiingo control keeps the adjustment stored by the original Tiingo job. Raw candle-equivalence statistics between these two legs should therefore be treated as diagnostic only because their adjustment semantics differ. The main objective of this run is the controlled Alpaca split-only model result.
+
+
+## Point-in-time corporate actions experiment (API v10.8.62)
+
+This experiment separates observed market prices from corporate-action context.
+
+Architecture:
+
+```text
+Alpaca RAW OHLCV (immutable)
+        +
+Alpaca corporate actions snapshot
+        |
+        +-- forward/reverse split -> local continuity normalization
+        |
+        +-- cash dividend -> point-in-time LightGBM features
+```
+
+The first version deliberately changes only one research family: dividend context in the model inputs. The target stays price-based and dividends are not yet credited to portfolio cash.
+
+### 1. Download a fresh RAW snapshot
+
+```bash
+python scripts/download_fresh_alpaca_snapshot.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --adjustment raw
+```
+
+Default collection:
+
+```text
+alpaca_market_bars_raw_20260919
+```
+
+### 2. Freeze corporate actions
+
+```bash
+python scripts/download_alpaca_corporate_actions_snapshot.py \
+  --job-id 20260918T234903-52bd06f3
+```
+
+Default collection:
+
+```text
+alpaca_corporate_actions_20260919
+```
+
+The REST snapshot includes forward/reverse/unit splits, cash/stock dividends and spin-offs. The experiment currently applies forward/reverse splits and cash-dividend features. Alpaca `process_date` is the point-in-time availability proxy; an event can only enter model features when `process_date <= decision session`.
+
+### 3. Run the controlled experiment
+
+```bash
+python scripts/research_point_in_time_corporate_actions.py \
+  --job-id 20260918T234903-52bd06f3
+```
+
+Outputs:
+
+```text
+output/point_in_time_corporate_actions/
+  summary.json
+  data_diagnostics.csv
+  baseline_predictions.csv
+  baseline_trades.csv
+  experiment_predictions.csv
+  experiment_trades.csv
+```
+
+The script runs two replays on the same locally reconstructed RAW->split price series:
+
+1. `RAW_SPLIT_PRICE_ONLY`: existing MCT feature family.
+2. `RAW_SPLIT_PIT_DIVIDEND_FEATURES`: same prices, same target, same LightGBM hyperparameters, plus dividend features known by `process_date`.
+
+Added features:
+
+```text
+ca_ex_dividend_yield_today
+ca_known_dividend_yield_next_5
+ca_known_dividend_yield_next_20
+ca_known_dividend_yield_next_60
+ca_dividend_yield_trailing_60
+```
+
+The script also compares the locally reconstructed split series with the previously downloaded Alpaca `adjustment=split` snapshot when that collection is available. This validates the split reconstruction independently of the model result.
+
+This version intentionally does not add dividend cash to simulated portfolio equity and does not change the forward target. Those are separate hypotheses and should only be tested after this input-context experiment is evaluated.
