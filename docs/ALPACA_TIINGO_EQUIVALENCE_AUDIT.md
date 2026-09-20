@@ -1235,3 +1235,187 @@ Primary questions:
 2. How much does OOS replay time fall relative to v10.8.73?
 3. Does soft rank support filter only marginal rotations rather than suppressing rotation broadly?
 4. Does the challenger improve capital and/or robustness while retaining the strategy's rotation edge?
+
+
+## Final direct-Alpaca no-database reproduction (API v10.8.75)
+
+API v10.8.75 creates the final reproducibility path for the current research line.
+
+The execution deliberately does not read market bars, corporate actions, strategy configuration, or prior results from MongoDB.
+
+### Data path
+
+```text
+local frozen JSON request
+        |
+        v
+Alpaca SIP API
+        |
+        +--> RAW daily bars
+        |
+        +--> corporate actions API
+                 |
+                 v
+        local split reconstruction
+                 |
+                 v
+        in-memory research frames
+                 |
+         +-------+-------+
+         |               |
+      CONTROL      SOFT CONSENSUS
+```
+
+Credentials are loaded only from the environment:
+
+```text
+ALPACA_API_KEY_ID
+ALPACA_SECRET_KEY
+```
+
+Aliases already supported by the project remain accepted.
+
+### Frozen research configuration
+
+The request is versioned in:
+
+```text
+config/final_research_alpaca_direct.json
+```
+
+The official reproduction window remains frozen at:
+
+```text
+2016-01-01 through 2026-09-17
+```
+
+This intentionally keeps the same closed period as the v10.8.74 result. The purpose of the final run is to test fresh provider retrieval and independence from the database without changing the evaluation window at the same time.
+
+An explicit `--end-date` override exists for later experiments, but it is not part of the official final reproduction command.
+
+The JSON preserves the LightGBM and walk-forward settings used by the current Control while changing the data-access fields to:
+
+```text
+market_data_provider = alpaca
+alpaca_adjustment = raw
+mongo_cache_enabled = false
+market_data_history_backfill_enabled = false
+```
+
+### Fresh local snapshot
+
+Every run downloads the RAW bars again from Alpaca and writes:
+
+```text
+output/final_research_alpaca_direct/
+  snapshot/
+    raw/
+      <SYMBOL>.csv
+    split_normalized/
+      <SYMBOL>.csv
+    corporate_actions.json
+    manifest.json
+```
+
+The manifest contains:
+
+- download UTC timestamp;
+- provider/feed;
+- closed research period;
+- configured and eligible universes;
+- structural exclusions;
+- row counts;
+- first and last timestamps;
+- per-symbol RAW SHA-256;
+- per-symbol locally split-normalized SHA-256;
+- corporate-action SHA-256;
+- frozen-request SHA-256;
+- combined content-derived snapshot ID.
+
+The snapshot is local filesystem data only. It is not persisted to MongoDB.
+
+### Corporate actions
+
+Corporate actions are downloaded directly from:
+
+```text
+https://data.alpaca.markets/v1/corporate-actions
+```
+
+using the same action families already audited in the prior point-in-time work.
+
+A 366-day process-date lookback before the research start is included so that an event processed before the first requested market bar but effective within the research window is not silently omitted.
+
+The structural identity guard remains active. In the current historical lineage, DOC is expected to remain excluded because its ticker spans the DOC -> PEAK merger/name lineage that cannot be treated as one continuous economic identity without an explicit lineage model.
+
+### Bars
+
+Bars are requested directly through `alpaca-py` using:
+
+```text
+feed = sip
+adjustment = raw
+timeframe = 1Day
+```
+
+The requested end passed to the bars API is one day after the frozen research end so the final requested daily session is included.
+
+No existing Mongo or filesystem market-data cache is consulted before the request.
+
+### Models
+
+The final run executes on the same downloaded snapshot:
+
+```text
+A. CONTROL
+B. CONTROL + Soft Horizon Consensus
+```
+
+The soft-consensus parameter remains frozen:
+
+```text
+penalty_strength = 1.0
+```
+
+No Optuna tuning is performed in this final reproduction. This avoids using the same research window again to select another hyperparameter after the v10.8.74 result.
+
+Batched OOS inference from v10.8.74 remains enabled.
+
+### Buy-and-hold
+
+The equal-weight buy-and-hold benchmark remains part of both variants and is computed from exactly the same freshly downloaded reconstructed frames.
+
+### Database prohibition
+
+The final runner:
+
+```text
+scripts/research_final_direct_alpaca.py
+```
+
+contains no:
+- Mongo client creation;
+- Mongo database lookup;
+- job-id lookup;
+- market-data collection read;
+- configuration collection read;
+- result write to MongoDB.
+
+A regression test scans the final runner to preserve this property.
+
+### Official final reproduction command
+
+```bash
+python scripts/research_final_direct_alpaca.py \
+  --penalty-strength 1.0
+```
+
+If a prior output directory exists and a completely new provider download is intentionally required:
+
+```bash
+python scripts/research_final_direct_alpaca.py \
+  --penalty-strength 1.0 \
+  --replace-output
+```
+
+The expected result is not forced to equal the previous Mongo-backed snapshot. A difference is scientifically meaningful if Alpaca now returns revised RAW records or revised corporate-action metadata. The manifest hashes make such a difference auditable.
