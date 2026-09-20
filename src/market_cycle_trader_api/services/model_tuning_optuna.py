@@ -21,28 +21,85 @@ def default_startup_trials(
     return max(10, min(24, len(list(search_space)) + 1))
 
 
+def _distribution_for_spec(
+    spec: dict[str, Any],
+    *,
+    current_settings: dict[str, Any] | None = None,
+) -> Any:
+    name = str(spec["name"])
+    low = spec["min"]
+    high = spec["max"]
+    scale = str(spec.get("scale") or "linear").strip().lower()
+
+    if (
+        name == "num_leaves"
+        and current_settings is not None
+        and current_settings.get("max_depth") is not None
+    ):
+        high = min(int(high), 2 ** int(current_settings["max_depth"]))
+
+    if str(spec["type"]) == "integer":
+        return IntDistribution(
+            low=int(low),
+            high=int(high),
+            log=(scale == "log"),
+        )
+    return FloatDistribution(
+        low=float(low),
+        high=float(high),
+        log=(scale == "log"),
+    )
+
+
 def optuna_distributions(
     search_space: Sequence[dict[str, Any]],
+    *,
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     distributions: dict[str, Any] = {}
+    working = dict(settings or {})
     for spec in search_space:
         name = str(spec["name"])
-        low = spec["min"]
-        high = spec["max"]
-        scale = str(spec.get("scale") or "linear").strip().lower()
-        if str(spec["type"]) == "integer":
-            distributions[name] = IntDistribution(
-                low=int(low),
-                high=int(high),
-                log=(scale == "log"),
+        distributions[name] = _distribution_for_spec(
+            spec,
+            current_settings=working,
+        )
+        if name in working:
+            continue
+    return distributions
+
+
+def _suggest_optuna_settings(
+    trial: Trial,
+    search_space: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+    for spec in search_space:
+        name = str(spec["name"])
+        distribution = _distribution_for_spec(
+            spec,
+            current_settings=settings,
+        )
+        if isinstance(distribution, IntDistribution):
+            settings[name] = trial.suggest_int(
+                name,
+                int(distribution.low),
+                int(distribution.high),
+                log=bool(distribution.log),
+            )
+        elif isinstance(distribution, FloatDistribution):
+            settings[name] = trial.suggest_float(
+                name,
+                float(distribution.low),
+                float(distribution.high),
+                log=bool(distribution.log),
             )
         else:
-            distributions[name] = FloatDistribution(
-                low=float(low),
-                high=float(high),
-                log=(scale == "log"),
+            raise TypeError(
+                f"Unsupported Optuna distribution for {name}: "
+                f"{type(distribution).__name__}"
             )
-    return distributions
+    return settings
 
 
 def fixed_control_constraints(
@@ -89,17 +146,22 @@ def create_optuna_tpe_study(
     seed: int,
     startup_trials: int | None = None,
 ) -> tuple[Study, dict[str, Any], dict[str, float]]:
-    distributions = optuna_distributions(search_space)
+    active_space = [dict(item) for item in search_space]
+    distributions = optuna_distributions(
+        active_space,
+        settings=base_tuning_values,
+    )
     resolved_startup_trials = int(
         startup_trials
         if startup_trials is not None
-        else default_startup_trials(search_space)
+        else default_startup_trials(active_space)
     )
 
     sampler = optuna.samplers.TPESampler(
         seed=int(seed),
         n_startup_trials=resolved_startup_trials,
         multivariate=True,
+        group=True,
         constant_liar=False,
         warn_independent_sampling=False,
     )
@@ -130,15 +192,16 @@ def create_optuna_tpe_study(
         constraints=control_violations,
     )
     study.add_trial(control_trial)
-    return study, distributions, thresholds
+    return study, active_space, thresholds
 
 
 def ask_optuna_candidate(
     study: Study,
-    distributions: dict[str, Any],
+    search_space: Sequence[dict[str, Any]],
 ) -> tuple[Trial, dict[str, Any]]:
-    trial = study.ask(fixed_distributions=distributions)
-    return trial, dict(trial.params)
+    trial = study.ask()
+    settings = _suggest_optuna_settings(trial, search_space)
+    return trial, settings
 
 
 def tell_optuna_candidate(
