@@ -1235,3 +1235,218 @@ Primary questions:
 2. How much does OOS replay time fall relative to v10.8.73?
 3. Does soft rank support filter only marginal rotations rather than suppressing rotation broadly?
 4. Does the challenger improve capital and/or robustness while retaining the strategy's rotation edge?
+
+
+## Final standalone Alpaca-direct research (API v10.8.75)
+
+API v10.8.75 prepares the final research execution without reading market bars, corporate actions, credentials, or the immutable request from MongoDB.
+
+The final runner is:
+
+```text
+scripts/research_final_alpaca_direct.py
+```
+
+The frozen request is versioned as:
+
+```text
+config/final_research_alpaca_direct_v10875.json
+```
+
+### Data flow
+
+```text
+Alpaca Historical Market Data API
+        |
+        | RAW SIP daily bars
+        v
+local checksummed snapshot
+        |
+        +-- Alpaca Corporate Actions API
+        |
+        v
+local split normalization
+        |
+structural identity guard
+        |
+        v
+MCT Control + Soft Horizon Consensus
+        |
+        v
+Buy-and-Hold comparison + walk-forward metrics
+```
+
+No MongoDB market-data collection is queried by this runner.
+
+The runner also has no import from `mongo_repository`. Alpaca credentials are read only from:
+
+```text
+ALPACA_API_KEY_ID
+ALPACA_SECRET_KEY
+```
+
+via the project environment / `.env`.
+
+### Fixed research window
+
+The final request freezes:
+
+```text
+history start: 2016-01-01
+analysis end:  2026-09-17
+feed:          SIP
+bar source:    Alpaca
+bar adjustment requested from Alpaca: RAW
+```
+
+The date range intentionally remains equal to the reference experiment so the fresh download tests data reproducibility rather than changing the study period.
+
+### Universe
+
+The final request restores the 56 configured assets:
+
+- 25 reference / anchor assets;
+- 31 research candidate assets.
+
+CLMT is downloaded again instead of inheriting a previous provider-coverage exclusion.
+
+DOC is still subject to the structural corporate-identity guard and is expected to be excluded if the direct Alpaca corporate-action snapshot confirms the DOC/PEAK merger lineage issue.
+
+### Local immutable snapshot
+
+The direct runner stores:
+
+```text
+output/final_research_alpaca_direct/snapshot/
+  manifest.json
+  corporate_actions.jsonl
+  bars/
+    AAPL.csv
+    ...
+```
+
+The manifest contains:
+
+- exact download timestamp;
+- direct Alpaca endpoints;
+- requested feed/timeframe/adjustment;
+- bar row counts and date coverage per symbol;
+- SHA-256 per symbol;
+- corporate-action SHA-256;
+- frozen request SHA-256;
+- combined snapshot SHA-256.
+
+The combined snapshot hash is persisted into the final research output so the exact dataset used in the TCC can be identified later.
+
+### Download semantics
+
+Historical bars are requested directly from:
+
+```text
+GET https://data.alpaca.markets/v2/stocks/{symbol}/bars
+```
+
+with:
+
+```text
+timeframe=1Day
+feed=sip
+adjustment=raw
+sort=asc
+```
+
+Corporate actions are requested from:
+
+```text
+GET https://data.alpaca.markets/v1/corporate-actions
+```
+
+with complete-quality records and pagination.
+
+The local transformation then applies only forward/reverse split normalization to pre-ex-date prices/volume. It does not use Alpaca dividend back-adjusted historical prices.
+
+### Resumable download
+
+To avoid wasting API time after a network interruption, the runner supports partial bar-download resume:
+
+```bash
+python scripts/research_final_alpaca_direct.py --resume-download
+```
+
+Already-written local bar files are reused and missing symbols continue downloading. Corporate actions are downloaded at the end and the final manifest is created only when the snapshot is complete.
+
+A completed snapshot can be rerun without network access:
+
+```bash
+python scripts/research_final_alpaca_direct.py --reuse-snapshot
+```
+
+To intentionally replace it with a new fresh download:
+
+```bash
+python scripts/research_final_alpaca_direct.py --replace-snapshot
+```
+
+### Final experiment
+
+The final run preserves the v10.8.74 architecture:
+
+```text
+A: CONTROL
+B: CONTROL + SOFT HORIZON CONSENSUS
+penalty_strength = 1.0
+```
+
+and preserves:
+
+- current LightGBM settings;
+- weighted multi-horizon target;
+- per-horizon soft rank consensus;
+- batched OOS inference;
+- walk-forward folds;
+- transaction costs;
+- buy-and-hold benchmark.
+
+There is no Optuna/CARO tuning in the final certification run.
+
+### Outputs
+
+```text
+output/final_research_alpaca_direct/results/
+  summary.json
+  request_used.json
+  strategy_comparison.csv
+  data_diagnostics.csv
+  excluded_assets.csv
+  control_predictions.csv
+  control_trades.csv
+  soft_horizon_consensus_predictions.csv
+  soft_horizon_consensus_trades.csv
+  soft_horizon_consensus_decisions.csv
+```
+
+### First fresh run
+
+```bash
+python scripts/research_final_alpaca_direct.py
+```
+
+Optional two-stage workflow:
+
+```bash
+python scripts/research_final_alpaca_direct.py --download-only
+python scripts/research_final_alpaca_direct.py --reuse-snapshot
+```
+
+### Final acceptance checks
+
+Before interpreting the challenger, verify:
+
+1. `database_used=false`;
+2. snapshot SHA-256 exists;
+3. asset/exclusion list is explainable;
+4. fresh Control is compared against the previous ~US$ 5.551M reference without assuming exact equality;
+5. Buy-and-Hold is reported from the same fresh snapshot;
+6. Soft Horizon Consensus is evaluated with `penalty_strength=1.0` without post-hoc tuning.
+
+Because this is a new direct Alpaca download, a difference from the historical Control is a data-reproducibility finding, not automatically a model regression.
