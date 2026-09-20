@@ -1008,6 +1008,25 @@ def _run_lightgbm(
                 trade_callback(payload)
 
         simulator = _simulate_optimized_allocation if allocation_execution_enabled(rep_config) else _simulate_exact
+
+        def simulation_progress(local_fraction: float, stage: str) -> None:
+            fraction = max(0.0, min(1.0, float(local_fraction)))
+            report(
+                run_base + run_span * (0.94 + 0.06 * fraction),
+                f"Run {run_index}/{repetitions} — {stage}",
+                repetition,
+            )
+            detail(
+                run_index=run_index,
+                run_count=repetitions,
+                fold_index=total_folds,
+                fold_count=total_folds,
+                phase="OOS simulation",
+                trained_models=int(round(fraction * 1000)),
+                total_models=1000,
+                device=lightgbm_device.upper(),
+            )
+
         result = simulator(
             "lightgbm_utility",
             scheduled,
@@ -1025,9 +1044,21 @@ def _run_lightgbm(
                 f"- LightGBM Utility predicts the same weighted multi-horizon risk-adjusted utility "
                 f"target across {rep_config.rotation_target_horizons}."
             ),
+            simulation_progress_callback=simulation_progress,
         )
         backend = "lightgbm_utility" if repetitions <= 1 else f"lightgbm_utility_seed_{seed}"
         result.backend = backend
+        simulation_profile = result.metrics.get("simulation_profile") or {}
+        technical(
+            "model=lightgbm event=oos_simulation_complete "
+            f"run={run_index}/{repetitions} "
+            f"sessions={simulation_profile.get('session_count')} "
+            f"benchmark_seconds={float(simulation_profile.get('benchmark_seconds') or 0.0):.3f} "
+            f"market_regime_seconds={float(simulation_profile.get('market_regime_seconds') or 0.0):.3f} "
+            f"policy_seconds={float(simulation_profile.get('policy_seconds') or 0.0):.3f} "
+            f"accounting_seconds={float(simulation_profile.get('accounting_seconds') or 0.0):.3f} "
+            f"total_seconds={float(simulation_profile.get('total_seconds') or 0.0):.3f}"
+        )
 
         latest_asset = None
         if isinstance(result.predictions, pd.DataFrame) and not result.predictions.empty:
@@ -1849,6 +1880,24 @@ def _run_iqn(
                 )
                 trade_callback(payload)
 
+        def iqn_simulation_progress(local_fraction: float, stage: str) -> None:
+            fraction = max(0.0, min(1.0, float(local_fraction)))
+            report(
+                run_base + run_span * (0.96 + 0.04 * fraction),
+                f"Run {run_index}/{repetitions} — {stage}",
+                repetition,
+            )
+            detail(
+                run_index=run_index,
+                run_count=repetitions,
+                fold_index=total_folds,
+                fold_count=total_folds,
+                phase="OOS simulation",
+                trained_models=int(round(fraction * 1000)),
+                total_models=1000,
+                device=device.upper(),
+            )
+
         result = _simulate_exact(
             "iqn",
             scheduled,
@@ -1866,6 +1915,7 @@ def _run_iqn(
                 "- IQN learns an implicit distribution of risk-adjusted long-horizon returns "
                 "for CASH and each asset action from the same walk-forward market states."
             ),
+            simulation_progress_callback=iqn_simulation_progress,
         )
         backend = "iqn" if repetitions <= 1 else f"iqn_seed_{seed}"
         result.backend = backend
