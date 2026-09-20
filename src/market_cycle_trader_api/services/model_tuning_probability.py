@@ -957,24 +957,52 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
         raise RuntimeError("Unable to generate a sufficiently diverse probabilistic candidate pool.")
 
     x_pool = np.asarray(proposal_vectors, dtype=float)
-    models = _fit_gaussian_processes(x_train, y_train, seed=seed + next_id * 104729)
-    means: list[np.ndarray] = []
-    stds: list[np.ndarray] = []
-    for model in models:
-        mean, std = model.predict(x_pool, return_std=True)
-        means.append(mean)
-        stds.append(np.maximum(std, 1e-12))
-    mean_matrix = np.stack(means, axis=1)
-    std_matrix = np.stack(stds, axis=1)
+    (
+        mean_matrix,
+        std_matrix,
+        surrogate_diagnostics,
+        gp_mean_matrix,
+        extra_trees_mean_matrix,
+    ) = _hybrid_surrogate_distribution(
+        x_train,
+        y_train,
+        x_pool,
+        seed=seed + next_id * 104729,
+    )
 
     thresholds = _baseline_thresholds(document)
-    probability, constrained_expected_improvement, acquisition = _probabilistic_acquisition(
+    raw_probability, raw_expected_improvement, _ = _probabilistic_acquisition(
         mean_matrix,
         std_matrix,
         thresholds=thresholds,
         y_train=y_train,
         seed=seed + next_id * 65537,
         exploration_weight=exploration_weight,
+    )
+    empirical_probability, empirical_successes, empirical_trials = _empirical_champion_pass_prior(
+        document
+    )
+    metric_reliability = np.asarray(
+        surrogate_diagnostics["metric_reliability"],
+        dtype=float,
+    )
+    gate_reliability = float(
+        0.50 * metric_reliability[0]
+        + (0.50 / max(1, _METRIC_COUNT - 1)) * metric_reliability[1:].sum()
+    )
+    (
+        probability,
+        constrained_expected_improvement,
+        acquisition,
+        effective_exploration_weight,
+    ) = _reliability_adjusted_acquisition(
+        raw_probability,
+        raw_expected_improvement,
+        std_matrix,
+        thresholds=thresholds,
+        exploration_weight=exploration_weight,
+        surrogate_reliability=gate_reliability,
+        empirical_probability=empirical_probability,
     )
     selected_index = int(np.argmax(acquisition))
     selected_settings = proposal_settings[selected_index]
@@ -1005,14 +1033,40 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
             "observation_count": int(len(x_train)),
             "candidate_pool_size": int(len(proposal_settings)),
             "estimated_probability_beats_champion": float(probability[selected_index]),
+            "raw_model_probability_beats_champion": float(raw_probability[selected_index]),
+            "empirical_champion_pass_prior": float(empirical_probability),
+            "empirical_champion_pass_successes": int(empirical_successes),
+            "empirical_champion_pass_trials": int(empirical_trials),
+            "surrogate_gate_reliability": float(gate_reliability),
             "estimated_expected_improvement": float(constrained_expected_improvement[selected_index]),
+            "raw_model_expected_improvement": float(raw_expected_improvement[selected_index]),
             "estimated_ending_capital_mean": float(mean_matrix[selected_index, 0]),
             "estimated_ending_capital_std": float(std_matrix[selected_index, 0]),
+            "estimated_ending_capital_gp_mean": float(gp_mean_matrix[selected_index, 0]),
+            "estimated_ending_capital_extra_trees_mean": float(extra_trees_mean_matrix[selected_index, 0]),
             "estimated_sharpe_mean": float(mean_matrix[selected_index, 1]),
             "estimated_maximum_drawdown_mean": float(mean_matrix[selected_index, 2]),
             "estimated_worst_fold_mean": float(mean_matrix[selected_index, 3]),
             "acquisition_score": float(acquisition[selected_index]),
             "exploration_weight": exploration_weight,
+            "effective_exploration_weight": float(effective_exploration_weight),
+            "surrogate_cross_validation": {
+                "fold_count": int(surrogate_diagnostics["fold_count"]),
+                "metric_order": [
+                    "ending_capital",
+                    "sharpe",
+                    "maximum_drawdown",
+                    "worst_fold_return",
+                ],
+                "gp_weight": np.asarray(surrogate_diagnostics["gp_weight"], dtype=float).tolist(),
+                "extra_trees_weight": np.asarray(surrogate_diagnostics["extra_trees_weight"], dtype=float).tolist(),
+                "metric_reliability": np.asarray(surrogate_diagnostics["metric_reliability"], dtype=float).tolist(),
+                "gp_spearman": np.asarray(surrogate_diagnostics["gp_spearman"], dtype=float).tolist(),
+                "extra_trees_spearman": np.asarray(surrogate_diagnostics["extra_trees_spearman"], dtype=float).tolist(),
+                "gp_nrmse": np.asarray(surrogate_diagnostics["gp_nrmse"], dtype=float).tolist(),
+                "extra_trees_nrmse": np.asarray(surrogate_diagnostics["extra_trees_nrmse"], dtype=float).tolist(),
+                "cv_rmse": np.asarray(surrogate_diagnostics["cv_rmse"], dtype=float).tolist(),
+            },
             "monte_carlo_scenarios": _MONTE_CARLO_SCENARIOS,
             "pool_composition": {
                 "global_fraction": float(pool_metadata["global_fraction"]),
@@ -1026,6 +1080,6 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
             "promising_region_probability_mean": float(probability[top_indices].mean()),
             "promising_region_expected_improvement_mean": float(constrained_expected_improvement[top_indices].mean()),
             "thresholds": thresholds,
-            "interpretation": "research_surrogate_probability_not_future_profit_probability",
+            "interpretation": "reliability_calibrated_hybrid_research_surrogate_probability_not_future_profit_probability",
         },
     }
