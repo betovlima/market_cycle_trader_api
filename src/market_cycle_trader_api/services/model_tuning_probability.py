@@ -989,10 +989,17 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
         surrogate_diagnostics["metric_reliability"],
         dtype=float,
     )
-    gate_reliability = float(
+    raw_gate_reliability = float(
         0.50 * metric_reliability[0]
         + (0.50 / max(1, _METRIC_COUNT - 1)) * metric_reliability[1:].sum()
     )
+    # Cross-validation on a small high-dimensional campaign can look much more
+    # certain than it really is. Shrink surrogate trust until observations are
+    # large relative to the tuning dimension.
+    observation_support = float(
+        len(x_train) / (len(x_train) + 2.0 * max(1, x_train.shape[1]))
+    )
+    gate_reliability = raw_gate_reliability * observation_support
     (
         probability,
         constrained_expected_improvement,
@@ -1041,6 +1048,8 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
             "empirical_champion_pass_successes": int(empirical_successes),
             "empirical_champion_pass_trials": int(empirical_trials),
             "surrogate_gate_reliability": float(gate_reliability),
+            "surrogate_raw_gate_reliability": float(raw_gate_reliability),
+            "surrogate_observation_support": float(observation_support),
             "estimated_expected_improvement": float(constrained_expected_improvement[selected_index]),
             "raw_model_expected_improvement": float(raw_expected_improvement[selected_index]),
             "estimated_ending_capital_mean": float(mean_matrix[selected_index, 0]),
