@@ -139,3 +139,48 @@ def test_control_is_seeded_and_candidate_can_be_told() -> None:
     assert math.isclose(float(study.trials[1].value), 4_000_000.0)
     assert study.trials[1].user_attrs["champion_gate_passed"] is False
     assert violations["sharpe"] > 0.0
+
+
+
+def test_dynamic_num_leaves_respects_max_depth() -> None:
+    search_space = [
+        {
+            "name": "max_depth",
+            "type": "integer",
+            "min": 2,
+            "max": 4,
+        },
+        {
+            "name": "num_leaves",
+            "type": "integer",
+            "min": 4,
+            "max": 12,
+        },
+    ]
+    base = {
+        "max_depth": 3,
+        "num_leaves": 6,
+    }
+    study, active_space, _ = create_optuna_tpe_study(
+        search_space=search_space,
+        base_tuning_values=base,
+        baseline_metrics=BASELINE,
+        seed=7,
+    )
+
+    for _ in range(6):
+        trial, settings = ask_optuna_candidate(study, active_space)
+        assert int(settings["num_leaves"]) <= 2 ** int(settings["max_depth"])
+        metrics = {
+            "ending_capital": 1_000_000.0 + float(trial.number),
+            "sharpe": 2.0,
+            "maximum_drawdown": -0.30,
+            "worst_fold_return": 0.5,
+        }
+        tell_optuna_candidate(
+            study,
+            trial,
+            metrics,
+            thresholds=fixed_control_constraints(BASELINE),
+            champion_gate_passed=False,
+        )
