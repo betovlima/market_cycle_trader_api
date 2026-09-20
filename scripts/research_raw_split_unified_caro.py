@@ -118,6 +118,7 @@ def _metrics(
         if fold_rows
         else None
     )
+    predictive = deepcopy(result.metrics.get("lightgbm_predictive_diagnostics") or {})
     return {
         "ending_capital": float(result.metrics.get("strategy_ending_capital") or 0.0),
         "sharpe": float(result.metrics.get("strategy_sharpe") or 0.0),
@@ -128,6 +129,14 @@ def _metrics(
         "requested_compute_device": result.metrics.get("requested_compute_device"),
         "effective_compute_device": result.metrics.get("effective_compute_device"),
         "compute_device_probe_errors": result.metrics.get("compute_device_probe_errors"),
+        "predictive_diagnostics": predictive,
+        "validation_mae": predictive.get("validation_mae_mean"),
+        "validation_rmse": predictive.get("validation_rmse_mean"),
+        "train_mae": predictive.get("train_mae_mean"),
+        "train_rmse": predictive.get("train_rmse_mean"),
+        "generalization_gap_rmse": predictive.get("generalization_gap_rmse_mean"),
+        "best_iteration_mean": predictive.get("best_iteration_mean_mean"),
+        "early_stopping_model_fraction": predictive.get("early_stopping_model_fraction_mean"),
         "eligible": True,
     }
 
@@ -177,14 +186,14 @@ def main() -> int:
     parser.add_argument("--job-id", default=None)
     parser.add_argument("--raw-collection", default=RAW_COLLECTION)
     parser.add_argument("--corporate-actions-collection", default=CA_COLLECTION)
-    parser.add_argument("--candidate-count", type=int, default=20)
+    parser.add_argument("--candidate-count", type=int, default=24)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--include-dividend-features",
         action="store_true",
         help=(
-            "Reserved for a later controlled campaign. v10.8.64 defaults to "
+            "Reserved for a later controlled campaign. v10.8.67 defaults to "
             "RAW+split price features only."
         ),
     )
@@ -192,7 +201,7 @@ def main() -> int:
 
     if args.include_dividend_features:
         raise ValueError(
-            "v10.8.64 calibrates the canonical RAW+split price architecture only. "
+            "v10.8.67 calibrates the canonical RAW+split price architecture only. "
             "Dividend-feature tuning must be run as a separate campaign."
         )
     if int(args.candidate_count) < 4:
@@ -278,8 +287,25 @@ def main() -> int:
             if item in frames and item not in reference_set
         ]
 
+        research_settings = deepcopy(request.research_model_settings)
+        lightgbm_methodology = deepcopy(research_settings.get("lightgbm") or {})
+        lightgbm_methodology.setdefault("early_stopping_enabled", True)
+        lightgbm_methodology.setdefault("early_stopping_rounds", 30)
+        lightgbm_methodology.setdefault("early_stopping_validation_fraction", 0.15)
+        lightgbm_methodology.setdefault("early_stopping_min_validation_sessions", 40)
+        lightgbm_methodology.setdefault("early_stopping_max_validation_sessions", 126)
+        # LightGBM row subsampling is active only when subsample_freq > 0.
+        # Keep the control inside the expanded CARO domain without changing
+        # behavior when subsample == 1.0.
+        lightgbm_methodology["subsample_freq"] = max(
+            1,
+            int(lightgbm_methodology.get("subsample_freq") or 1),
+        )
+        research_settings["lightgbm"] = lightgbm_methodology
+
         base_config = request.model_copy(
             update={
+                "research_model_settings": research_settings,
                 "assets": eligible,
                 "calendar_anchor_assets": anchors,
                 "research_reference_assets": references,
@@ -365,7 +391,7 @@ def main() -> int:
 
         checkpoint = {
             "schema_version": 1,
-            "api_version": "10.8.66",
+            "api_version": "10.8.67",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -462,6 +488,13 @@ def main() -> int:
                 "sharpe": metrics["sharpe"],
                 "maximum_drawdown": metrics["maximum_drawdown"],
                 "worst_fold_return": metrics["worst_fold_return"],
+                "validation_mae": metrics.get("validation_mae"),
+                "validation_rmse": metrics.get("validation_rmse"),
+                "train_mae": metrics.get("train_mae"),
+                "train_rmse": metrics.get("train_rmse"),
+                "generalization_gap_rmse": metrics.get("generalization_gap_rmse"),
+                "best_iteration_mean": metrics.get("best_iteration_mean"),
+                "early_stopping_model_fraction": metrics.get("early_stopping_model_fraction"),
                 **item["settings"],
             }
             rows.append(row)
@@ -469,10 +502,54 @@ def main() -> int:
         pd.DataFrame(split_diagnostics).to_csv(output_dir / "data_diagnostics.csv", index=False)
         pd.DataFrame(exclusions).to_csv(output_dir / "excluded_assets.csv", index=False)
 
+        control_model_diagnostics = deepcopy(
+            baseline_result.metrics.get("lightgbm_fold_diagnostics") or []
+        )
+        champion_model_diagnostics = deepcopy(
+            champion_result.metrics.get("lightgbm_fold_diagnostics") or []
+        )
+        _checkpoint(
+            output_dir / "control_model_diagnostics.json",
+            {
+                "folds": control_model_diagnostics,
+                "summary": baseline_result.metrics.get("lightgbm_predictive_diagnostics") or {},
+            },
+        )
+        _checkpoint(
+            output_dir / "champion_model_diagnostics.json",
+            {
+                "folds": champion_model_diagnostics,
+                "summary": champion_result.metrics.get("lightgbm_predictive_diagnostics") or {},
+            },
+        )
+        feature_rows = []
+        champion_feature_importance = (
+            (champion_result.metrics.get("lightgbm_predictive_diagnostics") or {})
+            .get("feature_importance_gain")
+            or {}
+        )
+        control_feature_importance = (
+            (baseline_result.metrics.get("lightgbm_predictive_diagnostics") or {})
+            .get("feature_importance_gain")
+            or {}
+        )
+        for feature in sorted(set(control_feature_importance) | set(champion_feature_importance)):
+            feature_rows.append(
+                {
+                    "feature": feature,
+                    "control_importance_gain": control_feature_importance.get(feature, 0.0),
+                    "champion_importance_gain": champion_feature_importance.get(feature, 0.0),
+                }
+            )
+        pd.DataFrame(feature_rows).to_csv(
+            output_dir / "feature_importance_gain.csv",
+            index=False,
+        )
+
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.66",
-            "experiment": "raw-split-unified-caro-v4",
+            "api_version": "10.8.67",
+            "experiment": "raw-split-unified-caro-v5",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -504,6 +581,16 @@ def main() -> int:
                 "tuning": "existing Unified CARO space-filling + probabilistic refinement",
                 "control_in_surrogate_training": True,
                 "control_as_initial_probability_anchor": True,
+                "temporal_early_stopping": {
+                    "enabled": True,
+                    "rounds": int(lightgbm_methodology.get("early_stopping_rounds", 30)),
+                    "validation_fraction": float(lightgbm_methodology.get("early_stopping_validation_fraction", 0.15)),
+                    "min_validation_sessions": int(lightgbm_methodology.get("early_stopping_min_validation_sessions", 40)),
+                    "max_validation_sessions": int(lightgbm_methodology.get("early_stopping_max_validation_sessions", 126)),
+                    "oos_used_for_early_stopping": False,
+                },
+                "predictive_diagnostics": ["MAE", "RMSE", "generalization_gap_rmse"],
+                "feature_importance": "LightGBM gain aggregated by fold",
                 "hyperparameter_search_only": True,
             },
         }
