@@ -26,6 +26,9 @@ from market_cycle_trader_api.engine.capital_rotation import (
     prepare_rotation_panel,
     run_rotation_models,
 )
+from market_cycle_trader_api.engine.compound_risk_overlay import (
+    allocation_execution_enabled,
+)
 from market_cycle_trader_api.infrastructure.persistence.mongo_repository import (
     create_client,
     get_database,
@@ -289,9 +292,7 @@ def main() -> int:
             }
         )
 
-        if bool(
-            getattr(base_config, "optimized_allocation_enabled", False)
-        ):
+        if allocation_execution_enabled(base_config):
             raise ValueError(
                 "Horizon voting v1 must run on the canonical single-position "
                 "rotation policy, not optimized allocation."
