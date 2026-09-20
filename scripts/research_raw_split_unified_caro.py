@@ -135,7 +135,7 @@ def _metrics(
         "train_mae": predictive.get("train_mae_mean"),
         "train_rmse": predictive.get("train_rmse_mean"),
         "generalization_gap_rmse": predictive.get("generalization_gap_rmse_mean"),
-        "best_iteration_mean": predictive.get("best_iteration_mean_mean"),
+        "best_iteration_mean": predictive.get("best_iteration_mean"),
         "early_stopping_model_fraction": predictive.get("early_stopping_model_fraction_mean"),
         "eligible": True,
     }
