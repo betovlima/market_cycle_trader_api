@@ -1235,3 +1235,252 @@ Primary questions:
 2. How much does OOS replay time fall relative to v10.8.73?
 3. Does soft rank support filter only marginal rotations rather than suppressing rotation broadly?
 4. Does the challenger improve capital and/or robustness while retaining the strategy's rotation edge?
+
+
+## Final standalone Alpaca research (API v10.8.75)
+
+API v10.8.75 creates the final reproducible research path without using MongoDB market data, MongoDB parameter snapshots, or MongoDB corporate-action collections.
+
+### Purpose
+
+The final run answers a different question from prior tuning campaigns:
+
+> Can the selected MCT methodology be reproduced from a fresh Alpaca download using only a versioned research configuration and local immutable snapshot?
+
+This is a **reproduction/certification run**, not another tuning campaign.
+
+No Optuna and no CARO are executed.
+
+The final configuration is frozen in:
+
+```text
+research/final_research_v10_8_75.json
+```
+
+### Frozen final research window
+
+```text
+history start:  2016-01-01
+history end:    2026-09-18
+analysis end:   2026-09-18
+timeframe:      1Day
+Alpaca feed:    SIP
+download:       RAW
+```
+
+The end date is explicitly closed and versioned. The script does not silently extend the experiment to a later market session.
+
+### Universe
+
+The request contains the same 56-symbol research universe used in the provider-equivalence line.
+
+Corporate-action structural identity filtering is then applied locally. For example, a ticker lineage such as the historical DOC/PEAK merger remains eligible for exclusion by the same conservative identity rule.
+
+### Data path
+
+The execution path is:
+
+```text
+Alpaca Historical Data API
+        |
+        +-- fresh RAW daily bars
+        |
+        +-- fresh corporate actions
+        |
+        v
+local immutable snapshot
+        |
+        +-- SHA-256 per source file
+        +-- global snapshot SHA-256
+        +-- runtime/library versions
+        +-- frozen config SHA-256
+        |
+        v
+local split normalization
+        |
+        v
+MCT feature/target construction
+        |
+        +-- CONTROL
+        |
+        +-- SOFT HORIZON CONSENSUS
+        |
+        v
+walk-forward OOS + Buy & Hold
+```
+
+### Database independence
+
+The final runner:
+
+```text
+scripts/research_final_standalone_alpaca.py
+```
+
+does not import or call:
+
+```text
+mongo_repository
+create_client()
+get_database()
+_latest_job()
+```
+
+and the frozen request requires:
+
+```text
+mongo_cache_enabled = false
+research_market_data_mode = standalone_snapshot
+```
+
+Alpaca credentials are read only from environment variables:
+
+```text
+ALPACA_API_KEY_ID
+ALPACA_SECRET_KEY
+```
+
+The existing APCA aliases are also accepted.
+
+Credentials are never written to the snapshot or results.
+
+### Fresh RAW snapshot
+
+Bars are downloaded directly from:
+
+```text
+https://data.alpaca.markets/v2/stocks/bars
+```
+
+with:
+
+```text
+feed=sip
+adjustment=raw
+timeframe=1Day
+```
+
+Corporate actions are downloaded directly from:
+
+```text
+https://data.alpaca.markets/v1/corporate-actions
+```
+
+The snapshot directory contains:
+
+```text
+snapshot/
+  manifest.json
+  corporate_actions.jsonl
+  raw_bars/
+    AAPL.csv
+    ...
+```
+
+The manifest contains individual source-file SHA-256 digests and one global snapshot digest.
+
+Reusing an existing snapshot verifies all source-file hashes before execution.
+
+### Final model configuration
+
+The LightGBM configuration is frozen; no parameter search occurs during the final run.
+
+The selected soft-consensus configuration is also frozen:
+
+```text
+penalty_strength = 1.0
+```
+
+The runner executes both:
+
+```text
+CONTROL
+SOFT_HORIZON_CONSENSUS
+```
+
+on exactly the same fresh local snapshot so the final comparison continues to include the canonical baseline.
+
+### Deterministic final run
+
+The standalone final configuration uses:
+
+```text
+deterministic_execution = true
+numeric_thread_limit = 1
+xgb_n_jobs = 1
+LightGBM n_jobs = 1
+rotation_accelerator = cpu
+random_state = 42
+```
+
+This final run prioritizes reproducibility over GPU throughput.
+
+### Run from a fresh Alpaca download
+
+```bash
+python scripts/research_final_standalone_alpaca.py \
+  --replace-snapshot
+```
+
+No job ID is required.
+
+No MongoDB server is required.
+
+### Reproduce the exact downloaded snapshot later
+
+```bash
+python scripts/research_final_standalone_alpaca.py \
+  --reuse-snapshot
+```
+
+The script rejects reuse if the frozen config hash differs or if any snapshot source-file digest fails integrity verification.
+
+### Result artifacts
+
+```text
+output/final_standalone_alpaca_20260918/
+  snapshot/
+    manifest.json
+    corporate_actions.jsonl
+    raw_bars/*.csv
+
+  results/
+    summary.json
+    strategy_comparison.csv
+    data_diagnostics.csv
+    excluded_assets.csv
+    frozen_research_config.json
+    resolved_final_request.json
+    snapshot_manifest.json
+    control_predictions.csv
+    control_trades.csv
+    soft_horizon_consensus_predictions.csv
+    soft_horizon_consensus_trades.csv
+    soft_horizon_consensus_decisions.csv
+```
+
+The final `summary.json` explicitly records:
+
+```text
+database_access = false
+tuning_enabled = false
+optimizer = null
+optuna_used = false
+caro_used = false
+snapshot_sha256
+config_sha256
+runtime_versions
+```
+
+### Interpretation
+
+Because most of the historical window overlaps earlier experiments, this run must not be mislabeled as a completely untouched temporal holdout.
+
+Its scientific role is:
+
+- independent data acquisition;
+- database-free reproducibility;
+- fresh-provider snapshot certification;
+- final frozen-configuration comparison.
+
+The outputs should be compared with prior v10.8.74 results, but differences are expected because the Alpaca snapshot itself is freshly downloaded and the final end date is fixed at 2026-09-18.
