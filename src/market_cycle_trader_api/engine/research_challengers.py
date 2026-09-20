@@ -309,33 +309,6 @@ def _lightgbm_last_tree_snapshot(
     }
 
 
-def _lightgbm_temporal_fit_split(
-    frame: pd.DataFrame,
-    settings: dict[str, Any],
-    minimum_rows: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not bool(settings.get("early_stopping_enabled", True)):
-        return frame, frame.iloc[0:0]
-
-    fraction = float(settings.get("early_stopping_validation_fraction", 0.15))
-    fraction = min(0.40, max(0.05, fraction))
-    min_validation = max(20, int(settings.get("early_stopping_min_validation_sessions", 40)))
-    max_validation = max(min_validation, int(settings.get("early_stopping_max_validation_sessions", 126)))
-
-    desired_validation = max(min_validation, int(round(len(frame) * fraction)))
-    desired_validation = min(max_validation, desired_validation)
-
-    # The minimum-training-row rule applies to the available chronological
-    # sample. Early stopping may reserve a tail, but it must retain at least
-    # 80% of that minimum for actual tree fitting.
-    minimum_fit_rows = max(200, int(math.ceil(float(minimum_rows) * 0.80)))
-    validation_rows = min(desired_validation, max(0, len(frame) - minimum_fit_rows))
-    if validation_rows < min_validation:
-        return frame, frame.iloc[0:0]
-
-    return frame.iloc[:-validation_rows], frame.iloc[-validation_rows:]
-
-
 def _regression_error_diagnostics(
     actual: np.ndarray,
     predicted: np.ndarray,
@@ -367,32 +340,15 @@ def _regression_error_diagnostics(
 def _lightgbm_model_fit_diagnostics(
     model: Any,
     train_frame: pd.DataFrame,
-    validation_frame: pd.DataFrame,
     *,
     target_column: str,
     configured_estimators: int,
 ) -> dict[str, Any]:
-    best_iteration = int(getattr(model, "best_iteration_", 0) or configured_estimators)
-    predict_kwargs = {"num_iteration": best_iteration} if best_iteration > 0 else {}
-    train_prediction = model.predict(train_frame[ROTATION_FEATURES], **predict_kwargs)
+    train_prediction = model.predict(train_frame[ROTATION_FEATURES])
     train_diag = _regression_error_diagnostics(
         train_frame[target_column].to_numpy(dtype=np.float64),
         np.asarray(train_prediction, dtype=np.float64),
     )
-
-    validation_diag = {
-        "rows": 0,
-        "absolute_error_sum": 0.0,
-        "squared_error_sum": 0.0,
-        "mae": None,
-        "rmse": None,
-    }
-    if not validation_frame.empty:
-        validation_prediction = model.predict(validation_frame[ROTATION_FEATURES], **predict_kwargs)
-        validation_diag = _regression_error_diagnostics(
-            validation_frame[target_column].to_numpy(dtype=np.float64),
-            np.asarray(validation_prediction, dtype=np.float64),
-        )
 
     gain = np.asarray(
         model.booster_.feature_importance(importance_type="gain"),
@@ -405,37 +361,63 @@ def _lightgbm_model_fit_diagnostics(
         for feature, value in zip(ROTATION_FEATURES, gain)
     }
 
-    train_rmse = train_diag.get("rmse")
-    validation_rmse = validation_diag.get("rmse")
-    generalization_gap = (
-        float(validation_rmse) - float(train_rmse)
-        if train_rmse is not None and validation_rmse is not None
-        else None
-    )
     return {
         "configured_estimators": int(configured_estimators),
-        "best_iteration": best_iteration,
-        "early_stopping_used": bool(not validation_frame.empty),
+        "best_iteration": int(configured_estimators),
+        "early_stopping_used": False,
         "train": train_diag,
-        "validation": validation_diag,
-        "generalization_gap_rmse": generalization_gap,
         "feature_importance_gain": importance,
     }
+
+
+def _evaluate_lightgbm_models_on_dates(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    dates: pd.DatetimeIndex,
+    *,
+    target_column: str = "forward_risk_adjusted_utility",
+) -> dict[str, float | int | None]:
+    actual_values: list[float] = []
+    predicted_values: list[float] = []
+
+    for symbol in symbols:
+        model = models.get(symbol)
+        frame = frames.get(symbol)
+        if model is None or frame is None or frame.empty:
+            continue
+        available_dates = pd.DatetimeIndex(dates).intersection(frame.index)
+        if len(available_dates) == 0:
+            continue
+        sample = frame.loc[available_dates].dropna(
+            subset=[target_column, *ROTATION_FEATURES]
+        )
+        if sample.empty:
+            continue
+        predicted = model.predict(sample[ROTATION_FEATURES])
+        actual_values.extend(
+            sample[target_column].to_numpy(dtype=np.float64).tolist()
+        )
+        predicted_values.extend(
+            np.asarray(predicted, dtype=np.float64).tolist()
+        )
+
+    return _regression_error_diagnostics(
+        np.asarray(actual_values, dtype=np.float64),
+        np.asarray(predicted_values, dtype=np.float64),
+    )
 
 
 def _aggregate_lightgbm_model_diagnostics(
     models: dict[str, Any],
     *,
     fold_id: int,
+    validation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     train_rows = 0
     train_abs = 0.0
     train_sq = 0.0
-    validation_rows = 0
-    validation_abs = 0.0
-    validation_sq = 0.0
-    best_iterations: list[int] = []
-    early_stopping_models = 0
+    configured_estimators: list[int] = []
     feature_gain = {feature: 0.0 for feature in ROTATION_FEATURES}
 
     for model in models.values():
@@ -443,16 +425,10 @@ def _aggregate_lightgbm_model_diagnostics(
         if not isinstance(diag, dict):
             continue
         train = diag.get("train") or {}
-        validation = diag.get("validation") or {}
         train_rows += int(train.get("rows") or 0)
         train_abs += float(train.get("absolute_error_sum") or 0.0)
         train_sq += float(train.get("squared_error_sum") or 0.0)
-        validation_rows += int(validation.get("rows") or 0)
-        validation_abs += float(validation.get("absolute_error_sum") or 0.0)
-        validation_sq += float(validation.get("squared_error_sum") or 0.0)
-        best_iterations.append(int(diag.get("best_iteration") or 0))
-        if bool(diag.get("early_stopping_used")):
-            early_stopping_models += 1
+        configured_estimators.append(int(diag.get("configured_estimators") or 0))
         for feature, value in (diag.get("feature_importance_gain") or {}).items():
             if feature in feature_gain:
                 feature_gain[feature] += float(value or 0.0)
@@ -471,34 +447,51 @@ def _aggregate_lightgbm_model_diagnostics(
             reverse=True,
         )
     ]
+
     train_rmse = math.sqrt(train_sq / train_rows) if train_rows else None
-    validation_rmse = math.sqrt(validation_sq / validation_rows) if validation_rows else None
+    validation = dict(validation or {})
+    validation_rows = int(validation.get("rows") or 0)
+    validation_mae = (
+        float(validation.get("mae"))
+        if validation.get("mae") is not None
+        else None
+    )
+    validation_rmse = (
+        float(validation.get("rmse"))
+        if validation.get("rmse") is not None
+        else None
+    )
+
+    effective_estimators = (
+        float(np.mean(configured_estimators))
+        if configured_estimators
+        else None
+    )
     return {
         "fold_id": int(fold_id),
         "model_count": int(model_count),
-        "early_stopping_model_count": int(early_stopping_models),
-        "early_stopping_model_fraction": (
-            float(early_stopping_models / model_count) if model_count else 0.0
-        ),
-        "best_iteration_mean": (
-            float(np.mean(best_iterations)) if best_iterations else None
-        ),
+        "early_stopping_model_count": 0,
+        "early_stopping_model_fraction": 0.0,
+        "best_iteration_mean": effective_estimators,
         "best_iteration_median": (
-            float(np.median(best_iterations)) if best_iterations else None
+            float(np.median(configured_estimators))
+            if configured_estimators
+            else None
         ),
+        "configured_estimators_mean": effective_estimators,
         "train_rows": int(train_rows),
         "train_mae": (train_abs / train_rows if train_rows else None),
         "train_rmse": train_rmse,
-        "validation_rows": int(validation_rows),
-        "validation_mae": (
-            validation_abs / validation_rows if validation_rows else None
-        ),
+        "validation_rows": validation_rows,
+        "validation_mae": validation_mae,
         "validation_rmse": validation_rmse,
         "generalization_gap_rmse": (
             float(validation_rmse) - float(train_rmse)
             if train_rmse is not None and validation_rmse is not None
             else None
         ),
+        "validation_source": "existing_chronological_calibration_window",
+        "feature_importance_source": "calibration_models",
         "feature_importance_gain": normalized_gain,
         "top_features_by_gain": top_features,
     }
@@ -516,6 +509,7 @@ def _aggregate_lightgbm_fold_diagnostics(
         "validation_rmse",
         "generalization_gap_rmse",
         "best_iteration_mean",
+        "configured_estimators_mean",
         "early_stopping_model_fraction",
     )
     output: dict[str, Any] = {"fold_count": len(folds)}
@@ -527,7 +521,7 @@ def _aggregate_lightgbm_fold_diagnostics(
         ]
         output_key = (
             field
-            if field == "best_iteration_mean"
+            if field in {"best_iteration_mean", "configured_estimators_mean"}
             else f"{field}_mean"
         )
         output[output_key] = float(np.mean(values)) if values else None
@@ -551,6 +545,8 @@ def _aggregate_lightgbm_fold_diagnostics(
             reverse=True,
         )
     ]
+    output["early_stopping_enabled"] = False
+    output["validation_source"] = "existing_chronological_calibration_window"
     return output
 
 
@@ -567,7 +563,7 @@ def _lightgbm_fit_models(
     device_type: str | None = None,
 ) -> dict[str, Any]:
     try:
-        from lightgbm import LGBMRegressor, early_stopping
+        from lightgbm import LGBMRegressor
     except ImportError as exc:
         raise RuntimeError("LightGBM research requires lightgbm. Install requirements.txt.") from exc
 
@@ -586,7 +582,7 @@ def _lightgbm_fit_models(
         f"model=lightgbm phase={phase} event=fit_start device={active_device} "
         f"models={len(symbols)} train_sessions={len(train_dates)} "
         f"estimators={int(settings['n_estimators'])} seed={int(config.random_state)} "
-        f"early_stopping={bool(settings.get('early_stopping_enabled', True))}"
+        f"early_stopping=false"
     )
     for position, symbol in enumerate(symbols, start=1):
         frame = frames[symbol].loc[train_dates].dropna(
@@ -602,11 +598,6 @@ def _lightgbm_fit_models(
                 progress_callback(position, len(symbols), active_device)
             continue
 
-        fit_frame, validation_frame = _lightgbm_temporal_fit_split(
-            frame,
-            settings,
-            minimum_rows,
-        )
         model = LGBMRegressor(
             objective="regression",
             boosting_type="gbdt",
@@ -630,32 +621,13 @@ def _lightgbm_fit_models(
             verbosity=-1,
         )
 
-        fit_kwargs: dict[str, Any] = {}
-        if not validation_frame.empty:
-            fit_kwargs["eval_set"] = [
-                (
-                    validation_frame[ROTATION_FEATURES],
-                    validation_frame[target_column],
-                )
-            ]
-            fit_kwargs["eval_metric"] = "rmse"
-            fit_kwargs["callbacks"] = [
-                early_stopping(
-                    stopping_rounds=max(5, int(settings.get("early_stopping_rounds", 30))),
-                    first_metric_only=True,
-                    verbose=False,
-                )
-            ]
-
         model.fit(
-            fit_frame[ROTATION_FEATURES],
-            fit_frame[target_column],
-            **fit_kwargs,
+            frame[ROTATION_FEATURES],
+            frame[target_column],
         )
         model._mct_fit_diagnostics = _lightgbm_model_fit_diagnostics(
             model,
-            fit_frame,
-            validation_frame,
+            frame,
             target_column=target_column,
             configured_estimators=int(settings["n_estimators"]),
         )
