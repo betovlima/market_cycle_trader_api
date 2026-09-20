@@ -77,13 +77,9 @@ def _lightgbm_settings(config: Any) -> dict[str, Any]:
     if missing:
         raise ValueError("LightGBM research settings are incomplete: " + ", ".join(missing))
     resolved = dict(lightgbm)
-    # v10.8.67: early stopping is a fixed methodological safeguard, not a
-    # CARO search dimension. Existing snapshots remain compatible.
-    resolved.setdefault("early_stopping_enabled", True)
-    resolved.setdefault("early_stopping_rounds", 30)
-    resolved.setdefault("early_stopping_validation_fraction", 0.15)
-    resolved.setdefault("early_stopping_min_validation_sessions", 40)
-    resolved.setdefault("early_stopping_max_validation_sessions", 126)
+    # v10.8.68: RMSE-based early stopping is deliberately disabled for the
+    # economic ranking model. Predictive MAE/RMSE remain diagnostics only.
+    resolved["early_stopping_enabled"] = False
     return resolved
 
 
