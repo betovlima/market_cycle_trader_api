@@ -114,7 +114,7 @@ def test_control_is_seeded_and_candidate_can_be_told() -> None:
         seed=42,
     )
 
-    assert len(study.trials) == 1
+    assert len(study.trials) >= 1
     control = study.trials[0]
     assert control.number == 0
     assert control.params == BASE
@@ -125,6 +125,7 @@ def test_control_is_seeded_and_candidate_can_be_told() -> None:
     )
 
     trial, _ = ask_optuna_candidate(study, distributions)
+    assert trial.user_attrs.get("kind") == "control_local_warm_start"
     candidate_metrics = {
         "ending_capital": 4_000_000.0,
         "sharpe": 1.8,
@@ -188,3 +189,37 @@ def test_dynamic_num_leaves_respects_max_depth() -> None:
             thresholds=fixed_control_constraints(BASELINE),
             champion_gate_passed=False,
         )
+
+
+
+def test_control_centered_warm_start_is_local_and_deterministic() -> None:
+    from market_cycle_trader_api.services.model_tuning_optuna import (
+        control_centered_warm_start_settings,
+    )
+    from market_cycle_trader_api.services.model_tuning_space import (
+        unit_value_for_setting,
+    )
+
+    first = control_centered_warm_start_settings(
+        SEARCH_SPACE,
+        BASE,
+        seed=42,
+        count=6,
+        radius=0.06,
+    )
+    second = control_centered_warm_start_settings(
+        SEARCH_SPACE,
+        BASE,
+        seed=42,
+        count=6,
+        radius=0.06,
+    )
+
+    assert first == second
+    assert len(first) > 0
+    for settings in first:
+        for spec in SEARCH_SPACE:
+            name = str(spec["name"])
+            anchor = unit_value_for_setting(spec, BASE[name])
+            value = unit_value_for_setting(spec, settings[name])
+            assert abs(value - anchor) <= 0.0600001
