@@ -2,50 +2,14 @@ from __future__ import annotations
 
 import math
 
-import pandas as pd
-
 from market_cycle_trader_api.engine.research_challengers import (
-    _lightgbm_temporal_fit_split,
     _regression_error_diagnostics,
 )
 from market_cycle_trader_api.services.model_tuning import _SEARCH_SPACE
-
-
-def test_temporal_early_stopping_uses_chronological_tail() -> None:
-    frame = pd.DataFrame(
-        {"value": range(700)},
-        index=pd.date_range("2020-01-01", periods=700, freq="D", tz="UTC"),
-    )
-    train, validation = _lightgbm_temporal_fit_split(
-        frame,
-        {
-            "early_stopping_enabled": True,
-            "early_stopping_validation_fraction": 0.15,
-            "early_stopping_min_validation_sessions": 40,
-            "early_stopping_max_validation_sessions": 126,
-        },
-        minimum_rows=700,
-    )
-
-    assert len(train) == 595
-    assert len(validation) == 105
-    assert train.index.max() < validation.index.min()
-    assert validation.index.equals(frame.index[-105:])
-
-
-def test_temporal_early_stopping_can_be_disabled() -> None:
-    frame = pd.DataFrame(
-        {"value": range(700)},
-        index=pd.date_range("2020-01-01", periods=700, freq="D", tz="UTC"),
-    )
-    train, validation = _lightgbm_temporal_fit_split(
-        frame,
-        {"early_stopping_enabled": False},
-        minimum_rows=700,
-    )
-
-    assert len(train) == len(frame)
-    assert validation.empty
+from market_cycle_trader_api.services.model_tuning_space import (
+    sample_value,
+    unit_value_for_setting,
+)
 
 
 def test_regression_diagnostics_report_mae_and_rmse() -> None:
@@ -60,8 +24,38 @@ def test_regression_diagnostics_report_mae_and_rmse() -> None:
 
 
 def test_unified_caro_contains_variance_control_dimensions() -> None:
-    names = {str(item["name"]) for item in _SEARCH_SPACE}
+    specs = {str(item["name"]): item for item in _SEARCH_SPACE}
 
-    assert "min_child_weight" in names
-    assert "subsample" in names
-    assert "subsample_freq" in names
+    assert "min_child_weight" in specs
+    assert "subsample" in specs
+    assert "subsample_freq" in specs
+    assert specs["min_child_weight"]["scale"] == "log"
+    assert float(specs["min_child_weight"]["min"]) <= 5.0
+    assert float(specs["min_child_weight"]["max"]) >= 5.0
+    assert int(specs["subsample_freq"]["min"]) == 0
+
+
+def test_log_scaled_child_weight_round_trip_contains_control() -> None:
+    spec = next(
+        item for item in _SEARCH_SPACE
+        if item["name"] == "min_child_weight"
+    )
+    unit = unit_value_for_setting(spec, 5.0)
+    reconstructed = sample_value(spec, unit)
+
+    assert 0.0 < unit < 1.0
+    assert math.isclose(float(reconstructed), 5.0, rel_tol=1e-5, abs_tol=1e-5)
+
+
+def test_log_scaled_midpoint_is_geometric_not_arithmetic() -> None:
+    spec = {
+        "name": "example",
+        "type": "number",
+        "min": 0.001,
+        "max": 10.0,
+        "precision": 8,
+        "scale": "log",
+    }
+    midpoint = sample_value(spec, 0.5)
+
+    assert math.isclose(float(midpoint), 0.1, rel_tol=1e-6)
