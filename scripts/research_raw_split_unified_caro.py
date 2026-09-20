@@ -119,6 +119,7 @@ def _metrics(
         else None
     )
     predictive = deepcopy(result.metrics.get("lightgbm_predictive_diagnostics") or {})
+    simulation_profile = deepcopy(result.metrics.get("simulation_profile") or {})
     return {
         "ending_capital": float(result.metrics.get("strategy_ending_capital") or 0.0),
         "sharpe": float(result.metrics.get("strategy_sharpe") or 0.0),
@@ -137,6 +138,13 @@ def _metrics(
         "generalization_gap_rmse": predictive.get("generalization_gap_rmse_mean"),
         "best_iteration_mean": predictive.get("best_iteration_mean"),
         "early_stopping_model_fraction": predictive.get("early_stopping_model_fraction_mean"),
+        "simulation_profile": simulation_profile,
+        "simulation_total_seconds": simulation_profile.get("total_seconds"),
+        "simulation_benchmark_seconds": simulation_profile.get("benchmark_seconds"),
+        "simulation_market_regime_seconds": simulation_profile.get("market_regime_seconds"),
+        "simulation_policy_seconds": simulation_profile.get("policy_seconds"),
+        "simulation_accounting_seconds": simulation_profile.get("accounting_seconds"),
+        "simulation_session_count": simulation_profile.get("session_count"),
         "eligible": True,
     }
 
@@ -510,6 +518,12 @@ def main() -> int:
                 "generalization_gap_rmse": metrics.get("generalization_gap_rmse"),
                 "best_iteration_mean": metrics.get("best_iteration_mean"),
                 "early_stopping_model_fraction": metrics.get("early_stopping_model_fraction"),
+                "simulation_total_seconds": metrics.get("simulation_total_seconds"),
+                "simulation_benchmark_seconds": metrics.get("simulation_benchmark_seconds"),
+                "simulation_market_regime_seconds": metrics.get("simulation_market_regime_seconds"),
+                "simulation_policy_seconds": metrics.get("simulation_policy_seconds"),
+                "simulation_accounting_seconds": metrics.get("simulation_accounting_seconds"),
+                "simulation_session_count": metrics.get("simulation_session_count"),
                 **item["settings"],
             }
             rows.append(row)
