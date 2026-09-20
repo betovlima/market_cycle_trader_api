@@ -64,8 +64,6 @@ def optuna_distributions(
             spec,
             current_settings=working,
         )
-        if name in working:
-            continue
     return distributions
 
 
@@ -145,7 +143,7 @@ def create_optuna_tpe_study(
     baseline_metrics: dict[str, Any],
     seed: int,
     startup_trials: int | None = None,
-) -> tuple[Study, dict[str, Any], dict[str, float]]:
+) -> tuple[Study, list[dict[str, Any]], dict[str, float]]:
     active_space = [dict(item) for item in search_space]
     distributions = optuna_distributions(
         active_space,
