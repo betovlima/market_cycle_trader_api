@@ -7,16 +7,20 @@ import warnings
 from typing import Any
 
 import numpy as np
-from scipy.stats import qmc
+from scipy.stats import qmc, spearmanr
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+from sklearn.model_selection import KFold
 
 from .model_tuning_space import settings_from_unit_point as _settings_from_unit_point, unit_value_for_setting
 from .model_tuning_ranking import candidate_economic_sort_key
 
-PROBABILITY_MODEL = "gaussian_process_unified_exploration_trust_region_cei_v4"
+PROBABILITY_MODEL = "hybrid_gp_extra_trees_reliability_cei_v5"
 _METRIC_COUNT = 4
 _MONTE_CARLO_SCENARIOS = 512
+_EXTRA_TREES_ESTIMATORS = 256
+_SURROGATE_RELIABILITY_FLOOR = 0.05
 _TRUST_REGION_INITIAL = 0.20
 _TRUST_REGION_MIN = 0.04
 _TRUST_REGION_MAX = 0.40
@@ -560,6 +564,288 @@ def _fit_gaussian_processes(
             model.fit(x_train, y_train[:, metric_index])
         models.append(model)
     return models
+
+
+def _fit_extra_trees(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    seed: int,
+) -> ExtraTreesRegressor:
+    model = ExtraTreesRegressor(
+        n_estimators=_EXTRA_TREES_ESTIMATORS,
+        min_samples_leaf=2 if len(x_train) >= 10 else 1,
+        max_features=0.75,
+        bootstrap=False,
+        random_state=int(seed),
+        n_jobs=1,
+    )
+    model.fit(x_train, y_train)
+    return model
+
+
+def _extra_trees_distribution(
+    model: ExtraTreesRegressor,
+    x_pool: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    predictions = np.stack(
+        [np.asarray(tree.predict(x_pool), dtype=float) for tree in model.estimators_],
+        axis=0,
+    )
+    means = np.mean(predictions, axis=0)
+    stds = np.std(predictions, axis=0, ddof=0)
+    return means, np.maximum(stds, 1e-12)
+
+
+def _safe_spearman(actual: np.ndarray, predicted: np.ndarray) -> float:
+    actual_values = np.asarray(actual, dtype=float)
+    predicted_values = np.asarray(predicted, dtype=float)
+    if len(actual_values) < 3 or np.std(actual_values) <= 1e-12 or np.std(predicted_values) <= 1e-12:
+        return 0.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        value = float(spearmanr(actual_values, predicted_values).statistic)
+    return value if np.isfinite(value) else 0.0
+
+
+def _surrogate_cross_validated_reliability(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    observation_count = len(x_train)
+    if observation_count < 6:
+        equal = np.full(_METRIC_COUNT, 0.5, dtype=float)
+        return {
+            "gp_weight": equal,
+            "extra_trees_weight": equal,
+            "metric_reliability": np.zeros(_METRIC_COUNT, dtype=float),
+            "gp_spearman": np.zeros(_METRIC_COUNT, dtype=float),
+            "extra_trees_spearman": np.zeros(_METRIC_COUNT, dtype=float),
+            "gp_nrmse": np.full(_METRIC_COUNT, np.inf, dtype=float),
+            "extra_trees_nrmse": np.full(_METRIC_COUNT, np.inf, dtype=float),
+            "cv_rmse": np.std(y_train, axis=0, ddof=0),
+            "fold_count": 0,
+        }
+
+    split_count = min(5, max(3, observation_count // 3))
+    splitter = KFold(
+        n_splits=split_count,
+        shuffle=True,
+        random_state=int(seed),
+    )
+    gp_oof = np.zeros_like(y_train, dtype=float)
+    tree_oof = np.zeros_like(y_train, dtype=float)
+
+    for fold_index, (train_index, test_index) in enumerate(splitter.split(x_train), start=1):
+        fold_x_train = x_train[train_index]
+        fold_y_train = y_train[train_index]
+        fold_x_test = x_train[test_index]
+
+        gp_models = _fit_gaussian_processes(
+            fold_x_train,
+            fold_y_train,
+            seed=int(seed) + fold_index * 1009,
+        )
+        for metric_index, model in enumerate(gp_models):
+            gp_oof[test_index, metric_index] = model.predict(fold_x_test)
+
+        tree_model = _fit_extra_trees(
+            fold_x_train,
+            fold_y_train,
+            seed=int(seed) + fold_index * 2017,
+        )
+        tree_oof[test_index, :] = np.asarray(
+            tree_model.predict(fold_x_test),
+            dtype=float,
+        )
+
+    gp_spearman = np.zeros(_METRIC_COUNT, dtype=float)
+    tree_spearman = np.zeros(_METRIC_COUNT, dtype=float)
+    gp_nrmse = np.zeros(_METRIC_COUNT, dtype=float)
+    tree_nrmse = np.zeros(_METRIC_COUNT, dtype=float)
+    cv_rmse = np.zeros(_METRIC_COUNT, dtype=float)
+    gp_score = np.zeros(_METRIC_COUNT, dtype=float)
+    tree_score = np.zeros(_METRIC_COUNT, dtype=float)
+
+    for metric_index in range(_METRIC_COUNT):
+        actual = y_train[:, metric_index]
+        scale = max(float(np.std(actual, ddof=0)), 1e-12)
+        gp_error = float(np.sqrt(np.mean(np.square(gp_oof[:, metric_index] - actual))))
+        tree_error = float(np.sqrt(np.mean(np.square(tree_oof[:, metric_index] - actual))))
+        gp_spearman[metric_index] = _safe_spearman(actual, gp_oof[:, metric_index])
+        tree_spearman[metric_index] = _safe_spearman(actual, tree_oof[:, metric_index])
+        gp_nrmse[metric_index] = gp_error / scale
+        tree_nrmse[metric_index] = tree_error / scale
+        cv_rmse[metric_index] = min(gp_error, tree_error)
+
+        gp_score[metric_index] = (
+            max(0.0, gp_spearman[metric_index]) ** 2
+            / max(gp_nrmse[metric_index], 0.25) ** 2
+        )
+        tree_score[metric_index] = (
+            max(0.0, tree_spearman[metric_index]) ** 2
+            / max(tree_nrmse[metric_index], 0.25) ** 2
+        )
+
+    score_total = gp_score + tree_score
+    gp_weight = np.where(
+        score_total > 1e-12,
+        (gp_score + _SURROGATE_RELIABILITY_FLOOR)
+        / (score_total + 2.0 * _SURROGATE_RELIABILITY_FLOOR),
+        0.5,
+    )
+    tree_weight = 1.0 - gp_weight
+
+    best_spearman = np.maximum(gp_spearman, tree_spearman)
+    best_nrmse = np.minimum(gp_nrmse, tree_nrmse)
+    metric_reliability = np.clip(
+        np.maximum(best_spearman, 0.0)
+        / np.maximum(best_nrmse, 1.0),
+        0.0,
+        1.0,
+    )
+
+    return {
+        "gp_weight": gp_weight,
+        "extra_trees_weight": tree_weight,
+        "metric_reliability": metric_reliability,
+        "gp_spearman": gp_spearman,
+        "extra_trees_spearman": tree_spearman,
+        "gp_nrmse": gp_nrmse,
+        "extra_trees_nrmse": tree_nrmse,
+        "cv_rmse": cv_rmse,
+        "fold_count": int(split_count),
+    }
+
+
+def _hybrid_surrogate_distribution(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_pool: np.ndarray,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], np.ndarray, np.ndarray]:
+    gp_models = _fit_gaussian_processes(
+        x_train,
+        y_train,
+        seed=int(seed) + 31,
+    )
+    gp_means: list[np.ndarray] = []
+    gp_stds: list[np.ndarray] = []
+    for model in gp_models:
+        mean, std = model.predict(x_pool, return_std=True)
+        gp_means.append(np.asarray(mean, dtype=float))
+        gp_stds.append(np.maximum(np.asarray(std, dtype=float), 1e-12))
+    gp_mean_matrix = np.stack(gp_means, axis=1)
+    gp_std_matrix = np.stack(gp_stds, axis=1)
+
+    tree_model = _fit_extra_trees(
+        x_train,
+        y_train,
+        seed=int(seed) + 53,
+    )
+    tree_mean_matrix, tree_std_matrix = _extra_trees_distribution(
+        tree_model,
+        x_pool,
+    )
+    if tree_mean_matrix.ndim == 1:
+        tree_mean_matrix = tree_mean_matrix[:, None]
+        tree_std_matrix = tree_std_matrix[:, None]
+
+    reliability = _surrogate_cross_validated_reliability(
+        x_train,
+        y_train,
+        seed=int(seed) + 79,
+    )
+    gp_weight = np.asarray(reliability["gp_weight"], dtype=float)[None, :]
+    tree_weight = np.asarray(reliability["extra_trees_weight"], dtype=float)[None, :]
+
+    mean_matrix = gp_weight * gp_mean_matrix + tree_weight * tree_mean_matrix
+    variance = (
+        gp_weight
+        * (
+            np.square(gp_std_matrix)
+            + np.square(gp_mean_matrix - mean_matrix)
+        )
+        + tree_weight
+        * (
+            np.square(tree_std_matrix)
+            + np.square(tree_mean_matrix - mean_matrix)
+        )
+    )
+
+    metric_reliability = np.asarray(reliability["metric_reliability"], dtype=float)
+    cv_rmse = np.asarray(reliability["cv_rmse"], dtype=float)
+    uncertainty_penalty = (
+        np.square((1.0 - metric_reliability) * cv_rmse)
+    )[None, :]
+    std_matrix = np.sqrt(np.maximum(variance + uncertainty_penalty, 1e-24))
+
+    diagnostics = {
+        "fold_count": int(reliability["fold_count"]),
+        "gp_weight": np.asarray(reliability["gp_weight"], dtype=float),
+        "extra_trees_weight": np.asarray(reliability["extra_trees_weight"], dtype=float),
+        "metric_reliability": metric_reliability,
+        "gp_spearman": np.asarray(reliability["gp_spearman"], dtype=float),
+        "extra_trees_spearman": np.asarray(reliability["extra_trees_spearman"], dtype=float),
+        "gp_nrmse": np.asarray(reliability["gp_nrmse"], dtype=float),
+        "extra_trees_nrmse": np.asarray(reliability["extra_trees_nrmse"], dtype=float),
+        "cv_rmse": cv_rmse,
+    }
+    return (
+        mean_matrix,
+        std_matrix,
+        diagnostics,
+        gp_mean_matrix,
+        tree_mean_matrix,
+    )
+
+
+def _empirical_champion_pass_prior(document: dict[str, Any]) -> tuple[float, int, int]:
+    observations = [
+        item
+        for item in _all_completed_observations(document)
+        if not bool(item.get("is_control"))
+    ]
+    successes = sum(
+        1 for item in observations
+        if bool(item.get("champion_gate_passed"))
+    )
+    trials = len(observations)
+    # Beta(1,1) posterior mean prevents zero/one certainty from small campaigns.
+    prior = (successes + 1.0) / (trials + 2.0)
+    return float(prior), int(successes), int(trials)
+
+
+def _reliability_adjusted_acquisition(
+    raw_probability: np.ndarray,
+    raw_expected_improvement: np.ndarray,
+    stds: np.ndarray,
+    *,
+    thresholds: dict[str, float],
+    exploration_weight: float,
+    surrogate_reliability: float,
+    empirical_probability: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    reliability = max(0.0, min(float(surrogate_reliability), 1.0))
+    prior = max(0.0, min(float(empirical_probability), 1.0))
+    probability = reliability * raw_probability + (1.0 - reliability) * prior
+    expected_improvement = raw_expected_improvement * (0.25 + 0.75 * reliability)
+
+    effective_exploration_weight = min(
+        2.0,
+        max(0.0, float(exploration_weight)) * (1.0 + 2.0 * (1.0 - reliability)),
+    )
+    normalized_uncertainty = stds[:, 0] / thresholds["baseline_capital"]
+    feasibility_weight = 0.25 + 0.75 * probability
+    acquisition = (
+        expected_improvement
+        + effective_exploration_weight * normalized_uncertainty * feasibility_weight
+        + 0.02 * probability
+    )
+    return probability, expected_improvement, acquisition, effective_exploration_weight
 
 
 def _outcome_correlation(y_train: np.ndarray) -> np.ndarray:
