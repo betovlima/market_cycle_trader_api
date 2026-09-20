@@ -916,6 +916,13 @@ def _run_lightgbm(
     total_folds = len(folds)
     total_models = len(symbols)
     requested_device, lightgbm_device, device_probe_errors = _resolve_lightgbm_device(config)
+    horizon_voting = _horizon_voting_settings(config)
+    if bool(horizon_voting["enabled"]) and allocation_execution_enabled(config):
+        raise ValueError(
+            "Horizon voting v1 is intentionally limited to the single-position "
+            "rotation policy. Optimized allocation / compound risk overlay must "
+            "be evaluated in a separate experiment."
+        )
 
     def report(fraction: float, stage: str, completed: int) -> None:
         if progress_callback is not None:
@@ -1092,9 +1099,38 @@ def _run_lightgbm(
                 final_fit_dates,
                 rep_config,
                 phase=f"run_{run_index}_fold_{fold_position}_final",
-                progress_callback=phase_progress("final training", 0.50, 0.90),
+                progress_callback=phase_progress(
+                    "final training",
+                    0.50,
+                    0.78 if bool(horizon_voting["enabled"]) else 0.90,
+                ),
                 technical_log_callback=technical_log_callback,
             )
+            final_horizon_models: dict[int, dict[str, Any]] = {}
+            if bool(horizon_voting["enabled"]):
+                detail(
+                    run_index=run_index,
+                    run_count=repetitions,
+                    fold_index=fold_position,
+                    fold_count=total_folds,
+                    phase="Horizon voting training",
+                    trained_models=0,
+                    total_models=len(symbols) * len(horizon_voting["horizons"]),
+                    device=lightgbm_device.upper(),
+                )
+                final_horizon_models = _fit_horizon_voting_models(
+                    frames,
+                    symbols,
+                    final_fit_dates,
+                    rep_config,
+                    phase=f"run_{run_index}_fold_{fold_position}_horizon_vote",
+                    progress_callback=phase_progress(
+                        "horizon voting training",
+                        0.80,
+                        0.98,
+                    ),
+                    technical_log_callback=technical_log_callback,
+                )
             latest_final_models = final_models
             latest_final_fold_id = fold_id
             latest_final_fold_position = fold_position
@@ -1162,7 +1198,7 @@ def _run_lightgbm(
                     fold_id=fold_id,
                 )
             else:
-                policies[fold_id] = _utility_policy(
+                base_policy = _utility_policy(
                     final_models,
                     frames,
                     symbols,
@@ -1175,8 +1211,31 @@ def _run_lightgbm(
                     fold_id=fold_id,
                     calibrated_switch_margin=float(best_candidate),
                 )
+                policies[fold_id] = (
+                    _horizon_consensus_guard_policy(
+                        base_policy,
+                        final_horizon_models,
+                        frames,
+                        symbols,
+                        rep_config,
+                        decision_diagnostics=diagnostics,
+                    )
+                    if bool(horizon_voting["enabled"])
+                    else base_policy
+                )
             margin_detail = {
                 "fold_id": fold_id,
+                "horizon_voting_enabled": bool(horizon_voting["enabled"]),
+                "horizon_voting_mode": (
+                    str(horizon_voting["mode"])
+                    if bool(horizon_voting["enabled"])
+                    else None
+                ),
+                "horizon_voting_minimum_consensus_weight": (
+                    float(horizon_voting["minimum_consensus_weight"])
+                    if bool(horizon_voting["enabled"])
+                    else None
+                ),
                 "calibrated_candidate_margin": float(best_candidate),
                 "effective_switch_margin": float(effective_margin),
                 "calibration_risk_adjusted_score": float(best_score),
@@ -1297,6 +1356,8 @@ def _run_lightgbm(
         backend = "lightgbm_utility" if repetitions <= 1 else f"lightgbm_utility_seed_{seed}"
         result.backend = backend
         simulation_profile = result.metrics.get("simulation_profile") or {}
+        if bool(horizon_voting["enabled"]):
+            result.metrics.update(_horizon_voting_result_metrics(result))
         if technical_log_callback is not None:
             technical_log_callback(
                 "model=lightgbm event=oos_simulation_complete "
@@ -1355,7 +1416,8 @@ def _run_lightgbm(
                 "deterministic_execution": bool(rep_config.deterministic_execution),
                 "numeric_thread_limit": int(rep_config.numeric_thread_limit),
                 "decision_diagnostics_schema_version": (
-                    11 if compound_risk_overlay_enabled(rep_config)
+                    12 if bool(horizon_voting["enabled"])
+                    else 11 if compound_risk_overlay_enabled(rep_config)
                     else 10 if concentrated_allocation_enabled(rep_config)
                     else 9 if portfolio_allocation_enabled(rep_config)
                     else 8 if absolute_utility_cash_gate_enabled(rep_config)
