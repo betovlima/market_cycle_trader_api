@@ -64,7 +64,7 @@ from scripts.research_raw_split_unified_caro import (
 )
 
 
-DEFAULT_OUTPUT = "output/raw_split_optuna_tpe"
+DEFAULT_OUTPUT = "output/raw_split_optuna_tpe_control_warm_start"
 
 
 def _run_candidate(
@@ -90,9 +90,13 @@ def _run_candidate(
         raise RuntimeError(f"{label} returned no result.")
     result = results[0]
     metrics = _metrics(result, folds, float(config.initial_capital))
+    buy_hold = float(metrics.get("buy_hold_ending_capital") or 0.0)
+    ratio = metrics.get("strategy_vs_buy_hold_capital_ratio")
     print(
         f"[optuna] completed {label} "
         f"capital={metrics['ending_capital']:,.2f} "
+        f"buy_hold={buy_hold:,.2f} "
+        f"vs_buy_hold={(f'{float(ratio):.3f}x' if ratio is not None else 'n/a')} "
         f"sharpe={metrics['sharpe']:.4f} "
         f"maxdd={metrics['maximum_drawdown']:.4%} "
         f"worst_fold={metrics['worst_fold_return']:.4%}",
@@ -129,6 +133,8 @@ def main() -> int:
     parser.add_argument("--candidate-count", type=int, default=24)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--startup-trials", type=int, default=None)
+    parser.add_argument("--warm-start-count", type=int, default=6)
+    parser.add_argument("--warm-start-radius", type=float, default=0.06)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--include-dividend-features",
@@ -147,8 +153,12 @@ def main() -> int:
         )
     if int(args.candidate_count) < 4:
         raise ValueError("--candidate-count must be at least 4.")
-    if args.startup_trials is not None and int(args.startup_trials) < 4:
-        raise ValueError("--startup-trials must be at least 4.")
+    if args.startup_trials is not None and int(args.startup_trials) < 1:
+        raise ValueError("--startup-trials must be at least 1.")
+    if int(args.warm_start_count) < 0:
+        raise ValueError("--warm-start-count cannot be negative.")
+    if not 0.01 <= float(args.warm_start_radius) <= 0.25:
+        raise ValueError("--warm-start-radius must be between 0.01 and 0.25.")
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -310,6 +320,8 @@ def main() -> int:
                     if args.startup_trials is not None
                     else None
                 ),
+                warm_start_count=int(args.warm_start_count),
+                warm_start_radius=float(args.warm_start_radius),
             )
         )
 
@@ -331,10 +343,11 @@ def main() -> int:
             },
         }
 
-        resolved_startup_trials = int(
+        resolved_startup_trials = max(
             int(args.startup_trials)
             if args.startup_trials is not None
-            else default_startup_trials(_SEARCH_SPACE)
+            else int(args.warm_start_count) + 1,
+            int(args.warm_start_count) + 1,
         )
 
         checkpoint: dict[str, Any] = {
@@ -362,6 +375,9 @@ def main() -> int:
             "candidate_count": int(args.candidate_count),
             "seed": int(args.seed),
             "startup_trials": resolved_startup_trials,
+            "warm_start_count": int(args.warm_start_count),
+            "warm_start_radius": float(args.warm_start_radius),
+            "warm_start_mode": "control_centered_latin_hypercube",
             "fixed_optimizer_constraints": fixed_constraint_thresholds,
             "champion_gate": deepcopy(
                 gate_document["probability_config"]
@@ -381,10 +397,16 @@ def main() -> int:
                 optuna_search_space,
             )
             candidate_id = int(trial.number)
+            proposal_kind = str(
+                trial.user_attrs.get("kind") or "optuna_tpe"
+            )
 
             config = _candidate_config(base_config, settings)
             result, metrics = _run_candidate(
-                label=f"CANDIDATE_{candidate_id}_OPTUNA_TPE",
+                label=(
+                    f"CANDIDATE_{candidate_id}_"
+                    f"{proposal_kind.upper()}"
+                ),
                 frames=frames,
                 config=config,
                 folds=folds,
@@ -419,7 +441,7 @@ def main() -> int:
             candidate_payload = {
                 "candidate_id": candidate_id,
                 "iteration": iteration,
-                "kind": "optuna_tpe",
+                "kind": proposal_kind,
                 "optuna_trial_number": int(trial.number),
                 "settings": deepcopy(settings),
                 "metrics": deepcopy(metrics),
@@ -485,6 +507,24 @@ def main() -> int:
                     "worst_fold_return": metrics[
                         "worst_fold_return"
                     ],
+                    "buy_hold_ending_capital": metrics.get(
+                        "buy_hold_ending_capital"
+                    ),
+                    "buy_hold_return": metrics.get("buy_hold_return"),
+                    "buy_hold_cagr": metrics.get("buy_hold_cagr"),
+                    "buy_hold_sharpe": metrics.get("buy_hold_sharpe"),
+                    "buy_hold_maximum_drawdown": metrics.get(
+                        "buy_hold_maximum_drawdown"
+                    ),
+                    "strategy_vs_buy_hold_capital_ratio": metrics.get(
+                        "strategy_vs_buy_hold_capital_ratio"
+                    ),
+                    "strategy_vs_buy_hold_excess_capital": metrics.get(
+                        "strategy_vs_buy_hold_excess_capital"
+                    ),
+                    "strategy_vs_buy_hold_excess_return": metrics.get(
+                        "strategy_vs_buy_hold_excess_return"
+                    ),
                     "constraint_sharpe": constraints.get("sharpe"),
                     "constraint_maximum_drawdown": constraints.get(
                         "maximum_drawdown"
@@ -591,6 +631,38 @@ def main() -> int:
             index=False,
         )
 
+        comparison_rows = []
+        for label, metrics in (
+            ("CONTROL", baseline_metrics),
+            ("CHAMPION", champion_metrics),
+        ):
+            comparison_rows.append(
+                {
+                    "portfolio": label,
+                    "benchmark_name": metrics.get("benchmark_name"),
+                    "strategy_ending_capital": metrics.get("ending_capital"),
+                    "buy_hold_ending_capital": metrics.get("buy_hold_ending_capital"),
+                    "strategy_return": metrics.get("strategy_return"),
+                    "buy_hold_return": metrics.get("buy_hold_return"),
+                    "strategy_cagr": metrics.get("cagr"),
+                    "buy_hold_cagr": metrics.get("buy_hold_cagr"),
+                    "strategy_sharpe": metrics.get("sharpe"),
+                    "buy_hold_sharpe": metrics.get("buy_hold_sharpe"),
+                    "strategy_maximum_drawdown": metrics.get("maximum_drawdown"),
+                    "buy_hold_maximum_drawdown": metrics.get("buy_hold_maximum_drawdown"),
+                    "capital_ratio_strategy_vs_buy_hold": metrics.get("strategy_vs_buy_hold_capital_ratio"),
+                    "excess_capital": metrics.get("strategy_vs_buy_hold_excess_capital"),
+                    "excess_return": metrics.get("strategy_vs_buy_hold_excess_return"),
+                    "cagr_spread": metrics.get("strategy_vs_buy_hold_cagr_spread"),
+                    "sharpe_spread": metrics.get("strategy_vs_buy_hold_sharpe_spread"),
+                    "drawdown_spread": metrics.get("strategy_vs_buy_hold_drawdown_spread"),
+                }
+            )
+        pd.DataFrame(comparison_rows).to_csv(
+            output_dir / "buy_hold_comparison.csv",
+            index=False,
+        )
+
         summary = {
             "schema_version": 1,
             "api_version": "10.8.70",
@@ -633,6 +705,9 @@ def main() -> int:
                     "group": True,
                     "constant_liar": False,
                     "startup_trials": resolved_startup_trials,
+                    "warm_start_count": int(args.warm_start_count),
+                    "warm_start_radius": float(args.warm_start_radius),
+                    "warm_start_mode": "control_centered_latin_hypercube",
                 },
                 "objective": "maximize ending_capital",
                 "optimizer_constraints": {
@@ -655,6 +730,10 @@ def main() -> int:
                 "same_candidate_budget_as_v10_8_69": (
                     int(args.candidate_count) == 24
                 ),
+                "startup_strategy": (
+                    "certified Control + local deterministic warm start "
+                    "before TPE adaptation"
+                ),
                 "oos_used_for_optimizer": False,
                 "predictive_diagnostics_role": (
                     "informative_only"
@@ -664,6 +743,29 @@ def main() -> int:
             "champion_candidate_id": champion_candidate_id,
             "champion_metrics": champion_metrics,
             "champion_settings": champion_settings,
+            "buy_hold_comparison": {
+                "benchmark_name": baseline_metrics.get("benchmark_name"),
+                "benchmark_method": (
+                    "equal-weight initial purchase across continuously "
+                    "available assets; no rebalancing; final liquidation"
+                ),
+                "control": {
+                    "strategy_ending_capital": baseline_metrics.get("ending_capital"),
+                    "buy_hold_ending_capital": baseline_metrics.get("buy_hold_ending_capital"),
+                    "capital_ratio": baseline_metrics.get("strategy_vs_buy_hold_capital_ratio"),
+                    "excess_capital": baseline_metrics.get("strategy_vs_buy_hold_excess_capital"),
+                    "excess_return": baseline_metrics.get("strategy_vs_buy_hold_excess_return"),
+                    "cagr_spread": baseline_metrics.get("strategy_vs_buy_hold_cagr_spread"),
+                },
+                "champion": {
+                    "strategy_ending_capital": champion_metrics.get("ending_capital"),
+                    "buy_hold_ending_capital": champion_metrics.get("buy_hold_ending_capital"),
+                    "capital_ratio": champion_metrics.get("strategy_vs_buy_hold_capital_ratio"),
+                    "excess_capital": champion_metrics.get("strategy_vs_buy_hold_excess_capital"),
+                    "excess_return": champion_metrics.get("strategy_vs_buy_hold_excess_return"),
+                    "cagr_spread": champion_metrics.get("strategy_vs_buy_hold_cagr_spread"),
+                },
+            },
             "optuna_study": optuna_study_diagnostics(study),
         }
         _checkpoint(output_dir / "summary.json", summary)
