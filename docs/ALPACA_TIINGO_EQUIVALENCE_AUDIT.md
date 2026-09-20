@@ -1053,3 +1053,185 @@ python scripts/research_raw_split_horizon_voting.py \
 The first question is deliberately narrow:
 
 > Does independent agreement across forecast horizons improve OOS capital and/or robustness relative to the exact current Control?
+
+
+## Soft multi-horizon rank consensus + batched OOS inference (API v10.8.74)
+
+API v10.8.74 follows the negative v10.8.73 hard-voting result.
+
+The hard-voting experiment showed that exact ticker agreement across horizons is too restrictive for a 55-asset universe. It changed approximately 36.6% of base actions, reduced trading activity by roughly 69%, and materially reduced ending capital. It also showed that CASH never won the horizon vote, because choosing the maximum predicted utility across many assets makes a simple CASH=0 comparison unsuitable.
+
+v10.8.74 therefore changes both the statistical representation of consensus and the OOS inference implementation.
+
+### Soft rank consensus
+
+Each horizon still has an independent LightGBM model trained on:
+
+```text
+forward_horizon_utility_5
+forward_horizon_utility_10
+forward_horizon_utility_20
+forward_horizon_utility_40
+forward_horizon_utility_60
+```
+
+But horizons no longer emit a one-hot ticker vote.
+
+For every decision date and horizon:
+
+1. all finite assets are ranked by predicted horizon utility;
+2. rank is converted to a percentile-like score in [0,1];
+3. top asset receives 1.0 and the last ranked asset receives 0.0;
+4. scores are aggregated with the existing horizon weights.
+
+With the canonical profile:
+
+```text
+5d  = 0.10
+10d = 0.15
+20d = 0.20
+40d = 0.30
+60d = 0.25
+```
+
+This preserves information such as an asset being consistently second or third across horizons even when it rarely wins an exact ticker vote.
+
+### CASH is not part of the consensus vote
+
+The existing base MCT policy remains solely responsible for CASH.
+
+If the base policy chooses CASH, the soft-consensus layer always preserves CASH.
+
+The horizon rank layer cannot:
+- force CASH;
+- block a base CASH decision;
+- choose a different asset.
+
+This removes the multiple-comparison problem observed in v10.8.73.
+
+### Continuous switch-margin modifier
+
+The base weighted-utility model remains the only layer that selects the candidate asset.
+
+For a proposed asset switch, the soft layer computes:
+
+```text
+base_target_rank_score
+current_asset_rank_score
+relative_rank_component
+soft_support
+```
+
+The existing calibrated switch margin is then multiplied by:
+
+```text
+margin_multiplier =
+    1 + penalty_strength * (1 - soft_support)
+```
+
+Default:
+
+```text
+penalty_strength = 1.0
+```
+
+Therefore:
+- support = 1.0 -> existing margin unchanged;
+- support = 0.75 -> margin becomes 1.25x;
+- support = 0.50 -> margin becomes 1.50x;
+- support = 0.00 -> margin becomes 2.00x.
+
+There is no exact majority threshold.
+
+A strong base-model utility gap can still execute even when horizons disagree. Only marginal rotations are increasingly filtered as consensus weakens.
+
+### Batched deterministic-equivalent OOS inference
+
+Profiling in v10.8.73 showed that approximately 98-99% of the silent OOS replay time was policy/model inference.
+
+The old replay performed approximately:
+
+```text
+decision date
+    x asset
+    x model set
+    -> model.predict(one row)
+```
+
+v10.8.74 precomputes predictions by fold and model set:
+
+```text
+one model
+    -> predict(all valid OOS rows for that fold)
+    -> cache by timestamp
+```
+
+The policy then performs only cache lookups during replay.
+
+The cache preserves the same validity rules as scalar inference:
+- feature row must be complete;
+- next session must exist;
+- next open and close must be finite and positive.
+
+No future information is added. The cache contains predictions only from the fold-specific model already trained before that fold.
+
+The implementation persists:
+- cache build seconds;
+- cached session count;
+- symbol count;
+- number of LightGBM predict calls;
+- predicted row count;
+- model role and fold.
+
+Tests compare cached and scalar utility vectors at zero relative tolerance with a tiny floating absolute tolerance.
+
+### Focused A/B
+
+The experiment remains intentionally small:
+
+```text
+A: CONTROL
+B: CONTROL + SOFT_HORIZON_CONSENSUS
+```
+
+No Optuna tuning is used.
+
+Both variants use:
+- the same frozen RAW + locally split-normalized data;
+- the same eligible universe;
+- the same folds and purge;
+- the same LightGBM settings;
+- the same transaction costs;
+- the same buy-and-hold benchmark.
+
+The Control also uses batched OOS inference, so the economic comparison is not confounded by different replay implementations.
+
+### Outputs
+
+```text
+output/raw_split_soft_horizon_consensus/
+  summary.json
+  strategy_comparison.csv
+  soft_horizon_consensus_decisions.csv
+  control_predictions.csv
+  control_trades.csv
+  soft_horizon_consensus_predictions.csv
+  soft_horizon_consensus_trades.csv
+  data_diagnostics.csv
+  excluded_assets.csv
+```
+
+### Run
+
+```bash
+python scripts/research_raw_split_soft_horizon_consensus.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --penalty-strength 1.0
+```
+
+Primary questions:
+
+1. Does the exact Control remain economically identical under batched inference?
+2. How much does OOS replay time fall relative to v10.8.73?
+3. Does soft rank support filter only marginal rotations rather than suppressing rotation broadly?
+4. Does the challenger improve capital and/or robustness while retaining the strategy's rotation edge?
