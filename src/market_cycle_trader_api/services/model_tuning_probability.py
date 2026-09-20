@@ -21,6 +21,8 @@ _METRIC_COUNT = 4
 _MONTE_CARLO_SCENARIOS = 512
 _EXTRA_TREES_ESTIMATORS = 256
 _SURROGATE_RELIABILITY_FLOOR = 0.05
+_TREE_DOMINANT_MIN_WEIGHT = 0.80
+_GP_OVERRIDE_SKILL_RATIO = 1.25
 _TRUST_REGION_INITIAL = 0.20
 _TRUST_REGION_MIN = 0.04
 _TRUST_REGION_MAX = 0.40
@@ -713,6 +715,25 @@ def _surrogate_cross_validated_reliability(
                 best_tuple = candidate_tuple
                 best_tree_weight = float(candidate_tree_weight)
                 best_prediction = prediction
+
+        gp_skill = max(0.0, gp_spearman[metric_index]) / max(gp_nrmse[metric_index], 0.25)
+        tree_skill = max(0.0, tree_spearman[metric_index]) / max(tree_nrmse[metric_index], 0.25)
+        gp_materially_better = bool(
+            gp_spearman[metric_index] >= 0.25
+            and gp_nrmse[metric_index] <= 1.0
+            and gp_skill >= _GP_OVERRIDE_SKILL_RATIO * max(tree_skill, 1e-12)
+        )
+
+        # The economic objective is known to be non-smooth because small
+        # hyperparameter changes can alter the selected asset and entire capital
+        # path. Extra Trees therefore receives a structural prior. GP can take
+        # more influence only after demonstrating materially better OOF skill.
+        if not gp_materially_better:
+            best_tree_weight = max(best_tree_weight, _TREE_DOMINANT_MIN_WEIGHT)
+            best_prediction = (
+                (1.0 - best_tree_weight) * gp_oof[:, metric_index]
+                + best_tree_weight * tree_oof[:, metric_index]
+            )
 
         tree_weight[metric_index] = best_tree_weight
         gp_weight[metric_index] = 1.0 - best_tree_weight
