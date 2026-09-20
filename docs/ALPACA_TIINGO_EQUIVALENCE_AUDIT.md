@@ -814,3 +814,98 @@ output/raw_split_optuna_tpe/
 The comparison question is intentionally narrow:
 
 > With the same frozen MCT experiment and the same candidate budget, can a specialized optimization library find a Control-beating or similarly strong region with less custom optimizer logic than Unified CARO?
+
+
+## Control-centered Optuna + OOS profiling + buy-and-hold reporting (API v10.8.71)
+
+API v10.8.71 supersedes the interrupted v10.8.70 run. It addresses three issues observed during that campaign.
+
+### 1. Control-centered Optuna warm start
+
+The certified Control remains trial 0. Instead of spending the initial budget on globally scattered startup trials, the next six trials are deterministic Latin-Hypercube perturbations around the Control in normalized parameter space.
+
+Defaults:
+
+```text
+warm_start_count = 6
+warm_start_radius = 0.06
+seed = 42
+```
+
+The radius applies after each parameter is mapped to [0,1], including logarithmic dimensions such as `min_child_weight`. Structural LightGBM constraints such as `num_leaves <= 2^max_depth` are preserved by the existing tuning-space mapper.
+
+After the Control plus the six local warm-start trials are complete, TPE becomes adaptive. This keeps the optimizer anchored around the already strong incumbent while still allowing later exploration.
+
+The goal is not to forbid global search; it is to avoid spending most of a 24-candidate budget proving again that distant regions are poor.
+
+### 2. Granular OOS simulation progress and profiling
+
+The old progress gap around 87.7% was caused by a silent full out-of-sample portfolio replay after final training.
+
+The simulators now emit granular progress through:
+- buy-and-hold benchmark construction;
+- market-regime diagnostics;
+- chronological OOS replay;
+- completion.
+
+They also persist:
+
+```text
+simulation_benchmark_seconds
+simulation_market_regime_seconds
+simulation_policy_seconds
+simulation_accounting_seconds
+simulation_total_seconds
+simulation_session_count
+```
+
+This allows later performance optimization to target the measured hotspot rather than changing deterministic calculations speculatively.
+
+### 3. Buy-and-hold remains a first-class benchmark
+
+The benchmark already implemented by MCT is a true equal-weight buy-and-hold across assets with complete prices for the OOS execution window:
+
+```text
+initial capital
+    -> one purchase at first execution open
+    -> fixed quantities, no periodic rebalance
+    -> final liquidation at the last close
+```
+
+The same fee and slippage functions are applied to the initial purchases and final liquidation.
+
+The research outputs now surface, for Control, every candidate, and Champion:
+
+- buy-and-hold ending capital;
+- buy-and-hold total return;
+- buy-and-hold CAGR;
+- buy-and-hold Sharpe;
+- buy-and-hold maximum drawdown;
+- strategy / buy-and-hold capital ratio;
+- excess capital;
+- excess return;
+- CAGR spread;
+- Sharpe spread;
+- drawdown spread.
+
+Per-fold research already records `benchmark_return` and `excess_return`; v10.8.71 keeps these and adds the full-study comparison explicitly.
+
+A dedicated artifact is written:
+
+```text
+output/raw_split_optuna_tpe_control_warm_start/buy_hold_comparison.csv
+```
+
+### Run
+
+Stop the older campaign before switching branches. Then run:
+
+```bash
+python scripts/research_raw_split_optuna_tpe.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 24 \
+  --warm-start-count 6 \
+  --warm-start-radius 0.06
+```
+
+The previous v10.8.70 output directory is intentionally not reused.
