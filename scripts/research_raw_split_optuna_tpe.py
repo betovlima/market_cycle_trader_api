@@ -352,8 +352,8 @@ def main() -> int:
 
         checkpoint: dict[str, Any] = {
             "schema_version": 1,
-            "api_version": "10.8.71",
-            "experiment": "raw-split-optuna-tpe-control-warm-start-v2",
+            "api_version": "10.8.72",
+            "experiment": "raw-split-optuna-tpe-control-warm-start-v3",
             "optimizer": OPTUNA_TPE_MODEL,
             "optuna_version": str(optuna.__version__),
             "optuna_constraint_api": (
@@ -665,8 +665,8 @@ def main() -> int:
 
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.71",
-            "experiment": "raw-split-optuna-tpe-control-warm-start-v2",
+            "api_version": "10.8.72",
+            "experiment": "raw-split-optuna-tpe-control-warm-start-v3",
             "optimizer": OPTUNA_TPE_MODEL,
             "optuna_version": str(optuna.__version__),
             "optuna_constraint_api": (
