@@ -93,7 +93,7 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 17
+TUNING_SCHEMA_VERSION = 18
 DEFAULT_CANDIDATE_COUNT = 24
 DEFAULT_SEED = 42
 TECHNICAL_RESEARCH_SEGMENT_MAX = 2000
@@ -133,9 +133,9 @@ _SEARCH_SPACE: tuple[dict[str, Any], ...] = (
     {"name": "max_depth", "type": "integer", "min": 2, "max": 4},
     {"name": "num_leaves", "type": "integer", "min": 4, "max": 12},
     {"name": "min_child_samples", "type": "integer", "min": 15, "max": 30},
-    {"name": "min_child_weight", "type": "number", "min": 0.0001, "max": 0.0500, "precision": 6},
+    {"name": "min_child_weight", "type": "number", "min": 0.001, "max": 10.0, "precision": 6, "scale": "log"},
     {"name": "subsample", "type": "number", "min": 0.65, "max": 1.00, "precision": 6},
-    {"name": "subsample_freq", "type": "integer", "min": 1, "max": 5},
+    {"name": "subsample_freq", "type": "integer", "min": 0, "max": 5},
     {"name": "colsample_bytree", "type": "number", "min": 0.75, "max": 0.95, "precision": 6},
     {"name": "reg_alpha", "type": "number", "min": 0.0, "max": 0.50, "precision": 6},
     {"name": "reg_lambda", "type": "number", "min": 1.0, "max": 4.0, "precision": 6},
