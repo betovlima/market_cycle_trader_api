@@ -172,7 +172,7 @@ def test_dynamic_num_leaves_respects_max_depth() -> None:
         seed=7,
     )
 
-    for _ in range(6):
+    for _ in range(12):
         trial, settings = ask_optuna_candidate(study, active_space)
         assert int(settings["num_leaves"]) <= 2 ** int(settings["max_depth"])
         metrics = {
