@@ -686,3 +686,131 @@ python scripts/research_raw_split_unified_caro.py \
   --job-id 20260918T234903-52bd06f3 \
   --candidate-count 24
 ```
+
+
+## Optuna TPE library baseline (API v10.8.70)
+
+API v10.8.70 adds a deliberately simpler optimizer baseline for comparison with the custom Unified CARO implementation.
+
+The experiment keeps the MCT research methodology fixed:
+
+```text
+same frozen RAW snapshot
+same local split reconstruction
+same structural identity exclusions
+same LightGBM full-fit behavior
+same 3 research folds
+same Control
+same Champion gate
+same 11-parameter search domain
+same seed
+same 24-candidate budget
+```
+
+Only the hyperparameter proposal engine changes.
+
+### Optimizer
+
+The baseline uses Optuna 5 `TPESampler` with:
+
+```text
+seed = fixed
+direction = maximize ending_capital
+multivariate = true
+group = true
+constant_liar = false
+execution = sequential ask/tell
+```
+
+Sequential ask/tell is intentional. Candidate training can still use the configured LightGBM GPU, but optimizer proposals are generated one at a time so that the seeded experiment remains reproducible.
+
+The Control is inserted into the Optuna study as completed trial 0 with its actual ending capital. Therefore TPE starts with the same strong reference that Unified CARO receives.
+
+### Dynamic structural search domain
+
+The Optuna adapter preserves the LightGBM structural rule:
+
+```text
+num_leaves <= 2 ** max_depth
+```
+
+This is represented as a dynamic Optuna search space rather than by sampling an invalid point and modifying it afterward.
+
+`TPESampler(multivariate=True, group=True)` is used specifically so Optuna can model this decomposed dynamic space.
+
+`min_child_weight` keeps the corrected v10.8.68 domain:
+
+```text
+0.001 .. 10.0
+log scale
+```
+
+### Objective and constraints
+
+Optuna receives one optimization objective:
+
+```text
+maximize ending_capital
+```
+
+Robustness is represented through fixed Control-relative feasibility constraints:
+
+```text
+Sharpe >= Control Sharpe - 0.05
+MaxDD  >= Control MaxDD  - 0.03
+Worst Fold Return >= 0
+```
+
+These constraints guide TPE search only. They do not replace MCT promotion governance.
+
+The existing dynamic MCT Champion gate remains authoritative. When a candidate passes the gate, it becomes the new MCT anchor and subsequent promotions must beat that Champion.
+
+This separation avoids implementing a custom scalar penalty function merely to make Optuna understand risk.
+
+### Startup phase
+
+By default the TPE startup count is:
+
+```text
+max(10, search_dimensions + 1)
+```
+
+For the current 11-dimensional LightGBM search this is 12 completed study trials. Because the Control is preloaded as trial 0, the fresh campaign normally evaluates 11 startup candidates before TPE begins adaptive proposals.
+
+### Dependency
+
+```text
+optuna>=5.0,<6
+```
+
+The v10.8.70 implementation uses the Optuna 5 trial-constraint API rather than the older deprecated `constraints_func` sampler callback.
+
+### Run after v10.8.69 completes
+
+```bash
+python scripts/research_raw_split_optuna_tpe.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 24
+```
+
+Outputs are isolated from CARO:
+
+```text
+output/raw_split_optuna_tpe/
+  summary.json
+  campaign_checkpoint.json
+  candidates.csv
+  data_diagnostics.csv
+  excluded_assets.csv
+  control_predictions.csv
+  control_trades.csv
+  champion_predictions.csv
+  champion_trades.csv
+  control_model_diagnostics.json
+  champion_model_diagnostics.json
+  feature_importance_gain.csv
+```
+
+The comparison question is intentionally narrow:
+
+> With the same frozen MCT experiment and the same candidate budget, can a specialized optimization library find a Control-beating or similarly strong region with less custom optimizer logic than Unified CARO?
