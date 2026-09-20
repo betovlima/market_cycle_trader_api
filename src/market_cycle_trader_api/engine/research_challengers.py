@@ -722,6 +722,7 @@ def _run_lightgbm(
         cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
+        model_fold_diagnostics: list[dict[str, Any]] = []
         latest_final_models: dict[str, Any] = {}
         latest_final_fold_id: int | None = None
         latest_final_fold_position: int | None = None
@@ -858,6 +859,12 @@ def _run_lightgbm(
                 phase=f"run_{run_index}_fold_{fold_position}_final",
                 progress_callback=phase_progress("final training", 0.50, 0.90),
                 technical_log_callback=technical_log_callback,
+            )
+            model_fold_diagnostics.append(
+                _aggregate_lightgbm_model_diagnostics(
+                    final_models,
+                    fold_id=fold_id,
+                )
             )
             latest_final_models = final_models
             latest_final_fold_id = fold_id
@@ -1064,6 +1071,9 @@ def _run_lightgbm(
                 train_end=latest_final_train_end,
             )
 
+        predictive_diagnostics = _aggregate_lightgbm_fold_diagnostics(
+            model_fold_diagnostics
+        )
         result.metrics.update(
             {
                 "backend": backend,
@@ -1096,6 +1106,10 @@ def _run_lightgbm(
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
+                "lightgbm_early_stopping_enabled": bool(_lightgbm_settings(rep_config).get("early_stopping_enabled", True)),
+                "lightgbm_early_stopping_rounds": int(_lightgbm_settings(rep_config).get("early_stopping_rounds", 30)),
+                "lightgbm_fold_diagnostics": model_fold_diagnostics,
+                "lightgbm_predictive_diagnostics": predictive_diagnostics,
                 "latest_research_tree": latest_tree,
             }
         )
