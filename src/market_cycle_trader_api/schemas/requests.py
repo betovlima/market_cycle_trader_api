@@ -17,7 +17,7 @@ AlpacaHistoricalFeed = Literal["sip", "iex"]
 AlpacaLiveFeed = Literal["iex", "sip"]
 AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
 HistoryBackfillProvider = Literal["alpaca", "tiingo"]
-ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only"]
+ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only", "standalone_snapshot"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
 
