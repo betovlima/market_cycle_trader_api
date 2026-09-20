@@ -1557,7 +1557,11 @@ def _run_lightgbm(
                     run_count=repetitions,
                     fold_index=fold_position,
                     fold_count=total_folds,
-                    phase="Horizon voting training",
+                    phase=(
+                        "Soft horizon consensus training"
+                        if bool(soft_horizon_consensus["enabled"])
+                        else "Horizon voting training"
+                    ),
                     trained_models=0,
                     total_models=len(symbols) * len(horizon_voting["horizons"]),
                     device=lightgbm_device.upper(),
@@ -1569,7 +1573,11 @@ def _run_lightgbm(
                     rep_config,
                     phase=f"run_{run_index}_fold_{fold_position}_horizon_vote",
                     progress_callback=phase_progress(
-                        "horizon voting training",
+                        (
+                            "soft horizon consensus training"
+                            if bool(soft_horizon_consensus["enabled"])
+                            else "horizon voting training"
+                        ),
                         0.80,
                         0.98,
                     ),
