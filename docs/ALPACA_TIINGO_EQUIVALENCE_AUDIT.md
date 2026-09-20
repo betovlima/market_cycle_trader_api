@@ -510,3 +510,67 @@ python scripts/research_raw_split_unified_caro.py \
 GPU behavior from API v10.8.66 is preserved. The result continues to report `requested_compute_device`, `effective_compute_device`, and GPU probe errors.
 
 The course material motivates early stopping, MAE/RMSE regression diagnostics, regularization/tuning sensitivity, and feature importance. Random Forest and stacking remain separate future research hypotheses and are intentionally not mixed into this calibration campaign.
+
+
+## Diagnostic-only validation + log-scaled child weight (API v10.8.68)
+
+The v10.8.67 campaign showed that per-asset RMSE early stopping was not aligned with the portfolio's economic cross-asset ranking objective. It also exposed a search-space defect: the existing Control used `min_child_weight=5.0`, while the v10.8.67 CARO domain stopped at `0.05`.
+
+API v10.8.68 corrects both issues.
+
+### Full LightGBM fit restored
+
+LightGBM once again trains on the complete chronological training window using the configured `n_estimators`.
+
+```text
+chronological TRAIN
+        |
+        +-- full LightGBM fit
+        |
+        +-- existing CALIBRATION window
+                 |
+                 +-- MAE/RMSE diagnostics only
+                 +-- switch-margin calibration
+                 +-- never truncates tree construction
+```
+
+There is no RMSE-based early stopping in the economic ranking model. The OOS region remains untouched.
+
+Predictive diagnostics remain available:
+- training MAE/RMSE from the calibration-training models;
+- validation MAE/RMSE on the already existing chronological calibration window;
+- RMSE generalization gap;
+- gain-based feature importance;
+- configured/effective estimator count.
+
+These metrics are informative only and do not enter the Champion gate.
+
+### Corrected CARO domain
+
+`min_child_weight` now uses a logarithmic domain:
+
+```text
+0.001 .. 10.0  (log scale)
+```
+
+This contains the existing Control value `5.0` and gives the Gaussian-process surrogate a meaningful distance around it instead of clipping the Control onto an artificial boundary.
+
+`subsample_freq` now spans:
+
+```text
+0 .. 5
+```
+
+so a historical Control with bagging disabled (`0`) is represented exactly. The RAW+split campaign no longer forces `subsample_freq=1`.
+
+The tuning-space mapper and Unified CARO normalization both understand `scale="log"`, so Latin-Hypercube / space-filling proposals and Gaussian-process observations use the same geometry.
+
+### Run
+
+```bash
+python scripts/research_raw_split_unified_caro.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 24
+```
+
+The expected Control should again reflect full-fit LightGBM behavior rather than the v10.8.67 RMSE-truncated trees. The exact capital must be observed from the frozen execution rather than hard-coded.
