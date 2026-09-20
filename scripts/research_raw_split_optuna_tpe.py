@@ -342,6 +342,12 @@ def main() -> int:
             "api_version": "10.8.70",
             "experiment": "raw-split-optuna-tpe-v1",
             "optimizer": OPTUNA_TPE_MODEL,
+            "optuna_version": str(optuna.__version__),
+            "optuna_constraint_api": (
+                "native_trial_constraints"
+                if hasattr(optuna.trial.Trial, "set_constraint")
+                else "legacy_constraints_func"
+            ),
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(
@@ -590,6 +596,12 @@ def main() -> int:
             "api_version": "10.8.70",
             "experiment": "raw-split-optuna-tpe-v1",
             "optimizer": OPTUNA_TPE_MODEL,
+            "optuna_version": str(optuna.__version__),
+            "optuna_constraint_api": (
+                "native_trial_constraints"
+                if hasattr(optuna.trial.Trial, "set_constraint")
+                else "legacy_constraints_func"
+            ),
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(
