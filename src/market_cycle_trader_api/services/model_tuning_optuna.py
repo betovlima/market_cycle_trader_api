@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any, Sequence
+import warnings
 
 import optuna
 from optuna.distributions import FloatDistribution, IntDistribution
@@ -168,6 +169,7 @@ def constraint_violations(
         "worst_fold_return": (
             float(thresholds["worst_fold_return"])
             - float(worst_fold if worst_fold is not None else float("-inf"))
+            + 1e-12
         ),
     }
 
@@ -211,7 +213,17 @@ def create_optuna_tpe_study(
     if not _native_constraint_api_available():
         sampler_kwargs["constraints_func"] = _legacy_constraints_func
 
-    sampler = optuna.samplers.TPESampler(**sampler_kwargs)
+    with warnings.catch_warnings():
+        experimental_warning = getattr(
+            optuna.exceptions,
+            "ExperimentalWarning",
+            Warning,
+        )
+        warnings.simplefilter(
+            "ignore",
+            experimental_warning,
+        )
+        sampler = optuna.samplers.TPESampler(**sampler_kwargs)
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
