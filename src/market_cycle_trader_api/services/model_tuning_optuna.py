@@ -15,6 +15,12 @@ DEFAULT_DRAWDOWN_TOLERANCE = 0.03
 DEFAULT_MIN_WORST_FOLD_RETURN = 0.0
 
 
+def default_startup_trials(
+    search_space: Sequence[dict[str, Any]],
+) -> int:
+    return max(10, min(24, len(list(search_space)) + 1))
+
+
 def optuna_distributions(
     search_space: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -87,7 +93,7 @@ def create_optuna_tpe_study(
     resolved_startup_trials = int(
         startup_trials
         if startup_trials is not None
-        else max(10, min(24, len(distributions) + 1))
+        else default_startup_trials(search_space)
     )
 
     sampler = optuna.samplers.TPESampler(
