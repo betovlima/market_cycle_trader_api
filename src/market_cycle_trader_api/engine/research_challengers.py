@@ -1351,9 +1351,18 @@ def _run_lightgbm(
     total_models = len(symbols)
     requested_device, lightgbm_device, device_probe_errors = _resolve_lightgbm_device(config)
     horizon_voting = _horizon_voting_settings(config)
-    if bool(horizon_voting["enabled"]) and allocation_execution_enabled(config):
+    soft_horizon_consensus = _soft_horizon_consensus_settings(config)
+    if bool(horizon_voting["enabled"]) and bool(soft_horizon_consensus["enabled"]):
         raise ValueError(
-            "Horizon voting v1 is intentionally limited to the single-position "
+            "Hard horizon voting and soft horizon consensus are mutually exclusive "
+            "research modes."
+        )
+    horizon_models_enabled = bool(
+        horizon_voting["enabled"] or soft_horizon_consensus["enabled"]
+    )
+    if horizon_models_enabled and allocation_execution_enabled(config):
+        raise ValueError(
+            "Horizon consensus research is intentionally limited to the single-position "
             "rotation policy. Optimized allocation / compound risk overlay must "
             "be evaluated in a separate experiment."
         )
@@ -1385,6 +1394,7 @@ def _run_lightgbm(
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
         model_fold_diagnostics: list[dict[str, Any]] = []
+        inference_cache_profiles: list[dict[str, Any]] = []
         latest_final_models: dict[str, Any] = {}
         latest_final_fold_id: int | None = None
         latest_final_fold_position: int | None = None
@@ -1536,12 +1546,12 @@ def _run_lightgbm(
                 progress_callback=phase_progress(
                     "final training",
                     0.50,
-                    0.78 if bool(horizon_voting["enabled"]) else 0.90,
+                    0.78 if horizon_models_enabled else 0.90,
                 ),
                 technical_log_callback=technical_log_callback,
             )
             final_horizon_models: dict[int, dict[str, Any]] = {}
-            if bool(horizon_voting["enabled"]):
+            if horizon_models_enabled:
                 detail(
                     run_index=run_index,
                     run_count=repetitions,
@@ -1580,6 +1590,74 @@ def _run_lightgbm(
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
                 )
+            fold_decision_dates = pd.DatetimeIndex(fold["decision_dates"])
+            base_utility_cache, base_cache_profile = _precompute_model_utilities(
+                final_models,
+                frames,
+                symbols,
+                fold_decision_dates,
+                rep_config,
+            )
+            base_cache_profile.update(
+                {
+                    "fold_id": int(fold_id),
+                    "model_role": "weighted_utility",
+                }
+            )
+            inference_cache_profiles.append(base_cache_profile)
+
+            cash_edge_utility_cache = None
+            if final_cash_edge_models is not None:
+                cash_edge_utility_cache, cash_cache_profile = _precompute_model_utilities(
+                    final_cash_edge_models,
+                    frames,
+                    symbols,
+                    fold_decision_dates,
+                    rep_config,
+                )
+                cash_cache_profile.update(
+                    {
+                        "fold_id": int(fold_id),
+                        "model_role": "cash_edge",
+                    }
+                )
+                inference_cache_profiles.append(cash_cache_profile)
+
+            horizon_utility_caches: dict[
+                int,
+                dict[pd.Timestamp, np.ndarray],
+            ] = {}
+            for horizon, horizon_models in final_horizon_models.items():
+                cache, cache_profile = _precompute_model_utilities(
+                    horizon_models,
+                    frames,
+                    symbols,
+                    fold_decision_dates,
+                    rep_config,
+                )
+                horizon_utility_caches[int(horizon)] = cache
+                cache_profile.update(
+                    {
+                        "fold_id": int(fold_id),
+                        "model_role": f"horizon_{int(horizon)}",
+                        "horizon": int(horizon),
+                    }
+                )
+                inference_cache_profiles.append(cache_profile)
+
+            if technical_log_callback is not None:
+                fold_profiles = [
+                    item
+                    for item in inference_cache_profiles
+                    if int(item.get("fold_id") or 0) == int(fold_id)
+                ]
+                technical_log_callback(
+                    "model=lightgbm event=oos_inference_cache_ready "
+                    f"fold={fold_id} roles={len(fold_profiles)} "
+                    f"seconds={sum(float(item.get('cache_build_seconds') or 0.0) for item in fold_profiles):.3f} "
+                    f"predict_calls={sum(int(item.get('cache_predict_calls') or 0) for item in fold_profiles)}"
+                )
+
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             if opportunity_cash_gate_enabled(rep_config):
                 gate_base_config = rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
@@ -1644,9 +1722,24 @@ def _run_lightgbm(
                     decision_diagnostics=diagnostics,
                     fold_id=fold_id,
                     calibrated_switch_margin=float(best_candidate),
+                    utility_cache=base_utility_cache,
+                    cash_edge_utility_cache=cash_edge_utility_cache,
                 )
-                policies[fold_id] = (
-                    _horizon_consensus_guard_policy(
+                if bool(soft_horizon_consensus["enabled"]):
+                    policies[fold_id] = _soft_horizon_consensus_policy(
+                        base_policy,
+                        final_models,
+                        final_horizon_models,
+                        frames,
+                        symbols,
+                        rep_config,
+                        base_switch_margin=float(effective_margin),
+                        base_utility_cache=base_utility_cache,
+                        horizon_utility_caches=horizon_utility_caches,
+                        decision_diagnostics=diagnostics,
+                    )
+                elif bool(horizon_voting["enabled"]):
+                    policies[fold_id] = _horizon_consensus_guard_policy(
                         base_policy,
                         final_horizon_models,
                         frames,
@@ -1654,9 +1747,8 @@ def _run_lightgbm(
                         rep_config,
                         decision_diagnostics=diagnostics,
                     )
-                    if bool(horizon_voting["enabled"])
-                    else base_policy
-                )
+                else:
+                    policies[fold_id] = base_policy
             margin_detail = {
                 "fold_id": fold_id,
                 "horizon_voting_enabled": bool(horizon_voting["enabled"]),
@@ -1668,6 +1760,19 @@ def _run_lightgbm(
                 "horizon_voting_minimum_consensus_weight": (
                     float(horizon_voting["minimum_consensus_weight"])
                     if bool(horizon_voting["enabled"])
+                    else None
+                ),
+                "soft_horizon_consensus_enabled": bool(
+                    soft_horizon_consensus["enabled"]
+                ),
+                "soft_horizon_consensus_mode": (
+                    str(soft_horizon_consensus["mode"])
+                    if bool(soft_horizon_consensus["enabled"])
+                    else None
+                ),
+                "soft_horizon_consensus_penalty_strength": (
+                    float(soft_horizon_consensus["penalty_strength"])
+                    if bool(soft_horizon_consensus["enabled"])
                     else None
                 ),
                 "calibrated_candidate_margin": float(best_candidate),
@@ -1792,6 +1897,25 @@ def _run_lightgbm(
         simulation_profile = result.metrics.get("simulation_profile") or {}
         if bool(horizon_voting["enabled"]):
             result.metrics.update(_horizon_voting_result_metrics(result))
+        if bool(soft_horizon_consensus["enabled"]):
+            result.metrics.update(
+                _soft_horizon_consensus_result_metrics(result)
+            )
+        result.metrics["oos_inference_cache_profiles"] = list(
+            inference_cache_profiles
+        )
+        result.metrics["oos_inference_cache_build_seconds"] = float(
+            sum(
+                float(item.get("cache_build_seconds") or 0.0)
+                for item in inference_cache_profiles
+            )
+        )
+        result.metrics["oos_inference_cache_predict_calls"] = int(
+            sum(
+                int(item.get("cache_predict_calls") or 0)
+                for item in inference_cache_profiles
+            )
+        )
         if technical_log_callback is not None:
             technical_log_callback(
                 "model=lightgbm event=oos_simulation_complete "
@@ -1850,7 +1974,8 @@ def _run_lightgbm(
                 "deterministic_execution": bool(rep_config.deterministic_execution),
                 "numeric_thread_limit": int(rep_config.numeric_thread_limit),
                 "decision_diagnostics_schema_version": (
-                    12 if bool(horizon_voting["enabled"])
+                    13 if bool(soft_horizon_consensus["enabled"])
+                    else 12 if bool(horizon_voting["enabled"])
                     else 11 if compound_risk_overlay_enabled(rep_config)
                     else 10 if concentrated_allocation_enabled(rep_config)
                     else 9 if portfolio_allocation_enabled(rep_config)
