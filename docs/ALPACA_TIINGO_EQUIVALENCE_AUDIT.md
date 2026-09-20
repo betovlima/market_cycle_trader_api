@@ -1235,3 +1235,143 @@ Primary questions:
 2. How much does OOS replay time fall relative to v10.8.73?
 3. Does soft rank support filter only marginal rotations rather than suppressing rotation broadly?
 4. Does the challenger improve capital and/or robustness while retaining the strategy's rotation edge?
+
+
+## Final direct-Alpaca validation protocol (API v10.8.75)
+
+API v10.8.75 freezes the current research architecture and changes only the market-data acquisition path for the final validation.
+
+The final run MUST NOT tune model or consensus parameters.
+
+Frozen research choices:
+
+```text
+LightGBM settings = current certified research settings
+soft_horizon_consensus.penalty_strength = 1.0
+hard horizon voting = disabled
+early stopping = disabled
+Optuna = not executed
+CARO = not executed
+```
+
+### No Mongo market data
+
+The final runner does not import the Mongo repository and does not read:
+
+- candles from MongoDB;
+- corporate actions from MongoDB;
+- cached predictions from MongoDB;
+- tuning candidates from MongoDB;
+- prior result rows from MongoDB.
+
+Fresh market data is downloaded directly from Alpaca.
+
+Bars:
+
+```text
+GET https://data.alpaca.markets/v2/stocks/{symbol}/bars
+adjustment=raw
+feed=<frozen request feed, normally sip>
+timeframe=<frozen request timeframe>
+```
+
+Corporate actions:
+
+```text
+GET https://data.alpaca.markets/v1/corporate-actions
+data_quality=complete
+```
+
+The local pipeline then applies only forward/reverse split normalization.
+
+Cash dividends are not used to back-adjust historical prices.
+
+### Frozen configuration file
+
+The final experiment also avoids reading its strategy configuration from MongoDB.
+
+A one-time helper may export only the immutable request document:
+
+```bash
+python scripts/export_final_research_request.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --output research/final_research_request.json
+```
+
+This helper exports configuration only. It explicitly contains no market bars, corporate-action rows, predictions or trades.
+
+After that file exists, the actual final validation is DB-independent.
+
+### Fresh immutable local snapshot
+
+The final runner writes:
+
+```text
+output/final_alpaca_direct_validation/
+  snapshot/
+    request.json
+    manifest.json
+    corporate_actions.json
+    raw_bars/
+      <SYMBOL>.csv
+  results/
+    summary.json
+    strategy_comparison.csv
+    download_diagnostics.csv
+    split_diagnostics.csv
+    excluded_assets.csv
+    control_predictions.csv
+    control_trades.csv
+    soft_horizon_consensus_predictions.csv
+    soft_horizon_consensus_trades.csv
+    soft_horizon_consensus_decisions.csv
+```
+
+A ZIP is also generated next to the output directory.
+
+Every local snapshot file receives a SHA-256 hash. A combined `snapshot_sha256` is persisted in the manifest and final summary.
+
+The retrieval timestamp is deliberately not part of the scientific snapshot hash. The hash represents the frozen request, downloaded market content and structural exclusions.
+
+### Final validation safeguards
+
+The script aborts if the output directory already exists unless `--replace-output` is explicitly supplied.
+
+It also rejects any value other than:
+
+```text
+penalty_strength = 1.0
+```
+
+This prevents tuning on the final validation dataset.
+
+### Run
+
+First export the frozen request configuration once:
+
+```bash
+python scripts/export_final_research_request.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --output research/final_research_request.json
+```
+
+Then run the final research directly from Alpaca:
+
+```bash
+python scripts/research_final_alpaca_direct_validation.py \
+  --request-json research/final_research_request.json
+```
+
+The final comparison remains:
+
+```text
+A: CONTROL
+B: CONTROL + SOFT HORIZON CONSENSUS
+C: BUY AND HOLD benchmark
+```
+
+The primary question is no longer parameter discovery.
+
+The primary question is:
+
+> When the selected architecture is rerun on a newly downloaded, independently frozen Alpaca RAW dataset, without reading historical market data from the database and without further tuning, does the soft-horizon challenger preserve its economic and robustness advantage?
