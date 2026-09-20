@@ -11,7 +11,7 @@ from scipy.stats import qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
-from .model_tuning_space import settings_from_unit_point as _settings_from_unit_point
+from .model_tuning_space import settings_from_unit_point as _settings_from_unit_point, unit_value_for_setting
 from .model_tuning_ranking import candidate_economic_sort_key
 
 PROBABILITY_MODEL = "gaussian_process_unified_exploration_trust_region_cei_v4"
@@ -44,10 +44,8 @@ def _settings_hash(values: dict[str, Any]) -> str:
 def _normalized_vector(settings: dict[str, Any], search_space: list[dict[str, Any]]) -> list[float]:
     vector: list[float] = []
     for spec in search_space:
-        low = float(spec["min"])
-        high = float(spec["max"])
-        value = float(settings.get(spec["name"], low))
-        vector.append(0.0 if high <= low else max(0.0, min(1.0, (value - low) / (high - low))))
+        value = settings.get(spec["name"], spec["min"])
+        vector.append(unit_value_for_setting(spec, value))
     return vector
 
 
