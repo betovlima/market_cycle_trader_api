@@ -619,7 +619,9 @@ These diagnostics produce separate GP / Extra Trees weights for:
 - maximum drawdown;
 - worst-fold return.
 
-A family with better observed rank/generalization performance receives more influence instead of assigning a fixed model weight.
+The blend is selected from out-of-fold predictions, which makes the surrogate ensemble a small stacking problem inside CARO only. It does not change the trading model.
+
+Because the observed economic response is discontinuous, Extra Trees has an 80% minimum central-estimate weight unless the GP demonstrates material out-of-fold superiority: positive rank skill, normalized RMSE at or below 1.0, and at least 25% more rank/error skill than Extra Trees. This prevents small-sample cross-validation noise from returning control to a GP-dominated smoothness assumption.
 
 ### Small-sample confidence correction
 
@@ -673,7 +675,7 @@ The RAW+split research `candidates.csv` also exports the principal hybrid-surrog
 
 ### Retrospective check on the v10.8.68 campaign
 
-Using the already observed v10.8.68 candidate settings/outcomes as an offline diagnostic, Extra Trees ranked the adaptive candidates materially better than the previous GP-only surrogate. This retrospective check is diagnostic only; it is not reused as candidate evidence in the new campaign.
+Using the already observed v10.8.68 candidate settings/outcomes as an offline diagnostic, the previous GP-only capital estimates had approximately 0.12 Spearman rank correlation across the nine adaptive candidates, while Extra Trees reached approximately 0.67. The discontinuity-guarded hybrid was therefore designed to be tree-dominant unless GP earns more influence out-of-fold. This retrospective check is diagnostic only; it is not reused as candidate evidence in the new campaign.
 
 The actual v10.8.69 candidate search must still run prospectively on the frozen snapshot.
 
