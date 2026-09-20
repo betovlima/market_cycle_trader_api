@@ -4,10 +4,14 @@ from copy import deepcopy
 from typing import Any, Sequence
 import warnings
 
+import numpy as np
 import optuna
+from scipy.stats import qmc
 from optuna.distributions import FloatDistribution, IntDistribution
 from optuna.study import Study
 from optuna.trial import Trial
+
+from .model_tuning_space import settings_from_unit_point, unit_value_for_setting
 
 
 OPTUNA_TPE_MODEL = "optuna_tpe_multivariate_constrained_v1"
@@ -187,6 +191,53 @@ def _apply_trial_constraints(
             trial.set_constraint(name, float(value))
 
 
+def control_centered_warm_start_settings(
+    search_space: Sequence[dict[str, Any]],
+    base_tuning_values: dict[str, Any],
+    *,
+    seed: int,
+    count: int = 6,
+    radius: float = 0.06,
+) -> list[dict[str, Any]]:
+    active_space = [dict(item) for item in search_space]
+    if count <= 0:
+        return []
+    bounded_radius = max(0.01, min(float(radius), 0.25))
+    anchor = np.asarray(
+        [
+            unit_value_for_setting(
+                spec,
+                base_tuning_values[str(spec["name"])],
+            )
+            for spec in active_space
+        ],
+        dtype=float,
+    )
+    design = qmc.LatinHypercube(
+        d=len(active_space),
+        seed=int(seed) + 17011,
+    ).random(n=int(count))
+    offsets = (design - 0.5) * (2.0 * bounded_radius)
+    points = np.clip(anchor[None, :] + offsets, 0.0, 1.0)
+
+    warm_settings: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, Any], ...]] = {
+        tuple(sorted(base_tuning_values.items()))
+    }
+    for point in points:
+        settings = settings_from_unit_point(
+            base_tuning_values,
+            active_space,
+            point,
+        )
+        key = tuple(sorted(settings.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        warm_settings.append(settings)
+    return warm_settings
+
+
 def create_optuna_tpe_study(
     *,
     search_space: Sequence[dict[str, Any]],
@@ -194,12 +245,25 @@ def create_optuna_tpe_study(
     baseline_metrics: dict[str, Any],
     seed: int,
     startup_trials: int | None = None,
+    warm_start_count: int = 6,
+    warm_start_radius: float = 0.06,
 ) -> tuple[Study, list[dict[str, Any]], dict[str, float]]:
     active_space = [dict(item) for item in search_space]
+    warm_settings = control_centered_warm_start_settings(
+        active_space,
+        base_tuning_values,
+        seed=int(seed),
+        count=int(warm_start_count),
+        radius=float(warm_start_radius),
+    )
     resolved_startup_trials = int(
         startup_trials
         if startup_trials is not None
-        else default_startup_trials(active_space)
+        else max(1, len(warm_settings) + 1)
+    )
+    resolved_startup_trials = max(
+        resolved_startup_trials,
+        len(warm_settings) + 1,
     )
 
     sampler_kwargs: dict[str, Any] = {
@@ -274,6 +338,17 @@ def create_optuna_tpe_study(
         float(baseline_metrics["ending_capital"]),
     )
 
+    for warm_index, warm_params in enumerate(warm_settings, start=1):
+        study.enqueue_trial(
+            warm_params,
+            user_attrs={
+                "kind": "control_local_warm_start",
+                "is_control": False,
+                "warm_start_index": int(warm_index),
+                "warm_start_radius": float(warm_start_radius),
+            },
+        )
+
     return study, active_space, thresholds
 
 
@@ -299,7 +374,8 @@ def tell_optuna_candidate(
         trial,
         violations,
     )
-    trial.set_user_attr("kind", "optuna_tpe")
+    if not trial.user_attrs.get("kind"):
+        trial.set_user_attr("kind", "optuna_tpe")
     trial.set_user_attr("is_control", False)
     trial.set_user_attr("champion_gate_passed", bool(champion_gate_passed))
     trial.set_user_attr("metrics", deepcopy(metrics))
