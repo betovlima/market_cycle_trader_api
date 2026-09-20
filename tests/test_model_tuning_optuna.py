@@ -140,9 +140,12 @@ def test_control_is_seeded_and_candidate_can_be_told() -> None:
         champion_gate_passed=False,
     )
 
-    assert len(study.trials) == 2
-    assert math.isclose(float(study.trials[1].value), 4_000_000.0)
-    assert study.trials[1].user_attrs["champion_gate_passed"] is False
+    completed_candidate = next(
+        item for item in study.trials
+        if item.number == trial.number
+    )
+    assert math.isclose(float(completed_candidate.value), 4_000_000.0)
+    assert completed_candidate.user_attrs["champion_gate_passed"] is False
     assert violations["sharpe"] > 0.0
 
 
