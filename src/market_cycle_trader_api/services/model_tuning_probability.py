@@ -807,7 +807,10 @@ def _empirical_champion_pass_prior(document: dict[str, Any]) -> tuple[float, int
     observations = [
         item
         for item in _all_completed_observations(document)
-        if not bool(item.get("is_control"))
+        if (
+            not bool(item.get("is_control"))
+            and item.get("champion_gate_passed") is not None
+        )
     ]
     successes = sum(
         1 for item in observations
