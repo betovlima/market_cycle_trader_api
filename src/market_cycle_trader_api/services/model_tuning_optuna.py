@@ -172,6 +172,19 @@ def constraint_violations(
     }
 
 
+def _apply_trial_constraints(
+    trial: Trial,
+    violations: dict[str, float],
+) -> None:
+    trial.set_user_attr(
+        _CONSTRAINT_ATTR,
+        deepcopy(violations),
+    )
+    if _native_constraint_api_available():
+        for name, value in violations.items():
+            trial.set_constraint(name, float(value))
+
+
 def create_optuna_tpe_study(
     *,
     search_space: Sequence[dict[str, Any]],
@@ -181,10 +194,6 @@ def create_optuna_tpe_study(
     startup_trials: int | None = None,
 ) -> tuple[Study, list[dict[str, Any]], dict[str, float]]:
     active_space = [dict(item) for item in search_space]
-    distributions = optuna_distributions(
-        active_space,
-        settings=base_tuning_values,
-    )
     resolved_startup_trials = int(
         startup_trials
         if startup_trials is not None
@@ -201,6 +210,7 @@ def create_optuna_tpe_study(
     }
     if not _native_constraint_api_available():
         sampler_kwargs["constraints_func"] = _legacy_constraints_func
+
     sampler = optuna.samplers.TPESampler(**sampler_kwargs)
     study = optuna.create_study(
         direction="maximize",
@@ -210,31 +220,48 @@ def create_optuna_tpe_study(
 
     thresholds = fixed_control_constraints(baseline_metrics)
     control_params = {
-        name: deepcopy(base_tuning_values[name])
-        for name in distributions
+        str(spec["name"]): deepcopy(
+            base_tuning_values[str(spec["name"])]
+        )
+        for spec in active_space
     }
     control_violations = constraint_violations(
         baseline_metrics,
         thresholds,
     )
-    control_user_attrs = {
-        "kind": "control",
-        "is_control": True,
-        "metrics": deepcopy(baseline_metrics),
-        _CONSTRAINT_ATTR: deepcopy(control_violations),
-    }
-    control_trial_kwargs: dict[str, Any] = {
-        "params": control_params,
-        "distributions": distributions,
-        "value": float(baseline_metrics["ending_capital"]),
-        "user_attrs": control_user_attrs,
-    }
-    if _native_constraint_api_available():
-        control_trial_kwargs["constraints"] = control_violations
-    control_trial = optuna.trial.create_trial(
-        **control_trial_kwargs
+
+    # Seed through Optuna's own trial lifecycle rather than add_trial().
+    # This guarantees that constraints are materialized by both the legacy
+    # 4.8 constraints callback and the native 5.x Trial.set_constraint API.
+    study.enqueue_trial(
+        control_params,
+        user_attrs={
+            "kind": "control",
+            "is_control": True,
+        },
     )
-    study.add_trial(control_trial)
+    control_trial = study.ask()
+    effective_control = _suggest_optuna_settings(
+        control_trial,
+        active_space,
+    )
+    if effective_control != control_params:
+        raise RuntimeError(
+            "Optuna did not materialize the frozen MCT Control exactly."
+        )
+    _apply_trial_constraints(
+        control_trial,
+        control_violations,
+    )
+    control_trial.set_user_attr(
+        "metrics",
+        deepcopy(baseline_metrics),
+    )
+    study.tell(
+        control_trial,
+        float(baseline_metrics["ending_capital"]),
+    )
+
     return study, active_space, thresholds
 
 
@@ -256,13 +283,10 @@ def tell_optuna_candidate(
     champion_gate_passed: bool,
 ) -> dict[str, float]:
     violations = constraint_violations(metrics, thresholds)
-    trial.set_user_attr(
-        _CONSTRAINT_ATTR,
-        deepcopy(violations),
+    _apply_trial_constraints(
+        trial,
+        violations,
     )
-    if _native_constraint_api_available():
-        for name, value in violations.items():
-            trial.set_constraint(name, float(value))
     trial.set_user_attr("kind", "optuna_tpe")
     trial.set_user_attr("is_control", False)
     trial.set_user_attr("champion_gate_passed", bool(champion_gate_passed))
