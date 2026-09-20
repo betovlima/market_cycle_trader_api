@@ -409,3 +409,104 @@ MongoDB/job rotation_accelerator
 ```
 
 GPU diagnostics remain persisted in campaign results.
+
+
+## Temporal early stopping + expanded LightGBM CARO (API v10.8.67)
+
+This version incorporates the overfitting/generalization controls studied in the MBA material on tree ensembles and boosting while preserving the point-in-time RAW + local split architecture.
+
+### LightGBM temporal early stopping
+
+Early stopping is enabled as a fixed methodology safeguard, not a CARO search dimension.
+
+Default protocol:
+
+```text
+chronological training sample
+    |
+    +-- first ~85% -> LightGBM fit
+    |
+    +-- final ~15% -> internal temporal validation
+                          |
+                          +-- stop after 30 non-improving boosting rounds
+```
+
+Guardrails:
+- validation is always the chronological tail of the training sample;
+- OOS is never used for early stopping;
+- validation uses at least 40 and at most 126 sessions when enough rows exist;
+- at least 80% of the configured minimum training rows are retained for fitting;
+- `n_estimators` remains the maximum tree budget while `best_iteration` records the effective tree count.
+
+### Expanded Unified CARO search space
+
+The previous eight dimensions remain at their prior bounds. Three variance-control dimensions were added:
+
+```text
+min_child_weight  0.0001 .. 0.0500
+subsample         0.65   .. 1.00
+subsample_freq    1      .. 5
+```
+
+The full search space is now:
+
+```text
+n_estimators
+learning_rate
+max_depth
+num_leaves
+min_child_samples
+min_child_weight
+subsample
+subsample_freq
+colsample_bytree
+reg_alpha
+reg_lambda
+```
+
+The default campaign size is 24 candidates to reflect the larger search dimension.
+
+### Predictive diagnostics
+
+Each final fold now records:
+- training MAE;
+- training RMSE;
+- temporal-validation MAE;
+- temporal-validation RMSE;
+- RMSE generalization gap;
+- configured estimator count;
+- mean/median effective `best_iteration`;
+- fraction of models using early stopping;
+- LightGBM gain-based feature importance.
+
+These diagnostics are informative only. They do not replace the existing economic Champion gate.
+
+### RAW + split research outputs
+
+```text
+output/raw_split_unified_caro/
+  summary.json
+  campaign_checkpoint.json
+  candidates.csv
+  data_diagnostics.csv
+  excluded_assets.csv
+  control_predictions.csv
+  control_trades.csv
+  champion_predictions.csv
+  champion_trades.csv
+  control_model_diagnostics.json
+  champion_model_diagnostics.json
+  feature_importance_gain.csv
+```
+
+Run:
+
+```bash
+python scripts/research_raw_split_unified_caro.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 24
+```
+
+GPU behavior from API v10.8.66 is preserved. The result continues to report `requested_compute_device`, `effective_compute_device`, and GPU probe errors.
+
+The course material motivates early stopping, MAE/RMSE regression diagnostics, regularization/tuning sensitivity, and feature importance. Random Forest and stacking remain separate future research hypotheses and are intentionally not mixed into this calibration campaign.
