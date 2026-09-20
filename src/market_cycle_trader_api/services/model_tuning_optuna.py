@@ -13,6 +13,42 @@ OPTUNA_TPE_MODEL = "optuna_tpe_multivariate_constrained_v1"
 DEFAULT_SHARPE_TOLERANCE = 0.05
 DEFAULT_DRAWDOWN_TOLERANCE = 0.03
 DEFAULT_MIN_WORST_FOLD_RETURN = 0.0
+_CONSTRAINT_ATTR = "_mct_optimizer_constraints"
+_CONSTRAINT_ORDER = (
+    "sharpe",
+    "maximum_drawdown",
+    "worst_fold_return",
+)
+
+
+def _native_constraint_api_available() -> bool:
+    return hasattr(optuna.trial.Trial, "set_constraint")
+
+
+def _legacy_constraints_func(
+    frozen_trial: optuna.trial.FrozenTrial,
+) -> list[float]:
+    values = frozen_trial.user_attrs.get(_CONSTRAINT_ATTR) or {}
+    return [
+        float(values.get(name, 0.0))
+        for name in _CONSTRAINT_ORDER
+    ]
+
+
+def _trial_constraints(
+    frozen_trial: optuna.trial.FrozenTrial,
+) -> dict[str, float]:
+    native = getattr(frozen_trial, "constraints", None)
+    if isinstance(native, dict):
+        return {
+            str(key): float(value)
+            for key, value in native.items()
+        }
+    values = frozen_trial.user_attrs.get(_CONSTRAINT_ATTR) or {}
+    return {
+        str(key): float(value)
+        for key, value in values.items()
+    }
 
 
 def default_startup_trials(
@@ -155,14 +191,17 @@ def create_optuna_tpe_study(
         else default_startup_trials(active_space)
     )
 
-    sampler = optuna.samplers.TPESampler(
-        seed=int(seed),
-        n_startup_trials=resolved_startup_trials,
-        multivariate=True,
-        group=True,
-        constant_liar=False,
-        warn_independent_sampling=False,
-    )
+    sampler_kwargs: dict[str, Any] = {
+        "seed": int(seed),
+        "n_startup_trials": resolved_startup_trials,
+        "multivariate": True,
+        "group": True,
+        "constant_liar": False,
+        "warn_independent_sampling": False,
+    }
+    if not _native_constraint_api_available():
+        sampler_kwargs["constraints_func"] = _legacy_constraints_func
+    sampler = optuna.samplers.TPESampler(**sampler_kwargs)
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
@@ -178,16 +217,22 @@ def create_optuna_tpe_study(
         baseline_metrics,
         thresholds,
     )
+    control_user_attrs = {
+        "kind": "control",
+        "is_control": True,
+        "metrics": deepcopy(baseline_metrics),
+        _CONSTRAINT_ATTR: deepcopy(control_violations),
+    }
+    control_trial_kwargs: dict[str, Any] = {
+        "params": control_params,
+        "distributions": distributions,
+        "value": float(baseline_metrics["ending_capital"]),
+        "user_attrs": control_user_attrs,
+    }
+    if _native_constraint_api_available():
+        control_trial_kwargs["constraints"] = control_violations
     control_trial = optuna.trial.create_trial(
-        params=control_params,
-        distributions=distributions,
-        value=float(baseline_metrics["ending_capital"]),
-        user_attrs={
-            "kind": "control",
-            "is_control": True,
-            "metrics": deepcopy(baseline_metrics),
-        },
-        constraints=control_violations,
+        **control_trial_kwargs
     )
     study.add_trial(control_trial)
     return study, active_space, thresholds
@@ -211,8 +256,13 @@ def tell_optuna_candidate(
     champion_gate_passed: bool,
 ) -> dict[str, float]:
     violations = constraint_violations(metrics, thresholds)
-    for name, value in violations.items():
-        trial.set_constraint(name, float(value))
+    trial.set_user_attr(
+        _CONSTRAINT_ATTR,
+        deepcopy(violations),
+    )
+    if _native_constraint_api_available():
+        for name, value in violations.items():
+            trial.set_constraint(name, float(value))
     trial.set_user_attr("kind", "optuna_tpe")
     trial.set_user_attr("is_control", False)
     trial.set_user_attr("champion_gate_passed", bool(champion_gate_passed))
@@ -230,7 +280,10 @@ def optuna_study_diagnostics(study: Study) -> dict[str, Any]:
     feasible = [
         trial
         for trial in completed
-        if all(float(value) <= 0.0 for value in trial.constraints.values())
+        if all(
+            float(value) <= 0.0
+            for value in _trial_constraints(trial).values()
+        )
     ]
     best = max(
         completed,
