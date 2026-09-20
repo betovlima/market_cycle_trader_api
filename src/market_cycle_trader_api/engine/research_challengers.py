@@ -529,7 +529,12 @@ def _aggregate_lightgbm_fold_diagnostics(
             for item in folds
             if item.get(field) is not None and np.isfinite(float(item[field]))
         ]
-        output[f"{field}_mean"] = float(np.mean(values)) if values else None
+        output_key = (
+            field
+            if field == "best_iteration_mean"
+            else f"{field}_mean"
+        )
+        output[output_key] = float(np.mean(values)) if values else None
 
     feature_gain = {feature: 0.0 for feature in ROTATION_FEATURES}
     for fold in folds:
