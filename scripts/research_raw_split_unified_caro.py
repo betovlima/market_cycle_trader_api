@@ -120,11 +120,48 @@ def _metrics(
     )
     predictive = deepcopy(result.metrics.get("lightgbm_predictive_diagnostics") or {})
     simulation_profile = deepcopy(result.metrics.get("simulation_profile") or {})
+    strategy_ending = float(result.metrics.get("strategy_ending_capital") or 0.0)
+    buy_hold_ending = float(result.metrics.get("buy_hold_ending_capital") or 0.0)
+    strategy_return = float(result.metrics.get("strategy_return") or 0.0)
+    buy_hold_return = float(result.metrics.get("buy_hold_return") or 0.0)
+    strategy_cagr = float(result.metrics.get("strategy_cagr") or 0.0)
+    buy_hold_cagr = float(result.metrics.get("buy_hold_cagr") or 0.0)
+    strategy_sharpe = float(result.metrics.get("strategy_sharpe") or 0.0)
+    buy_hold_sharpe = float(result.metrics.get("buy_hold_sharpe") or 0.0)
+    strategy_maxdd = float(result.metrics.get("strategy_maximum_drawdown") or 0.0)
+    buy_hold_maxdd = float(result.metrics.get("buy_hold_maximum_drawdown") or 0.0)
     return {
-        "ending_capital": float(result.metrics.get("strategy_ending_capital") or 0.0),
-        "sharpe": float(result.metrics.get("strategy_sharpe") or 0.0),
-        "maximum_drawdown": float(result.metrics.get("strategy_maximum_drawdown") or 0.0),
-        "cagr": float(result.metrics.get("strategy_cagr") or 0.0),
+        "ending_capital": strategy_ending,
+        "sharpe": strategy_sharpe,
+        "maximum_drawdown": strategy_maxdd,
+        "cagr": strategy_cagr,
+        "strategy_return": strategy_return,
+        "buy_hold_ending_capital": buy_hold_ending,
+        "buy_hold_return": buy_hold_return,
+        "buy_hold_cagr": buy_hold_cagr,
+        "buy_hold_sharpe": buy_hold_sharpe,
+        "buy_hold_maximum_drawdown": buy_hold_maxdd,
+        "benchmark_name": result.metrics.get("benchmark_name"),
+        "strategy_vs_buy_hold_capital_ratio": (
+            strategy_ending / buy_hold_ending
+            if buy_hold_ending > 0
+            else None
+        ),
+        "strategy_vs_buy_hold_excess_capital": (
+            strategy_ending - buy_hold_ending
+        ),
+        "strategy_vs_buy_hold_excess_return": (
+            strategy_return - buy_hold_return
+        ),
+        "strategy_vs_buy_hold_cagr_spread": (
+            strategy_cagr - buy_hold_cagr
+        ),
+        "strategy_vs_buy_hold_sharpe_spread": (
+            strategy_sharpe - buy_hold_sharpe
+        ),
+        "strategy_vs_buy_hold_drawdown_spread": (
+            strategy_maxdd - buy_hold_maxdd
+        ),
         "worst_fold_return": worst_fold_return,
         "folds": fold_rows,
         "requested_compute_device": result.metrics.get("requested_compute_device"),
@@ -171,8 +208,12 @@ def _run_candidate(
         raise RuntimeError(f"{label} returned no result.")
     result = results[0]
     metrics = _metrics(result, folds, float(config.initial_capital))
+    buy_hold = float(metrics.get("buy_hold_ending_capital") or 0.0)
+    ratio = metrics.get("strategy_vs_buy_hold_capital_ratio")
     print(
         f"[caro] completed {label} capital={metrics['ending_capital']:,.2f} "
+        f"buy_hold={buy_hold:,.2f} "
+        f"vs_buy_hold={(f'{float(ratio):.3f}x' if ratio is not None else 'n/a')} "
         f"sharpe={metrics['sharpe']:.4f} maxdd={metrics['maximum_drawdown']:.4%} "
         f"worst_fold={metrics['worst_fold_return']:.4%}",
         flush=True,
@@ -511,6 +552,15 @@ def main() -> int:
                 "sharpe": metrics["sharpe"],
                 "maximum_drawdown": metrics["maximum_drawdown"],
                 "worst_fold_return": metrics["worst_fold_return"],
+                "buy_hold_ending_capital": metrics.get("buy_hold_ending_capital"),
+                "buy_hold_return": metrics.get("buy_hold_return"),
+                "buy_hold_cagr": metrics.get("buy_hold_cagr"),
+                "buy_hold_sharpe": metrics.get("buy_hold_sharpe"),
+                "buy_hold_maximum_drawdown": metrics.get("buy_hold_maximum_drawdown"),
+                "strategy_vs_buy_hold_capital_ratio": metrics.get("strategy_vs_buy_hold_capital_ratio"),
+                "strategy_vs_buy_hold_excess_capital": metrics.get("strategy_vs_buy_hold_excess_capital"),
+                "strategy_vs_buy_hold_excess_return": metrics.get("strategy_vs_buy_hold_excess_return"),
+                "strategy_vs_buy_hold_cagr_spread": metrics.get("strategy_vs_buy_hold_cagr_spread"),
                 "validation_mae": metrics.get("validation_mae"),
                 "validation_rmse": metrics.get("validation_rmse"),
                 "train_mae": metrics.get("train_mae"),
