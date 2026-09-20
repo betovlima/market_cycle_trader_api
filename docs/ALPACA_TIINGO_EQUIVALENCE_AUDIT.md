@@ -924,3 +924,132 @@ NameError: name 'technical' is not defined
 API v10.8.72 calls the existing optional `technical_log_callback` directly under a null guard. No model, market-data, optimizer, benchmark, or simulation calculation changes.
 
 The v10.8.71 warm-start, buy-and-hold reporting, OOS granular progress, and profiling behavior are preserved unchanged.
+
+
+## Weighted multi-horizon voting consensus (API v10.8.73)
+
+API v10.8.73 adds a focused A/B experiment for an ensemble-voting hypothesis without changing the certified Control.
+
+The existing MCT model remains the Control:
+
+```text
+5d/10d/20d/40d/60d
+        |
+weighted target
+        |
+LightGBM
+        |
+base asset/CASH policy
+```
+
+The challenger trains an additional LightGBM target for each configured horizon using the same features and the same LightGBM hyperparameters.
+
+Each horizon predicts its own forward risk-adjusted utility. Its vote is:
+
+```text
+argmax(CASH=0, utility(asset 1), ..., utility(asset N))
+```
+
+Therefore a horizon votes CASH when every finite asset utility for that horizon is non-positive.
+
+The configured target-horizon weights are reused as vote weights. With the current profile:
+
+```text
+5d  = 0.10
+10d = 0.15
+20d = 0.20
+40d = 0.30
+60d = 0.25
+```
+
+### Conservative v1 decision rule
+
+Voting v1 is a consensus guard around the existing policy, not a replacement policy.
+
+A weighted consensus can:
+- confirm the base model's selected asset;
+- veto a proposed rotation and keep the current position;
+- override an asset proposal to CASH when CASH has sufficient weighted consensus.
+
+It cannot jump directly to another asset that the base policy did not select. This keeps the A/B experiment focused on whether independent horizon agreement reduces unstable switches.
+
+The default minimum consensus is:
+
+```text
+0.50
+```
+
+The existing base CASH decision is always preserved; voting is never allowed to block a protective CASH action.
+
+### Horizon-specific labels
+
+The canonical frame now persists:
+
+```text
+forward_horizon_utility_5
+forward_horizon_utility_10
+forward_horizon_utility_20
+forward_horizon_utility_40
+forward_horizon_utility_60
+```
+
+and the corresponding horizon net-log-return targets.
+
+These labels contain only information from their own forward horizon. The existing weighted production target remains unchanged.
+
+### Experimental isolation
+
+The first experiment does not tune voting parameters and does not run Optuna.
+
+It runs only:
+
+```text
+A: CONTROL
+B: CONTROL + HORIZON_VOTING
+```
+
+with identical:
+- RAW + local split data;
+- eligible assets;
+- folds and purge;
+- LightGBM hyperparameters;
+- transaction costs and slippage;
+- buy-and-hold benchmark;
+- initial capital.
+
+This intentionally costs more model training for the challenger because five independent horizon model sets are fitted. The experiment is limited to the canonical single-position rotation policy; optimized-allocation and compound-risk-overlay modes are rejected in v1.
+
+### Outputs
+
+```text
+output/raw_split_horizon_voting_consensus/
+  summary.json
+  strategy_comparison.csv
+  horizon_voting_decisions.csv
+  control_predictions.csv
+  control_trades.csv
+  horizon_voting_predictions.csv
+  horizon_voting_trades.csv
+  data_diagnostics.csv
+  excluded_assets.csv
+```
+
+Decision diagnostics include:
+- winner asset and weighted consensus;
+- CASH vote weight;
+- base-target vote weight;
+- per-horizon winner, score and weight;
+- whether voting changed the base action;
+- accept / CASH override / blocked-switch reason.
+
+### Run
+
+```bash
+python scripts/research_raw_split_horizon_voting.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --minimum-consensus-weight 0.50
+```
+
+The first question is deliberately narrow:
+
+> Does independent agreement across forecast horizons improve OOS capital and/or robustness relative to the exact current Control?
