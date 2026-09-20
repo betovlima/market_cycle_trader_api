@@ -30,6 +30,7 @@ from .capital_rotation import (
     _training_transition_log_return,
     _utility_policy,
     _model_utilities,
+    _precompute_model_utilities,
     prepare_rotation_panel,
 )
 from .optimized_allocation import fit_expected_return_calibrator
