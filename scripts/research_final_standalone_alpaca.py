@@ -321,7 +321,7 @@ def _download_bars(
             frame.to_csv(
                 target,
                 index=False,
-                float_format="%.12g",
+                float_format="%.17g",
             )
             files[symbol] = target
             row_counts[symbol] = int(len(frame))
@@ -1116,6 +1116,22 @@ def main() -> int:
             snapshot_dir
             / "corporate_actions.jsonl"
         )
+        expected_hashes = (
+            manifest.get("file_hashes") or {}
+        )
+        for relative_path, expected_sha in expected_hashes.items():
+            local_path = snapshot_dir / str(relative_path)
+            if not local_path.exists():
+                raise RuntimeError(
+                    f"Snapshot manifest file is missing: {relative_path}"
+                )
+            actual_sha = _sha256_file(local_path)
+            if actual_sha != str(expected_sha):
+                raise RuntimeError(
+                    f"Snapshot integrity mismatch for {relative_path}: "
+                    f"expected={expected_sha}, actual={actual_sha}"
+                )
+
         corporate_actions = [
             json.loads(line)
             for line in ca_path.read_text(
@@ -1522,6 +1538,10 @@ def main() -> int:
         results_dir
         / "resolved_final_request.json",
         resolved_request,
+    )
+    shutil.copyfile(
+        config_path,
+        results_dir / "frozen_research_config.json",
     )
     shutil.copyfile(
         snapshot_dir / "manifest.json",
