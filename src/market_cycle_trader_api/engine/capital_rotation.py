@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 import math
+import time
 from typing import Any, Callable
 import numpy as np
 import pandas as pd
@@ -1355,10 +1356,25 @@ def _simulate_optimized_allocation(
     *,
     model_label: str = "LightGBM Utility",
     method_line: str | None = None,
+    simulation_progress_callback: Callable[[float, str], None] | None = None,
 ) -> RotationRunResult:
     if len(decision_dates) < 2:
         raise ValueError("The final-test interval is too short.")
+
+    simulation_started = time.perf_counter()
+    simulation_timing: dict[str, float] = {}
+    total_sessions = max(1, len(decision_dates) - 1)
+
+    def simulation_progress(fraction: float, stage: str) -> None:
+        if simulation_progress_callback is not None:
+            simulation_progress_callback(
+                max(0.0, min(1.0, float(fraction))),
+                str(stage),
+            )
+
     execution_dates = decision_dates[1:]
+    simulation_progress(0.01, "OOS benchmark")
+    phase_started = time.perf_counter()
     benchmark = _equal_weight_benchmark(
         frames,
         symbols,
@@ -1368,6 +1384,7 @@ def _simulate_optimized_allocation(
         fee_calculator,
         slippage,
     )
+    simulation_timing["benchmark_seconds"] = time.perf_counter() - phase_started
     cash = float(config.initial_capital)
     shares = {symbol: 0.0 for symbol in symbols}
     total_fees = 0.0
@@ -1403,13 +1420,19 @@ def _simulate_optimized_allocation(
         output["CASH"] = float(max(0.0, cash / equity))
         return output
 
+    replay_started = time.perf_counter()
+    policy_seconds = 0.0
+    progress_stride = max(1, total_sessions // 20)
+    simulation_progress(0.08, f"OOS allocation replay 0/{total_sessions}")
     for idx in range(len(decision_dates) - 1):
         decision_date = pd.Timestamp(decision_dates[idx])
         execution_date = pd.Timestamp(decision_dates[idx + 1])
         metadata = (decision_metadata or {}).get(decision_date, {})
         fold_id = metadata.get("fold_id")
         before_weights = current_weights(decision_date)
+        policy_started = time.perf_counter()
         allocation = policy(decision_date, before_weights)
+        policy_seconds += time.perf_counter() - policy_started
         diag = dict((policy_decision_diagnostics or {}).get(decision_date, {}))
 
         equity_open = cash
@@ -1569,6 +1592,17 @@ def _simulate_optimized_allocation(
             "opportunity_accepted": allocation.opportunity_accepted,
             **diag,
         })
+        completed_sessions = idx + 1
+        if (
+            completed_sessions % progress_stride == 0
+            or completed_sessions == total_sessions
+        ):
+            replay_fraction = completed_sessions / total_sessions
+            simulation_progress(
+                0.08 + 0.90 * replay_fraction,
+                f"OOS allocation replay {completed_sessions}/{total_sessions}",
+            )
+
 
     final_date = pd.Timestamp(execution_dates[-1])
     if any(float(shares[symbol]) > 0 for symbol in symbols):
@@ -1722,6 +1756,17 @@ def _simulate_optimized_allocation(
             "- A linear-programmed convex CVaR risk penalty allocates capital across eligible assets and CASH.",
         ]
     )
+    simulation_timing["portfolio_replay_seconds"] = time.perf_counter() - replay_started
+    simulation_timing["policy_seconds"] = float(policy_seconds)
+    simulation_timing["accounting_seconds"] = max(
+        0.0,
+        simulation_timing["portfolio_replay_seconds"] - float(policy_seconds),
+    )
+    simulation_timing["total_seconds"] = time.perf_counter() - simulation_started
+    simulation_timing["session_count"] = int(total_sessions)
+    metrics["simulation_profile"] = dict(simulation_timing)
+    simulation_progress(1.0, f"OOS allocation replay {total_sessions}/{total_sessions} completed")
+
     summary = "\n".join([
         f"COMPOUND CAPITAL ROTATION — {allocation_title}",
         "",
@@ -1757,14 +1802,33 @@ def _simulate_optimized_allocation(
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
 
-def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None, *, model_label: str='LightGBM Utility', method_line: str | None=None) -> RotationRunResult:
+def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tuple[int, float]], frames: dict[str, pd.DataFrame], symbols: list[str], decision_dates: pd.DatetimeIndex, config: Any, fee_calculator: Callable, slippage: Callable, decision_metadata: dict[pd.Timestamp, dict[str, Any]] | None=None, policy_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None=None, trade_callback: Callable[[dict[str, Any]], None] | None=None, *, model_label: str='LightGBM Utility', method_line: str | None=None, simulation_progress_callback: Callable[[float, str], None] | None = None) -> RotationRunResult:
     if len(decision_dates) < 2:
         raise ValueError('The final-test interval is too short.')
+
+    simulation_started = time.perf_counter()
+    simulation_timing: dict[str, float] = {}
+    total_sessions = max(1, len(decision_dates) - 1)
+
+    def simulation_progress(fraction: float, stage: str) -> None:
+        if simulation_progress_callback is not None:
+            simulation_progress_callback(
+                max(0.0, min(1.0, float(fraction))),
+                str(stage),
+            )
+
     execution_dates = decision_dates[1:]
+    simulation_progress(0.01, "OOS benchmark")
+    phase_started = time.perf_counter()
     benchmark = _equal_weight_benchmark(frames, symbols, execution_dates, float(config.initial_capital), config, fee_calculator, slippage)
+    simulation_timing["benchmark_seconds"] = time.perf_counter() - phase_started
+
+    simulation_progress(0.08, "OOS market-regime diagnostics")
+    phase_started = time.perf_counter()
     market_regime_by_date = _precompute_market_regime_diagnostics(
         frames, symbols, decision_dates
     )
+    simulation_timing["market_regime_seconds"] = time.perf_counter() - phase_started
     cash = float(config.initial_capital)
     position = 0
     quantity = 0.0
@@ -1782,13 +1846,19 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     records: list[dict[str, Any]] = []
     prediction_rows: list[dict[str, Any]] = []
     equity_values: list[float] = []
+    replay_started = time.perf_counter()
+    policy_seconds = 0.0
+    progress_stride = max(1, total_sessions // 20)
+    simulation_progress(0.12, f"OOS portfolio replay 0/{total_sessions}")
     for idx in range(len(decision_dates) - 1):
         decision_date = decision_dates[idx]
         execution_date = decision_dates[idx + 1]
         previous_position = position
         metadata = (decision_metadata or {}).get(pd.Timestamp(decision_date), {})
         fold_id = metadata.get('fold_id')
+        policy_started = time.perf_counter()
         target_position, score = policy(decision_date, position, holding_days)
+        policy_seconds += time.perf_counter() - policy_started
         decision_diag = dict((policy_decision_diagnostics or {}).get(pd.Timestamp(decision_date), {}))
         decision_diag.update(market_regime_by_date.get(pd.Timestamp(decision_date), {}))
 
@@ -2087,6 +2157,16 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
             equity = cash
             selected_asset = 'CASH'
         equity_values.append(equity)
+        completed_sessions = idx + 1
+        if (
+            completed_sessions % progress_stride == 0
+            or completed_sessions == total_sessions
+        ):
+            replay_fraction = completed_sessions / total_sessions
+            simulation_progress(
+                0.12 + 0.86 * replay_fraction,
+                f"OOS portfolio replay {completed_sessions}/{total_sessions}",
+            )
         actions = [trade['action'] for trade in day_trades]
         trade_action = 'ROTATE' if 'SELL' in actions and 'BUY' in actions else actions[-1] if actions else ''
         prediction_rows.append({'timestamp': execution_date, 'close': float('nan'), 'strategy_equity': equity, 'buy_hold_equity': float(benchmark.loc[execution_date]), 'trade_action': trade_action, 'trade_reason': 'COMPOUND_CAPITAL_ROTATION' if trade_action else '', 'execution_price': float(day_trades[-1]['execution_price']) if day_trades else None, 'selected_asset': selected_asset, 'previous_asset': symbols[previous_position - 1] if previous_position > 0 else 'CASH', 'decision_score': float(score), 'decision_date': decision_date, 'walk_forward_fold': fold_id, 'fold_test_start': metadata.get('test_start'), 'fold_test_end': metadata.get('test_end'), **decision_diag})
@@ -2199,6 +2279,17 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     if not getattr(config, 'research_candidate_assets', None):
         candidate_assets = [symbol for symbol in symbols if symbol not in reference_set]
     metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve, initial), 'buy_hold_cagr': _cagr(benchmark_curve, initial), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_cash_gate_enabled': bool(opportunity_cash_gate_enabled(config)), 'absolute_utility_cash_gate_enabled': bool(absolute_utility_cash_gate_enabled(config)), 'absolute_utility_entry_threshold': (float(config.opportunity_utility_entry_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_exit_threshold': (float(config.opportunity_utility_exit_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_gate_decisions': int(len(absolute_utility_rows)), 'absolute_utility_gate_accepted': absolute_utility_accepted_count, 'absolute_utility_gate_rejected': absolute_utility_rejected_count, 'absolute_utility_gate_acceptance_rate': (float(absolute_utility_accepted_count / len(absolute_utility_rows)) if absolute_utility_rows else None), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'opportunity_entry_threshold_mean': float(np.mean(opportunity_entry_thresholds)) if opportunity_entry_thresholds else None, 'opportunity_exit_threshold_mean': float(np.mean(opportunity_exit_thresholds)) if opportunity_exit_thresholds else None, 'opportunity_gate_adaptive_refreshes': opportunity_adaptive_refreshes, 'opportunity_gate_regularized_sessions': opportunity_regularized_sessions, 'opportunity_target_horizon_sessions': int(round(float(np.mean(opportunity_target_horizons)))) if opportunity_target_horizons else None, 'cash_gate_changed_base_action_sessions': int(len(cash_gate_rows)), 'cash_gate_entries': cash_gate_entries, 'cash_gate_exits': cash_gate_exits, 'cash_gate_counterfactual_negative_sessions': int(sum(value < 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_counterfactual_positive_sessions': int(sum(value > 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_avoided_loss_return_sum': cash_gate_avoided_loss_sum, 'cash_gate_missed_gain_return_sum': cash_gate_missed_gain_sum, 'cash_gate_net_avoided_return_sum': float(cash_gate_avoided_loss_sum - cash_gate_missed_gain_sum), 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
+    simulation_timing["portfolio_replay_seconds"] = time.perf_counter() - replay_started
+    simulation_timing["policy_seconds"] = float(policy_seconds)
+    simulation_timing["accounting_seconds"] = max(
+        0.0,
+        simulation_timing["portfolio_replay_seconds"] - float(policy_seconds),
+    )
+    simulation_timing["total_seconds"] = time.perf_counter() - simulation_started
+    simulation_timing["session_count"] = int(total_sessions)
+    metrics["simulation_profile"] = dict(simulation_timing)
+    simulation_progress(1.0, f"OOS portfolio replay {total_sessions}/{total_sessions} completed")
+
     summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- LightGBM Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
