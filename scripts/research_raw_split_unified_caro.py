@@ -193,7 +193,7 @@ def main() -> int:
         "--include-dividend-features",
         action="store_true",
         help=(
-            "Reserved for a later controlled campaign. v10.8.67 defaults to "
+            "Reserved for a later controlled campaign. v10.8.68 defaults to "
             "RAW+split price features only."
         ),
     )
@@ -201,7 +201,7 @@ def main() -> int:
 
     if args.include_dividend_features:
         raise ValueError(
-            "v10.8.67 calibrates the canonical RAW+split price architecture only. "
+            "v10.8.68 calibrates the canonical RAW+split price architecture only. "
             "Dividend-feature tuning must be run as a separate campaign."
         )
     if int(args.candidate_count) < 4:
@@ -289,18 +289,9 @@ def main() -> int:
 
         research_settings = deepcopy(request.research_model_settings)
         lightgbm_methodology = deepcopy(research_settings.get("lightgbm") or {})
-        lightgbm_methodology.setdefault("early_stopping_enabled", True)
-        lightgbm_methodology.setdefault("early_stopping_rounds", 30)
-        lightgbm_methodology.setdefault("early_stopping_validation_fraction", 0.15)
-        lightgbm_methodology.setdefault("early_stopping_min_validation_sessions", 40)
-        lightgbm_methodology.setdefault("early_stopping_max_validation_sessions", 126)
-        # LightGBM row subsampling is active only when subsample_freq > 0.
-        # Keep the control inside the expanded CARO domain without changing
-        # behavior when subsample == 1.0.
-        lightgbm_methodology["subsample_freq"] = max(
-            1,
-            int(lightgbm_methodology.get("subsample_freq") or 1),
-        )
+        # v10.8.68 restores full-fit LightGBM behavior. Predictive error metrics
+        # are evaluated on the existing chronological calibration window only.
+        lightgbm_methodology["early_stopping_enabled"] = False
         research_settings["lightgbm"] = lightgbm_methodology
 
         base_config = request.model_copy(
@@ -391,7 +382,7 @@ def main() -> int:
 
         checkpoint = {
             "schema_version": 1,
-            "api_version": "10.8.67",
+            "api_version": "10.8.68",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -548,8 +539,8 @@ def main() -> int:
 
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.67",
-            "experiment": "raw-split-unified-caro-v5",
+            "api_version": "10.8.68",
+            "experiment": "raw-split-unified-caro-v6",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -582,15 +573,16 @@ def main() -> int:
                 "control_in_surrogate_training": True,
                 "control_as_initial_probability_anchor": True,
                 "temporal_early_stopping": {
-                    "enabled": True,
-                    "rounds": int(lightgbm_methodology.get("early_stopping_rounds", 30)),
-                    "validation_fraction": float(lightgbm_methodology.get("early_stopping_validation_fraction", 0.15)),
-                    "min_validation_sessions": int(lightgbm_methodology.get("early_stopping_min_validation_sessions", 40)),
-                    "max_validation_sessions": int(lightgbm_methodology.get("early_stopping_max_validation_sessions", 126)),
+                    "enabled": False,
+                    "reason": "RMSE early stopping was not aligned with economic cross-asset ranking quality",
                     "oos_used_for_early_stopping": False,
                 },
-                "predictive_diagnostics": ["MAE", "RMSE", "generalization_gap_rmse"],
-                "feature_importance": "LightGBM gain aggregated by fold",
+                "predictive_diagnostics": {
+                    "metrics": ["MAE", "RMSE", "generalization_gap_rmse"],
+                    "selection_role": "informative_only",
+                    "validation_source": "existing chronological calibration window",
+                },
+                "feature_importance": "LightGBM gain from calibration models aggregated by fold",
                 "hyperparameter_search_only": True,
             },
         }
