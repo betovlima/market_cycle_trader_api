@@ -752,6 +752,20 @@ def _run_lightgbm(
                 progress_callback=phase_progress("calibration training", 0.02, 0.38),
                 technical_log_callback=technical_log_callback,
             )
+            calibration_predictive_diagnostics = _evaluate_lightgbm_models_on_dates(
+                calibration_models,
+                frames,
+                symbols,
+                calibration_dates,
+                target_column="forward_risk_adjusted_utility",
+            )
+            model_fold_diagnostics.append(
+                _aggregate_lightgbm_model_diagnostics(
+                    calibration_models,
+                    fold_id=fold_id,
+                    validation=calibration_predictive_diagnostics,
+                )
+            )
             calibration_cash_edge_models = None
             if _risk_off_enabled(rep_config):
                 calibration_cash_edge_models = _lightgbm_fit_models(
@@ -832,12 +846,6 @@ def _run_lightgbm(
                 phase=f"run_{run_index}_fold_{fold_position}_final",
                 progress_callback=phase_progress("final training", 0.50, 0.90),
                 technical_log_callback=technical_log_callback,
-            )
-            model_fold_diagnostics.append(
-                _aggregate_lightgbm_model_diagnostics(
-                    final_models,
-                    fold_id=fold_id,
-                )
             )
             latest_final_models = final_models
             latest_final_fold_id = fold_id
@@ -1079,8 +1087,9 @@ def _run_lightgbm(
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
-                "lightgbm_early_stopping_enabled": bool(_lightgbm_settings(rep_config).get("early_stopping_enabled", True)),
-                "lightgbm_early_stopping_rounds": int(_lightgbm_settings(rep_config).get("early_stopping_rounds", 30)),
+                "lightgbm_early_stopping_enabled": False,
+                "lightgbm_early_stopping_rounds": None,
+                "lightgbm_validation_role": "diagnostic_only_existing_calibration_window",
                 "lightgbm_fold_diagnostics": model_fold_diagnostics,
                 "lightgbm_predictive_diagnostics": predictive_diagnostics,
                 "latest_research_tree": latest_tree,
