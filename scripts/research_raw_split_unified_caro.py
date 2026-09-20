@@ -470,10 +470,34 @@ def main() -> int:
         rows = []
         for item in checkpoint["candidates"]:
             metrics = item["metrics"]
+            proposal = item.get("proposal") or {}
+            surrogate_cv = proposal.get("surrogate_cross_validation") or {}
+            metric_order = list(surrogate_cv.get("metric_order") or [])
+            gp_weights = list(surrogate_cv.get("gp_weight") or [])
+            tree_weights = list(surrogate_cv.get("extra_trees_weight") or [])
+            capital_index = metric_order.index("ending_capital") if "ending_capital" in metric_order else -1
             row = {
                 "candidate_id": item["candidate_id"],
                 "kind": item["kind"],
                 "champion_gate_passed": item["champion_gate_passed"],
+                "estimated_probability_beats_champion": proposal.get("estimated_probability_beats_champion"),
+                "raw_model_probability_beats_champion": proposal.get("raw_model_probability_beats_champion"),
+                "surrogate_gate_reliability": proposal.get("surrogate_gate_reliability"),
+                "surrogate_observation_support": proposal.get("surrogate_observation_support"),
+                "empirical_champion_pass_prior": proposal.get("empirical_champion_pass_prior"),
+                "estimated_ending_capital_mean": proposal.get("estimated_ending_capital_mean"),
+                "estimated_ending_capital_gp_mean": proposal.get("estimated_ending_capital_gp_mean"),
+                "estimated_ending_capital_extra_trees_mean": proposal.get("estimated_ending_capital_extra_trees_mean"),
+                "capital_gp_weight": (
+                    gp_weights[capital_index]
+                    if 0 <= capital_index < len(gp_weights)
+                    else None
+                ),
+                "capital_extra_trees_weight": (
+                    tree_weights[capital_index]
+                    if 0 <= capital_index < len(tree_weights)
+                    else None
+                ),
                 "ending_capital": metrics["ending_capital"],
                 "cagr": metrics["cagr"],
                 "sharpe": metrics["sharpe"],
