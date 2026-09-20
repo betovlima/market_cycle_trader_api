@@ -10,6 +10,7 @@ from market_cycle_trader_api.services.model_tuning_optuna import (
     fixed_control_constraints,
     optuna_distributions,
     tell_optuna_candidate,
+    _trial_constraints,
 )
 
 
@@ -118,7 +119,10 @@ def test_control_is_seeded_and_candidate_can_be_told() -> None:
     assert control.number == 0
     assert control.params == BASE
     assert math.isclose(float(control.value), BASELINE["ending_capital"])
-    assert all(float(value) <= 0.0 for value in control.constraints.values())
+    assert all(
+        float(value) <= 0.0
+        for value in _trial_constraints(control).values()
+    )
 
     trial, _ = ask_optuna_candidate(study, distributions)
     candidate_metrics = {
