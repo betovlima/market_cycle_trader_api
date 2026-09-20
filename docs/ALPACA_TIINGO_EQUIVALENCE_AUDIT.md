@@ -574,3 +574,113 @@ python scripts/research_raw_split_unified_caro.py \
 ```
 
 The expected Control should again reflect full-fit LightGBM behavior rather than the v10.8.67 RMSE-truncated trees. The exact capital must be observed from the frozen execution rather than hard-coded.
+
+
+## Hybrid discontinuity-aware CARO surrogate (API v10.8.69)
+
+The v10.8.68 campaign restored the RAW+split full-fit Control but showed that the Gaussian-process surrogate was poorly calibrated for the discrete rotation objective. Small hyperparameter changes can change asset ordering, which can change the entire portfolio path and produce a non-smooth economic response surface.
+
+API v10.8.69 replaces the GP-only adaptive proposal with a hybrid surrogate:
+
+```text
+completed CARO observations
+          |
+          +-- Gaussian Process
+          |      smooth response component
+          |
+          +-- Extra Trees
+                 discontinuity-aware component
+          |
+          +-- cross-validated reliability
+                 Spearman rank correlation
+                 normalized RMSE
+          |
+          +-- reliability-weighted blend
+          |
+          +-- calibrated P(beat) + expected improvement
+```
+
+The Gaussian Process is retained because it is useful when the local response is smooth. Extra Trees is added because tree ensembles can represent abrupt changes and piecewise response surfaces without imposing the same smoothness assumption.
+
+### Data-driven family weights
+
+Each adaptive iteration performs deterministic K-fold out-of-sample surrogate diagnostics on the completed campaign observations.
+
+For each economic metric:
+
+- GP out-of-fold Spearman correlation;
+- Extra Trees out-of-fold Spearman correlation;
+- GP normalized RMSE;
+- Extra Trees normalized RMSE.
+
+These diagnostics produce separate GP / Extra Trees weights for:
+- ending capital;
+- Sharpe;
+- maximum drawdown;
+- worst-fold return.
+
+A family with better observed rank/generalization performance receives more influence instead of assigning a fixed model weight.
+
+### Small-sample confidence correction
+
+Cross-validation can appear overconfident when the number of completed observations is small relative to the 11-dimensional tuning space. The hybrid reliability is therefore multiplied by:
+
+```text
+observation_support =
+    observations / (observations + 2 * search_dimensions)
+```
+
+This deliberately keeps the first adaptive proposals conservative.
+
+### Empirical Champion-pass prior
+
+The model-based Champion probability is not used directly. Completed non-control candidates with an evaluated Champion gate define a Beta(1,1)-smoothed empirical prior:
+
+```text
+P_empirical =
+    (champion_passes + 1)
+    / (evaluated_candidates + 2)
+```
+
+The displayed / acquisition `P(beat)` becomes:
+
+```text
+P_adjusted =
+    reliability * P_model
+    + (1 - reliability) * P_empirical
+```
+
+When the surrogate has weak evidence, confidence is pulled toward the actual campaign success rate instead of producing a misleading large probability.
+
+Expected improvement is also damped under weak surrogate reliability, while the exploration term is increased. Therefore low-confidence periods trigger more discovery rather than aggressive exploitation.
+
+### Persisted diagnostics
+
+Adaptive candidate proposals now persist:
+
+- raw model P(beat);
+- reliability-adjusted P(beat);
+- empirical Champion-pass prior;
+- raw and effective surrogate reliability;
+- observation-support factor;
+- GP / Extra Trees cross-validation weights;
+- GP / Extra Trees Spearman correlations;
+- GP / Extra Trees normalized RMSE;
+- hybrid, GP-only and Extra-Trees-only capital estimates;
+- base and effective exploration weights.
+
+The RAW+split research `candidates.csv` also exports the principal hybrid-surrogate fields for direct analysis.
+
+### Retrospective check on the v10.8.68 campaign
+
+Using the already observed v10.8.68 candidate settings/outcomes as an offline diagnostic, Extra Trees ranked the adaptive candidates materially better than the previous GP-only surrogate. This retrospective check is diagnostic only; it is not reused as candidate evidence in the new campaign.
+
+The actual v10.8.69 candidate search must still run prospectively on the frozen snapshot.
+
+Run:
+
+```bash
+python scripts/research_raw_split_unified_caro.py \
+  --job-id 20260918T234903-52bd06f3 \
+  --candidate-count 24
+```
