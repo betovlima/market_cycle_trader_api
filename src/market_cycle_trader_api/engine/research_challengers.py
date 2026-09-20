@@ -891,6 +891,439 @@ def _horizon_voting_result_metrics(result: RotationRunResult) -> dict[str, Any]:
     }
 
 
+def _soft_horizon_consensus_settings(config: Any) -> dict[str, Any]:
+    raw = (_research_settings(config).get("soft_horizon_consensus") or {})
+    hard = _horizon_voting_settings(config)
+    return {
+        "enabled": bool(raw.get("enabled", False)) if isinstance(raw, dict) else False,
+        "penalty_strength": (
+            float(raw.get("penalty_strength", 1.0))
+            if isinstance(raw, dict)
+            else 1.0
+        ),
+        "horizons": list(hard["horizons"]),
+        "weights": list(hard["weights"]),
+        "mode": "weighted_rank_margin_modifier",
+    }
+
+
+def _horizon_rank_consensus_snapshot(
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamp: pd.Timestamp,
+    config: Any,
+    *,
+    base_target: int,
+    current_position: int,
+    horizon_utility_caches: dict[int, dict[pd.Timestamp, np.ndarray]] | None = None,
+) -> dict[str, Any]:
+    settings = _soft_horizon_consensus_settings(config)
+    aggregate = np.zeros(len(symbols) + 1, dtype=np.float64)
+    available_weight = 0.0
+    horizon_details: list[dict[str, Any]] = []
+
+    for horizon, weight in zip(
+        settings["horizons"],
+        settings["weights"],
+        strict=True,
+    ):
+        cache = (
+            (horizon_utility_caches or {}).get(int(horizon))
+            if horizon_utility_caches is not None
+            else None
+        )
+        utilities = _model_utilities(
+            horizon_models.get(int(horizon), {}),
+            frames,
+            symbols,
+            timestamp,
+            config,
+            utility_cache=cache,
+        )
+        ranked = sorted(
+            (
+                position
+                for position in range(1, len(utilities))
+                if np.isfinite(utilities[position])
+            ),
+            key=lambda position: (
+                -float(utilities[position]),
+                symbols[position - 1],
+            ),
+        )
+        if not ranked:
+            horizon_details.append(
+                {
+                    "horizon": int(horizon),
+                    "weight": float(weight),
+                    "available_assets": 0,
+                    "winner_asset": None,
+                    "base_target_rank": None,
+                    "base_target_rank_score": None,
+                    "current_position_rank": None,
+                    "current_position_rank_score": None,
+                }
+            )
+            continue
+
+        available_weight += float(weight)
+        denominator = max(1, len(ranked) - 1)
+        rank_scores: dict[int, float] = {}
+        for rank_index, position in enumerate(ranked):
+            rank_score = (
+                1.0
+                if len(ranked) == 1
+                else 1.0 - float(rank_index) / float(denominator)
+            )
+            rank_scores[int(position)] = float(rank_score)
+            aggregate[int(position)] += float(weight) * float(rank_score)
+
+        base_rank = (
+            ranked.index(int(base_target)) + 1
+            if int(base_target) in ranked
+            else None
+        )
+        current_rank = (
+            ranked.index(int(current_position)) + 1
+            if int(current_position) in ranked
+            else None
+        )
+        horizon_details.append(
+            {
+                "horizon": int(horizon),
+                "weight": float(weight),
+                "available_assets": int(len(ranked)),
+                "winner_asset": symbols[ranked[0] - 1],
+                "winner_score": float(utilities[ranked[0]]),
+                "base_target_rank": base_rank,
+                "base_target_rank_score": (
+                    rank_scores.get(int(base_target))
+                    if int(base_target) > 0
+                    else None
+                ),
+                "current_position_rank": current_rank,
+                "current_position_rank_score": (
+                    rank_scores.get(int(current_position))
+                    if int(current_position) > 0
+                    else None
+                ),
+            }
+        )
+
+    if available_weight > 0:
+        aggregate[1:] = aggregate[1:] / float(available_weight)
+
+    finite_positions = [
+        position
+        for position in range(1, len(aggregate))
+        if np.isfinite(aggregate[position])
+    ]
+    consensus_winner = (
+        max(
+            finite_positions,
+            key=lambda position: (
+                float(aggregate[position]),
+                -position,
+            ),
+        )
+        if finite_positions
+        else 0
+    )
+    base_score = (
+        float(aggregate[int(base_target)])
+        if int(base_target) > 0 and int(base_target) < len(aggregate)
+        else None
+    )
+    current_score = (
+        float(aggregate[int(current_position)])
+        if int(current_position) > 0 and int(current_position) < len(aggregate)
+        else None
+    )
+    if base_score is None:
+        support = None
+        relative_component = None
+    elif current_score is None:
+        relative_component = float(base_score)
+        support = float(base_score)
+    else:
+        relative_component = float(
+            np.clip(
+                0.5 + 0.5 * (float(base_score) - float(current_score)),
+                0.0,
+                1.0,
+            )
+        )
+        support = float(
+            0.5 * float(base_score) + 0.5 * relative_component
+        )
+
+    return {
+        "consensus_winner_position": int(consensus_winner),
+        "consensus_winner_asset": (
+            symbols[consensus_winner - 1]
+            if consensus_winner > 0
+            else None
+        ),
+        "consensus_winner_score": (
+            float(aggregate[consensus_winner])
+            if consensus_winner > 0
+            else None
+        ),
+        "base_target_rank_score": base_score,
+        "current_position_rank_score": current_score,
+        "relative_rank_component": relative_component,
+        "soft_support": support,
+        "available_horizon_weight": float(available_weight),
+        "aggregate_rank_scores": {
+            symbols[position - 1]: float(aggregate[position])
+            for position in range(1, len(aggregate))
+        },
+        "horizons": horizon_details,
+    }
+
+
+def _soft_horizon_consensus_policy(
+    base_policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    base_models: dict[str, Any],
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    *,
+    base_switch_margin: float,
+    base_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+    horizon_utility_caches: dict[int, dict[pd.Timestamp, np.ndarray]] | None = None,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+    settings = _soft_horizon_consensus_settings(config)
+    penalty_strength = max(0.0, float(settings["penalty_strength"]))
+
+    def policy(
+        timestamp: pd.Timestamp,
+        current_position: int,
+        holding_days: int,
+    ) -> tuple[int, float]:
+        base_target, base_score = base_policy(
+            timestamp,
+            current_position,
+            holding_days,
+        )
+        key = pd.Timestamp(timestamp)
+
+        if int(base_target) == 0:
+            if decision_diagnostics is not None:
+                decision_diagnostics.setdefault(key, {}).update(
+                    {
+                        "soft_horizon_consensus_enabled": True,
+                        "soft_horizon_consensus_mode": str(settings["mode"]),
+                        "soft_horizon_consensus_reason": "BASE_CASH_PRESERVED",
+                        "soft_horizon_consensus_changed_base_action": False,
+                    }
+                )
+            return 0, float(base_score)
+
+        snapshot = _horizon_rank_consensus_snapshot(
+            horizon_models,
+            frames,
+            symbols,
+            timestamp,
+            config,
+            base_target=int(base_target),
+            current_position=int(current_position),
+            horizon_utility_caches=horizon_utility_caches,
+        )
+
+        if int(base_target) == int(current_position):
+            final_target = int(base_target)
+            reason = "BASE_HOLD_PRESERVED"
+            base_gap = 0.0
+            margin_multiplier = 1.0
+            dynamic_margin = float(base_switch_margin)
+        else:
+            base_utilities = _model_utilities(
+                base_models,
+                frames,
+                symbols,
+                timestamp,
+                config,
+                utility_cache=base_utility_cache,
+            )
+            target_utility = (
+                float(base_utilities[int(base_target)])
+                if int(base_target) < len(base_utilities)
+                else float("nan")
+            )
+            current_utility = (
+                float(base_utilities[int(current_position)])
+                if 0 <= int(current_position) < len(base_utilities)
+                else 0.0
+            )
+            base_gap = target_utility - current_utility
+            support = snapshot.get("soft_support")
+            if support is None or not np.isfinite(float(support)):
+                margin_multiplier = 1.0
+            else:
+                margin_multiplier = 1.0 + penalty_strength * (
+                    1.0 - float(np.clip(float(support), 0.0, 1.0))
+                )
+            dynamic_margin = float(base_switch_margin) * float(
+                margin_multiplier
+            )
+
+            if not np.isfinite(base_gap):
+                final_target = int(base_target)
+                reason = "SOFT_CONSENSUS_NO_GAP_PRESERVE"
+            elif float(base_gap) + 1e-15 >= float(dynamic_margin):
+                final_target = int(base_target)
+                reason = "SOFT_CONSENSUS_ACCEPT"
+            else:
+                final_target = (
+                    int(current_position)
+                    if int(current_position) > 0
+                    else 0
+                )
+                reason = "SOFT_CONSENSUS_BLOCK_MARGINAL_SWITCH"
+
+        if decision_diagnostics is not None:
+            diagnostic = decision_diagnostics.setdefault(key, {})
+            diagnostic.update(
+                {
+                    "soft_horizon_consensus_enabled": True,
+                    "soft_horizon_consensus_mode": str(settings["mode"]),
+                    "soft_horizon_consensus_penalty_strength": float(
+                        penalty_strength
+                    ),
+                    "soft_horizon_consensus_base_target_asset": (
+                        symbols[int(base_target) - 1]
+                        if int(base_target) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_current_asset": (
+                        symbols[int(current_position) - 1]
+                        if int(current_position) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_winner_asset": snapshot.get(
+                        "consensus_winner_asset"
+                    ),
+                    "soft_horizon_consensus_winner_score": snapshot.get(
+                        "consensus_winner_score"
+                    ),
+                    "soft_horizon_consensus_base_target_rank_score": snapshot.get(
+                        "base_target_rank_score"
+                    ),
+                    "soft_horizon_consensus_current_rank_score": snapshot.get(
+                        "current_position_rank_score"
+                    ),
+                    "soft_horizon_consensus_relative_rank_component": snapshot.get(
+                        "relative_rank_component"
+                    ),
+                    "soft_horizon_consensus_support": snapshot.get(
+                        "soft_support"
+                    ),
+                    "soft_horizon_consensus_base_gap": (
+                        float(base_gap)
+                        if np.isfinite(float(base_gap))
+                        else None
+                    ),
+                    "soft_horizon_consensus_base_switch_margin": float(
+                        base_switch_margin
+                    ),
+                    "soft_horizon_consensus_margin_multiplier": float(
+                        margin_multiplier
+                    ),
+                    "soft_horizon_consensus_dynamic_margin": float(
+                        dynamic_margin
+                    ),
+                    "soft_horizon_consensus_horizons": list(
+                        snapshot["horizons"]
+                    ),
+                    "soft_horizon_consensus_final_action_asset": (
+                        symbols[int(final_target) - 1]
+                        if int(final_target) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_reason": reason,
+                    "soft_horizon_consensus_changed_base_action": (
+                        int(final_target) != int(base_target)
+                    ),
+                }
+            )
+        return int(final_target), float(base_score)
+
+    return policy
+
+
+def _soft_horizon_consensus_result_metrics(
+    result: RotationRunResult,
+) -> dict[str, Any]:
+    predictions = result.predictions
+    if not isinstance(predictions, pd.DataFrame) or predictions.empty:
+        return {}
+    column = "soft_horizon_consensus_enabled"
+    if column not in predictions.columns:
+        return {}
+    rows = predictions.loc[
+        predictions[column].fillna(False).astype(bool)
+    ]
+    if rows.empty:
+        return {}
+
+    reasons = rows.get(
+        "soft_horizon_consensus_reason",
+        pd.Series(dtype=object),
+    )
+    changed = rows.get(
+        "soft_horizon_consensus_changed_base_action",
+        pd.Series(dtype=bool),
+    ).fillna(False).astype(bool)
+    support = pd.to_numeric(
+        rows.get(
+            "soft_horizon_consensus_support",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    )
+    multiplier = pd.to_numeric(
+        rows.get(
+            "soft_horizon_consensus_margin_multiplier",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    )
+    return {
+        "soft_horizon_consensus_enabled": True,
+        "soft_horizon_consensus_decisions": int(len(rows)),
+        "soft_horizon_consensus_changed_base_actions": int(changed.sum()),
+        "soft_horizon_consensus_change_rate": float(changed.mean()),
+        "soft_horizon_consensus_blocked_marginal_switches": int(
+            (
+                reasons
+                == "SOFT_CONSENSUS_BLOCK_MARGINAL_SWITCH"
+            ).sum()
+        ),
+        "soft_horizon_consensus_accepts": int(
+            (reasons == "SOFT_CONSENSUS_ACCEPT").sum()
+        ),
+        "soft_horizon_consensus_average_support": (
+            float(support.dropna().mean())
+            if support.notna().any()
+            else None
+        ),
+        "soft_horizon_consensus_median_support": (
+            float(support.dropna().median())
+            if support.notna().any()
+            else None
+        ),
+        "soft_horizon_consensus_average_margin_multiplier": (
+            float(multiplier.dropna().mean())
+            if multiplier.notna().any()
+            else None
+        ),
+    }
+
+
 def _run_lightgbm(
     bars_by_symbol: dict[str, pd.DataFrame],
     config: Any,
