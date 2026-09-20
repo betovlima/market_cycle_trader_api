@@ -758,10 +758,10 @@ Robustness is represented through fixed Control-relative feasibility constraints
 ```text
 Sharpe >= Control Sharpe - 0.05
 MaxDD  >= Control MaxDD  - 0.03
-Worst Fold Return >= 0
+Worst Fold Return > 0
 ```
 
-These constraints guide TPE search only. They do not replace MCT promotion governance.
+These constraints guide TPE search only. The worst-fold constraint uses a tiny positive epsilon so an exact zero remains infeasible, matching the strict MCT gate. They do not replace MCT promotion governance.
 
 The existing dynamic MCT Champion gate remains authoritative. When a candidate passes the gate, it becomes the new MCT anchor and subsequent promotions must beat that Champion.
 
