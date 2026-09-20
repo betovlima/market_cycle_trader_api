@@ -909,3 +909,18 @@ python scripts/research_raw_split_optuna_tpe.py \
 ```
 
 The previous v10.8.70 output directory is intentionally not reused.
+
+
+## OOS technical logger callback fix (API v10.8.72)
+
+API v10.8.71 added OOS simulation profiling. The post-simulation timing log accidentally called a local helper named `technical()` that exists in the LightGBM fit helper but not in `_run_lightgbm()`.
+
+The failure occurred only after the CONTROL completed its OOS replay:
+
+```text
+NameError: name 'technical' is not defined
+```
+
+API v10.8.72 calls the existing optional `technical_log_callback` directly under a null guard. No model, market-data, optimizer, benchmark, or simulation calculation changes.
+
+The v10.8.71 warm-start, buy-and-hold reporting, OOS granular progress, and profiling behavior are preserved unchanged.
