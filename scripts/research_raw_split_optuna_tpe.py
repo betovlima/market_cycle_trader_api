@@ -618,6 +618,7 @@ def main() -> int:
                     "model": OPTUNA_TPE_MODEL,
                     "seed": int(args.seed),
                     "multivariate": True,
+                    "group": True,
                     "constant_liar": False,
                     "startup_trials": resolved_startup_trials,
                 },
