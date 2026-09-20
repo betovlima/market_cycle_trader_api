@@ -116,3 +116,7 @@ def test_cross_validated_hybrid_weights_are_finite_and_normalized() -> None:
     assert np.all(np.isfinite(tree_weight))
     assert np.allclose(gp_weight + tree_weight, 1.0)
     assert np.all((reliability >= 0.0) & (reliability <= 1.0))
+    # The first synthetic metric is deliberately discontinuous. Unless GP
+    # proves material OOF superiority, the discontinuity guard keeps trees
+    # dominant in the central surrogate estimate.
+    assert float(tree_weight[0]) >= 0.80
