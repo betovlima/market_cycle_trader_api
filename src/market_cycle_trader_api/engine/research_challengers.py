@@ -642,6 +642,254 @@ def _lightgbm_fit_models(
     return fitted
 
 
+def _horizon_voting_settings(config: Any) -> dict[str, Any]:
+    raw = (_research_settings(config).get("horizon_voting") or {})
+    enabled = bool(raw.get("enabled", False)) if isinstance(raw, dict) else False
+    horizons = [int(item) for item in config.rotation_target_horizons]
+    weights = np.asarray(config.rotation_target_horizon_weights, dtype=float)
+    if len(horizons) != len(weights):
+        raise ValueError("Horizon voting requires one weight per configured target horizon.")
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0:
+        raise ValueError("Horizon voting requires finite positive horizon weights.")
+    weights = weights / float(weights.sum())
+    return {
+        "enabled": enabled,
+        "minimum_consensus_weight": float(raw.get("minimum_consensus_weight", 0.50)) if isinstance(raw, dict) else 0.50,
+        "cash_override_enabled": bool(raw.get("cash_override_enabled", True)) if isinstance(raw, dict) else True,
+        "horizons": horizons,
+        "weights": [float(item) for item in weights],
+        "mode": "weighted_horizon_consensus_guard",
+    }
+
+
+def _fit_horizon_voting_models(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    train_dates: pd.DatetimeIndex,
+    config: Any,
+    *,
+    phase: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    technical_log_callback: Callable[[str], None] | None = None,
+) -> dict[int, dict[str, Any]]:
+    settings = _horizon_voting_settings(config)
+    horizons = list(settings["horizons"])
+    fitted: dict[int, dict[str, Any]] = {}
+    total = max(1, len(horizons) * len(symbols))
+
+    for horizon_index, horizon in enumerate(horizons):
+        def horizon_progress(position: int, symbol_total: int, device: str, *, _index=horizon_index) -> None:
+            if progress_callback is None:
+                return
+            completed = _index * len(symbols) + int(position)
+            progress_callback(completed, total, device)
+
+        target_column = f"forward_horizon_utility_{int(horizon)}"
+        fitted[int(horizon)] = _lightgbm_fit_models(
+            frames,
+            symbols,
+            train_dates,
+            config,
+            phase=f"{phase}_h{int(horizon)}",
+            progress_callback=horizon_progress,
+            technical_log_callback=technical_log_callback,
+            target_column=target_column,
+        )
+    return fitted
+
+
+def _horizon_vote_snapshot(
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamp: pd.Timestamp,
+    config: Any,
+    *,
+    base_target: int,
+    current_position: int,
+) -> dict[str, Any]:
+    settings = _horizon_voting_settings(config)
+    vote_weights = np.zeros(len(symbols) + 1, dtype=np.float64)
+    horizon_details: list[dict[str, Any]] = []
+
+    for horizon, weight in zip(settings["horizons"], settings["weights"], strict=True):
+        utilities = _model_utilities(
+            horizon_models.get(int(horizon), {}),
+            frames,
+            symbols,
+            timestamp,
+            config,
+        )
+        if not np.isfinite(utilities[1:]).any():
+            winner = 0
+            winner_score = 0.0
+        else:
+            winner = int(np.nanargmax(utilities))
+            winner_score = float(utilities[winner])
+        vote_weights[winner] += float(weight)
+        horizon_details.append(
+            {
+                "horizon": int(horizon),
+                "weight": float(weight),
+                "winner_position": int(winner),
+                "winner_asset": "CASH" if winner == 0 else symbols[winner - 1],
+                "winner_score": float(winner_score),
+            }
+        )
+
+    max_vote = float(np.max(vote_weights))
+    tied = [
+        int(index)
+        for index, value in enumerate(vote_weights)
+        if abs(float(value) - max_vote) <= 1e-12
+    ]
+    if int(base_target) in tied:
+        winner = int(base_target)
+    elif int(current_position) in tied:
+        winner = int(current_position)
+    else:
+        winner = min(tied)
+
+    return {
+        "winner_position": int(winner),
+        "winner_asset": "CASH" if winner == 0 else symbols[winner - 1],
+        "winner_weight": float(vote_weights[winner]),
+        "cash_vote_weight": float(vote_weights[0]),
+        "base_target_vote_weight": (
+            float(vote_weights[int(base_target)])
+            if 0 <= int(base_target) < len(vote_weights)
+            else 0.0
+        ),
+        "current_position_vote_weight": (
+            float(vote_weights[int(current_position)])
+            if 0 <= int(current_position) < len(vote_weights)
+            else 0.0
+        ),
+        "vote_weights": {
+            ("CASH" if index == 0 else symbols[index - 1]): float(value)
+            for index, value in enumerate(vote_weights)
+            if float(value) > 0.0
+        },
+        "horizons": horizon_details,
+    }
+
+
+def _horizon_consensus_guard_policy(
+    base_policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    *,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+    settings = _horizon_voting_settings(config)
+    minimum_consensus = max(0.0, min(1.0, float(settings["minimum_consensus_weight"])))
+    cash_override_enabled = bool(settings["cash_override_enabled"])
+
+    def policy(timestamp: pd.Timestamp, current_position: int, holding_days: int) -> tuple[int, float]:
+        base_target, base_score = base_policy(timestamp, current_position, holding_days)
+        snapshot = _horizon_vote_snapshot(
+            horizon_models,
+            frames,
+            symbols,
+            timestamp,
+            config,
+            base_target=int(base_target),
+            current_position=int(current_position),
+        )
+        vote_winner = int(snapshot["winner_position"])
+        consensus = float(snapshot["winner_weight"])
+
+        if int(base_target) == 0:
+            final_target = 0
+            reason = "BASE_CASH_PRESERVED"
+        elif (
+            cash_override_enabled
+            and vote_winner == 0
+            and consensus >= minimum_consensus
+        ):
+            final_target = 0
+            reason = "HORIZON_CONSENSUS_CASH_OVERRIDE"
+        elif (
+            vote_winner == int(base_target)
+            and consensus >= minimum_consensus
+        ):
+            final_target = int(base_target)
+            reason = "HORIZON_CONSENSUS_ACCEPT"
+        elif int(base_target) == int(current_position):
+            final_target = int(current_position)
+            reason = "BASE_HOLD_PRESERVED"
+        else:
+            final_target = int(current_position) if int(current_position) > 0 else 0
+            reason = "HORIZON_CONSENSUS_BLOCK_SWITCH"
+
+        if decision_diagnostics is not None:
+            diagnostic = decision_diagnostics.setdefault(pd.Timestamp(timestamp), {})
+            diagnostic.update(
+                {
+                    "horizon_voting_enabled": True,
+                    "horizon_voting_mode": str(settings["mode"]),
+                    "horizon_voting_minimum_consensus_weight": float(minimum_consensus),
+                    "horizon_voting_base_target_asset": (
+                        "CASH" if int(base_target) == 0 else symbols[int(base_target) - 1]
+                    ),
+                    "horizon_voting_winner_asset": str(snapshot["winner_asset"]),
+                    "horizon_voting_winner_weight": float(snapshot["winner_weight"]),
+                    "horizon_voting_cash_vote_weight": float(snapshot["cash_vote_weight"]),
+                    "horizon_voting_base_target_vote_weight": float(snapshot["base_target_vote_weight"]),
+                    "horizon_voting_current_position_vote_weight": float(snapshot["current_position_vote_weight"]),
+                    "horizon_voting_vote_weights": dict(snapshot["vote_weights"]),
+                    "horizon_voting_horizons": list(snapshot["horizons"]),
+                    "horizon_voting_final_action_asset": (
+                        "CASH" if int(final_target) == 0 else symbols[int(final_target) - 1]
+                    ),
+                    "horizon_voting_reason": reason,
+                    "horizon_voting_changed_base_action": int(final_target) != int(base_target),
+                }
+            )
+        return int(final_target), float(base_score)
+
+    return policy
+
+
+def _horizon_voting_result_metrics(result: RotationRunResult) -> dict[str, Any]:
+    predictions = result.predictions
+    if not isinstance(predictions, pd.DataFrame) or predictions.empty:
+        return {}
+    if "horizon_voting_enabled" not in predictions.columns:
+        return {}
+    enabled = predictions["horizon_voting_enabled"].fillna(False).astype(bool)
+    rows = predictions.loc[enabled]
+    if rows.empty:
+        return {}
+    reasons = rows.get("horizon_voting_reason", pd.Series(dtype=object))
+    changed = rows.get("horizon_voting_changed_base_action", pd.Series(dtype=bool)).fillna(False).astype(bool)
+    winner_weight = pd.to_numeric(
+        rows.get("horizon_voting_winner_weight", pd.Series(dtype=float)),
+        errors="coerce",
+    )
+    cash_weight = pd.to_numeric(
+        rows.get("horizon_voting_cash_vote_weight", pd.Series(dtype=float)),
+        errors="coerce",
+    )
+    return {
+        "horizon_voting_enabled": True,
+        "horizon_voting_decisions": int(len(rows)),
+        "horizon_voting_changed_base_actions": int(changed.sum()),
+        "horizon_voting_change_rate": float(changed.mean()),
+        "horizon_voting_consensus_accepts": int((reasons == "HORIZON_CONSENSUS_ACCEPT").sum()),
+        "horizon_voting_cash_overrides": int((reasons == "HORIZON_CONSENSUS_CASH_OVERRIDE").sum()),
+        "horizon_voting_blocked_switches": int((reasons == "HORIZON_CONSENSUS_BLOCK_SWITCH").sum()),
+        "horizon_voting_average_winner_weight": (
+            float(winner_weight.dropna().mean()) if winner_weight.notna().any() else None
+        ),
+        "horizon_voting_average_cash_vote_weight": (
+            float(cash_weight.dropna().mean()) if cash_weight.notna().any() else None
+        ),
+    }
+
+
 def _run_lightgbm(
     bars_by_symbol: dict[str, pd.DataFrame],
     config: Any,
