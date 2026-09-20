@@ -51,7 +51,7 @@ from scripts.research_raw_split_unified_caro import (
 )
 
 
-DEFAULT_OUTPUT = "output/raw_split_soft_horizon_consensus_consensus"
+DEFAULT_OUTPUT = "output/raw_split_soft_horizon_consensus"
 
 
 def _checkpoint(path: Path, payload: dict[str, Any]) -> None:
@@ -87,44 +87,77 @@ def _run(
     )
     if not results:
         raise RuntimeError(f"{label} returned no result.")
+
     result = results[0]
-    metrics = _metrics(result, folds, float(config.initial_capital))
+    metrics = _metrics(
+        result,
+        folds,
+        float(config.initial_capital),
+    )
     metrics.update(
         {
             key: value
             for key, value in result.metrics.items()
-            if str(key).startswith("soft_horizon_consensus_")
+            if (
+                str(key).startswith("soft_horizon_consensus_")
+                or str(key).startswith("oos_inference_cache_")
+            )
         }
     )
-    buy_hold = float(metrics.get("buy_hold_ending_capital") or 0.0)
-    ratio = metrics.get("strategy_vs_buy_hold_capital_ratio")
+
+    buy_hold = float(
+        metrics.get("buy_hold_ending_capital") or 0.0
+    )
+    ratio = metrics.get(
+        "strategy_vs_buy_hold_capital_ratio"
+    )
     print(
         f"[soft-consensus] completed {label} "
         f"capital={metrics['ending_capital']:,.2f} "
         f"buy_hold={buy_hold:,.2f} "
-        f"vs_buy_hold={(f'{float(ratio):.3f}x' if ratio is not None else 'n/a')} "
+        f"vs_buy_hold="
+        f"{(f'{float(ratio):.3f}x' if ratio is not None else 'n/a')} "
         f"sharpe={metrics['sharpe']:.4f} "
         f"maxdd={metrics['maximum_drawdown']:.4%} "
-        f"worst_fold={metrics['worst_fold_return']:.4%}",
+        f"worst_fold={metrics['worst_fold_return']:.4%} "
+        f"simulation={float(metrics.get('simulation_total_seconds') or 0.0):.2f}s "
+        f"cache_build={float(metrics.get('oos_inference_cache_build_seconds') or 0.0):.2f}s",
         flush=True,
     )
     return result, metrics
 
 
-def _comparison_row(label: str, metrics: dict[str, Any]) -> dict[str, Any]:
+def _comparison_row(
+    label: str,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "variant": label,
         "ending_capital": metrics.get("ending_capital"),
         "return": metrics.get("strategy_return"),
         "cagr": metrics.get("cagr"),
         "sharpe": metrics.get("sharpe"),
-        "maximum_drawdown": metrics.get("maximum_drawdown"),
-        "worst_fold_return": metrics.get("worst_fold_return"),
-        "buy_hold_ending_capital": metrics.get("buy_hold_ending_capital"),
-        "buy_hold_return": metrics.get("buy_hold_return"),
-        "buy_hold_cagr": metrics.get("buy_hold_cagr"),
-        "buy_hold_sharpe": metrics.get("buy_hold_sharpe"),
-        "buy_hold_maximum_drawdown": metrics.get("buy_hold_maximum_drawdown"),
+        "maximum_drawdown": metrics.get(
+            "maximum_drawdown"
+        ),
+        "worst_fold_return": metrics.get(
+            "worst_fold_return"
+        ),
+        "buy_hold_ending_capital": metrics.get(
+            "buy_hold_ending_capital"
+        ),
+        "buy_hold_return": metrics.get(
+            "buy_hold_return"
+        ),
+        "buy_hold_cagr": metrics.get(
+            "buy_hold_cagr"
+        ),
+        "buy_hold_sharpe": metrics.get(
+            "buy_hold_sharpe"
+        ),
+        "buy_hold_maximum_drawdown": metrics.get(
+            "buy_hold_maximum_drawdown"
+        ),
         "strategy_vs_buy_hold_capital_ratio": metrics.get(
             "strategy_vs_buy_hold_capital_ratio"
         ),
@@ -134,32 +167,44 @@ def _comparison_row(label: str, metrics: dict[str, Any]) -> dict[str, Any]:
         "strategy_vs_buy_hold_excess_return": metrics.get(
             "strategy_vs_buy_hold_excess_return"
         ),
-        "simulation_total_seconds": metrics.get("simulation_total_seconds"),
-        "simulation_policy_seconds": metrics.get("simulation_policy_seconds"),
+        "simulation_total_seconds": metrics.get(
+            "simulation_total_seconds"
+        ),
+        "simulation_policy_seconds": metrics.get(
+            "simulation_policy_seconds"
+        ),
         "simulation_accounting_seconds": metrics.get(
             "simulation_accounting_seconds"
         ),
-        "soft_horizon_consensus_decisions": metrics.get("soft_horizon_consensus_decisions"),
+        "oos_inference_cache_build_seconds": metrics.get(
+            "oos_inference_cache_build_seconds"
+        ),
+        "oos_inference_cache_predict_calls": metrics.get(
+            "oos_inference_cache_predict_calls"
+        ),
+        "soft_horizon_consensus_decisions": metrics.get(
+            "soft_horizon_consensus_decisions"
+        ),
         "soft_horizon_consensus_changed_base_actions": metrics.get(
             "soft_horizon_consensus_changed_base_actions"
         ),
         "soft_horizon_consensus_change_rate": metrics.get(
             "soft_horizon_consensus_change_rate"
         ),
-        "soft_horizon_consensus_consensus_accepts": metrics.get(
-            "soft_horizon_consensus_consensus_accepts"
+        "soft_horizon_consensus_accepts": metrics.get(
+            "soft_horizon_consensus_accepts"
         ),
-        "soft_horizon_consensus_cash_overrides": metrics.get(
-            "soft_horizon_consensus_cash_overrides"
+        "soft_horizon_consensus_blocked_marginal_switches": metrics.get(
+            "soft_horizon_consensus_blocked_marginal_switches"
         ),
-        "soft_horizon_consensus_blocked_switches": metrics.get(
-            "soft_horizon_consensus_blocked_switches"
+        "soft_horizon_consensus_average_support": metrics.get(
+            "soft_horizon_consensus_average_support"
         ),
-        "soft_horizon_consensus_average_winner_weight": metrics.get(
-            "soft_horizon_consensus_average_winner_weight"
+        "soft_horizon_consensus_median_support": metrics.get(
+            "soft_horizon_consensus_median_support"
         ),
-        "soft_horizon_consensus_average_cash_vote_weight": metrics.get(
-            "soft_horizon_consensus_average_cash_vote_weight"
+        "soft_horizon_consensus_average_margin_multiplier": metrics.get(
+            "soft_horizon_consensus_average_margin_multiplier"
         ),
     }
 
@@ -167,50 +212,77 @@ def _comparison_row(label: str, metrics: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "A/B test of the canonical RAW+split MCT Control against a "
-            "weighted multi-soft horizon consensus consensus guard."
+            "A/B test of the canonical RAW+split MCT Control against "
+            "soft weighted multi-horizon rank consensus."
         )
     )
     parser.add_argument("--job-id", default=None)
-    parser.add_argument("--raw-collection", default=RAW_COLLECTION)
-    parser.add_argument("--corporate-actions-collection", default=CA_COLLECTION)
+    parser.add_argument(
+        "--raw-collection",
+        default=RAW_COLLECTION,
+    )
+    parser.add_argument(
+        "--corporate-actions-collection",
+        default=CA_COLLECTION,
+    )
     parser.add_argument(
         "--penalty-strength",
         type=float,
         default=1.0,
         help=(
-            "Continuous multiplier strength applied to the existing switch "
-            "margin when multi-horizon rank support is weak."
+            "Continuous strength used to increase the existing "
+            "switch margin when multi-horizon rank support is weak."
         ),
     )
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT,
+    )
     args = parser.parse_args()
 
     if float(args.penalty_strength) < 0.0:
-        raise ValueError("--penalty-strength cannot be negative.")
+        raise ValueError(
+            "--penalty-strength cannot be negative."
+        )
 
     output_dir = (ROOT / args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     client = create_client()
     try:
         db = get_database(client)
-        job = _latest_job(db, args.job_id)
-        request = BacktestExecutionRequest.model_validate(job["request"])
-        start = _utc(request.start_date).normalize()
+        job = _latest_job(
+            db,
+            args.job_id,
+        )
+        request = BacktestExecutionRequest.model_validate(
+            job["request"]
+        )
+        start = _utc(
+            request.start_date
+        ).normalize()
         end = _utc(
-            request.analysis_end_date or request.end_date
+            request.analysis_end_date
+            or request.end_date
         ).normalize()
         end_exclusive = end + pd.Timedelta(days=1)
 
         raw_collection = db[str(args.raw_collection)]
-        ca_collection = db[str(args.corporate_actions_collection)]
+        ca_collection = db[
+            str(args.corporate_actions_collection)
+        ]
 
         frames: dict[str, pd.DataFrame] = {}
         exclusions: list[dict[str, Any]] = []
         data_diagnostics: list[dict[str, Any]] = []
 
-        for position, symbol in enumerate(request.assets, start=1):
+        for position, symbol in enumerate(
+            request.assets,
+            start=1,
+        ):
             raw = _read_bars(
                 raw_collection,
                 symbol=symbol,
@@ -220,22 +292,41 @@ def main() -> int:
                 start=start,
                 end_exclusive=end_exclusive,
             )
-            actions = _corporate_actions(ca_collection, symbol)
-            issue = _structural_identity_issue(symbol, actions)
+            actions = _corporate_actions(
+                ca_collection,
+                symbol,
+            )
+            issue = _structural_identity_issue(
+                symbol,
+                actions,
+            )
             if issue is not None:
-                exclusions.append({"symbol": symbol, **issue})
+                exclusions.append(
+                    {
+                        "symbol": symbol,
+                        **issue,
+                    }
+                )
                 print(
                     f"[data] {position}/{len(request.assets)} "
-                    f"{symbol} excluded reason={issue['reason']}",
+                    f"{symbol} excluded "
+                    f"reason={issue['reason']}",
                     flush=True,
                 )
                 continue
             if raw.empty:
                 exclusions.append(
-                    {"symbol": symbol, "reason": "missing_raw_history"}
+                    {
+                        "symbol": symbol,
+                        "reason": "missing_raw_history",
+                    }
                 )
                 continue
-            reconstructed, applied = _split_normalize(raw, actions)
+
+            reconstructed, applied = _split_normalize(
+                raw,
+                actions,
+            )
             frames[symbol] = reconstructed
             data_diagnostics.append(
                 {
@@ -259,19 +350,35 @@ def main() -> int:
         ]
         if len(references) < 2:
             references = list(anchors)
+
         reference_set = set(references)
         candidates = [
             symbol
             for symbol in request.research_candidate_assets
-            if symbol in frames and symbol not in reference_set
+            if (
+                symbol in frames
+                and symbol not in reference_set
+            )
         ]
 
-        base_settings = deepcopy(request.research_model_settings)
-        base_lightgbm = deepcopy(base_settings.get("lightgbm") or {})
-        base_lightgbm["early_stopping_enabled"] = False
+        base_settings = deepcopy(
+            request.research_model_settings
+        )
+        base_lightgbm = deepcopy(
+            base_settings.get("lightgbm") or {}
+        )
+        base_lightgbm[
+            "early_stopping_enabled"
+        ] = False
         base_settings["lightgbm"] = base_lightgbm
-        base_settings["horizon_voting"] = {"enabled": False}
-        base_settings["soft_horizon_consensus"] = {"enabled": False}
+        base_settings["horizon_voting"] = {
+            "enabled": False,
+        }
+        base_settings[
+            "soft_horizon_consensus"
+        ] = {
+            "enabled": False,
+        }
 
         base_config = request.model_copy(
             update={
@@ -290,12 +397,19 @@ def main() -> int:
 
         if allocation_execution_enabled(base_config):
             raise ValueError(
-                "Soft horizon consensus v2 must run on the canonical single-position "
-                "rotation policy, not optimized allocation."
+                "Soft horizon consensus v2 is intentionally "
+                "limited to the canonical single-position "
+                "rotation policy."
             )
 
-        _, common_dates = prepare_rotation_panel(frames, base_config)
-        folds = _build_walk_forward_folds(common_dates, base_config)
+        _, common_dates = prepare_rotation_panel(
+            frames,
+            base_config,
+        )
+        folds = _build_walk_forward_folds(
+            common_dates,
+            base_config,
+        )
 
         control_result, control_metrics = _run(
             label="CONTROL",
@@ -304,22 +418,30 @@ def main() -> int:
             folds=folds,
         )
 
-        consensus_settings = deepcopy(base_settings)
-        consensus_settings["horizon_voting"] = {"enabled": False}
-        consensus_settings["soft_horizon_consensus"] = {
-            "enabled": True,
-            "penalty_strength": float(args.penalty_strength),
+        challenger_settings = deepcopy(base_settings)
+        challenger_settings["horizon_voting"] = {
+            "enabled": False,
         }
-        consensus_config = base_config.model_copy(
+        challenger_settings[
+            "soft_horizon_consensus"
+        ] = {
+            "enabled": True,
+            "penalty_strength": float(
+                args.penalty_strength
+            ),
+        }
+        challenger_config = base_config.model_copy(
             update={
-                "research_model_settings": consensus_settings,
+                "research_model_settings": (
+                    challenger_settings
+                ),
             }
         )
 
-        voting_result, voting_metrics = _run(
+        challenger_result, challenger_metrics = _run(
             label="SOFT_HORIZON_CONSENSUS",
             frames=frames,
-            config=consensus_config,
+            config=challenger_config,
             folds=folds,
         )
 
@@ -331,53 +453,79 @@ def main() -> int:
             output_dir / "control_trades.csv",
             index=False,
         )
-        voting_result.predictions.to_csv(
-            output_dir / "soft_horizon_consensus_predictions.csv",
+        challenger_result.predictions.to_csv(
+            output_dir
+            / "soft_horizon_consensus_predictions.csv",
             index=True,
         )
-        voting_result.trades.to_csv(
-            output_dir / "soft_horizon_consensus_trades.csv",
+        challenger_result.trades.to_csv(
+            output_dir
+            / "soft_horizon_consensus_trades.csv",
             index=False,
         )
 
-        voting_columns = [
+        consensus_columns = [
             column
-            for column in voting_result.predictions.columns
-            if str(column).startswith("soft_horizon_consensus_")
+            for column
+            in challenger_result.predictions.columns
+            if str(column).startswith(
+                "soft_horizon_consensus_"
+            )
         ]
-        if voting_columns:
-            voting_result.predictions[voting_columns].to_csv(
-                output_dir / "soft_horizon_consensus_decisions.csv",
+        if consensus_columns:
+            challenger_result.predictions[
+                consensus_columns
+            ].to_csv(
+                output_dir
+                / "soft_horizon_consensus_decisions.csv",
                 index=True,
             )
 
         comparison = pd.DataFrame(
             [
-                _comparison_row("CONTROL", control_metrics),
-                _comparison_row("SOFT_HORIZON_CONSENSUS", voting_metrics),
+                _comparison_row(
+                    "CONTROL",
+                    control_metrics,
+                ),
+                _comparison_row(
+                    "SOFT_HORIZON_CONSENSUS",
+                    challenger_metrics,
+                ),
             ]
         )
         comparison.to_csv(
             output_dir / "strategy_comparison.csv",
             index=False,
         )
-        pd.DataFrame(data_diagnostics).to_csv(
+        pd.DataFrame(
+            data_diagnostics
+        ).to_csv(
             output_dir / "data_diagnostics.csv",
             index=False,
         )
-        pd.DataFrame(exclusions).to_csv(
+        pd.DataFrame(
+            exclusions
+        ).to_csv(
             output_dir / "excluded_assets.csv",
             index=False,
         )
 
-        control_capital = float(control_metrics["ending_capital"])
-        voting_capital = float(voting_metrics["ending_capital"])
+        control_capital = float(
+            control_metrics["ending_capital"]
+        )
+        challenger_capital = float(
+            challenger_metrics["ending_capital"]
+        )
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.73",
-            "experiment": "raw-split-soft-consensus-consensus-v1",
+            "api_version": "10.8.74",
+            "experiment": (
+                "raw-split-soft-horizon-consensus-v2"
+            ),
             "source_job_id": job.get("id"),
-            "raw_collection": str(args.raw_collection),
+            "raw_collection": str(
+                args.raw_collection
+            ),
             "corporate_actions_collection": str(
                 args.corporate_actions_collection
             ),
@@ -385,39 +533,51 @@ def main() -> int:
             "excluded_assets": exclusions,
             "methodology": {
                 "control": (
-                    "canonical weighted multi-horizon LightGBM utility policy"
+                    "canonical weighted multi-horizon "
+                    "LightGBM utility policy"
                 ),
                 "challenger": (
-                    "same Control policy plus independent per-horizon LightGBM "
-                    "weighted rank aggregation that continuously modifies only "
-                    "the existing switch margin"
+                    "same Control policy plus independent "
+                    "per-horizon LightGBM percentile-rank "
+                    "aggregation used only as a continuous "
+                    "switch-margin modifier"
                 ),
                 "horizons": [
                     int(item)
-                    for item in base_config.rotation_target_horizons
+                    for item
+                    in base_config.rotation_target_horizons
                 ],
                 "horizon_weights": [
                     float(item)
-                    for item in base_config.rotation_target_horizon_weights
+                    for item
+                    in base_config.rotation_target_horizon_weights
                 ],
-                "penalty_strength": float(args.penalty_strength),
+                "penalty_strength": float(
+                    args.penalty_strength
+                ),
                 "rank_aggregation": (
-                    "within each horizon, finite assets are percentile-ranked; "
-                    "normalized ranks are aggregated using the existing horizon weights"
+                    "each horizon percentile-ranks all finite "
+                    "assets; normalized ranks are aggregated "
+                    "with the configured horizon weights"
                 ),
                 "cash_policy": (
-                    "CASH remains exclusively controlled by the existing base policy; "
-                    "soft horizon consensus does not vote CASH"
+                    "CASH remains exclusively controlled by "
+                    "the existing base policy; the consensus "
+                    "layer does not vote on CASH"
                 ),
-                "policy_rule": (
-                    "The base model still selects the asset. Rank consensus produces "
-                    "a continuous support score that can increase the already-calibrated "
-                    "switch margin up to (1 + penalty_strength)x. No exact ticker-majority "
-                    "threshold is used, and consensus cannot select a different asset."
+                "switch_rule": (
+                    "consensus support continuously increases "
+                    "the existing calibrated switch margin. "
+                    "There is no exact ticker-majority threshold"
+                ),
+                "asset_selection": (
+                    "the base policy remains the only layer "
+                    "allowed to select a new asset"
                 ),
                 "batched_inference": (
-                    "OOS LightGBM predictions are precomputed per fold/model set and "
-                    "reused during replay; training and economic calculations are unchanged"
+                    "OOS LightGBM predictions are precomputed "
+                    "per fold and model set, then reused during "
+                    "replay"
                 ),
                 "same_hyperparameters": True,
                 "same_folds": True,
@@ -427,49 +587,93 @@ def main() -> int:
                 "oos_used_for_training_or_threshold_selection": False,
             },
             "control": control_metrics,
-            "soft_horizon_consensus": voting_metrics,
+            "soft_horizon_consensus": challenger_metrics,
             "comparison": {
-                "capital_difference": voting_capital - control_capital,
+                "capital_difference": (
+                    challenger_capital - control_capital
+                ),
                 "capital_ratio": (
-                    voting_capital / control_capital
+                    challenger_capital / control_capital
                     if control_capital > 0
                     else None
                 ),
                 "cagr_difference": (
-                    float(voting_metrics["cagr"])
+                    float(challenger_metrics["cagr"])
                     - float(control_metrics["cagr"])
                 ),
                 "sharpe_difference": (
-                    float(voting_metrics["sharpe"])
+                    float(challenger_metrics["sharpe"])
                     - float(control_metrics["sharpe"])
                 ),
                 "maximum_drawdown_difference": (
-                    float(voting_metrics["maximum_drawdown"])
-                    - float(control_metrics["maximum_drawdown"])
+                    float(
+                        challenger_metrics[
+                            "maximum_drawdown"
+                        ]
+                    )
+                    - float(
+                        control_metrics[
+                            "maximum_drawdown"
+                        ]
+                    )
                 ),
                 "worst_fold_difference": (
-                    float(voting_metrics["worst_fold_return"])
-                    - float(control_metrics["worst_fold_return"])
+                    float(
+                        challenger_metrics[
+                            "worst_fold_return"
+                        ]
+                    )
+                    - float(
+                        control_metrics[
+                            "worst_fold_return"
+                        ]
+                    )
+                ),
+                "simulation_speed_ratio": (
+                    float(
+                        challenger_metrics.get(
+                            "simulation_total_seconds"
+                        )
+                        or 0.0
+                    )
+                    / float(
+                        control_metrics.get(
+                            "simulation_total_seconds"
+                        )
+                        or 1.0
+                    )
                 ),
             },
         }
-        _checkpoint(output_dir / "summary.json", summary)
+        _checkpoint(
+            output_dir / "summary.json",
+            summary,
+        )
 
         print("")
-        print("[done] soft horizon consensus A/B completed", flush=True)
         print(
-            f"[done] CONTROL={control_capital:,.2f}",
+            "[done] soft horizon consensus A/B completed",
             flush=True,
         )
         print(
-            f"[done] SOFT_HORIZON_CONSENSUS={voting_capital:,.2f}",
+            f"[done] CONTROL="
+            f"{control_capital:,.2f}",
             flush=True,
         )
         print(
-            f"[done] delta={voting_capital - control_capital:,.2f}",
+            f"[done] SOFT_HORIZON_CONSENSUS="
+            f"{challenger_capital:,.2f}",
             flush=True,
         )
-        print(f"[done] output={output_dir}", flush=True)
+        print(
+            f"[done] delta="
+            f"{challenger_capital - control_capital:,.2f}",
+            flush=True,
+        )
+        print(
+            f"[done] output={output_dir}",
+            flush=True,
+        )
         return 0
     finally:
         client.close()
