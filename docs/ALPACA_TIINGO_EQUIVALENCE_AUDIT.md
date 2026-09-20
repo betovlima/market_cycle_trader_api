@@ -711,7 +711,7 @@ Only the hyperparameter proposal engine changes.
 
 ### Optimizer
 
-The baseline uses Optuna 5 `TPESampler` with:
+The baseline uses Optuna `TPESampler` with compatibility for Optuna 4.8 through 5.x:
 
 ```text
 seed = fixed
@@ -780,10 +780,10 @@ For the current 11-dimensional LightGBM search this is 12 completed study trials
 ### Dependency
 
 ```text
-optuna>=5.0,<6
+optuna>=4.8,<6
 ```
 
-The v10.8.70 implementation uses the Optuna 5 trial-constraint API rather than the older deprecated `constraints_func` sampler callback.
+The v10.8.70 adapter detects the constraint API at runtime. On Optuna 5.x it uses `Trial.set_constraint()`. On Optuna 4.8 it uses the supported `constraints_func` callback with the same persisted MCT constraint values. This keeps the experiment reproducible across both supported major/minor lines without changing the objective or feasibility rules.
 
 ### Run after v10.8.69 completes
 
