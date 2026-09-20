@@ -299,7 +299,7 @@ def main() -> int:
             ).encode("utf-8")
         ).hexdigest()
 
-        study, distributions, fixed_constraint_thresholds = (
+        study, optuna_search_space, fixed_constraint_thresholds = (
             create_optuna_tpe_study(
                 search_space=_SEARCH_SPACE,
                 base_tuning_values=base_tuning_values,
@@ -372,7 +372,7 @@ def main() -> int:
         for iteration in range(1, int(args.candidate_count) + 1):
             trial, settings = ask_optuna_candidate(
                 study,
-                distributions,
+                optuna_search_space,
             )
             candidate_id = int(trial.number)
 
