@@ -225,6 +225,10 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     
     
     
+    for component_idx, horizon in enumerate(horizons):
+        data[f'forward_horizon_utility_{int(horizon)}'] = utility_components[:, component_idx]
+        data[f'forward_horizon_net_log_return_{int(horizon)}'] = net_return_components[:, component_idx]
+
     data['forward_net_log_return'] = weighted_net_log_return
     data['forward_cash_edge'] = weighted_utility
     data['forward_movement_capture'] = movement_capture
