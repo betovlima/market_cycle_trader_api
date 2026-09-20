@@ -93,8 +93,8 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 16
-DEFAULT_CANDIDATE_COUNT = 20
+TUNING_SCHEMA_VERSION = 17
+DEFAULT_CANDIDATE_COUNT = 24
 DEFAULT_SEED = 42
 TECHNICAL_RESEARCH_SEGMENT_MAX = 2000
 DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT = 100
@@ -128,14 +128,17 @@ def _normalized_fold_protocol(value: dict[str, Any] | None) -> dict[str, int]:
 
 
 _SEARCH_SPACE: tuple[dict[str, Any], ...] = (
-    {"name": "n_estimators", "type": "integer", "min": 220, "max": 380},
-    {"name": "learning_rate", "type": "number", "min": 0.020, "max": 0.050, "precision": 6},
-    {"name": "max_depth", "type": "integer", "min": 2, "max": 4},
-    {"name": "num_leaves", "type": "integer", "min": 4, "max": 12},
-    {"name": "min_child_samples", "type": "integer", "min": 15, "max": 30},
-    {"name": "colsample_bytree", "type": "number", "min": 0.75, "max": 0.95, "precision": 6},
-    {"name": "reg_alpha", "type": "number", "min": 0.0, "max": 0.50, "precision": 6},
-    {"name": "reg_lambda", "type": "number", "min": 1.0, "max": 4.0, "precision": 6},
+    {"name": "n_estimators", "type": "integer", "min": 220, "max": 420},
+    {"name": "learning_rate", "type": "number", "min": 0.015, "max": 0.050, "precision": 6},
+    {"name": "max_depth", "type": "integer", "min": 2, "max": 5},
+    {"name": "num_leaves", "type": "integer", "min": 4, "max": 16},
+    {"name": "min_child_samples", "type": "integer", "min": 15, "max": 40},
+    {"name": "min_child_weight", "type": "number", "min": 0.0001, "max": 0.0500, "precision": 6},
+    {"name": "subsample", "type": "number", "min": 0.65, "max": 1.00, "precision": 6},
+    {"name": "subsample_freq", "type": "integer", "min": 1, "max": 5},
+    {"name": "colsample_bytree", "type": "number", "min": 0.65, "max": 1.00, "precision": 6},
+    {"name": "reg_alpha", "type": "number", "min": 0.0, "max": 0.75, "precision": 6},
+    {"name": "reg_lambda", "type": "number", "min": 0.5, "max": 5.0, "precision": 6},
 )
 _TUNED_NAMES = tuple(item["name"] for item in _SEARCH_SPACE)
 MODEL_PARAMETER_TUNING_SCOPE = "model_parameters"
