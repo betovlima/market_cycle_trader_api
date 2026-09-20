@@ -38,6 +38,7 @@ from market_cycle_trader_api.services.model_tuning_optuna import (
     OPTUNA_TPE_MODEL,
     ask_optuna_candidate,
     create_optuna_tpe_study,
+    default_startup_trials,
     optuna_study_diagnostics,
     tell_optuna_candidate,
 )
@@ -331,12 +332,9 @@ def main() -> int:
         }
 
         resolved_startup_trials = int(
-            getattr(study.sampler, "_n_startup_trials", 0)
-            or (
-                int(args.startup_trials)
-                if args.startup_trials is not None
-                else max(10, min(24, len(_SEARCH_SPACE) + 1))
-            )
+            int(args.startup_trials)
+            if args.startup_trials is not None
+            else default_startup_trials(_SEARCH_SPACE)
         )
 
         checkpoint: dict[str, Any] = {
