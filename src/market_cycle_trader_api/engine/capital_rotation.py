@@ -398,8 +398,98 @@ def _numeric_thread_context(config: Any):
 
 
 
-def _model_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], timestamp: pd.Timestamp, config: Any) -> np.ndarray:
-    
+def _precompute_model_utilities(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamps: pd.DatetimeIndex,
+    config: Any,
+) -> tuple[dict[pd.Timestamp, np.ndarray], dict[str, Any]]:
+    dates = pd.DatetimeIndex(timestamps)
+    matrix = np.full(
+        (len(dates), len(symbols) + 1),
+        float("-inf"),
+        dtype=np.float64,
+    )
+    matrix[:, 0] = 0.0
+    started = time.perf_counter()
+    predict_calls = 0
+    predicted_rows = 0
+
+    for column, symbol in enumerate(symbols, start=1):
+        model = models.get(symbol)
+        frame = frames.get(symbol)
+        if model is None or frame is None or frame.empty:
+            continue
+
+        locations = frame.index.get_indexer(dates)
+        candidate_rows = np.flatnonzero(
+            (locations >= 0) & (locations + 1 < len(frame.index))
+        )
+        if len(candidate_rows) == 0:
+            continue
+
+        positions = locations[candidate_rows]
+        features = frame.iloc[positions][ROTATION_FEATURES]
+        feature_ok = ~features.isna().any(axis=1).to_numpy()
+        next_rows = frame.iloc[positions + 1]
+        next_open = pd.to_numeric(
+            next_rows["open"],
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+        next_close = pd.to_numeric(
+            next_rows["close"],
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+        market_ok = (
+            np.isfinite(next_open)
+            & (next_open > 0.0)
+            & np.isfinite(next_close)
+            & (next_close > 0.0)
+        )
+        valid_mask = feature_ok & market_ok
+        if not np.any(valid_mask):
+            continue
+
+        valid_rows = candidate_rows[valid_mask]
+        valid_positions = locations[valid_rows]
+        batch = frame.iloc[valid_positions][ROTATION_FEATURES]
+        prediction = np.asarray(
+            model.predict(batch),
+            dtype=np.float64,
+        )
+        matrix[valid_rows, column] = prediction
+        predict_calls += 1
+        predicted_rows += int(len(prediction))
+
+    cache = {
+        pd.Timestamp(date): matrix[row].copy()
+        for row, date in enumerate(dates)
+    }
+    return cache, {
+        "cache_build_seconds": time.perf_counter() - started,
+        "cache_session_count": int(len(dates)),
+        "cache_symbol_count": int(len(symbols)),
+        "cache_predict_calls": int(predict_calls),
+        "cache_predicted_rows": int(predicted_rows),
+        "cache_mode": "batched_lightgbm_prediction",
+    }
+
+
+def _model_utilities(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamp: pd.Timestamp,
+    config: Any,
+    *,
+    utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+) -> np.ndarray:
+    key = pd.Timestamp(timestamp)
+    if utility_cache is not None:
+        cached = utility_cache.get(key)
+        if cached is not None:
+            return np.asarray(cached, dtype=np.float64).copy()
 
     values = [0.0]
     for symbol in symbols:
@@ -443,6 +533,8 @@ def _utility_policy(
     decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     fold_id: int | None = None,
     calibrated_switch_margin: float | None = None,
+    utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+    cash_edge_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
 ) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
     
 
@@ -485,6 +577,8 @@ def _utility_policy(
             decision_diagnostics=cash_gate_base_diagnostics,
             fold_id=fold_id,
             calibrated_switch_margin=calibrated_switch_margin,
+            utility_cache=utility_cache,
+            cash_edge_utility_cache=cash_edge_utility_cache,
         )
 
     def position_asset(position: int) -> str:
@@ -516,12 +610,26 @@ def _utility_policy(
                 cash_gate_state["pending_sample"] = None
                 opportunity_gate.refresh_if_needed()
 
-        utilities = _model_utilities(models, frames, symbols, timestamp, config)
+        utilities = _model_utilities(
+            models,
+            frames,
+            symbols,
+            timestamp,
+            config,
+            utility_cache=utility_cache,
+        )
         if not np.isfinite(utilities[1:]).any():
             return (0, 0.0)
 
         cash_edges = (
-            _model_utilities(cash_edge_models or {}, frames, symbols, timestamp, config)
+            _model_utilities(
+                cash_edge_models or {},
+                frames,
+                symbols,
+                timestamp,
+                config,
+                utility_cache=cash_edge_utility_cache,
+            )
             if risk_off
             else utilities.copy()
         )
