@@ -262,7 +262,7 @@
         "penalty_strength": 1
       }
     },
-    "research_market_data_mode": "database_only",
+    "research_market_data_mode": "standalone_snapshot",
     "expected_market_data_signature_sha256": null,
     "research_market_data_snapshot_id": null,
     "walk_forward_fold_count_override": null
