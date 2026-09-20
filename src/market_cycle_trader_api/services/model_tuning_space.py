@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from typing import Any, Iterable, Sequence
 
 ENTRY_THRESHOLD = "opportunity_utility_entry_threshold"
@@ -10,10 +11,33 @@ EXIT_THRESHOLD = "opportunity_utility_exit_threshold"
 def sample_value(spec: dict[str, Any], unit_value: float) -> Any:
     low = float(spec["min"])
     high = float(spec["max"])
-    value = low + float(unit_value) * (high - low)
+    unit = max(0.0, min(1.0, float(unit_value)))
+    scale = str(spec.get("scale") or "linear").strip().lower()
+    if scale == "log":
+        if low <= 0 or high <= 0:
+            raise ValueError("Log-scaled tuning parameters require positive min/max bounds.")
+        value = math.exp(math.log(low) + unit * (math.log(high) - math.log(low)))
+    else:
+        value = low + unit * (high - low)
     if spec["type"] == "integer":
         return int(round(value))
     return round(value, int(spec.get("precision") or 8))
+
+
+def unit_value_for_setting(spec: dict[str, Any], value: Any) -> float:
+    low = float(spec["min"])
+    high = float(spec["max"])
+    numeric = float(value)
+    if high <= low:
+        return 0.0
+    scale = str(spec.get("scale") or "linear").strip().lower()
+    if scale == "log":
+        if low <= 0 or high <= 0 or numeric <= 0:
+            raise ValueError("Log-scaled tuning parameters require positive values.")
+        raw = (math.log(numeric) - math.log(low)) / (math.log(high) - math.log(low))
+    else:
+        raw = (numeric - low) / (high - low)
+    return max(0.0, min(1.0, float(raw)))
 
 
 def normalize_tuning_values(
