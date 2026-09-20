@@ -805,17 +805,18 @@ def _download_snapshot(
     request: BacktestExecutionRequest,
     snapshot_dir: Path,
     replace: bool,
+    resume: bool,
 ) -> dict[str, Any]:
     if snapshot_dir.exists():
-        if not replace:
+        if replace:
+            shutil.rmtree(snapshot_dir)
+        elif not resume:
             raise RuntimeError(
                 f"Snapshot directory already exists: {snapshot_dir}. "
-                "Use --replace-snapshot for a new direct Alpaca download "
+                "Use --replace-snapshot for a new direct Alpaca download, "
+                "--resume-download to continue an interrupted download, "
                 "or --reuse-snapshot to run an existing completed snapshot."
             )
-        shutil.rmtree(
-            snapshot_dir
-        )
 
     bars_dir = snapshot_dir / "bars"
     bars_dir.mkdir(
@@ -846,6 +847,40 @@ def _download_snapshot(
         request.assets,
         start=1,
     ):
+        target = bars_dir / f"{symbol}.csv"
+        if resume and target.is_file() and target.stat().st_size > 0:
+            print(
+                f"[alpaca] bars {position}/{len(request.assets)} "
+                f"{symbol} resume=existing",
+                flush=True,
+            )
+            payload = target.read_bytes()
+            resumed = pd.read_csv(target)
+            if "timestamp" in resumed.columns:
+                resumed["timestamp"] = pd.to_datetime(
+                    resumed["timestamp"],
+                    utc=True,
+                    errors="coerce",
+                )
+                resumed = resumed.dropna(subset=["timestamp"])
+            bar_manifest[symbol] = {
+                "rows": int(len(resumed)),
+                "first_timestamp": (
+                    str(resumed["timestamp"].min())
+                    if len(resumed)
+                    else None
+                ),
+                "last_timestamp": (
+                    str(resumed["timestamp"].max())
+                    if len(resumed)
+                    else None
+                ),
+                "sha256": _sha256_bytes(payload),
+                "file": str(target.relative_to(snapshot_dir)),
+                "resumed": True,
+            }
+            continue
+
         print(
             f"[alpaca] bars "
             f"{position}/{len(request.assets)} "
@@ -862,10 +897,6 @@ def _download_snapshot(
         )
         payload = _frame_csv_bytes(
             frame
-        )
-        target = (
-            bars_dir
-            / f"{symbol}.csv"
         )
         target.write_bytes(
             payload
@@ -896,7 +927,19 @@ def _download_snapshot(
                     snapshot_dir
                 )
             ),
+            "resumed": False,
         }
+        _checkpoint(
+            snapshot_dir / "download_state.json",
+            {
+                "schema_version": 1,
+                "api_version": API_VERSION,
+                "completed_bars": list(bar_manifest),
+                "completed_count": len(bar_manifest),
+                "asset_count": len(request.assets),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     actions = (
         _download_corporate_actions(
@@ -1000,6 +1043,9 @@ def _download_snapshot(
         / "manifest.json",
         manifest,
     )
+    state_path = snapshot_dir / "download_state.json"
+    if state_path.exists():
+        state_path.unlink()
     return manifest
 
 
@@ -1627,14 +1673,27 @@ def main() -> int:
         action="store_true",
     )
     parser.add_argument(
+        "--resume-download",
+        action="store_true",
+    )
+    parser.add_argument(
         "--replace-snapshot",
         action="store_true",
     )
     args = parser.parse_args()
 
-    if args.reuse_snapshot and args.replace_snapshot:
+    selected_snapshot_modes = sum(
+        bool(value)
+        for value in (
+            args.reuse_snapshot,
+            args.resume_download,
+            args.replace_snapshot,
+        )
+    )
+    if selected_snapshot_modes > 1:
         raise ValueError(
-            "--reuse-snapshot and --replace-snapshot are mutually exclusive."
+            "--reuse-snapshot, --resume-download and --replace-snapshot "
+            "are mutually exclusive."
         )
     if float(
         args.penalty_strength
@@ -1683,9 +1742,8 @@ def main() -> int:
         manifest = _download_snapshot(
             request=request,
             snapshot_dir=snapshot_dir,
-            replace=bool(
-                args.replace_snapshot
-            ),
+            replace=bool(args.replace_snapshot),
+            resume=bool(args.resume_download),
         )
         manifest = _verify_snapshot(
             snapshot_dir
