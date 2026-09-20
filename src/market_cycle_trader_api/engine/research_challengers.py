@@ -1049,16 +1049,17 @@ def _run_lightgbm(
         backend = "lightgbm_utility" if repetitions <= 1 else f"lightgbm_utility_seed_{seed}"
         result.backend = backend
         simulation_profile = result.metrics.get("simulation_profile") or {}
-        technical(
-            "model=lightgbm event=oos_simulation_complete "
-            f"run={run_index}/{repetitions} "
-            f"sessions={simulation_profile.get('session_count')} "
-            f"benchmark_seconds={float(simulation_profile.get('benchmark_seconds') or 0.0):.3f} "
-            f"market_regime_seconds={float(simulation_profile.get('market_regime_seconds') or 0.0):.3f} "
-            f"policy_seconds={float(simulation_profile.get('policy_seconds') or 0.0):.3f} "
-            f"accounting_seconds={float(simulation_profile.get('accounting_seconds') or 0.0):.3f} "
-            f"total_seconds={float(simulation_profile.get('total_seconds') or 0.0):.3f}"
-        )
+        if technical_log_callback is not None:
+            technical_log_callback(
+                "model=lightgbm event=oos_simulation_complete "
+                f"run={run_index}/{repetitions} "
+                f"sessions={simulation_profile.get('session_count')} "
+                f"benchmark_seconds={float(simulation_profile.get('benchmark_seconds') or 0.0):.3f} "
+                f"market_regime_seconds={float(simulation_profile.get('market_regime_seconds') or 0.0):.3f} "
+                f"policy_seconds={float(simulation_profile.get('policy_seconds') or 0.0):.3f} "
+                f"accounting_seconds={float(simulation_profile.get('accounting_seconds') or 0.0):.3f} "
+                f"total_seconds={float(simulation_profile.get('total_seconds') or 0.0):.3f}"
+            )
 
         latest_asset = None
         if isinstance(result.predictions, pd.DataFrame) and not result.predictions.empty:
