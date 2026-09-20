@@ -623,8 +623,10 @@ def _surrogate_cross_validated_reliability(
             "metric_reliability": np.zeros(_METRIC_COUNT, dtype=float),
             "gp_spearman": np.zeros(_METRIC_COUNT, dtype=float),
             "extra_trees_spearman": np.zeros(_METRIC_COUNT, dtype=float),
+            "stacked_spearman": np.zeros(_METRIC_COUNT, dtype=float),
             "gp_nrmse": np.full(_METRIC_COUNT, np.inf, dtype=float),
             "extra_trees_nrmse": np.full(_METRIC_COUNT, np.inf, dtype=float),
+            "stacked_nrmse": np.full(_METRIC_COUNT, np.inf, dtype=float),
             "cv_rmse": np.std(y_train, axis=0, ddof=0),
             "fold_count": 0,
         }
@@ -663,49 +665,69 @@ def _surrogate_cross_validated_reliability(
 
     gp_spearman = np.zeros(_METRIC_COUNT, dtype=float)
     tree_spearman = np.zeros(_METRIC_COUNT, dtype=float)
+    stacked_spearman = np.zeros(_METRIC_COUNT, dtype=float)
     gp_nrmse = np.zeros(_METRIC_COUNT, dtype=float)
     tree_nrmse = np.zeros(_METRIC_COUNT, dtype=float)
+    stacked_nrmse = np.zeros(_METRIC_COUNT, dtype=float)
     cv_rmse = np.zeros(_METRIC_COUNT, dtype=float)
-    gp_score = np.zeros(_METRIC_COUNT, dtype=float)
-    tree_score = np.zeros(_METRIC_COUNT, dtype=float)
+    gp_weight = np.zeros(_METRIC_COUNT, dtype=float)
+    tree_weight = np.zeros(_METRIC_COUNT, dtype=float)
+    metric_reliability = np.zeros(_METRIC_COUNT, dtype=float)
+
+    weight_grid = np.linspace(0.0, 1.0, 21)
 
     for metric_index in range(_METRIC_COUNT):
         actual = y_train[:, metric_index]
         scale = max(float(np.std(actual, ddof=0)), 1e-12)
+
         gp_error = float(np.sqrt(np.mean(np.square(gp_oof[:, metric_index] - actual))))
         tree_error = float(np.sqrt(np.mean(np.square(tree_oof[:, metric_index] - actual))))
         gp_spearman[metric_index] = _safe_spearman(actual, gp_oof[:, metric_index])
         tree_spearman[metric_index] = _safe_spearman(actual, tree_oof[:, metric_index])
         gp_nrmse[metric_index] = gp_error / scale
         tree_nrmse[metric_index] = tree_error / scale
-        cv_rmse[metric_index] = min(gp_error, tree_error)
 
-        gp_score[metric_index] = (
-            max(0.0, gp_spearman[metric_index]) ** 2
-            / max(gp_nrmse[metric_index], 0.25) ** 2
-        )
-        tree_score[metric_index] = (
-            max(0.0, tree_spearman[metric_index]) ** 2
-            / max(tree_nrmse[metric_index], 0.25) ** 2
+        best_tuple: tuple[float, float, float, float] | None = None
+        best_tree_weight = 0.5
+        best_prediction = 0.5 * (
+            gp_oof[:, metric_index] + tree_oof[:, metric_index]
         )
 
-    score_total = gp_score + tree_score
-    gp_weight = np.where(
-        score_total > 1e-12,
-        (gp_score + _SURROGATE_RELIABILITY_FLOOR)
-        / (score_total + 2.0 * _SURROGATE_RELIABILITY_FLOOR),
-        0.5,
-    )
-    tree_weight = 1.0 - gp_weight
+        for candidate_tree_weight in weight_grid:
+            candidate_gp_weight = 1.0 - float(candidate_tree_weight)
+            prediction = (
+                candidate_gp_weight * gp_oof[:, metric_index]
+                + float(candidate_tree_weight) * tree_oof[:, metric_index]
+            )
+            rank_quality = _safe_spearman(actual, prediction)
+            rmse = float(np.sqrt(np.mean(np.square(prediction - actual))))
+            nrmse = rmse / scale
+            score = max(0.0, rank_quality) / max(nrmse, 0.25)
+            candidate_tuple = (
+                float(score),
+                float(rank_quality),
+                -float(nrmse),
+                float(candidate_tree_weight),
+            )
+            if best_tuple is None or candidate_tuple > best_tuple:
+                best_tuple = candidate_tuple
+                best_tree_weight = float(candidate_tree_weight)
+                best_prediction = prediction
 
-    best_spearman = np.maximum(gp_spearman, tree_spearman)
-    best_nrmse = np.minimum(gp_nrmse, tree_nrmse)
-    metric_reliability = np.clip(
-        np.maximum(best_spearman, 0.0)
-        / np.maximum(best_nrmse, 1.0),
-        0.0,
-        1.0,
-    )
+        tree_weight[metric_index] = best_tree_weight
+        gp_weight[metric_index] = 1.0 - best_tree_weight
+        stacked_spearman[metric_index] = _safe_spearman(actual, best_prediction)
+        stacked_error = float(
+            np.sqrt(np.mean(np.square(best_prediction - actual)))
+        )
+        stacked_nrmse[metric_index] = stacked_error / scale
+        cv_rmse[metric_index] = stacked_error
+        metric_reliability[metric_index] = np.clip(
+            max(0.0, stacked_spearman[metric_index])
+            / max(stacked_nrmse[metric_index], 1.0),
+            0.0,
+            1.0,
+        )
 
     return {
         "gp_weight": gp_weight,
@@ -713,8 +735,10 @@ def _surrogate_cross_validated_reliability(
         "metric_reliability": metric_reliability,
         "gp_spearman": gp_spearman,
         "extra_trees_spearman": tree_spearman,
+        "stacked_spearman": stacked_spearman,
         "gp_nrmse": gp_nrmse,
         "extra_trees_nrmse": tree_nrmse,
+        "stacked_nrmse": stacked_nrmse,
         "cv_rmse": cv_rmse,
         "fold_count": int(split_count),
     }
@@ -790,8 +814,10 @@ def _hybrid_surrogate_distribution(
         "metric_reliability": metric_reliability,
         "gp_spearman": np.asarray(reliability["gp_spearman"], dtype=float),
         "extra_trees_spearman": np.asarray(reliability["extra_trees_spearman"], dtype=float),
+        "stacked_spearman": np.asarray(reliability["stacked_spearman"], dtype=float),
         "gp_nrmse": np.asarray(reliability["gp_nrmse"], dtype=float),
         "extra_trees_nrmse": np.asarray(reliability["extra_trees_nrmse"], dtype=float),
+        "stacked_nrmse": np.asarray(reliability["stacked_nrmse"], dtype=float),
         "cv_rmse": cv_rmse,
     }
     return (
@@ -1075,8 +1101,10 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
                 "metric_reliability": np.asarray(surrogate_diagnostics["metric_reliability"], dtype=float).tolist(),
                 "gp_spearman": np.asarray(surrogate_diagnostics["gp_spearman"], dtype=float).tolist(),
                 "extra_trees_spearman": np.asarray(surrogate_diagnostics["extra_trees_spearman"], dtype=float).tolist(),
+                "stacked_spearman": np.asarray(surrogate_diagnostics["stacked_spearman"], dtype=float).tolist(),
                 "gp_nrmse": np.asarray(surrogate_diagnostics["gp_nrmse"], dtype=float).tolist(),
                 "extra_trees_nrmse": np.asarray(surrogate_diagnostics["extra_trees_nrmse"], dtype=float).tolist(),
+                "stacked_nrmse": np.asarray(surrogate_diagnostics["stacked_nrmse"], dtype=float).tolist(),
                 "cv_rmse": np.asarray(surrogate_diagnostics["cv_rmse"], dtype=float).tolist(),
             },
             "monte_carlo_scenarios": _MONTE_CARLO_SCENARIOS,
