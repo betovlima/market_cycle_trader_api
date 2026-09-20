@@ -134,3 +134,16 @@ def test_actions_for_symbol_covers_identity_fields_and_serializes_stably() -> No
     assert len(selected) == 2
     assert selected[0]["id"] == "a"
     assert _canonical_actions_bytes(documents) == _canonical_actions_bytes(documents)
+
+
+
+def test_final_runner_has_no_mongo_repository_dependency() -> None:
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "research_final_alpaca_direct.py"
+    ).read_text(encoding="utf-8")
+
+    assert "mongo_repository" not in script
+    assert "create_client(" not in script
+    assert "get_database(" not in script
