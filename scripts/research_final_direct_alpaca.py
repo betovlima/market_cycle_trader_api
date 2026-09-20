@@ -811,6 +811,9 @@ def main() -> int:
         request_path,
         args.end_date,
     )
+    source_request_sha = _request_hash(
+        request_payload
+    )
     if allocation_execution_enabled(request):
         raise ValueError(
             "Final soft-consensus research is limited to "
@@ -1184,7 +1187,7 @@ def main() -> int:
         frozen_request_path,
         frozen_request_payload,
     )
-    request_sha = _request_hash(
+    effective_request_sha = _request_hash(
         frozen_request_payload
     )
 
@@ -1202,7 +1205,8 @@ def main() -> int:
         "corporate_actions_sha256": (
             ca_sha
         ),
-        "request_sha256": request_sha,
+        "source_request_sha256": source_request_sha,
+        "effective_request_sha256": effective_request_sha,
         "assets": snapshot_entries,
     }
     snapshot_id = _request_hash(
@@ -1243,7 +1247,9 @@ def main() -> int:
         "corporate_actions_sha256": (
             ca_sha
         ),
-        "request_sha256": request_sha,
+        "source_request_path": str(request_path),
+        "source_request_sha256": source_request_sha,
+        "effective_request_sha256": effective_request_sha,
         "configured_asset_count": (
             len(request.assets)
         ),
