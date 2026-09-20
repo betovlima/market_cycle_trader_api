@@ -830,6 +830,18 @@ def _download_snapshot(
             timezone.utc
         ).isoformat()
     )
+    request_payload = request.model_dump(mode="json")
+    request_sha = _canonical_json_sha256(request_payload)
+
+    state_path = snapshot_dir / "download_state.json"
+    if resume and state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state_request_sha = str(state.get("request_sha256") or "")
+        if state_request_sha and state_request_sha != request_sha:
+            raise RuntimeError(
+                "Interrupted snapshot was created with a different request. "
+                "Use --replace-snapshot instead of --resume-download."
+            )
     end = str(
         request.analysis_end_date
         or request.end_date
@@ -937,6 +949,7 @@ def _download_snapshot(
                 "completed_bars": list(bar_manifest),
                 "completed_count": len(bar_manifest),
                 "asset_count": len(request.assets),
+                "request_sha256": request_sha,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -966,16 +979,6 @@ def _download_snapshot(
         actions_payload
     )
 
-    request_payload = (
-        request.model_dump(
-            mode="json"
-        )
-    )
-    request_sha = (
-        _canonical_json_sha256(
-            request_payload
-        )
-    )
     actions_sha = (
         _sha256_bytes(
             actions_payload
@@ -1148,6 +1151,21 @@ def _verify_snapshot(
             "Snapshot manifest SHA-256 is inconsistent."
         )
     return manifest
+
+
+def _assert_snapshot_matches_request(
+    manifest: dict[str, Any],
+    request: BacktestExecutionRequest,
+) -> None:
+    current_sha = _canonical_json_sha256(
+        request.model_dump(mode="json")
+    )
+    manifest_sha = str(manifest.get("request_sha256") or "")
+    if current_sha != manifest_sha:
+        raise RuntimeError(
+            "Local snapshot request hash does not match the current final "
+            "research config. Use --replace-snapshot to download a matching snapshot."
+        )
 
 
 def _load_snapshot_frames(
@@ -1748,6 +1766,11 @@ def main() -> int:
         manifest = _verify_snapshot(
             snapshot_dir
         )
+
+    _assert_snapshot_matches_request(
+        manifest,
+        request,
+    )
 
     _checkpoint(
         results_dir
