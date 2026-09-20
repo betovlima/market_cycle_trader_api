@@ -193,7 +193,7 @@ def main() -> int:
         "--include-dividend-features",
         action="store_true",
         help=(
-            "Reserved for a later controlled campaign. v10.8.68 defaults to "
+            "Reserved for a later controlled campaign. v10.8.69 defaults to "
             "RAW+split price features only."
         ),
     )
@@ -201,7 +201,7 @@ def main() -> int:
 
     if args.include_dividend_features:
         raise ValueError(
-            "v10.8.68 calibrates the canonical RAW+split price architecture only. "
+            "v10.8.69 calibrates the canonical RAW+split price architecture only. "
             "Dividend-feature tuning must be run as a separate campaign."
         )
     if int(args.candidate_count) < 4:
@@ -289,7 +289,7 @@ def main() -> int:
 
         research_settings = deepcopy(request.research_model_settings)
         lightgbm_methodology = deepcopy(research_settings.get("lightgbm") or {})
-        # v10.8.68 restores full-fit LightGBM behavior. Predictive error metrics
+        # v10.8.69 restores full-fit LightGBM behavior. Predictive error metrics
         # are evaluated on the existing chronological calibration window only.
         lightgbm_methodology["early_stopping_enabled"] = False
         research_settings["lightgbm"] = lightgbm_methodology
@@ -382,7 +382,7 @@ def main() -> int:
 
         checkpoint = {
             "schema_version": 1,
-            "api_version": "10.8.68",
+            "api_version": "10.8.69",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -539,8 +539,8 @@ def main() -> int:
 
         summary = {
             "schema_version": 1,
-            "api_version": "10.8.68",
-            "experiment": "raw-split-unified-caro-v6",
+            "api_version": "10.8.69",
+            "experiment": "raw-split-unified-caro-v7",
             "source_job_id": job.get("id"),
             "raw_collection": str(args.raw_collection),
             "corporate_actions_collection": str(args.corporate_actions_collection),
@@ -569,7 +569,15 @@ def main() -> int:
                 "split_handling": "local forward/reverse split normalization",
                 "dividend_features": False,
                 "structural_identity_guard": True,
-                "tuning": "existing Unified CARO space-filling + probabilistic refinement",
+                "tuning": "Unified CARO with reliability-calibrated GP + ExtraTrees hybrid surrogate",
+                "surrogate": {
+                    "model": "hybrid_gp_extra_trees_reliability_cei_v5",
+                    "gp_role": "smooth local/global response model",
+                    "extra_trees_role": "non-smooth discontinuity-aware response model",
+                    "weighting": "cross-validated Spearman + normalized RMSE",
+                    "confidence_shrinkage": "dimension-aware observation support + empirical champion-pass prior",
+                    "low_reliability_behavior": "increase exploration and shrink P(beat) toward empirical prior",
+                },
                 "control_in_surrogate_training": True,
                 "control_as_initial_probability_anchor": True,
                 "temporal_early_stopping": {
