@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_81.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_82.json"
     )
 
     assert document["schema_version"] == 1
@@ -54,6 +54,7 @@ def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
     assert request.timeframe == "1Day"
     assert request.alpaca_adjustment == "raw"
     assert document["data_source"]["bars_adjustment"] == "raw"
+    assert document["data_source"]["bar_snapshot_as_of_end"] == "2026-09-17"
 
     source = (
         ROOT
