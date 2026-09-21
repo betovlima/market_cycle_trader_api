@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_83.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_84.json"
     )
 
     assert document["schema_version"] == 1
@@ -22,14 +22,14 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
         document["lineage"]["base_commit"]
         == "05b765df0496c905a4195948027a9b3b7adf2bce"
     )
-    assert document["lineage"]["change_scope"] == "direct_alpaca_transport_plus_prevalidated_gpu_backend_with_original_10_8_74_request_semantics"
+    assert document["lineage"]["change_scope"] == "cpu_vs_gpu_isolation_on_exact_v10_8_83_snapshot"
     assert request.research_market_data_mode == "database_only"
     assert request.mongo_cache_enabled is False
     assert request.alpaca_adjustment == "all"
     assert request.start_date == "2016-01-01"
     assert request.end_date is None
     assert request.analysis_end_date == "2026-09-17"
-    assert request.rotation_accelerator == "cuda"
+    assert request.rotation_accelerator == "cpu"
     assert request.rotation_allow_cpu_fallback is False
     assert request.deterministic_execution is False
     assert request.xgb_n_jobs == -1
@@ -52,7 +52,7 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
 
 def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_83.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_84.json"
     )
 
     assert request.alpaca_historical_feed == "sip"
@@ -72,6 +72,24 @@ def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
     assert 'adjustment = "raw"' in source
     assert '"adjustment": "all"' not in source
     assert "Adjustment.ALL" not in source
+
+
+def test_cpu_isolation_uses_exact_v10_8_83_snapshot_identity() -> None:
+    document, request = research._load_config(
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_84.json"
+    )
+
+    assert request.rotation_accelerator == "cpu"
+    assert request.rotation_allow_cpu_fallback is False
+    assert request.deterministic_execution is False
+    assert (
+        document["methodology"]["expected_snapshot_sha256"]
+        == "5b4a2dac1ed9a6128c504d3cb12048726bda3f879f7448317a578776ac3d3dde"
+    )
+    assert (
+        document["methodology"]["isolation_test"]
+        == "same_snapshot_same_request_same_model_only_device_changes_cuda_to_cpu"
+    )
 
 
 def test_direct_runner_has_no_mongo_database_dependency() -> None:
