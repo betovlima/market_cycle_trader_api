@@ -1627,6 +1627,34 @@ def main() -> int:
         "soft_horizon_consensus": (
             challenger_metrics
         ),
+        "reference_10_8_74": {
+            "control_ending_capital": 5551143.963971565,
+            "soft_horizon_consensus_ending_capital": 7376955.5577371465,
+            "soft_horizon_consensus_changed_base_actions": 11,
+        },
+        "reproduction_audit": {
+            "control_capital_delta_vs_10_8_74": (
+                control_capital - 5551143.963971565
+            ),
+            "soft_capital_delta_vs_10_8_74": (
+                challenger_capital - 7376955.5577371465
+            ),
+            "control_capital_ratio_vs_10_8_74": (
+                control_capital / 5551143.963971565
+            ),
+            "soft_capital_ratio_vs_10_8_74": (
+                challenger_capital / 7376955.5577371465
+            ),
+            "changed_base_actions_delta_vs_10_8_74": (
+                int(
+                    challenger_metrics.get(
+                        "soft_horizon_consensus_changed_base_actions"
+                    )
+                    or 0
+                )
+                - 11
+            ),
+        },
         "comparison": {
             "capital_difference": (
                 challenger_capital
@@ -1716,6 +1744,16 @@ def main() -> int:
     print(
         f"[done] delta="
         f"{challenger_capital - control_capital:,.2f}",
+        flush=True,
+    )
+    print(
+        f"[done] reference_10.8.74 CONTROL=5,551,143.96 "
+        f"delta={control_capital - 5551143.963971565:,.2f}",
+        flush=True,
+    )
+    print(
+        f"[done] reference_10.8.74 SOFT=7,376,955.56 "
+        f"delta={challenger_capital - 7376955.5577371465:,.2f}",
         flush=True,
     )
     print(
