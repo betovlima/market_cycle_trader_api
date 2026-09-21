@@ -22,7 +22,7 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
         document["lineage"]["base_commit"]
         == "05b765df0496c905a4195948027a9b3b7adf2bce"
     )
-    assert document["lineage"]["change_scope"] == "market_data_transport_only_plus_prevalidated_gpu_backend"
+    assert document["lineage"]["change_scope"] == "direct_alpaca_transport_plus_prevalidated_gpu_backend_with_original_10_8_74_request_semantics"
     assert request.research_market_data_mode == "database_only"
     assert request.mongo_cache_enabled is False
     assert request.alpaca_adjustment == "all"
@@ -32,7 +32,7 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     assert request.rotation_accelerator == "cuda"
     assert request.rotation_allow_cpu_fallback is False
     assert request.deterministic_execution is False
-    assert request.xgb_n_jobs == 1
+    assert request.xgb_n_jobs == -1
     assert request.numeric_thread_limit == 1
     assert len(request.assets) == 56
     assert "DOC" in request.assets
@@ -52,7 +52,7 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
 
 def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_81.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_83.json"
     )
 
     assert request.alpaca_historical_feed == "sip"
