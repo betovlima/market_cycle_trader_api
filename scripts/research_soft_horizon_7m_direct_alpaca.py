@@ -1341,18 +1341,15 @@ def main() -> int:
             "research_reference_assets": references,
             "research_candidate_assets": candidates,
             "research_model_settings": base_settings,
+            # Preserve the exact model-facing configuration used by the
+            # reproduced 10.8.74 experiment.  The transport changed to a
+            # local immutable Alpaca snapshot, but run_rotation_models still
+            # receives the same RAW+split semantic configuration as 10.8.74.
             "market_data_provider": "alpaca",
-            "alpaca_adjustment": "raw",
-            "research_market_data_mode": (
-                "standalone_snapshot"
-            ),
-            "expected_market_data_signature_sha256": (
-                manifest["snapshot_sha256"]
-            ),
-            "research_market_data_snapshot_id": (
-                manifest["snapshot_sha256"]
-            ),
-            "mongo_cache_enabled": False,
+            "alpaca_adjustment": "split",
+            "research_market_data_mode": "database_only",
+            "expected_market_data_signature_sha256": None,
+            "research_market_data_snapshot_id": None,
         }
     )
 
