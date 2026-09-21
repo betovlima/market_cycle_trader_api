@@ -1248,7 +1248,7 @@ def main() -> int:
             "script_version": SCRIPT_VERSION,
             "downloaded_at": downloaded_at,
             "database_access": False,
-            "source": "alpaca_direct_http",
+            "source": "alpaca_py_download_stock_bars",
             "credential_source": credential_metadata,
             "config_path": str(
                 config_path.relative_to(ROOT)
@@ -1747,7 +1747,7 @@ def main() -> int:
             "base_commit": "05b765df0496c905a4195948027a9b3b7adf2bce",
             "base_experiment": "raw-split-soft-horizon-consensus-v2",
             "base_source_job_id": "20260918T234903-52bd06f3",
-            "change_scope": "market_data_transport_only",
+            "change_scope": "market_data_transport_only_plus_prevalidated_gpu_backend",
         },
         "snapshot_sha256": (
             manifest["snapshot_sha256"]
