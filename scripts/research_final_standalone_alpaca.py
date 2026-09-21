@@ -80,9 +80,9 @@ ARRAY_TO_TYPE = {
     "rights_distributions": "rights_distribution",
 }
 
-DEFAULT_CONFIG = "research/final_research_v10_8_75.json"
-DEFAULT_OUTPUT = "output/final_standalone_alpaca_20260918"
-SCRIPT_VERSION = "final-standalone-alpaca-v1"
+DEFAULT_CONFIG = "research/final_research_v10_8_76.json"
+DEFAULT_OUTPUT = "output/final_standalone_alpaca_20260918_v10876"
+SCRIPT_VERSION = "final-standalone-alpaca-v2"
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -977,7 +977,45 @@ def _load_config(
             "Final standalone research requires a "
             "closed end_date."
         )
+    if request.rotation_accelerator != "cuda":
+        raise ValueError(
+            "Final TCC research requires MCT_ROTATION_ACCELERATOR=cuda. "
+            f"Resolved value is {request.rotation_accelerator!r}."
+        )
+    if request.rotation_allow_cpu_fallback:
+        raise ValueError(
+            "Final TCC research requires MCT_ROTATION_ALLOW_CPU_FALLBACK=false."
+        )
+    if request.deterministic_execution:
+        raise ValueError(
+            "Final TCC GPU research requires deterministic_execution=false "
+            "because the LightGBM GPU backend is not compatible with strict deterministic mode."
+        )
     return document, request
+
+
+def _explicit_structural_exclusions(
+    document: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    raw = document.get("structural_exclusions") or []
+    if not isinstance(raw, list):
+        raise ValueError("structural_exclusions must be a list.")
+    result: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("Each structural exclusion must be an object.")
+        symbol = str(item.get("symbol") or "").strip().upper()
+        reason = str(item.get("reason") or "").strip()
+        if not symbol or not reason:
+            raise ValueError(
+                "Each structural exclusion requires symbol and reason."
+            )
+        result[symbol] = {
+            key: value
+            for key, value in item.items()
+            if key != "symbol"
+        }
+    return result
 
 
 def main() -> int:
@@ -1046,8 +1084,18 @@ def main() -> int:
     config_document, request = _load_config(
         config_path
     )
+    explicit_structural_exclusions = _explicit_structural_exclusions(
+        config_document
+    )
     config_sha256 = _canonical_sha256(
         config_document
+    )
+    print(
+        "[compute] "
+        f"accelerator={request.rotation_accelerator} "
+        f"cpu_fallback={request.rotation_allow_cpu_fallback} "
+        f"deterministic={request.deterministic_execution}",
+        flush=True,
     )
 
     if snapshot_dir.exists():
@@ -1230,6 +1278,26 @@ def main() -> int:
         raw = _load_raw_bar_file(
             bars_files[symbol]
         )
+        explicit_issue = explicit_structural_exclusions.get(
+            str(symbol).strip().upper()
+        )
+        if explicit_issue is not None:
+            exclusions.append(
+                {
+                    "symbol": symbol,
+                    **explicit_issue,
+                    "source": "frozen_final_config",
+                }
+            )
+            print(
+                f"[data] {position}/{len(request.assets)} "
+                f"{symbol} excluded "
+                f"reason={explicit_issue['reason']} "
+                "source=frozen_final_config",
+                flush=True,
+            )
+            continue
+
         actions = _actions_for_symbol(
             corporate_actions,
             symbol,
@@ -1557,9 +1625,9 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.75",
+        "api_version": "10.8.76",
         "experiment": (
-            "final-standalone-fresh-alpaca-soft-consensus-v1"
+            "final-standalone-fresh-alpaca-soft-consensus-v2"
         ),
         "database_access": False,
         "tuning_enabled": False,
@@ -1601,6 +1669,9 @@ def main() -> int:
                 request.deterministic_execution
             ),
             "random_state": request.random_state,
+            "rotation_accelerator": request.rotation_accelerator,
+            "rotation_allow_cpu_fallback": request.rotation_allow_cpu_fallback,
+            "accelerator_source": "environment",
         },
         "asset_count_requested": len(
             request.assets
