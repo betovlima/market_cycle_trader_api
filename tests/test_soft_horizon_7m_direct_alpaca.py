@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_80.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_81.json"
     )
 
     assert document["schema_version"] == 1
@@ -29,9 +29,9 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     assert request.start_date == "2016-01-01"
     assert request.end_date == "2026-09-18"
     assert request.analysis_end_date == "2026-09-18"
-    assert request.rotation_accelerator == "cpu"
-    assert request.rotation_allow_cpu_fallback is True
-    assert request.deterministic_execution is True
+    assert request.rotation_accelerator == "cuda"
+    assert request.rotation_allow_cpu_fallback is False
+    assert request.deterministic_execution is False
     assert request.xgb_n_jobs == 1
     assert request.numeric_thread_limit == 1
     assert len(request.assets) == 56
@@ -43,6 +43,28 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
         ]
         == 1.0
     )
+
+
+def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
+    document, request = research._load_config(
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_81.json"
+    )
+
+    assert request.alpaca_historical_feed == "sip"
+    assert request.timeframe == "1Day"
+    assert request.alpaca_adjustment == "raw"
+    assert document["data_source"]["bars_adjustment"] == "raw"
+
+    source = (
+        ROOT
+        / "scripts"
+        / "research_soft_horizon_7m_direct_alpaca.py"
+    ).read_text(encoding="utf-8")
+
+    assert "download_stock_bars(" in source
+    assert 'adjustment = "raw"' in source
+    assert '"adjustment": "all"' not in source
+    assert "Adjustment.ALL" not in source
 
 
 def test_direct_runner_has_no_mongo_database_dependency() -> None:
