@@ -426,8 +426,14 @@ Em volume:
 
 Portanto, para o universo elegível final, a queda de capital não é explicada por
 uma discrepância material entre `RAW + normalização local de splits` e o
-histórico Alpaca `split-adjusted`. A diferença principal é a composição limpa
-do universo, em especial a exclusão estrutural de CLMT.
+histórico Alpaca `split-adjusted`.
+
+A composição limpa do universo, em especial a exclusão estrutural de CLMT, é uma
+diferença relevante entre os experimentos e altera treinamento, rankings e
+decisões. Entretanto, não é correto atribuir toda a diferença de capital a CLMT
+sem controle adicional, porque o backend de treinamento também mudou: o
+experimento anterior de aproximadamente US$ 7.38 milhões usou CPU, enquanto a
+execução final usou GPU.
 
 ### Interpretação para o TCC
 
@@ -445,6 +451,13 @@ A execução final limpa e reproduzível sustenta:
 6. Soft Horizon Consensus final de aproximadamente US$ 3.81 milhões;
 7. ganho agregado moderado do Soft (+7.41%), com trade-off de pior fold.
 
-Esses valores devem ser tratados como o resultado final reproduzível desta
-janela, salvo descoberta de erro metodológico independente de desempenho. Não
-fazer tuning posterior para recuperar a faixa de US$ 7 milhões.
+Esses valores constituem o resultado da execução final GPU sobre o snapshot
+congelado. Não fazer tuning posterior para recuperar a faixa de US$ 7 milhões.
+
+Antes de atribuir causalmente a diferença em relação ao experimento anterior,
+um teste de sensibilidade CPU versus GPU sobre o mesmo snapshot, universo e
+parâmetros pode ser executado como auditoria metodológica. Esse teste não deve
+alterar hiperparâmetros nem escolher o melhor backend pelo capital; serve apenas
+para quantificar se o backend computacional modifica materialmente as previsões
+do LightGBM. O resultado final principal permanece o da configuração GPU
+previamente definida.
