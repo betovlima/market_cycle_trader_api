@@ -40,6 +40,9 @@ from market_cycle_trader_api.engine.capital_rotation import (
 from market_cycle_trader_api.engine.compound_risk_overlay import (
     allocation_execution_enabled,
 )
+from market_cycle_trader_api.infrastructure.market_data.alpaca import (
+    download_stock_bars,
+)
 from market_cycle_trader_api.schemas.requests import (
     BacktestExecutionRequest,
 )
@@ -80,9 +83,9 @@ ARRAY_TO_TYPE = {
     "rights_distributions": "rights_distribution",
 }
 
-DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_80.json"
-DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10880"
-SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.0.1"
+DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_81.json"
+DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10881"
+SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.1.0"
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -230,119 +233,110 @@ def _download_bars(
     snapshot_dir: Path,
     chunk_size: int,
 ) -> tuple[dict[str, Path], dict[str, Any]]:
+    """Download bars with the exact Alpaca semantics used by the 10.8.74 snapshot.
+
+    The original alpaca_market_bars_raw_20260919 collection was built by
+    download_fresh_alpaca_snapshot.py, which called download_stock_bars()
+    once per symbol with SIP, 1Day, adjustment=raw, and end + 1 calendar day.
+    This standalone runner deliberately reuses that same downloader while
+    writing the returned frames to immutable local CSV files instead of MongoDB.
+    """
+    del chunk_size  # Kept in the CLI for compatibility; original loader was per-symbol.
+
     bars_dir = snapshot_dir / "raw_bars"
     bars_dir.mkdir(parents=True, exist_ok=True)
+
     symbols = list(request.assets)
-    start = (
-        _utc(request.start_date)
-        .normalize()
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    end_exclusive = (
-        _utc(request.end_date)
-        .normalize()
-        + pd.Timedelta(days=1)
-    )
-    end = end_exclusive.isoformat().replace("+00:00", "Z")
+    timeframe = str(request.timeframe)
+    feed = str(request.alpaca_historical_feed or "sip").strip().lower()
+    adjustment = "raw"
+    start = pd.Timestamp(request.start_date)
+    end_text = request.analysis_end_date or request.end_date
+    end = pd.Timestamp(end_text)
+    api_end = end + pd.Timedelta(days=1)
+
+    api_key_id = str(headers.get("APCA-API-KEY-ID") or "").strip()
+    secret_key = str(headers.get("APCA-API-SECRET-KEY") or "").strip()
+    if not api_key_id or not secret_key:
+        raise RuntimeError("Alpaca API credentials are not configured.")
 
     files: dict[str, Path] = {}
     row_counts: dict[str, int] = {}
-    resolved_chunk_size = max(1, min(100, int(chunk_size)))
+    symbol_summaries: list[dict[str, Any]] = []
 
-    for offset in range(0, len(symbols), resolved_chunk_size):
-        chunk = symbols[offset : offset + resolved_chunk_size]
-        rows_by_symbol: dict[str, list[dict[str, Any]]] = {
-            symbol: [] for symbol in chunk
-        }
-        page_token: str | None = None
-        page_count = 0
+    print(
+        f"[alpaca-bars] loader=10.8.74-download_stock_bars "
+        f"assets={len(symbols)} feed={feed} adjustment={adjustment} "
+        f"timeframe={timeframe} start={start.date()} end={end.date()}",
+        flush=True,
+    )
 
-        while True:
-            params: dict[str, Any] = {
-                "symbols": ",".join(chunk),
-                "timeframe": request.timeframe,
-                "start": start,
-                "end": end,
-                "adjustment": "raw",
-                "feed": request.alpaca_historical_feed,
-                "sort": "asc",
-                "limit": 10000,
-            }
-            if page_token:
-                params["page_token"] = page_token
-
-            payload = _request_json(
-                BARS_ENDPOINT,
-                headers=headers,
-                params=params,
-            )
-            page_count += 1
-            groups = payload.get("bars") or {}
-            if not isinstance(groups, dict):
-                raise RuntimeError(
-                    "Unexpected Alpaca bars payload: 'bars' is not an object."
-                )
-
-            for symbol in chunk:
-                values = groups.get(symbol) or []
-                if not isinstance(values, list):
-                    continue
-                rows_by_symbol[symbol].extend(
-                    _bar_record(value)
-                    for value in values
-                    if isinstance(value, dict)
-                    and value.get("t") is not None
-                )
-
-            page_token = payload.get("next_page_token")
-            if not page_token:
-                break
-
-        for symbol in chunk:
-            frame = pd.DataFrame(rows_by_symbol[symbol])
-            if frame.empty:
-                raise RuntimeError(
-                    f"Fresh Alpaca snapshot returned no RAW bars for {symbol}."
-                )
-            frame["timestamp"] = pd.to_datetime(
-                frame["timestamp"],
-                utc=True,
-            )
-            frame = (
-                frame.drop_duplicates(
-                    subset=["timestamp"],
-                    keep="last",
-                )
-                .sort_values("timestamp")
-                .reset_index(drop=True)
-            )
-            target = bars_dir / f"{symbol}.csv"
-            frame.to_csv(
-                target,
-                index=False,
-                float_format="%.17g",
-            )
-            files[symbol] = target
-            row_counts[symbol] = int(len(frame))
-
+    for position, symbol in enumerate(symbols, start=1):
         print(
-            f"[alpaca-bars] "
-            f"progress={min(offset + len(chunk), len(symbols))}/{len(symbols)} "
-            f"chunk={chunk[0]}..{chunk[-1]} pages={page_count}",
+            f"[alpaca-bars] {position}/{len(symbols)} downloading {symbol}...",
+            flush=True,
+        )
+        frame = download_stock_bars(
+            api_key_id=api_key_id,
+            secret_key=secret_key,
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=api_end,
+            feed=feed,
+            adjustment=adjustment,
+        )
+        if frame is None or frame.empty:
+            raise RuntimeError(
+                f"Fresh Alpaca RAW snapshot returned no bars for {symbol}."
+            )
+
+        frame = frame.copy().sort_index()
+        frame = frame[~frame.index.duplicated(keep="last")]
+        for column in ("open", "high", "low", "close", "volume"):
+            frame[column] = pd.to_numeric(
+                frame[column],
+                errors="raise",
+            ).astype(float)
+
+        target = bars_dir / f"{symbol}.csv"
+        frame.reset_index().to_csv(
+            target,
+            index=False,
+            float_format="%.17g",
+        )
+        files[symbol] = target
+        row_counts[symbol] = int(len(frame))
+
+        first = pd.Timestamp(frame.index.min()).date().isoformat()
+        last = pd.Timestamp(frame.index.max()).date().isoformat()
+        symbol_summaries.append(
+            {
+                "symbol": symbol,
+                "rows": int(len(frame)),
+                "first": first,
+                "last": last,
+            }
+        )
+        print(
+            f"[alpaca-bars] {symbol} rows={len(frame)} "
+            f"first={first} last={last}",
             flush=True,
         )
 
     return files, {
-        "endpoint": BARS_ENDPOINT,
-        "feed": request.alpaca_historical_feed,
-        "adjustment": "raw",
-        "timeframe": request.timeframe,
-        "start": start,
-        "end_exclusive": end,
+        "loader": "market_cycle_trader_api.infrastructure.market_data.alpaca.download_stock_bars",
+        "loader_semantics": "matches download_fresh_alpaca_snapshot.py used for raw_20260919",
+        "feed": feed,
+        "adjustment": adjustment,
+        "timeframe": timeframe,
+        "requested_start": start.date().isoformat(),
+        "requested_end": end.date().isoformat(),
+        "api_end_exclusive_upper_bound": api_end.date().isoformat(),
         "asset_count": len(symbols),
         "row_counts": row_counts,
         "total_rows": int(sum(row_counts.values())),
+        "symbols": symbol_summaries,
     }
 
 
@@ -383,8 +377,17 @@ def _download_corporate_actions(
     query_start = (
         research_start - timedelta(days=366)
     ).isoformat()
-    query_end = str(request.end_date)
-    symbols = list(request.assets)
+    query_end = str(
+        request.analysis_end_date
+        or request.end_date
+    )
+    symbols = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in request.assets
+            if str(symbol).strip()
+        }
+    )
     resolved_chunk_size = max(1, min(100, int(chunk_size)))
     documents: list[dict[str, Any]] = []
 
@@ -998,15 +1001,18 @@ def _load_config(
             "10.8.74 reproduction requires the original 56-asset request "
             "including DOC and CLMT before the original structural guard."
         )
-    if request.rotation_accelerator != "cpu":
+    if request.rotation_accelerator != "cuda":
         raise ValueError(
-            "10.8.74 reproduction requires rotation_accelerator=cpu. "
-            "CPU/GPU equivalence was studied separately; this run isolates "
-            "only Mongo snapshot transport versus direct Alpaca transport."
+            "This direct Alpaca replay requires rotation_accelerator=cuda."
         )
-    if not request.deterministic_execution:
+    if request.rotation_allow_cpu_fallback:
         raise ValueError(
-            "10.8.74 reproduction requires deterministic_execution=true."
+            "This direct Alpaca replay requires "
+            "rotation_allow_cpu_fallback=false."
+        )
+    if request.deterministic_execution:
+        raise ValueError(
+            "GPU execution requires deterministic_execution=false."
         )
     consensus = (
         request.research_model_settings.get("soft_horizon_consensus")
@@ -1594,7 +1600,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.80",
+        "api_version": "10.8.81",
         "experiment": (
             "raw-split-soft-horizon-consensus-direct-alpaca-v1"
         ),
