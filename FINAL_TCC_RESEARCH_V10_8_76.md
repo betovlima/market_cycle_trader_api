@@ -1,4 +1,4 @@
-# Execução final do TCC — API 10.8.76
+# Execução final do TCC — config congelada 10.8.76 / runner 10.8.77
 
 ## Objetivo
 
@@ -195,3 +195,68 @@ Registrar:
 Se o ganho próximo à faixa anterior de US$ 7 milhões persistir, ele pode compor
 o resultado final do TCC. Se não persistir, registrar o resultado efetivamente
 obtido sem novo tuning.
+
+
+## Correção 10.8.77 — dtype na normalização de splits
+
+Na primeira execução final com carga nova da Alpaca, o download e a criação do
+snapshot foram concluídos. A execução falhou depois, durante a normalização local
+de splits, com:
+
+```text
+pandas.errors.LossySetitemError
+TypeError: Invalid value [...] for dtype 'int64'
+```
+
+A causa não foi um problema nos dados da Alpaca. A coluna `volume` do arquivo
+RAW foi inferida como `int64`. Para splits cuja razão gera unidades
+fracionárias, por exemplo 3:2, a normalização calcula um volume `float`.
+Versões recentes do pandas recusam atribuir silenciosamente esse valor
+fracionário de volta a uma coluna inteira.
+
+A correção converte explicitamente todas as colunas OHLCV
+(`open/high/low/close/volume`) para `float` antes de aplicar qualquer fator de
+split. Isso preserva a precisão da normalização e evita coerção implícita
+dependente da versão do pandas.
+
+Versão da correção:
+
+- API/pacote: `10.8.77`
+- runner: `final-standalone-alpaca-v2.0.1`
+- branch: `research/api-v10.8.77-final-standalone-alpaca-split-dtype`
+- configuração científica permanece congelada em:
+  `research/final_research_v10_8_76.json`
+
+Foi adicionado teste de regressão com OHLCV `int64` e split 3:2 para verificar
+que preços e volumes fracionários são normalizados sem erro e que todas as
+colunas OHLCV resultantes são `float`.
+
+### Retomada da execução final
+
+Não executar `--replace-snapshot` novamente. O snapshot novo da Alpaca já foi
+baixado e congelado antes da falha. A correção é apenas de processamento local.
+
+Atualizar a branch:
+
+```bash
+git fetch origin
+git switch research/api-v10.8.77-final-standalone-alpaca-split-dtype
+git pull --ff-only origin research/api-v10.8.77-final-standalone-alpaca-split-dtype
+```
+
+Executar os testes:
+
+```bash
+python -m pytest tests/test_final_standalone_alpaca.py -q
+```
+
+Retomar usando exatamente o snapshot já criado:
+
+```bash
+python scripts/research_final_standalone_alpaca.py --reuse-snapshot
+```
+
+O runner verifica o hash da configuração e os hashes dos arquivos do snapshot
+antes de reutilizá-los. Assim, a correção 10.8.77 não altera a carga final da
+Alpaca nem a janela temporal congelada; apenas permite que o pipeline continue a
+partir dos mesmos dados.
