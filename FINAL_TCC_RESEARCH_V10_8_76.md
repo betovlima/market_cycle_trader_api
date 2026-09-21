@@ -260,3 +260,42 @@ O runner verifica o hash da configuração e os hashes dos arquivos do snapshot
 antes de reutilizá-los. Assim, a correção 10.8.77 não altera a carga final da
 Alpaca nem a janela temporal congelada; apenas permite que o pipeline continue a
 partir dos mesmos dados.
+
+
+## Correção 10.8.78 — constante OHLCV ausente
+
+A primeira correção de dtype da 10.8.77 passou a iterar sobre `OHLCV`, mas o
+runner standalone não declarava essa constante. Isso causou:
+
+```text
+NameError: name 'OHLCV' is not defined
+```
+
+A 10.8.78 declara explicitamente:
+
+```python
+OHLCV = ("open", "high", "low", "close", "volume")
+```
+
+e mantém a conversão das cinco colunas para `float` antes da normalização de
+splits.
+
+- API/pacote: `10.8.78`
+- runner: `final-standalone-alpaca-v2.0.2`
+- branch: `research/api-v10.8.78-final-standalone-alpaca-ohlcv-constant`
+- configuração científica continua congelada em:
+  `research/final_research_v10_8_76.json`
+- snapshot Alpaca existente deve continuar sendo reutilizado.
+
+Foi adicionado um teste explícito que exige a presença da constante OHLCV com as
+cinco colunas esperadas.
+
+Retomada:
+
+```bash
+git fetch origin
+git switch research/api-v10.8.78-final-standalone-alpaca-ohlcv-constant
+git pull --ff-only origin research/api-v10.8.78-final-standalone-alpaca-ohlcv-constant
+python -m pytest tests/test_final_standalone_alpaca.py -q
+python scripts/research_final_standalone_alpaca.py --reuse-snapshot
+```
