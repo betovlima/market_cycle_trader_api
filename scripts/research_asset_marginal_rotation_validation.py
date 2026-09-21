@@ -253,6 +253,12 @@ def _install_frozen_universe_execution_config() -> None:
     leadership._execution_config = frozen_universe_execution_config
 
 
+def _install_long_path_safe_io() -> None:
+    base._ensure_dir = file_io.ensure_dir
+    base._path_exists = file_io.exists
+    base._read_json = file_io.read_json
+
+
 def main() -> int:
     args = _bootstrap_args()
     code_identity()  # Capture the implementation/environment before simulation.
@@ -270,9 +276,7 @@ def main() -> int:
     base._decision_dates = _decision_dates
     base._write_json = _write_json
     base._write_csv = _write_csv
-    base._ensure_dir = file_io.ensure_dir
-    base._path_exists = file_io.exists
-    base._read_json = file_io.read_json
+    _install_long_path_safe_io()
     base.SCRIPT_VERSION = SCRIPT_VERSION
     return int(base.main())
 
