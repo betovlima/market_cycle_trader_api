@@ -66,6 +66,10 @@ def _write_csv(path: Path, frame: pd.DataFrame) -> None:
     temporary.replace(path)
 
 
+def _read_csv(path: Path, **kwargs: Any) -> pd.DataFrame:
+    return pd.read_csv(path, **kwargs)
+
+
 def _sha256_json(value: Any) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), default=str
@@ -596,10 +600,10 @@ def main() -> int:
     completed: set[str] = set()
 
     if not args.no_resume and intrinsic_path.exists() and raw_prediction_path.exists():
-        intrinsic_existing = pd.read_csv(intrinsic_path)
-        prediction_existing = pd.read_csv(raw_prediction_path)
+        intrinsic_existing = _read_csv(intrinsic_path)
+        prediction_existing = _read_csv(raw_prediction_path)
         fold_existing = (
-            pd.read_csv(fold_path) if fold_path.exists() else pd.DataFrame()
+            _read_csv(fold_path) if fold_path.exists() else pd.DataFrame()
         )
         if not intrinsic_existing.empty:
             intrinsic_existing["symbol"] = (
@@ -700,7 +704,7 @@ def main() -> int:
                 f"excess={float(aggregate['compound_oos_excess_return']):.2%}."
             )
 
-    intrinsic = pd.read_csv(intrinsic_path)
+    intrinsic = _read_csv(intrinsic_path)
     intrinsic["symbol"] = intrinsic["symbol"].astype(str).str.upper()
     intrinsic_records: list[dict[str, Any]] = []
     for row in intrinsic.to_dict(orient="records"):
@@ -711,7 +715,7 @@ def main() -> int:
     intrinsic = pd.DataFrame(intrinsic_records)
     _write_csv(intrinsic_path, intrinsic)
 
-    raw_predictions = pd.read_csv(raw_prediction_path)
+    raw_predictions = _read_csv(raw_prediction_path)
     ranked = _rank_predictions(raw_predictions)
     _write_csv(output_dir / "leadership_ranked_predictions.csv", ranked)
 
