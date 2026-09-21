@@ -23,6 +23,9 @@ from market_cycle_trader_api.engine.compound_rotation_backtest import (
 from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest
 import research_asset_marginal_rotation_contribution as selector
 import research_asset_marginal_rotation_leadership as leadership_v2
+import research_asset_marginal_rotation_validation as marginal_validation
+import research_asset_rotation_independent_validation as independent_validation
+import research_windows_file_io as windows_file_io
 from research_marginal_reproducibility import market_data_hashes, verify_validation_pair
 
 
