@@ -82,7 +82,7 @@ ARRAY_TO_TYPE = {
 
 DEFAULT_CONFIG = "research/final_research_v10_8_76.json"
 DEFAULT_OUTPUT = "output/final_standalone_alpaca_20260918_v10876"
-SCRIPT_VERSION = "final-standalone-alpaca-v2"
+SCRIPT_VERSION = "final-standalone-alpaca-v2.0.1"
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -550,6 +550,12 @@ def _split_normalize(
     actions: list[dict[str, Any]],
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     result = raw.copy()
+    for column in OHLCV:
+        if column in result.columns:
+            result[column] = pd.to_numeric(
+                result[column],
+                errors="raise",
+            ).astype(float)
     session_dates = (
         pd.DatetimeIndex(result.index)
         .tz_convert("UTC")
@@ -1625,7 +1631,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.76",
+        "api_version": "10.8.77",
         "experiment": (
             "final-standalone-fresh-alpaca-soft-consensus-v2"
         ),
