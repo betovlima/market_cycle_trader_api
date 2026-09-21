@@ -1,4 +1,4 @@
-# Validação técnica — API 10.8.41 / pesquisa 2.0.0
+# Validação técnica — API 10.8.42 / pesquisa 2.0.1
 
 Base: `10e2d46b71fc7051098116f6385f6561215cdaad`, branch
 `research/asset-marginal-rotation-contribution-v1`.
@@ -56,3 +56,26 @@ de resultados, não a base OHLCV completa. Não há resultado econômico novo pa
 a v2 nem promessa de recuperar os 23,52 milhões. Repetir o intervalo que já foi
 analisado é um teste retrospectivo; a confirmação independente exige dados
 reservados para depois do congelamento da nova hipótese.
+
+
+## Incidente real de 2026-09-20
+
+Execução observada em Windows/Python 3.14.2:
+- Phase 1A processou os 82/82 ativos;
+- último ativo registrado: `YANG`, com o log de conclusão normal;
+- logo depois ocorreu `FileNotFoundError` ao abrir
+  `leadership_selection_through_2025-09-04/intrinsic_timing_summary.csv`;
+- a causa foi a assimetria entre escrita e leitura: a v2 já gravava CSVs com o
+  helper `research_windows_file_io`, que usa o prefixo de caminho longo do Windows,
+  mas o script base ainda relia os mesmos arquivos com `pd.read_csv(path)`.
+
+A API 10.8.42 / pesquisa 2.0.1 corrige essa assimetria introduzindo o hook
+`_read_csv` no script base e injetando `file_io.read_csv` pelo wrapper v2.
+
+Foi acrescentado teste de regressão para verificar que o wrapper instala
+`read_csv`, `write_csv` e `write_json` compatíveis com caminhos longos.
+
+Este incidente ocorreu depois do processamento dos ativos, portanto não há
+evidência de erro específico no modelo de YANG. A execução que falhou não deve
+ser tratada como experimento concluído porque as etapas de qualificação,
+seleção marginal e validação final ainda não foram executadas.
