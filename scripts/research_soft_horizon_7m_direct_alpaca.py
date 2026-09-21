@@ -86,6 +86,9 @@ ARRAY_TO_TYPE = {
 DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_81.json"
 DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10881"
 SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.1.0"
+REFERENCE_DIAGNOSTICS = (
+    ROOT / "research" / "reference_10_8_74_raw_snapshot_diagnostics.json"
+)
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -1329,6 +1332,136 @@ def main() -> int:
             }
         )
 
+    # Audit only: compare the fresh direct-Alpaca load against the
+    # frozen diagnostics of the reproduced 10.8.74 ~US$7.38M run.
+    # This never changes the universe, features, folds, or model.
+    reference_document = json.loads(
+        REFERENCE_DIAGNOSTICS.read_text(encoding="utf-8")
+    )
+    reference_by_symbol = {
+        str(row["symbol"]): row
+        for row in reference_document.get("diagnostics", [])
+    }
+    current_by_symbol = {
+        str(row["symbol"]): row
+        for row in data_diagnostics
+    }
+    audit_rows: list[dict[str, Any]] = []
+    for symbol in sorted(set(reference_by_symbol) | set(current_by_symbol)):
+        expected = reference_by_symbol.get(symbol)
+        actual = current_by_symbol.get(symbol)
+        audit_rows.append(
+            {
+                "symbol": symbol,
+                "expected_raw_rows": (
+                    expected.get("raw_rows") if expected else None
+                ),
+                "actual_raw_rows": (
+                    actual.get("raw_rows") if actual else None
+                ),
+                "raw_rows_delta": (
+                    int(actual.get("raw_rows", 0))
+                    - int(expected.get("raw_rows", 0))
+                    if expected and actual
+                    else None
+                ),
+                "expected_corporate_actions": (
+                    expected.get("corporate_actions") if expected else None
+                ),
+                "actual_corporate_actions": (
+                    actual.get("corporate_actions") if actual else None
+                ),
+                "corporate_actions_delta": (
+                    int(actual.get("corporate_actions", 0))
+                    - int(expected.get("corporate_actions", 0))
+                    if expected and actual
+                    else None
+                ),
+                "expected_splits_applied": (
+                    expected.get("splits_applied") if expected else None
+                ),
+                "actual_splits_applied": (
+                    actual.get("splits_applied") if actual else None
+                ),
+                "splits_applied_delta": (
+                    int(actual.get("splits_applied", 0))
+                    - int(expected.get("splits_applied", 0))
+                    if expected and actual
+                    else None
+                ),
+            }
+        )
+
+    pd.DataFrame(audit_rows).to_csv(
+        results_dir / "reference_10_8_74_data_audit.csv",
+        index=False,
+    )
+    raw_row_mismatches = [
+        row["symbol"]
+        for row in audit_rows
+        if row["raw_rows_delta"] not in (None, 0)
+    ]
+    corporate_action_mismatches = [
+        row["symbol"]
+        for row in audit_rows
+        if row["corporate_actions_delta"] not in (None, 0)
+    ]
+    split_mismatches = [
+        row["symbol"]
+        for row in audit_rows
+        if row["splits_applied_delta"] not in (None, 0)
+    ]
+    reference_audit = {
+        "reference_api_version": "10.8.74",
+        "reference_total_eligible_raw_rows": int(
+            reference_document.get("eligible_total_raw_rows", 0)
+        ),
+        "actual_total_eligible_raw_rows": int(
+            sum(int(row["raw_rows"]) for row in data_diagnostics)
+        ),
+        "reference_total_splits_applied": int(
+            reference_document.get("eligible_total_splits_applied", 0)
+        ),
+        "actual_total_splits_applied": int(
+            sum(int(row["splits_applied"]) for row in data_diagnostics)
+        ),
+        "raw_row_mismatch_symbols": raw_row_mismatches,
+        "corporate_action_mismatch_symbols": corporate_action_mismatches,
+        "split_mismatch_symbols": split_mismatches,
+        "excluded_assets": exclusions,
+    }
+    _checkpoint(
+        results_dir / "reference_10_8_74_data_audit.json",
+        reference_audit,
+    )
+    print(
+        "[data-audit] "
+        f"eligible_rows={reference_audit['actual_total_eligible_raw_rows']} "
+        f"reference_rows={reference_audit['reference_total_eligible_raw_rows']} "
+        f"row_mismatches={len(raw_row_mismatches)} "
+        f"ca_mismatches={len(corporate_action_mismatches)} "
+        f"split_mismatches={len(split_mismatches)}",
+        flush=True,
+    )
+    if raw_row_mismatches:
+        print(
+            "[data-audit] raw row mismatch symbols="
+            + ",".join(raw_row_mismatches),
+            flush=True,
+        )
+    if corporate_action_mismatches:
+        print(
+            "[data-audit] corporate-action mismatch symbols="
+            + ",".join(corporate_action_mismatches),
+            flush=True,
+        )
+    if split_mismatches:
+        print(
+            "[data-audit] split mismatch symbols="
+            + ",".join(split_mismatches),
+            flush=True,
+        )
+
     if len(frames) < 2:
         raise RuntimeError(
             "Fewer than two structurally valid assets remain."
@@ -1619,6 +1752,7 @@ def main() -> int:
         "snapshot_sha256": (
             manifest["snapshot_sha256"]
         ),
+        "reference_10_8_74_data_audit": reference_audit,
         "config_sha256": config_sha256,
         "research_window": {
             "start": request.start_date,
