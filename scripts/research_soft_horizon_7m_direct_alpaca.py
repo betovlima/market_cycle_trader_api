@@ -83,9 +83,9 @@ ARRAY_TO_TYPE = {
     "rights_distributions": "rights_distribution",
 }
 
-DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_82.json"
-DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10882"
-SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.2.0"
+DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_83.json"
+DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10883"
+SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.3.0"
 REFERENCE_DIAGNOSTICS = (
     ROOT / "research" / "reference_10_8_74_raw_snapshot_diagnostics.json"
 )
@@ -986,24 +986,28 @@ def _load_config(
             "10.8.74 reproduction requires "
             "research_market_data_mode=database_only."
         )
-    if request.alpaca_adjustment != "raw":
+    data_source = document.get("data_source") or {}
+    if str(data_source.get("download_adjustment") or "").lower() != "raw":
         raise ValueError(
-            "Final standalone research must download "
-            "Alpaca adjustment=raw."
+            "Direct Alpaca transport must use adjustment=raw."
         )
-    if not request.end_date:
+    if request.start_date != "2016-01-01":
         raise ValueError(
-            "Final standalone research requires a "
-            "closed end_date."
+            "10.8.74 reproduction requires start_date=2016-01-01."
         )
-
-    # Reproduction contract: do not allow this runner to drift away from
-    # the 10.8.74 experiment that produced ~US$7.38M.  Only the physical
-    # data transport is allowed to change.
-    if request.start_date != "2016-01-01" or request.end_date != "2026-09-18":
+    if request.end_date is not None:
         raise ValueError(
-            "10.8.74 reproduction requires the frozen "
-            "2016-01-01 -> 2026-09-18 research window."
+            "Recovered 10.8.74 source request requires end_date=null."
+        )
+    if request.analysis_end_date != "2026-09-17":
+        raise ValueError(
+            "Recovered 10.8.74 source request requires "
+            "analysis_end_date=2026-09-17."
+        )
+    if request.alpaca_adjustment != "all":
+        raise ValueError(
+            "Recovered source request requires alpaca_adjustment=all; "
+            "the research runner still downloads RAW and locally normalizes splits."
         )
     if len(request.assets) != 56 or "DOC" not in request.assets or "CLMT" not in request.assets:
         raise ValueError(
@@ -1023,11 +1027,13 @@ def _load_config(
         raise ValueError(
             "GPU execution requires deterministic_execution=false."
         )
-    consensus = (
-        request.research_model_settings.get("soft_horizon_consensus")
-        or {}
-    )
-    if float(consensus.get("penalty_strength", 0.0)) != 1.0:
+    methodology = document.get("methodology") or {}
+    if float(
+        methodology.get(
+            "soft_horizon_consensus_penalty_strength",
+            0.0,
+        )
+    ) != 1.0:
         raise ValueError(
             "10.8.74 reproduction requires soft horizon "
             "penalty_strength=1.0."
@@ -1511,6 +1517,13 @@ def main() -> int:
     base_settings = deepcopy(
         request.research_model_settings
     )
+    base_lightgbm = deepcopy(
+        base_settings.get("lightgbm") or {}
+    )
+    base_lightgbm[
+        "early_stopping_enabled"
+    ] = False
+    base_settings["lightgbm"] = base_lightgbm
     base_settings[
         "horizon_voting"
     ] = {"enabled": False}
@@ -1572,12 +1585,10 @@ def main() -> int:
         "enabled": True,
         "penalty_strength": float(
             (
-                request.research_model_settings.get(
-                    "soft_horizon_consensus"
-                )
+                config_document.get("methodology")
                 or {}
             ).get(
-                "penalty_strength",
+                "soft_horizon_consensus_penalty_strength",
                 1.0,
             )
         ),
@@ -1745,7 +1756,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.82",
+        "api_version": "10.8.83",
         "experiment": (
             "raw-split-soft-horizon-consensus-direct-alpaca-v1"
         ),
