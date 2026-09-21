@@ -80,9 +80,9 @@ ARRAY_TO_TYPE = {
     "rights_distributions": "rights_distribution",
 }
 
-DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_79.json"
+DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_80.json"
 DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10879"
-SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1"
+SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.0.1"
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -968,11 +968,11 @@ def _load_config(
         )
     if (
         request.research_market_data_mode
-        != "standalone_snapshot"
+        != "database_only"
     ):
         raise ValueError(
-            "Final standalone research requires "
-            "research_market_data_mode=standalone_snapshot."
+            "10.8.74 reproduction requires "
+            "research_market_data_mode=database_only."
         )
     if request.alpaca_adjustment != "raw":
         raise ValueError(
@@ -1594,7 +1594,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.79",
+        "api_version": "10.8.80",
         "experiment": (
             "raw-split-soft-horizon-consensus-direct-alpaca-v1"
         ),
