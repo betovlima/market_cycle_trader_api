@@ -1,0 +1,352 @@
+{
+  "schema_version": 1,
+  "source_api_version": "10.8.74",
+  "source_experiment": "raw-split-soft-horizon-consensus-v2",
+  "source_job_id": "20260918T234903-52bd06f3",
+  "source_commit": "05b765df0496c905a4195948027a9b3b7adf2bce",
+  "purpose": "Audit-only reference. Not used as model input or tuning gate.",
+  "requested_assets": 56,
+  "eligible_assets": 55,
+  "expected_exclusion": {
+    "symbol": "DOC",
+    "reason": "structural_identity_change",
+    "action_type": "stock_merger",
+    "effective_date": "2024-03-01",
+    "acquiree_symbol": "DOC",
+    "acquirer_symbol": "PEAK"
+  },
+  "eligible_total_raw_rows": 148060,
+  "eligible_total_splits_applied": 17,
+  "diagnostics": [
+    {
+      "symbol": "NVDA",
+      "raw_rows": 2692,
+      "corporate_actions": 45,
+      "splits_applied": 2
+    },
+    {
+      "symbol": "AAPL",
+      "raw_rows": 2692,
+      "corporate_actions": 44,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "MSFT",
+      "raw_rows": 2692,
+      "corporate_actions": 44,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "AMZN",
+      "raw_rows": 2692,
+      "corporate_actions": 2,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "GOOGL",
+      "raw_rows": 2692,
+      "corporate_actions": 11,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "META",
+      "raw_rows": 2692,
+      "corporate_actions": 12,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "TSLA",
+      "raw_rows": 2692,
+      "corporate_actions": 2,
+      "splits_applied": 2
+    },
+    {
+      "symbol": "AMD",
+      "raw_rows": 2692,
+      "corporate_actions": 1,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "JPM",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "SPY",
+      "raw_rows": 2692,
+      "corporate_actions": 40,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "AVGO",
+      "raw_rows": 2692,
+      "corporate_actions": 45,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "NFLX",
+      "raw_rows": 2692,
+      "corporate_actions": 1,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "CRM",
+      "raw_rows": 2692,
+      "corporate_actions": 11,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ORCL",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "COST",
+      "raw_rows": 2692,
+      "corporate_actions": 46,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "LLY",
+      "raw_rows": 2692,
+      "corporate_actions": 46,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "XOM",
+      "raw_rows": 2692,
+      "corporate_actions": 46,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CAT",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "WMT",
+      "raw_rows": 2692,
+      "corporate_actions": 45,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "V",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "HD",
+      "raw_rows": 2692,
+      "corporate_actions": 45,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ADC",
+      "raw_rows": 2692,
+      "corporate_actions": 88,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ADEA",
+      "raw_rows": 2692,
+      "corporate_actions": 17,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ADI",
+      "raw_rows": 2692,
+      "corporate_actions": 44,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ADM",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "DDS",
+      "raw_rows": 2692,
+      "corporate_actions": 47,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CNQ",
+      "raw_rows": 2692,
+      "corporate_actions": 44,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "VRTS",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "XSD",
+      "raw_rows": 2692,
+      "corporate_actions": 41,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CXW",
+      "raw_rows": 2692,
+      "corporate_actions": 17,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ENS",
+      "raw_rows": 2692,
+      "corporate_actions": 42,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CORT",
+      "raw_rows": 2692,
+      "corporate_actions": 0,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CCK",
+      "raw_rows": 2692,
+      "corporate_actions": 23,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CEF",
+      "raw_rows": 2692,
+      "corporate_actions": 2,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "GKOS",
+      "raw_rows": 2692,
+      "corporate_actions": 0,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "RACE",
+      "raw_rows": 2692,
+      "corporate_actions": 12,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "TX",
+      "raw_rows": 2692,
+      "corporate_actions": 15,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "UNF",
+      "raw_rows": 2692,
+      "corporate_actions": 42,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "BXMT",
+      "raw_rows": 2692,
+      "corporate_actions": 42,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "PXLW",
+      "raw_rows": 2692,
+      "corporate_actions": 1,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "KKR",
+      "raw_rows": 2692,
+      "corporate_actions": 44,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "SCSC",
+      "raw_rows": 2692,
+      "corporate_actions": 0,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "LKFT",
+      "raw_rows": 2692,
+      "corporate_actions": 1,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "DNN",
+      "raw_rows": 2692,
+      "corporate_actions": 0,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "VNCE",
+      "raw_rows": 2692,
+      "corporate_actions": 1,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "UNFI",
+      "raw_rows": 2692,
+      "corporate_actions": 0,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "CLMT",
+      "raw_rows": 2692,
+      "corporate_actions": 2,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "APD",
+      "raw_rows": 2692,
+      "corporate_actions": 43,
+      "splits_applied": 1
+    },
+    {
+      "symbol": "MGM",
+      "raw_rows": 2692,
+      "corporate_actions": 24,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "MAN",
+      "raw_rows": 2692,
+      "corporate_actions": 21,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "MYE",
+      "raw_rows": 2692,
+      "corporate_actions": 42,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "YANG",
+      "raw_rows": 2692,
+      "corporate_actions": 25,
+      "splits_applied": 3
+    },
+    {
+      "symbol": "MKSI",
+      "raw_rows": 2692,
+      "corporate_actions": 44,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "MCS",
+      "raw_rows": 2692,
+      "corporate_actions": 34,
+      "splits_applied": 0
+    },
+    {
+      "symbol": "ECC",
+      "raw_rows": 2692,
+      "corporate_actions": 123,
+      "splits_applied": 0
+    }
+  ]
+}
