@@ -12,6 +12,16 @@ from scripts import research_final_standalone_alpaca as final_research
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_ohlcv_columns_are_declared_for_split_normalization() -> None:
+    assert final_research.OHLCV == (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    )
+
+
 def test_final_config_is_database_free_and_frozen(monkeypatch) -> None:
     monkeypatch.setenv("MCT_ROTATION_ACCELERATOR", "cuda")
     monkeypatch.setenv("MCT_ROTATION_ALLOW_CPU_FALLBACK", "false")
