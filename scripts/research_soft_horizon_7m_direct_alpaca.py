@@ -81,7 +81,7 @@ ARRAY_TO_TYPE = {
 }
 
 DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_80.json"
-DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10879"
+DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10880"
 SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.0.1"
 
 
