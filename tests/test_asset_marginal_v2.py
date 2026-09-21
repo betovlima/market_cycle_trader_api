@@ -200,6 +200,20 @@ class MarginalV2Tests(unittest.TestCase):
             leadership_v2.research._write_csv = original_write_csv
             leadership_v2.research._write_json = original_write_json
 
+    def test_validation_wrapper_installs_long_path_safe_snapshot_io(self):
+        original_ensure_dir = independent_validation._ensure_dir
+        original_path_exists = independent_validation._path_exists
+        original_read_json = independent_validation._read_json
+        try:
+            marginal_validation._install_long_path_safe_io()
+            self.assertIs(independent_validation._ensure_dir, windows_file_io.ensure_dir)
+            self.assertIs(independent_validation._path_exists, windows_file_io.exists)
+            self.assertIs(independent_validation._read_json, windows_file_io.read_json)
+        finally:
+            independent_validation._ensure_dir = original_ensure_dir
+            independent_validation._path_exists = original_path_exists
+            independent_validation._read_json = original_read_json
+
     def test_market_snapshot_mismatch_invalidates_the_final_comparison(self):
         _, _, frames, _, _ = fixture()
         hashes = market_data_hashes(frames)
