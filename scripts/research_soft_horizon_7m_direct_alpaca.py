@@ -83,9 +83,9 @@ ARRAY_TO_TYPE = {
     "rights_distributions": "rights_distribution",
 }
 
-DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_81.json"
-DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10881"
-SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.1.0"
+DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_82.json"
+DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10882"
+SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.2.0"
 REFERENCE_DIAGNOSTICS = (
     ROOT / "research" / "reference_10_8_74_raw_snapshot_diagnostics.json"
 )
@@ -235,6 +235,7 @@ def _download_bars(
     request: BacktestExecutionRequest,
     snapshot_dir: Path,
     chunk_size: int,
+    bar_snapshot_as_of_end: str | None = None,
 ) -> tuple[dict[str, Path], dict[str, Any]]:
     """Download bars with the exact Alpaca semantics used by the 10.8.74 snapshot.
 
@@ -254,9 +255,12 @@ def _download_bars(
     feed = str(request.alpaca_historical_feed or "sip").strip().lower()
     adjustment = "raw"
     start = pd.Timestamp(request.start_date)
-    end_text = request.analysis_end_date or request.end_date
-    end = pd.Timestamp(end_text)
-    api_end = end + pd.Timedelta(days=1)
+    research_end_text = request.analysis_end_date or request.end_date
+    research_end = pd.Timestamp(research_end_text)
+    bar_end = pd.Timestamp(
+        bar_snapshot_as_of_end or research_end_text
+    )
+    api_end = bar_end + pd.Timedelta(days=1)
 
     api_key_id = str(headers.get("APCA-API-KEY-ID") or "").strip()
     secret_key = str(headers.get("APCA-API-SECRET-KEY") or "").strip()
@@ -270,7 +274,8 @@ def _download_bars(
     print(
         f"[alpaca-bars] loader=10.8.74-download_stock_bars "
         f"assets={len(symbols)} feed={feed} adjustment={adjustment} "
-        f"timeframe={timeframe} start={start.date()} end={end.date()}",
+        f"timeframe={timeframe} start={start.date()} "
+        f"bar_asof_end={bar_end.date()} research_end={research_end.date()}",
         flush=True,
     )
 
@@ -334,7 +339,8 @@ def _download_bars(
         "adjustment": adjustment,
         "timeframe": timeframe,
         "requested_start": start.date().isoformat(),
-        "requested_end": end.date().isoformat(),
+        "research_end": research_end.date().isoformat(),
+        "bar_snapshot_as_of_end": bar_end.date().isoformat(),
         "api_end_exclusive_upper_bound": api_end.date().isoformat(),
         "asset_count": len(symbols),
         "row_counts": row_counts,
@@ -1205,6 +1211,12 @@ def main() -> int:
                 chunk_size=int(
                     args.bars_chunk_size
                 ),
+                bar_snapshot_as_of_end=(
+                    (
+                        config_document.get("data_source")
+                        or {}
+                    ).get("bar_snapshot_as_of_end")
+                ),
             )
         )
         (
@@ -1733,7 +1745,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.81",
+        "api_version": "10.8.82",
         "experiment": (
             "raw-split-soft-horizon-consensus-direct-alpaca-v1"
         ),
