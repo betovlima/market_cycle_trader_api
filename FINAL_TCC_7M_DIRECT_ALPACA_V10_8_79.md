@@ -263,3 +263,64 @@ Qualquer diferença deve ser investigada primeiro em:
 9. 11 intervenções do Soft.
 
 Não fazer tuning para aproximar artificialmente os US$ 7.38 milhões.
+
+
+## Correção 10.8.80 — `research_market_data_mode`
+
+A primeira execução da 10.8.79 abortou antes de qualquer chamada à Alpaca com:
+
+```text
+ValidationError: research_market_data_mode
+Input should be 'backtest_bootstrap_missing' or 'database_only'
+input_value='standalone_snapshot'
+```
+
+Causa:
+
+- a branch 10.8.79 deriva corretamente do código 10.8.74;
+- o schema da 10.8.74 define:
+  `ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only"]`;
+- porém o JSON congelado inicial tinha herdado
+  `research_market_data_mode="standalone_snapshot"` da linha 10.8.75;
+- esse valor nem sequer é válido para o schema 10.8.74 e impedia o request de ser
+  construído.
+
+A 10.8.80 corrige apenas esse contrato:
+
+```json
+"research_market_data_mode": "database_only"
+```
+
+Isso também é o valor model-facing usado pelo experimento 10.8.74 de
+US$ 7.376.955,56. Portanto a correção reduz, em vez de aumentar, a divergência
+em relação ao experimento de referência.
+
+Versão da correção:
+
+- API/pacote: `10.8.80`
+- runner: `soft-horizon-7m-direct-alpaca-v1.0.1`
+- branch:
+  `research/api-v10.8.80-soft-horizon-7m-direct-alpaca-mode-fix`
+- config:
+  `research/soft_horizon_7m_direct_alpaca_v10_8_80.json`
+- output:
+  `output/soft_horizon_7m_direct_alpaca_v10880/`
+
+A falha aconteceu em `BacktestExecutionRequest.model_validate(...)`, antes do
+download de barras e corporate actions. Portanto essa tentativa não produziu um
+snapshot Alpaca final que deva ser preservado.
+
+### Execução 10.8.80
+
+```bash
+git fetch origin
+git switch research/api-v10.8.80-soft-horizon-7m-direct-alpaca-mode-fix
+git pull --ff-only origin research/api-v10.8.80-soft-horizon-7m-direct-alpaca-mode-fix
+
+python -m pytest tests/test_soft_horizon_7m_direct_alpaca.py -q
+
+python scripts/research_soft_horizon_7m_direct_alpaca.py --replace-snapshot
+```
+
+Se o download da 10.8.80 terminar e uma etapa posterior falhar, a partir desse
+momento usar `--reuse-snapshot` para preservar exatamente a nova carga.
