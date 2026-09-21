@@ -141,6 +141,46 @@ def test_local_split_normalization_changes_only_pre_ex_date_units() -> None:
     assert len(applied) == 1
 
 
+def test_split_normalization_accepts_integer_ohlcv_and_fractional_adjustments() -> None:
+    index = pd.to_datetime(
+        [
+            "2026-01-02T00:00:00Z",
+            "2026-01-05T00:00:00Z",
+            "2026-01-06T00:00:00Z",
+        ],
+        utc=True,
+    )
+    raw = pd.DataFrame(
+        {
+            "open": [101, 103, 69],
+            "high": [102, 104, 70],
+            "low": [100, 102, 68],
+            "close": [101, 103, 69],
+            "volume": [1001, 1201, 2501],
+        },
+        index=index,
+        dtype="int64",
+    )
+    actions = [
+        {
+            "action_type": "forward_split",
+            "ex_date": "2026-01-06",
+            "process_date": "2026-01-05",
+            "old_rate": 2,
+            "new_rate": 3,
+        }
+    ]
+
+    normalized, applied = final_research._split_normalize(raw, actions)
+
+    assert all(normalized[column].dtype.kind == "f" for column in final_research.OHLCV)
+    assert np.isclose(normalized.iloc[0]["close"], 101.0 * (2.0 / 3.0))
+    assert np.isclose(normalized.iloc[0]["volume"], 1001.0 * 1.5)
+    assert np.isclose(normalized.iloc[2]["close"], 69.0)
+    assert np.isclose(normalized.iloc[2]["volume"], 2501.0)
+    assert len(applied) == 1
+
+
 def test_structural_identity_guard_excludes_acquiree_ticker_reuse() -> None:
     issue = final_research._structural_identity_issue(
         "DOC",
