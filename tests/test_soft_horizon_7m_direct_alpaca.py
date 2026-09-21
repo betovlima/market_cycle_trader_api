@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_79.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_80.json"
     )
 
     assert document["schema_version"] == 1
@@ -23,7 +23,7 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
         == "05b765df0496c905a4195948027a9b3b7adf2bce"
     )
     assert document["lineage"]["change_scope"] == "market_data_transport_only"
-    assert request.research_market_data_mode == "standalone_snapshot"
+    assert request.research_market_data_mode == "database_only"
     assert request.mongo_cache_enabled is False
     assert request.alpaca_adjustment == "raw"
     assert request.start_date == "2016-01-01"
