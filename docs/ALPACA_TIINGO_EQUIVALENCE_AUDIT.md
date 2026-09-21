@@ -1235,3 +1235,157 @@ Primary questions:
 2. How much does OOS replay time fall relative to v10.8.73?
 3. Does soft rank support filter only marginal rotations rather than suppressing rotation broadly?
 4. Does the challenger improve capital and/or robustness while retaining the strategy's rotation edge?
+
+
+## Final standalone fresh-Alpaca research (API v10.8.75)
+
+API v10.8.75 creates the final reproducible research path without using MongoDB as a source of market data, corporate actions, job configuration, or experiment state.
+
+The frozen experiment configuration is committed to:
+
+```text
+research/final_research_v10_8_75.json
+```
+
+It contains the complete 56-asset universe, study window, transaction-cost assumptions, walk-forward configuration, LightGBM hyperparameters, and the already-selected soft-consensus setting:
+
+```text
+penalty_strength = 1.0
+```
+
+The final runner is:
+
+```text
+scripts/research_final_fresh_alpaca_standalone.py
+```
+
+### Data acquisition
+
+By default every execution downloads again:
+
+1. RAW daily SIP stock bars directly from Alpaca;
+2. corporate actions directly from Alpaca's corporate-actions endpoint.
+
+Credentials are read exclusively from environment variables:
+
+```text
+ALPACA_API_KEY_ID
+ALPACA_SECRET_KEY
+```
+
+No MongoDB client is created.
+
+The requested study window remains frozen:
+
+```text
+2016-01-01 through 2026-09-17
+```
+
+This means a new execution tests whether the same frozen historical experiment can be reconstructed from a fresh Alpaca retrieval without relying on the project's historical database snapshot.
+
+### Local immutable research snapshot
+
+Fresh inputs are written under:
+
+```text
+output/final_fresh_alpaca_standalone/input/
+  raw/
+  split/
+  corporate_actions.json
+  snapshot_manifest.json
+```
+
+RAW data is never overwritten by local adjustments. Split-normalized series are written separately.
+
+The manifest stores:
+- frozen configuration SHA-256;
+- canonical per-symbol RAW data SHA-256;
+- file SHA-256;
+- corporate-action artifact hash;
+- combined snapshot SHA-256;
+- coverage and row counts.
+
+Canonical data hashes are calculated from deterministic uncompressed CSV serialization rather than gzip bytes, so gzip metadata cannot change the scientific data identity.
+
+### Corporate-action policy
+
+The same point-in-time architecture is preserved:
+
+```text
+fresh Alpaca RAW bars
+        +
+fresh Alpaca corporate-action ledger
+        ↓
+local split/reverse-split reconstruction
+        ↓
+structural identity guard
+        ↓
+MCT features / LightGBM / walk-forward
+```
+
+Mergers that make a ticker structurally ambiguous remain excluded. In the established dataset this affects DOC.
+
+Dividend back-adjustment is not applied.
+
+### Models evaluated
+
+The final run is intentionally not a new tuning campaign.
+
+It evaluates the already-defined hypotheses:
+
+```text
+A: CONTROL
+B: CONTROL + SOFT_HORIZON_CONSENSUS
+```
+
+The LightGBM parameters and soft-consensus penalty are frozen before the fresh download.
+
+This separation is important for the TCC: the final fresh-data run is a reproducibility/confirmation experiment, not another search for parameters that maximize the same sample.
+
+### Buy-and-hold
+
+The equal-weight buy-and-hold benchmark remains included with the same initial capital, transaction-cost functions, and OOS window.
+
+The final summary reports:
+- ending capital;
+- total return;
+- CAGR;
+- Sharpe;
+- maximum drawdown;
+- worst fold;
+- strategy / buy-and-hold ratio.
+
+### No-Mongo guarantee
+
+A dedicated test verifies that the final runner does not import or call:
+
+```text
+create_client
+get_database
+mongo_repository
+JOBS_COLLECTION
+_latest_job
+```
+
+Run:
+
+```bash
+pytest -q tests/test_final_fresh_alpaca_standalone.py
+```
+
+### Final execution
+
+```bash
+python scripts/research_final_fresh_alpaca_standalone.py
+```
+
+The normal mode always downloads fresh data from Alpaca.
+
+Only for exact replay/debugging of the just-downloaded local artifact:
+
+```bash
+python scripts/research_final_fresh_alpaca_standalone.py \
+  --reuse-local-snapshot
+```
+
+That replay still does not access MongoDB.
