@@ -73,6 +73,18 @@ def _write_csv(path: Path, frame: pd.DataFrame) -> None:
     temporary.replace(path)
 
 
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists()
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -231,12 +243,12 @@ def main() -> int:
         / "research_output"
         / f"asset_rotation_independent_validation_strategy_{args.strategy_sequence}_{validation_end.date().isoformat()}"
     ).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(output_dir)
 
     frozen_path = Path(args.frozen_snapshot).resolve()
-    if not frozen_path.exists():
+    if not _path_exists(frozen_path):
         raise RuntimeError(f"Frozen rotation selection snapshot not found: {frozen_path}")
-    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    frozen = _read_json(frozen_path)
 
     client = MongoClient(
         mongo_uri,
