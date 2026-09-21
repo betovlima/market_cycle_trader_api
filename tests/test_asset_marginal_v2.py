@@ -22,6 +22,7 @@ from market_cycle_trader_api.engine.compound_rotation_backtest import (
 )
 from market_cycle_trader_api.schemas.requests import BacktestExecutionRequest
 import research_asset_marginal_rotation_contribution as selector
+import research_asset_marginal_rotation_leadership as leadership_v2
 from research_marginal_reproducibility import market_data_hashes, verify_validation_pair
 
 
@@ -184,6 +185,20 @@ class MarginalV2Tests(unittest.TestCase):
                           index=pd.to_datetime(["2025-09-05", "2026-09-04"], utc=True))
         self.assertAlmostEqual(_cagr(curve, 10000), -.028436281949587937, places=12)
         self.assertAlmostEqual(_cagr(curve), -.06467029662314394, places=12)
+
+    def test_leadership_installs_long_path_safe_csv_reader(self):
+        original_read = leadership_v2.research._read_csv
+        original_write_csv = leadership_v2.research._write_csv
+        original_write_json = leadership_v2.research._write_json
+        try:
+            leadership_v2._install_long_path_safe_io()
+            self.assertIs(leadership_v2.research._read_csv, leadership_v2.file_io.read_csv)
+            self.assertIs(leadership_v2.research._write_csv, leadership_v2.file_io.write_csv)
+            self.assertIs(leadership_v2.research._write_json, leadership_v2.file_io.write_json)
+        finally:
+            leadership_v2.research._read_csv = original_read
+            leadership_v2.research._write_csv = original_write_csv
+            leadership_v2.research._write_json = original_write_json
 
     def test_market_snapshot_mismatch_invalidates_the_final_comparison(self):
         _, _, frames, _, _ = fixture()
