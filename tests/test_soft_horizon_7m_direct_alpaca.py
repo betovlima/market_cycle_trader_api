@@ -22,7 +22,7 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
         document["lineage"]["base_commit"]
         == "05b765df0496c905a4195948027a9b3b7adf2bce"
     )
-    assert document["lineage"]["change_scope"] == "market_data_transport_only"
+    assert document["lineage"]["change_scope"] == "market_data_transport_only_plus_prevalidated_gpu_backend"
     assert request.research_market_data_mode == "database_only"
     assert request.mongo_cache_enabled is False
     assert request.alpaca_adjustment == "raw"
