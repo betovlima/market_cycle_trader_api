@@ -1,4 +1,4 @@
-# Validação técnica — API 10.8.42 / pesquisa 2.0.1
+# Validação técnica — API 10.8.43 / pesquisa 2.0.2
 
 Base: `10e2d46b71fc7051098116f6385f6561215cdaad`, branch
 `research/asset-marginal-rotation-contribution-v1`.
@@ -79,3 +79,36 @@ Este incidente ocorreu depois do processamento dos ativos, portanto não há
 evidência de erro específico no modelo de YANG. A execução que falhou não deve
 ser tratada como experimento concluído porque as etapas de qualificação,
 seleção marginal e validação final ainda não foram executadas.
+
+
+## Segundo incidente real de 2026-09-20 — Phase 2B
+
+Após a correção da leitura CSV da Phase 1A, a execução avançou até a validação
+independente. A Phase 2B falhou ao procurar
+`marginal/marginal_rotation_contribution_snapshot_frozen.json`.
+
+A existência do mesmo snapshot já havia sido confirmada pelo runner v2 por meio
+de `research_windows_file_io.exists`. Portanto, o erro não indica ausência do
+artefato de seleção. A causa é o validador base usar novamente APIs normais de
+`pathlib` em um caminho longo do Windows:
+
+- `output_dir.mkdir(...)`;
+- `frozen_path.exists()`;
+- `frozen_path.read_text(...)`.
+
+A pesquisa 2.0.2 torna essas três operações injetáveis e o wrapper v2 instala os
+helpers de caminho longo já usados nas demais fases. Foi acrescentado teste de
+regressão que verifica a instalação de `ensure_dir`, `exists` e `read_json`
+no validador independente.
+
+### Estado da execução
+
+A seleção marginal já produziu os snapshots necessários. Por isso a retomada
+recomendada é somente a validação:
+
+```bash
+python scripts/research_asset_marginal_rotation_independent_then_validate.py --strategy-sequence 10 --history-start 2016-01-01 --snapshot-end 2026-09-04 --validation-sessions 252 --workers 4 --validation-only
+```
+
+Não executar `--fresh-run` para essa retomada, pois isso apagaria os artefatos
+da Phase 1 e repetiria desnecessariamente o processamento dos 82 ativos.
