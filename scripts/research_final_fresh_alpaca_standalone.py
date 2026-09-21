@@ -476,10 +476,21 @@ def _split_normalize(
     return result, applied
 
 
+def _frame_data_sha256(
+    frame: pd.DataFrame,
+) -> str:
+    canonical = frame.to_csv(
+        index=True,
+        float_format="%.17g",
+        lineterminator="\n",
+    ).encode("utf-8")
+    return _sha256_bytes(canonical)
+
+
 def _write_frame_csv(
     frame: pd.DataFrame,
     path: Path,
-) -> str:
+) -> dict[str, str]:
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -489,8 +500,12 @@ def _write_frame_csv(
         index=True,
         compression="gzip",
         float_format="%.17g",
+        lineterminator="\n",
     )
-    return _sha256_file(path)
+    return {
+        "file_sha256": _sha256_file(path),
+        "data_sha256": _frame_data_sha256(frame),
+    }
 
 
 def _metrics(
@@ -1070,7 +1085,7 @@ def main() -> int:
             raw_path = (
                 raw_dir / f"{symbol}.csv.gz"
             )
-            file_sha = _write_frame_csv(
+            hashes = _write_frame_csv(
                 frame,
                 raw_path,
             )
@@ -1081,7 +1096,8 @@ def main() -> int:
                             output_dir
                         )
                     ),
-                    "sha256": file_sha,
+                    "file_sha256": hashes["file_sha256"],
+                    "data_sha256": hashes["data_sha256"],
                     "kind": "raw_bars",
                     "symbol": symbol,
                     "rows": int(len(frame)),
@@ -1099,7 +1115,7 @@ def main() -> int:
             sorted(
                 (
                     item["path"],
-                    item["sha256"],
+                    item.get("data_sha256") or item.get("sha256"),
                 )
                 for item in snapshot_files
             ),
@@ -1206,7 +1222,7 @@ def main() -> int:
         split_path = (
             split_dir / f"{symbol}.csv.gz"
         )
-        split_sha = _write_frame_csv(
+        split_hashes = _write_frame_csv(
             reconstructed,
             split_path,
         )
@@ -1223,7 +1239,8 @@ def main() -> int:
                 ).isoformat(),
                 "corporate_actions": len(actions),
                 "splits_applied": len(applied),
-                "split_file_sha256": split_sha,
+                "split_file_sha256": split_hashes["file_sha256"],
+                "split_data_sha256": split_hashes["data_sha256"],
             }
         )
         print(
