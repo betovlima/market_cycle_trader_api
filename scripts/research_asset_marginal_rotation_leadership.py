@@ -20,7 +20,7 @@ from market_cycle_trader_api.services.asset_marginal_score_replay import (  # no
     export_execution_rows, replay_policy_settings,
 )
 
-SCRIPT_VERSION = "asset-marginal-rotation-leadership-v2.0.0"
+SCRIPT_VERSION = "asset-marginal-rotation-leadership-v2.0.1"
 _ANALYSIS_FAILURES: dict[str, str] = {}
 _REPLAY_CONFIG: dict[str, Any] = {}
 
@@ -180,9 +180,10 @@ def _install_candidate_failure_isolation() -> None:
     research._leadership_qualification = leadership_qualification
 
 
-def _install_long_path_safe_writes() -> None:
+def _install_long_path_safe_io() -> None:
     research._write_json = file_io.write_json
     research._write_csv = file_io.write_csv
+    research._read_csv = file_io.read_csv
 
 
 def main() -> int:
@@ -191,7 +192,7 @@ def main() -> int:
     if not args.no_resume:
         raise RuntimeError("v2 Leadership requires --no-resume (or the runner's --fresh-run) to export a complete execution tape.")
     _install_candidate_failure_isolation()
-    _install_long_path_safe_writes()
+    _install_long_path_safe_io()
     _install_replay_export()
     research.SCRIPT_VERSION = SCRIPT_VERSION
     result = int(research.main())
