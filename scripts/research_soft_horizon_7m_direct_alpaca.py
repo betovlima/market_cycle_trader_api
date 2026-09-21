@@ -83,9 +83,9 @@ ARRAY_TO_TYPE = {
     "rights_distributions": "rights_distribution",
 }
 
-DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_83.json"
-DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10883"
-SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.3.0"
+DEFAULT_CONFIG = "research/soft_horizon_7m_direct_alpaca_v10_8_84.json"
+DEFAULT_OUTPUT = "output/soft_horizon_7m_direct_alpaca_v10884"
+SCRIPT_VERSION = "soft-horizon-7m-direct-alpaca-v1.4.0"
 REFERENCE_DIAGNOSTICS = (
     ROOT / "research" / "reference_10_8_74_raw_snapshot_diagnostics.json"
 )
@@ -1014,9 +1014,9 @@ def _load_config(
             "10.8.74 reproduction requires the original 56-asset request "
             "including DOC and CLMT before the original structural guard."
         )
-    if request.rotation_accelerator != "cuda":
+    if request.rotation_accelerator != "cpu":
         raise ValueError(
-            "This direct Alpaca replay requires rotation_accelerator=cuda."
+            "CPU isolation replay requires rotation_accelerator=cpu."
         )
     if request.rotation_allow_cpu_fallback:
         raise ValueError(
@@ -1025,7 +1025,8 @@ def _load_config(
         )
     if request.deterministic_execution:
         raise ValueError(
-            "GPU execution requires deterministic_execution=false."
+            "CPU isolation keeps deterministic_execution=false "
+            "unchanged from v10.8.83 so only the compute backend changes."
         )
     methodology = document.get("methodology") or {}
     if float(
@@ -1075,6 +1076,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--snapshot-source-dir",
+        default=None,
+        help=(
+            "Reuse an immutable snapshot directory created by another "
+            "research run. Its manifest SHA-256 and every file hash are "
+            "validated. This is intended for CPU/GPU isolation tests."
+        ),
+    )
+    parser.add_argument(
         "--bars-chunk-size",
         type=int,
         default=20,
@@ -1086,13 +1096,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if (
-        args.replace_snapshot
-        and args.reuse_snapshot
+    external_snapshot = bool(
+        str(args.snapshot_source_dir or "").strip()
+    )
+    if args.replace_snapshot and (
+        args.reuse_snapshot or external_snapshot
     ):
         raise ValueError(
-            "--replace-snapshot and --reuse-snapshot "
-            "are mutually exclusive."
+            "--replace-snapshot cannot be combined with "
+            "--reuse-snapshot or --snapshot-source-dir."
         )
 
     config_path = (
@@ -1101,8 +1113,15 @@ def main() -> int:
     output_dir = (
         ROOT / args.output_dir
     ).resolve()
-    snapshot_dir = output_dir / "snapshot"
+    snapshot_dir = (
+        Path(args.snapshot_source_dir).expanduser().resolve()
+        if external_snapshot
+        else output_dir / "snapshot"
+    )
     results_dir = output_dir / "results"
+    reuse_snapshot = bool(
+        args.reuse_snapshot or external_snapshot
+    )
 
     config_document, request = _load_config(
         config_path
@@ -1111,30 +1130,37 @@ def main() -> int:
         config_document
     )
 
-    if snapshot_dir.exists():
+    if external_snapshot and not snapshot_dir.exists():
+        raise RuntimeError(
+            f"External snapshot directory does not exist: {snapshot_dir}"
+        )
+
+    if (not external_snapshot) and snapshot_dir.exists():
         if args.replace_snapshot:
             shutil.rmtree(snapshot_dir)
-        elif not args.reuse_snapshot:
+        elif not reuse_snapshot:
             raise RuntimeError(
                 f"Snapshot already exists: {snapshot_dir}. "
                 "Use --replace-snapshot for a fresh Alpaca download "
                 "or --reuse-snapshot to reproduce an existing snapshot."
             )
 
-    snapshot_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if not external_snapshot:
+        snapshot_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
     results_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    headers, credential_metadata = (
-        _alpaca_headers()
-    )
+    headers: dict[str, str] | None = None
+    credential_metadata: dict[str, str] | None = None
+    if not reuse_snapshot:
+        headers, credential_metadata = _alpaca_headers()
 
-    if args.reuse_snapshot:
+    if reuse_snapshot:
         manifest_path = (
             snapshot_dir / "manifest.json"
         )
@@ -1147,7 +1173,30 @@ def main() -> int:
                 encoding="utf-8"
             )
         )
-        if (
+        expected_snapshot_sha = str(
+            (
+                config_document.get("methodology")
+                or {}
+            ).get("expected_snapshot_sha256")
+            or ""
+        ).strip()
+        actual_snapshot_sha = str(
+            manifest.get("snapshot_sha256")
+            or ""
+        ).strip()
+
+        if external_snapshot:
+            if (
+                not expected_snapshot_sha
+                or actual_snapshot_sha
+                != expected_snapshot_sha
+            ):
+                raise RuntimeError(
+                    "External snapshot identity mismatch: "
+                    f"expected={expected_snapshot_sha or 'missing'}, "
+                    f"actual={actual_snapshot_sha or 'missing'}"
+                )
+        elif (
             manifest.get("config_sha256")
             != config_sha256
         ):
@@ -1206,6 +1255,10 @@ def main() -> int:
             flush=True,
         )
     else:
+        if headers is None:
+            raise RuntimeError(
+                "Alpaca credentials were not initialized for a fresh download."
+            )
         downloaded_at = pd.Timestamp.now(
             tz="UTC"
         ).isoformat()
@@ -1756,7 +1809,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.83",
+        "api_version": "10.8.84",
         "experiment": (
             "raw-split-soft-horizon-consensus-direct-alpaca-v1"
         ),
@@ -1770,11 +1823,13 @@ def main() -> int:
             "base_commit": "05b765df0496c905a4195948027a9b3b7adf2bce",
             "base_experiment": "raw-split-soft-horizon-consensus-v2",
             "base_source_job_id": "20260918T234903-52bd06f3",
-            "change_scope": "direct_alpaca_transport_plus_prevalidated_gpu_backend_with_original_10_8_74_request_semantics",
+            "change_scope": "cpu_vs_gpu_isolation_on_exact_v10_8_83_snapshot",
         },
         "snapshot_sha256": (
             manifest["snapshot_sha256"]
         ),
+        "snapshot_source_dir": str(snapshot_dir),
+        "external_snapshot_reuse": external_snapshot,
         "reference_10_8_74_data_audit": reference_audit,
         "config_sha256": config_sha256,
         "research_window": {
