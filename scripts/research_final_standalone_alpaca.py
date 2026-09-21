@@ -46,6 +46,7 @@ from market_cycle_trader_api.schemas.requests import (
 
 
 BARS_ENDPOINT = "https://data.alpaca.markets/v2/stocks/bars"
+OHLCV = ("open", "high", "low", "close", "volume")
 CORPORATE_ACTIONS_ENDPOINT = (
     "https://data.alpaca.markets/v1/corporate-actions"
 )
@@ -82,7 +83,7 @@ ARRAY_TO_TYPE = {
 
 DEFAULT_CONFIG = "research/final_research_v10_8_76.json"
 DEFAULT_OUTPUT = "output/final_standalone_alpaca_20260918_v10876"
-SCRIPT_VERSION = "final-standalone-alpaca-v2.0.1"
+SCRIPT_VERSION = "final-standalone-alpaca-v2.0.2"
 
 
 def _utc(value: Any) -> pd.Timestamp:
@@ -1631,7 +1632,7 @@ def main() -> int:
     )
     summary = {
         "schema_version": 1,
-        "api_version": "10.8.77",
+        "api_version": "10.8.78",
         "experiment": (
             "final-standalone-fresh-alpaca-soft-consensus-v2"
         ),
