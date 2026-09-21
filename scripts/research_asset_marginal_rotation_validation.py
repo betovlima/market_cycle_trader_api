@@ -17,9 +17,10 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 import research_asset_rotation_independent_validation as base  # noqa: E402
 import research_asset_rotation_leadership as leadership  # noqa: E402
+import research_windows_file_io as file_io  # noqa: E402
 from research_marginal_reproducibility import code_identity, market_data_hashes  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-validation-v2.0.0"
+SCRIPT_VERSION = "asset-marginal-rotation-validation-v2.0.2"
 _MARKET_DATA_HASHES: dict[str, str] = {}
 
 
@@ -269,6 +270,9 @@ def main() -> int:
     base._decision_dates = _decision_dates
     base._write_json = _write_json
     base._write_csv = _write_csv
+    base._ensure_dir = file_io.ensure_dir
+    base._path_exists = file_io.exists
+    base._read_json = file_io.read_json
     base.SCRIPT_VERSION = SCRIPT_VERSION
     return int(base.main())
 
