@@ -984,6 +984,39 @@ def _load_config(
             "Final standalone research requires a "
             "closed end_date."
         )
+
+    # Reproduction contract: do not allow this runner to drift away from
+    # the 10.8.74 experiment that produced ~US$7.38M.  Only the physical
+    # data transport is allowed to change.
+    if request.start_date != "2016-01-01" or request.end_date != "2026-09-18":
+        raise ValueError(
+            "10.8.74 reproduction requires the frozen "
+            "2016-01-01 -> 2026-09-18 research window."
+        )
+    if len(request.assets) != 56 or "DOC" not in request.assets or "CLMT" not in request.assets:
+        raise ValueError(
+            "10.8.74 reproduction requires the original 56-asset request "
+            "including DOC and CLMT before the original structural guard."
+        )
+    if request.rotation_accelerator != "cpu":
+        raise ValueError(
+            "10.8.74 reproduction requires rotation_accelerator=cpu. "
+            "CPU/GPU equivalence was studied separately; this run isolates "
+            "only Mongo snapshot transport versus direct Alpaca transport."
+        )
+    if not request.deterministic_execution:
+        raise ValueError(
+            "10.8.74 reproduction requires deterministic_execution=true."
+        )
+    consensus = (
+        request.research_model_settings.get("soft_horizon_consensus")
+        or {}
+    )
+    if float(consensus.get("penalty_strength", 0.0)) != 1.0:
+        raise ValueError(
+            "10.8.74 reproduction requires soft horizon "
+            "penalty_strength=1.0."
+        )
     return document, request
 
 
