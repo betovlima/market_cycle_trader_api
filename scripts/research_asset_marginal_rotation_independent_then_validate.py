@@ -17,7 +17,7 @@ import research_asset_rotation_independent_then_validate as independent  # noqa:
 import research_windows_file_io as file_io  # noqa: E402
 from research_marginal_reproducibility import code_identity, verify_validation_pair  # noqa: E402
 
-SCRIPT_VERSION = "asset-marginal-rotation-contribution-v2.0.1"
+SCRIPT_VERSION = "asset-marginal-rotation-contribution-v2.0.2"
 DEFAULT_VALIDATION_SESSIONS = 252
 LEADERSHIP_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_leadership.py"
 VALIDATION_SCRIPT = PROJECT_ROOT / "scripts" / "research_asset_marginal_rotation_validation.py"
