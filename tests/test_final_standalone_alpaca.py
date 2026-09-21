@@ -12,9 +12,11 @@ from scripts import research_final_standalone_alpaca as final_research
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_final_config_is_database_free_and_frozen() -> None:
+def test_final_config_is_database_free_and_frozen(monkeypatch) -> None:
+    monkeypatch.setenv("MCT_ROTATION_ACCELERATOR", "cuda")
+    monkeypatch.setenv("MCT_ROTATION_ALLOW_CPU_FALLBACK", "false")
     document, request = final_research._load_config(
-        ROOT / "research" / "final_research_v10_8_75.json"
+        ROOT / "research" / "final_research_v10_8_76.json"
     )
 
     assert document["schema_version"] == 1
@@ -23,7 +25,9 @@ def test_final_config_is_database_free_and_frozen() -> None:
     assert request.alpaca_adjustment == "raw"
     assert request.end_date == "2026-09-18"
     assert request.analysis_end_date == "2026-09-18"
-    assert request.deterministic_execution is True
+    assert request.deterministic_execution is False
+    assert request.rotation_accelerator == "cuda"
+    assert request.rotation_allow_cpu_fallback is False
     assert request.xgb_n_jobs == 1
     assert request.numeric_thread_limit == 1
     assert len(request.assets) == 56
@@ -32,6 +36,25 @@ def test_final_config_is_database_free_and_frozen() -> None:
             "penalty_strength"
         ]
         == 1.0
+    )
+
+
+def test_final_config_has_explicit_clmt_structural_exclusion(monkeypatch) -> None:
+    monkeypatch.setenv("MCT_ROTATION_ACCELERATOR", "cuda")
+    monkeypatch.setenv("MCT_ROTATION_ALLOW_CPU_FALLBACK", "false")
+    document, _ = final_research._load_config(
+        ROOT / "research" / "final_research_v10_8_76.json"
+    )
+    exclusions = final_research._explicit_structural_exclusions(document)
+
+    assert "CLMT" in exclusions
+    assert (
+        exclusions["CLMT"]["reason"]
+        == "known_structural_history_identity_discontinuity"
+    )
+    assert (
+        exclusions["CLMT"]["policy"]
+        == "exclude_do_not_bridge_or_reconstruct"
     )
 
 
