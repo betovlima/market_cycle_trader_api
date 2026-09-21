@@ -1770,7 +1770,7 @@ def main() -> int:
             "base_commit": "05b765df0496c905a4195948027a9b3b7adf2bce",
             "base_experiment": "raw-split-soft-horizon-consensus-v2",
             "base_source_job_id": "20260918T234903-52bd06f3",
-            "change_scope": "market_data_transport_only_plus_prevalidated_gpu_backend",
+            "change_scope": "direct_alpaca_transport_plus_prevalidated_gpu_backend_with_original_10_8_74_request_semantics",
         },
         "snapshot_sha256": (
             manifest["snapshot_sha256"]
