@@ -1,6 +1,6 @@
 # Git — contribuição marginal v2
 
-API/pacote: `10.8.42`. Experimento: `asset-marginal-rotation-contribution-v2.0.1`.
+API/pacote: `10.8.43`. Experimento: `asset-marginal-rotation-contribution-v2.0.2`.
 
 ## Correção 10.8.42 / 2.0.1 — Windows long path
 
@@ -91,3 +91,52 @@ python scripts/research_asset_marginal_rotation_independent_then_validate.py --s
 Até que exista uma recuperação validada dos artefatos parcialmente finalizados,
 não reutilizar silenciosamente a pasta da execução interrompida como se fosse um
 resultado completo.
+
+
+## Correção 10.8.43 / 2.0.2 — validação independente em caminho longo
+
+Na execução posterior à correção 10.8.42, a Phase 1A e a Phase 1B avançaram e
+os snapshots marginal e baseline foram produzidos. A Phase 2A baseline também
+foi iniciada/concluída antes da falha observada na Phase 2B.
+
+A Phase 2B falhou com:
+
+```text
+Frozen rotation selection snapshot not found:
+...\marginal\marginal_rotation_contribution_snapshot_frozen.json
+```
+
+Diagnóstico: o runner v2 verificava a existência dos snapshots com
+`research_windows_file_io.exists`, portanto conseguiu confirmar o arquivo.
+Porém o subprocesso de validação independente voltava a usar
+`Path.exists()`, `Path.read_text()` e `Path.mkdir()` diretamente. No caminho
+completo do experimento em Windows, essa assimetria reproduzia o problema de
+caminho longo na Phase 2B.
+
+Correção:
+- branch: `research/asset-marginal-rotation-contribution-v2.0.2`;
+- API/pacote: `10.8.43`;
+- pesquisa: `asset-marginal-rotation-contribution-v2.0.2`;
+- o validador base ganhou hooks injetáveis para criar diretório, testar existência
+  e ler JSON;
+- o wrapper marginal instala `research_windows_file_io.ensure_dir`,
+  `research_windows_file_io.exists` e `research_windows_file_io.read_json`;
+- teste de regressão adicionado para esse contrato.
+
+### Retomar sem repetir Phase 1A/1B
+
+Não usar `--fresh-run` para retomar este incidente. Os snapshots congelados da
+execução já existem e devem ser preservados.
+
+```bash
+git fetch origin
+git switch research/asset-marginal-rotation-contribution-v2.0.2
+git pull --ff-only origin research/asset-marginal-rotation-contribution-v2.0.2
+python -m unittest discover -s tests -p test_asset_marginal_v2.py -v
+
+python scripts/research_asset_marginal_rotation_independent_then_validate.py --strategy-sequence 10 --history-start 2016-01-01 --snapshot-end 2026-09-04 --validation-sessions 252 --workers 4 --validation-only
+```
+
+O `--validation-only` reutiliza exclusivamente os snapshots congelados da
+Phase 1 e executa novamente as validações baseline e expandida. Isso evita
+reprocessar os 82 ativos e mantém a comparação ligada à seleção já produzida.
