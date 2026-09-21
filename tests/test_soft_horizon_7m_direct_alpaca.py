@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     document, request = research._load_config(
-        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_82.json"
+        ROOT / "research" / "soft_horizon_7m_direct_alpaca_v10_8_83.json"
     )
 
     assert document["schema_version"] == 1
@@ -25,10 +25,10 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     assert document["lineage"]["change_scope"] == "market_data_transport_only_plus_prevalidated_gpu_backend"
     assert request.research_market_data_mode == "database_only"
     assert request.mongo_cache_enabled is False
-    assert request.alpaca_adjustment == "raw"
+    assert request.alpaca_adjustment == "all"
     assert request.start_date == "2016-01-01"
-    assert request.end_date == "2026-09-18"
-    assert request.analysis_end_date == "2026-09-18"
+    assert request.end_date is None
+    assert request.analysis_end_date == "2026-09-17"
     assert request.rotation_accelerator == "cuda"
     assert request.rotation_allow_cpu_fallback is False
     assert request.deterministic_execution is False
@@ -37,12 +37,17 @@ def test_frozen_7m_config_preserves_10_8_74_request() -> None:
     assert len(request.assets) == 56
     assert "DOC" in request.assets
     assert "CLMT" in request.assets
-    assert (
-        request.research_model_settings["soft_horizon_consensus"][
-            "penalty_strength"
-        ]
-        == 1.0
-    )
+    assert document["methodology"]["soft_horizon_consensus_penalty_strength"] == 1.0
+    assert request.research_model_settings["schema_version"] == 3
+    assert request.research_model_settings["settings_revision"] == 2
+    assert request.research_model_settings["profile_id"] == "strategy"
+    lightgbm = request.research_model_settings["lightgbm"]
+    assert lightgbm["n_estimators"] == 329
+    assert lightgbm["n_jobs"] == -1
+    assert lightgbm["repetitions"] == 1
+    assert lightgbm["seed_step"] == 1000
+    assert lightgbm["random_state"] == 42
+    assert "soft_horizon_consensus" not in request.research_model_settings
 
 
 def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
@@ -52,8 +57,9 @@ def test_direct_alpaca_transport_is_raw_sip_and_never_all() -> None:
 
     assert request.alpaca_historical_feed == "sip"
     assert request.timeframe == "1Day"
-    assert request.alpaca_adjustment == "raw"
+    assert request.alpaca_adjustment == "all"
     assert document["data_source"]["bars_adjustment"] == "raw"
+    assert document["data_source"]["download_adjustment"] == "raw"
     assert document["data_source"]["bar_snapshot_as_of_end"] == "2026-09-17"
 
     source = (
