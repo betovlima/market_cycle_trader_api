@@ -1878,6 +1878,29 @@ def main() -> int:
         "soft_horizon_consensus": (
             challenger_metrics
         ),
+        "gpu_reference_v10_8_83": {
+            "snapshot_sha256": "5b4a2dac1ed9a6128c504d3cb12048726bda3f879f7448317a578776ac3d3dde",
+            "control_ending_capital": 4150383.1310602436,
+            "soft_ending_capital": 4489769.453271521,
+            "soft_changed_base_actions": 16,
+        },
+        "cpu_gpu_isolation": {
+            "control_capital_delta_vs_gpu": (
+                control_capital - 4150383.1310602436
+            ),
+            "soft_capital_delta_vs_gpu": (
+                challenger_capital - 4489769.453271521
+            ),
+            "soft_changed_actions_delta_vs_gpu": (
+                int(
+                    challenger_metrics.get(
+                        "soft_horizon_consensus_changed_base_actions"
+                    )
+                    or 0
+                )
+                - 16
+            ),
+        },
         "reference_10_8_74": {
             "control_ending_capital": 5551143.963971565,
             "soft_horizon_consensus_ending_capital": 7376955.5577371465,
