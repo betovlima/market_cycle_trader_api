@@ -1567,6 +1567,24 @@ def _run_lightgbm(
         )
         backend = "lightgbm_utility" if repetitions <= 1 else f"lightgbm_utility_seed_{seed}"
         result.backend = backend
+        if bool(soft["enabled"]):
+            result.metrics.update(_soft_horizon_consensus_result_metrics(result))
+
+        predictive_diagnostics = _aggregate_lightgbm_fold_diagnostics(
+            model_fold_diagnostics
+        )
+        cache_build_seconds = float(
+            sum(
+                float(item.get("cache_build_seconds") or 0.0)
+                for item in inference_cache_profiles
+            )
+        )
+        cache_predict_calls = int(
+            sum(
+                int(item.get("cache_predict_calls") or 0)
+                for item in inference_cache_profiles
+            )
+        )
 
         latest_asset = None
         if isinstance(result.predictions, pd.DataFrame) and not result.predictions.empty:
@@ -1601,6 +1619,20 @@ def _run_lightgbm(
                 "repetition_count": repetitions,
                 "walk_forward_fold_count": len(folds),
                 "walk_forward_folds": _fold_performance(result.predictions, folds, float(rep_config.initial_capital)),
+                "calendar_source_asset": calendar_source_asset,
+                "lightgbm_predictive_diagnostics": predictive_diagnostics,
+                "oos_inference_cache_profiles": list(inference_cache_profiles),
+                "oos_inference_cache_build_seconds": cache_build_seconds,
+                "oos_inference_cache_predict_calls": cache_predict_calls,
+                "soft_horizon_consensus_enabled": bool(soft["enabled"]),
+                "soft_horizon_consensus_mode": (
+                    str(soft["mode"]) if bool(soft["enabled"]) else None
+                ),
+                "soft_horizon_consensus_penalty_strength": (
+                    float(soft["penalty_strength"])
+                    if bool(soft["enabled"])
+                    else None
+                ),
                 "effective_switch_margin": float(np.mean([item["effective_switch_margin"] for item in margin_details])),
                 "effective_switch_margin_mean": float(np.mean([item["effective_switch_margin"] for item in margin_details])),
                 "calibrated_switch_margin": float(np.mean([item["calibrated_candidate_margin"] for item in margin_details])),
@@ -2408,6 +2440,7 @@ def _run_iqn(
                 "repetition_count": repetitions,
                 "walk_forward_fold_count": len(folds),
                 "walk_forward_folds": _fold_performance(result.predictions, folds, float(rep_config.initial_capital)),
+                "calendar_source_asset": calendar_source_asset,
                 "effective_compute_device": device,
                 "gpu_name": gpu_name,
                 "framework_version": torch_version,
