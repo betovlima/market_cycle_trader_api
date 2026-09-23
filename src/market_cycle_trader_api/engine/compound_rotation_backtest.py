@@ -423,6 +423,29 @@ def run_job(
             "structural_exclusion_count": int(
                 len(structural_exclusions)
             ),
+            "eligible_total_rows": int(
+                sum(len(frame) for frame in bars_by_symbol.values())
+            ),
+            "total_splits_applied": int(
+                sum(
+                    int(
+                        (frame.attrs.get("market_data_provenance", {}) or {})
+                        .get("splits_applied")
+                        or 0
+                    )
+                    for frame in bars_by_symbol.values()
+                )
+            ),
+            "total_corporate_actions": int(
+                sum(
+                    int(
+                        (frame.attrs.get("market_data_provenance", {}) or {})
+                        .get("corporate_action_count")
+                        or 0
+                    )
+                    for frame in bars_by_symbol.values()
+                )
+            ),
         }
     )
 
@@ -483,6 +506,14 @@ def run_job(
             "Eligible assets: "
             f"{reproducibility['eligible_asset_count']}/"
             f"{reproducibility['configured_asset_count']}\n"
+        )
+        result.summary += (
+            "Eligible RAW rows: "
+            f"{reproducibility['eligible_total_rows']}\n"
+        )
+        result.summary += (
+            "Causal splits applied: "
+            f"{reproducibility['total_splits_applied']}\n"
         )
         if structural_exclusions:
             result.summary += (
