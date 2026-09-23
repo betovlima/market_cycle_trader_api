@@ -1288,6 +1288,86 @@ def _run_lightgbm(
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
                 )
+            fold_decision_dates = pd.DatetimeIndex(fold["decision_dates"])
+            base_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None
+            cash_edge_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None
+            horizon_utility_caches: dict[
+                int,
+                dict[pd.Timestamp, np.ndarray],
+            ] = {}
+
+            uses_single_position_utility_policy = (
+                not compound_risk_overlay_enabled(rep_config)
+                and not portfolio_allocation_enabled(rep_config)
+            )
+            if uses_single_position_utility_policy:
+                base_utility_cache, base_cache_profile = _precompute_model_utilities(
+                    final_models,
+                    frames,
+                    symbols,
+                    fold_decision_dates,
+                    rep_config,
+                )
+                base_cache_profile.update(
+                    {
+                        "fold_id": int(fold_id),
+                        "model_role": "weighted_utility",
+                    }
+                )
+                inference_cache_profiles.append(base_cache_profile)
+
+                if final_cash_edge_models is not None:
+                    (
+                        cash_edge_utility_cache,
+                        cash_edge_cache_profile,
+                    ) = _precompute_model_utilities(
+                        final_cash_edge_models,
+                        frames,
+                        symbols,
+                        fold_decision_dates,
+                        rep_config,
+                    )
+                    cash_edge_cache_profile.update(
+                        {
+                            "fold_id": int(fold_id),
+                            "model_role": "cash_edge",
+                        }
+                    )
+                    inference_cache_profiles.append(cash_edge_cache_profile)
+
+                for horizon, horizon_models in final_horizon_models.items():
+                    cache, cache_profile = _precompute_model_utilities(
+                        horizon_models,
+                        frames,
+                        symbols,
+                        fold_decision_dates,
+                        rep_config,
+                    )
+                    horizon_utility_caches[int(horizon)] = cache
+                    cache_profile.update(
+                        {
+                            "fold_id": int(fold_id),
+                            "model_role": f"horizon_{int(horizon)}",
+                            "horizon": int(horizon),
+                        }
+                    )
+                    inference_cache_profiles.append(cache_profile)
+
+                if technical_log_callback is not None:
+                    fold_profiles = [
+                        item
+                        for item in inference_cache_profiles
+                        if int(item.get("fold_id") or 0) == int(fold_id)
+                    ]
+                    technical_log_callback(
+                        "model=lightgbm event=oos_inference_cache_ready "
+                        f"fold={fold_id} roles={len(fold_profiles)} "
+                        "seconds="
+                        f"{sum(float(item.get('cache_build_seconds') or 0.0) for item in fold_profiles):.3f} "
+                        "predict_calls="
+                        f"{sum(int(item.get('cache_predict_calls') or 0) for item in fold_profiles)}"
+                    )
+
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             if opportunity_cash_gate_enabled(rep_config):
                 gate_base_config = rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
@@ -1340,7 +1420,7 @@ def _run_lightgbm(
                     fold_id=fold_id,
                 )
             else:
-                policies[fold_id] = _utility_policy(
+                base_policy = _utility_policy(
                     final_models,
                     frames,
                     symbols,
@@ -1348,13 +1428,46 @@ def _run_lightgbm(
                     effective_margin,
                     cash_edge_models=final_cash_edge_models,
                     opportunity_gate=opportunity_gate,
-                    cash_gate_base_state=cash_gate_base_state if (opportunity_cash_gate_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)) else None,
+                    cash_gate_base_state=(
+                        cash_gate_base_state
+                        if (
+                            opportunity_cash_gate_enabled(rep_config)
+                            or absolute_utility_cash_gate_enabled(rep_config)
+                        )
+                        else None
+                    ),
                     decision_diagnostics=diagnostics,
                     fold_id=fold_id,
                     calibrated_switch_margin=float(best_candidate),
+                    utility_cache=base_utility_cache,
+                    cash_edge_utility_cache=cash_edge_utility_cache,
                 )
+                if bool(soft["enabled"]):
+                    policies[fold_id] = _soft_horizon_consensus_policy(
+                        base_policy,
+                        final_models,
+                        final_horizon_models,
+                        frames,
+                        symbols,
+                        rep_config,
+                        base_switch_margin=float(effective_margin),
+                        base_utility_cache=base_utility_cache,
+                        horizon_utility_caches=horizon_utility_caches,
+                        decision_diagnostics=diagnostics,
+                    )
+                else:
+                    policies[fold_id] = base_policy
             margin_detail = {
                 "fold_id": fold_id,
+                "soft_horizon_consensus_enabled": bool(soft["enabled"]),
+                "soft_horizon_consensus_mode": (
+                    str(soft["mode"]) if bool(soft["enabled"]) else None
+                ),
+                "soft_horizon_consensus_penalty_strength": (
+                    float(soft["penalty_strength"])
+                    if bool(soft["enabled"])
+                    else None
+                ),
                 "calibrated_candidate_margin": float(best_candidate),
                 "effective_switch_margin": float(effective_margin),
                 "calibration_risk_adjusted_score": float(best_score),
