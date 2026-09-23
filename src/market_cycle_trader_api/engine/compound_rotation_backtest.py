@@ -446,6 +446,20 @@ def run_job(
                     for frame in bars_by_symbol.values()
                 )
             ),
+            "total_dividend_events": int(
+                sum(
+                    int(
+                        (frame.attrs.get("market_data_provenance", {}) or {})
+                        .get("dividend_event_count")
+                        or 0
+                    )
+                    for frame in bars_by_symbol.values()
+                )
+            ),
+            "dividend_adjustment_applied": False,
+            "dividend_events_used_by_model": False,
+            "split_normalization_direction": "event_date_forward",
+            "split_normalization_uses_future_events": False,
         }
     )
 
@@ -514,6 +528,15 @@ def run_job(
         result.summary += (
             "Causal splits applied: "
             f"{reproducibility['total_splits_applied']}\n"
+        )
+        result.summary += (
+            "Split normalization: event-date forward; "
+            "future events do not rewrite past rows\n"
+        )
+        result.summary += (
+            "Dividend events: "
+            f"{reproducibility['total_dividend_events']} "
+            "(audit only; no price/feature/target adjustment)\n"
         )
         if structural_exclusions:
             result.summary += (
