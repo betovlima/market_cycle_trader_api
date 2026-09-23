@@ -321,16 +321,10 @@ def split_normalize(
     raw: pd.DataFrame,
     actions: list[dict[str, Any]],
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    """Apply forward-causal split normalization used by the latest TCC research.
-
-    RAW observations before a split remain untouched. Starting on the split
-    session, prices are converted back to the pre-split economic unit and
-    volumes to the matching share unit. Future events never rewrite past rows.
-    """
+    """Replicate the split normalization used by the homologated TCC main."""
     result = raw.copy()
     source_attrs = dict(getattr(raw, "attrs", {}))
-    index = pd.DatetimeIndex(result.index).tz_convert("UTC")
-    factor_on_session = pd.Series(1.0, index=index, dtype=float)
+    session_dates = pd.DatetimeIndex(result.index).tz_convert("UTC").normalize()
     applied: list[dict[str, Any]] = []
 
     splits = [
@@ -355,14 +349,21 @@ def split_normalize(
         if old_rate <= 0.0 or new_rate <= 0.0:
             continue
 
-        split_factor = new_rate / old_rate
-        sessions = index[index.normalize() == ex_date]
-        if len(sessions) != 1:
-            raise RuntimeError(
-                f"Split on {ex_date.date()} does not map to exactly one RAW session."
+        price_factor = old_rate / new_rate
+        volume_factor = new_rate / old_rate
+        mask = session_dates < ex_date
+        if not mask.any():
+            continue
+
+        for column in ("open", "high", "low", "close"):
+            result.loc[mask, column] = (
+                pd.to_numeric(result.loc[mask, column], errors="coerce")
+                * price_factor
             )
-        session = sessions[0]
-        factor_on_session.loc[session] *= split_factor
+        result.loc[mask, "volume"] = (
+            pd.to_numeric(result.loc[mask, "volume"], errors="coerce")
+            * volume_factor
+        )
         applied.append(
             {
                 "action_type": action.get("action_type"),
@@ -370,23 +371,10 @@ def split_normalize(
                 "process_date": str(action.get("process_date")),
                 "old_rate": old_rate,
                 "new_rate": new_rate,
-                "split_factor": split_factor,
-                "normalization_direction": "event_date_forward",
+                "price_factor": price_factor,
+                "volume_factor": volume_factor,
+                "normalization_direction": "pre_ex_date_history",
             }
-        )
-
-    cumulative = factor_on_session.cumprod()
-
-    for column in ("open", "high", "low", "close", "vwap"):
-        if column in result.columns:
-            result[column] = (
-                pd.to_numeric(result[column], errors="coerce")
-                * cumulative.to_numpy(dtype=float)
-            )
-    if "volume" in result.columns:
-        result["volume"] = (
-            pd.to_numeric(result["volume"], errors="coerce")
-            / cumulative.to_numpy(dtype=float)
         )
 
     result.attrs.update(source_attrs)
@@ -448,8 +436,8 @@ def load_research_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             "corporate_action_count": int(len(actions)),
             "splits_applied": int(len(applied)),
             "split_events": applied,
-            "split_normalization_direction": "event_date_forward",
-            "split_normalization_uses_future_events": False,
+            "split_normalization_direction": "pre_ex_date_history",
+            "split_normalization_uses_future_events": True,
             "dividend_event_count": int(len(dividends)),
             "dividend_adjustment_applied": False,
             "dividend_events_used_by_model": False,
