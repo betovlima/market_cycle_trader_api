@@ -756,6 +756,42 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
                 )
             _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
             bootstrapped_rows = len(downloaded)
+        elif allow_bootstrap and execution_end:
+            latest = collection.find_one(
+                identity,
+                {"timestamp": 1, "_id": 0},
+                sort=[("timestamp", -1)],
+            )
+            latest_stamp = (
+                _optional_utc_timestamp(latest.get("timestamp"))
+                if latest is not None
+                else None
+            )
+            target_end = date.fromisoformat(str(execution_end))
+            if latest_stamp is None or latest_stamp.date() < target_end:
+                overlap_days = max(
+                    0,
+                    int(getattr(config, "mongo_refresh_overlap_days", 0)),
+                )
+                refresh_start = (
+                    (latest_stamp - pd.Timedelta(days=overlap_days)).date().isoformat()
+                    if latest_stamp is not None
+                    else config.start_date
+                )
+                downloaded = _download_alpaca_bars(
+                    symbol,
+                    config,
+                    refresh_start,
+                    execution_end,
+                )
+                if downloaded is not None and not downloaded.empty:
+                    _upsert_frame(
+                        collection,
+                        downloaded,
+                        identity,
+                        config.mongo_write_batch_size,
+                    )
+                    bootstrapped_rows += int(len(downloaded))
 
         cached = _read_frame(collection, identity, start, end)
         if cached.empty:
@@ -773,7 +809,13 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         )
         provenance = dict(result.attrs.get("market_data_provenance", {}))
         provenance["research_access_path"] = (
-            "alpaca_bootstrap_then_mongodb" if bootstrapped_rows else "mongodb_only"
+            "alpaca_refresh_then_mongodb"
+            if bootstrapped_rows and first is not None
+            else (
+                "alpaca_bootstrap_then_mongodb"
+                if bootstrapped_rows
+                else "mongodb_only"
+            )
         )
         provenance["cache_bootstrap_rows"] = int(bootstrapped_rows)
         provenance["requested_end"] = normalize_end_date(execution_end)
