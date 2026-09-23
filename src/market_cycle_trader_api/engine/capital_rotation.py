@@ -224,6 +224,10 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     
     
     
+    for component_idx, horizon in enumerate(horizons):
+        data[f'forward_horizon_utility_{int(horizon)}'] = utility_components[:, component_idx]
+        data[f'forward_horizon_net_log_return_{int(horizon)}'] = net_return_components[:, component_idx]
+
     data['forward_net_log_return'] = weighted_net_log_return
     data['forward_cash_edge'] = weighted_utility
     data['forward_movement_capture'] = movement_capture
@@ -239,39 +243,66 @@ def build_rotation_frame(bars: pd.DataFrame, config: Any) -> pd.DataFrame:
     data = data.dropna(subset=required)
     return data
 
-def prepare_rotation_panel(bars_by_symbol: dict[str, pd.DataFrame], config: Any) -> tuple[dict[str, pd.DataFrame], pd.DatetimeIndex]:
-    
+def _select_calendar_source_symbol(
+    frames: dict[str, pd.DataFrame],
+) -> str:
+    """Select the deterministic asset with the longest valid history."""
+    if not frames:
+        raise ValueError("No valid asset frames are available for calendar selection.")
+
+    def rank(symbol: str) -> tuple[int, int, int, str]:
+        index = pd.DatetimeIndex(frames[symbol].index)
+        if index.empty:
+            return (0, 2**63 - 1, 0, symbol)
+        first = pd.Timestamp(index.min()).value
+        last = pd.Timestamp(index.max()).value
+        return (-len(index), first, -last, symbol)
+
+    return sorted(frames, key=rank)[0]
 
 
-
-
-
-
-
-
+def _prepare_rotation_panel_with_source(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    config: Any,
+) -> tuple[dict[str, pd.DataFrame], pd.DatetimeIndex, str]:
     frames = {
         symbol: build_rotation_frame(frame, config)
         for symbol, frame in bars_by_symbol.items()
         if frame is not None and not frame.empty
     }
     if len(frames) < 2:
-        raise ValueError('Compound rotation needs at least two assets with valid aligned data.')
+        raise ValueError(
+            "Compound rotation needs at least two assets with valid data."
+        )
 
-    configured_anchors = list(getattr(config, 'calendar_anchor_assets', []) or [])
-    anchor_symbols = [symbol for symbol in configured_anchors if symbol in frames]
-    if len(anchor_symbols) < 2:
-        anchor_symbols = sorted(frames)
+    calendar_symbol = _select_calendar_source_symbol(frames)
+    calendar = pd.DatetimeIndex(frames[calendar_symbol].index).sort_values()
+    minimum_calendar_rows = max(
+        700,
+        int(getattr(config, "rotation_minimum_training_rows", 700)),
+    )
+    if len(calendar) < minimum_calendar_rows:
+        raise ValueError(
+            "The automatically selected market calendar is too short for "
+            "train/calibration/test."
+        )
 
-    common: pd.DatetimeIndex | None = None
-    for symbol in anchor_symbols:
-        index = pd.DatetimeIndex(frames[symbol].index)
-        common = index if common is None else common.intersection(index)
-    if common is None or len(common) < 700:
-        raise ValueError('The anchored aligned history is too short for train/calibration/test.')
+    aligned = {
+        symbol: frame.reindex(calendar).copy()
+        for symbol, frame in frames.items()
+    }
+    return aligned, calendar, calendar_symbol
 
-    common = common.sort_values()
-    aligned = {symbol: frame.reindex(common).copy() for symbol, frame in frames.items()}
-    return aligned, common
+
+def prepare_rotation_panel(
+    bars_by_symbol: dict[str, pd.DataFrame],
+    config: Any,
+) -> tuple[dict[str, pd.DataFrame], pd.DatetimeIndex]:
+    aligned, calendar, _ = _prepare_rotation_panel_with_source(
+        bars_by_symbol,
+        config,
+    )
+    return aligned, calendar
 
 def _annualized_sharpe(curve: pd.Series, periods_per_year: float=252.0) -> float:
     returns = curve.pct_change().dropna()
@@ -286,15 +317,23 @@ def _maximum_drawdown(curve: pd.Series) -> float:
     drawdown = curve / peak - 1
     return float(drawdown.min())
 
-def _cagr(curve: pd.Series) -> float:
+def _cagr(
+    curve: pd.Series,
+    initial_capital: float | None = None,
+) -> float:
     if len(curve) < 2:
         return float('nan')
     start = pd.Timestamp(curve.index[0])
     end = pd.Timestamp(curve.index[-1])
     years = max((end - start).days / 365.25, 1 / 365.25)
-    if float(curve.iloc[0]) <= 0 or float(curve.iloc[-1]) <= 0:
+    initial = (
+        float(curve.iloc[0])
+        if initial_capital is None
+        else float(initial_capital)
+    )
+    if not np.isfinite(initial) or initial <= 0 or float(curve.iloc[-1]) <= 0:
         return float('nan')
-    return float((curve.iloc[-1] / curve.iloc[0]) ** (1 / years) - 1)
+    return float((curve.iloc[-1] / initial) ** (1 / years) - 1)
 
 def _geometric_trade_return(trades: pd.DataFrame) -> float:
     if trades.empty or 'position_return' not in trades:
@@ -392,7 +431,95 @@ def _numeric_thread_context(config: Any):
 
 
 
-def _model_utilities(models: dict[str, Any], frames: dict[str, pd.DataFrame], symbols: list[str], timestamp: pd.Timestamp, config: Any) -> np.ndarray:
+def _precompute_model_utilities(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamps: pd.DatetimeIndex,
+    config: Any,
+) -> tuple[dict[pd.Timestamp, np.ndarray], dict[str, Any]]:
+    dates = pd.DatetimeIndex(timestamps)
+    matrix = np.full(
+        (len(dates), len(symbols) + 1),
+        float("-inf"),
+        dtype=np.float64,
+    )
+    matrix[:, 0] = 0.0
+    started = time.perf_counter()
+    predict_calls = 0
+    predicted_rows = 0
+
+    for column, symbol in enumerate(symbols, start=1):
+        model = models.get(symbol)
+        frame = frames.get(symbol)
+        if model is None or frame is None or frame.empty:
+            continue
+
+        locations = frame.index.get_indexer(dates)
+        candidate_rows = np.flatnonzero(
+            (locations >= 0) & (locations + 1 < len(frame.index))
+        )
+        if len(candidate_rows) == 0:
+            continue
+
+        positions = locations[candidate_rows]
+        features = frame.iloc[positions][ROTATION_FEATURES]
+        feature_ok = ~features.isna().any(axis=1).to_numpy()
+        next_rows = frame.iloc[positions + 1]
+        next_open = pd.to_numeric(
+            next_rows["open"],
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+        next_close = pd.to_numeric(
+            next_rows["close"],
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+        market_ok = (
+            np.isfinite(next_open)
+            & (next_open > 0.0)
+            & np.isfinite(next_close)
+            & (next_close > 0.0)
+        )
+        valid_mask = feature_ok & market_ok
+        if not np.any(valid_mask):
+            continue
+
+        valid_rows = candidate_rows[valid_mask]
+        valid_positions = locations[valid_rows]
+        batch = frame.iloc[valid_positions][ROTATION_FEATURES]
+        prediction = np.asarray(model.predict(batch), dtype=np.float64)
+        matrix[valid_rows, column] = prediction
+        predict_calls += 1
+        predicted_rows += int(len(prediction))
+
+    cache = {
+        pd.Timestamp(date): matrix[row].copy()
+        for row, date in enumerate(dates)
+    }
+    return cache, {
+        "cache_build_seconds": time.perf_counter() - started,
+        "cache_session_count": int(len(dates)),
+        "cache_symbol_count": int(len(symbols)),
+        "cache_predict_calls": int(predict_calls),
+        "cache_predicted_rows": int(predicted_rows),
+        "cache_mode": "batched_lightgbm_prediction",
+    }
+
+
+def _model_utilities(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamp: pd.Timestamp,
+    config: Any,
+    *,
+    utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+) -> np.ndarray:
+    key = pd.Timestamp(timestamp)
+    if utility_cache is not None:
+        cached = utility_cache.get(key)
+        if cached is not None:
+            return np.asarray(cached, dtype=np.float64).copy()
     
 
     values = [0.0]
@@ -437,6 +564,8 @@ def _utility_policy(
     decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
     fold_id: int | None = None,
     calibrated_switch_margin: float | None = None,
+    utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+    cash_edge_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
 ) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
     
 
@@ -510,12 +639,26 @@ def _utility_policy(
                 cash_gate_state["pending_sample"] = None
                 opportunity_gate.refresh_if_needed()
 
-        utilities = _model_utilities(models, frames, symbols, timestamp, config)
+        utilities = _model_utilities(
+            models,
+            frames,
+            symbols,
+            timestamp,
+            config,
+            utility_cache=utility_cache,
+        )
         if not np.isfinite(utilities[1:]).any():
             return (0, 0.0)
 
         cash_edges = (
-            _model_utilities(cash_edge_models or {}, frames, symbols, timestamp, config)
+            _model_utilities(
+                cash_edge_models or {},
+                frames,
+                symbols,
+                timestamp,
+                config,
+                utility_cache=cash_edge_utility_cache,
+            )
             if risk_off
             else utilities.copy()
         )
@@ -1642,14 +1785,14 @@ def _simulate_optimized_allocation(
         "initial_capital": initial,
         "strategy_ending_capital": ending,
         "strategy_return": ending / initial - 1.0,
-        "strategy_cagr": _cagr(strategy_curve),
+        "strategy_cagr": _cagr(strategy_curve, initial),
         "strategy_sharpe": _annualized_sharpe(strategy_curve, 252.0),
         "strategy_maximum_drawdown": _maximum_drawdown(strategy_curve),
         "compound_log_growth": float(math.log(max(ending / initial, 1e-12))),
         "risk_adjusted_compound_score": _curve_risk_adjusted_score(strategy_curve, config),
         "buy_hold_ending_capital": benchmark_ending,
         "buy_hold_return": benchmark_ending / initial - 1.0,
-        "buy_hold_cagr": _cagr(benchmark_curve),
+        "buy_hold_cagr": _cagr(benchmark_curve, initial),
         "buy_hold_sharpe": _annualized_sharpe(benchmark_curve, 252.0),
         "buy_hold_maximum_drawdown": _maximum_drawdown(benchmark_curve),
         "excess_return": ending / initial - benchmark_ending / initial,
@@ -2197,7 +2340,7 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
     candidate_assets = [symbol for symbol in getattr(config, 'research_candidate_assets', []) if symbol in symbols and symbol not in reference_set]
     if not getattr(config, 'research_candidate_assets', None):
         candidate_assets = [symbol for symbol in symbols if symbol not in reference_set]
-    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve), 'buy_hold_cagr': _cagr(benchmark_curve), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_cash_gate_enabled': bool(opportunity_cash_gate_enabled(config)), 'absolute_utility_cash_gate_enabled': bool(absolute_utility_cash_gate_enabled(config)), 'absolute_utility_entry_threshold': (float(config.opportunity_utility_entry_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_exit_threshold': (float(config.opportunity_utility_exit_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_gate_decisions': int(len(absolute_utility_rows)), 'absolute_utility_gate_accepted': absolute_utility_accepted_count, 'absolute_utility_gate_rejected': absolute_utility_rejected_count, 'absolute_utility_gate_acceptance_rate': (float(absolute_utility_accepted_count / len(absolute_utility_rows)) if absolute_utility_rows else None), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'opportunity_entry_threshold_mean': float(np.mean(opportunity_entry_thresholds)) if opportunity_entry_thresholds else None, 'opportunity_exit_threshold_mean': float(np.mean(opportunity_exit_thresholds)) if opportunity_exit_thresholds else None, 'opportunity_gate_adaptive_refreshes': opportunity_adaptive_refreshes, 'opportunity_gate_regularized_sessions': opportunity_regularized_sessions, 'opportunity_target_horizon_sessions': int(round(float(np.mean(opportunity_target_horizons)))) if opportunity_target_horizons else None, 'cash_gate_changed_base_action_sessions': int(len(cash_gate_rows)), 'cash_gate_entries': cash_gate_entries, 'cash_gate_exits': cash_gate_exits, 'cash_gate_counterfactual_negative_sessions': int(sum(value < 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_counterfactual_positive_sessions': int(sum(value > 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_avoided_loss_return_sum': cash_gate_avoided_loss_sum, 'cash_gate_missed_gain_return_sum': cash_gate_missed_gain_sum, 'cash_gate_net_avoided_return_sum': float(cash_gate_avoided_loss_sum - cash_gate_missed_gain_sum), 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
+    metrics = {'portfolio_rotation': True, 'strategy_mode': config.strategy_mode, 'strategy_label': model_label, 'symbol': 'PORTFOLIO', 'backend': backend, 'assets': symbols, 'calendar_anchor_assets': anchor_assets, 'research_reference_assets': reference_assets, 'research_candidate_assets': candidate_assets, 'timeframe': '1Day', 'decision_horizon_days': int(config.rotation_horizon_days), 'decision_horizon_bars': None, 'decision_horizon_label': f'{int(config.rotation_horizon_days)} trading sessions', 'overnight_positions_allowed': True, 'benchmark_name': 'Equal-weight buy-and-hold across continuously available assets', 'walk_forward_enabled': bool(config.rotation_walk_forward_enabled), 'walk_forward_purge_days': int(config.rotation_purge_days), 'walk_forward_calibration_days': int(config.rotation_walk_forward_calibration_days), 'walk_forward_test_days': int(config.rotation_walk_forward_test_days), 'downside_penalty': float(config.rotation_downside_penalty), 'drawdown_penalty': float(config.rotation_drawdown_penalty), 'initial_capital': initial, 'strategy_ending_capital': ending, 'strategy_return': ending / initial - 1, 'buy_hold_ending_capital': benchmark_ending, 'buy_hold_return': benchmark_ending / initial - 1, 'excess_return': ending / initial - benchmark_ending / initial, 'strategy_maximum_drawdown': _maximum_drawdown(strategy_curve), 'buy_hold_maximum_drawdown': _maximum_drawdown(benchmark_curve), 'strategy_sharpe': _annualized_sharpe(strategy_curve, periods_per_year), 'buy_hold_sharpe': _annualized_sharpe(benchmark_curve, periods_per_year), 'strategy_cagr': _cagr(strategy_curve, initial), 'buy_hold_cagr': _cagr(benchmark_curve, initial), 'compound_log_growth': float(math.log(max(ending / initial, 1e-12))), 'risk_adjusted_compound_score': _curve_risk_adjusted_score(strategy_curve, config), 'market_exposure': float(exposure), 'cash_days': cash_days, 'selective_opportunity_enabled': bool(selective_opportunity_enabled(config)), 'opportunity_cash_gate_enabled': bool(opportunity_cash_gate_enabled(config)), 'absolute_utility_cash_gate_enabled': bool(absolute_utility_cash_gate_enabled(config)), 'absolute_utility_entry_threshold': (float(config.opportunity_utility_entry_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_exit_threshold': (float(config.opportunity_utility_exit_threshold) if absolute_utility_cash_gate_enabled(config) else None), 'absolute_utility_gate_decisions': int(len(absolute_utility_rows)), 'absolute_utility_gate_accepted': absolute_utility_accepted_count, 'absolute_utility_gate_rejected': absolute_utility_rejected_count, 'absolute_utility_gate_acceptance_rate': (float(absolute_utility_accepted_count / len(absolute_utility_rows)) if absolute_utility_rows else None), 'opportunity_gate_decisions': int(len(opportunity_rows)), 'opportunity_gate_accepted': opportunity_accepted, 'opportunity_gate_rejected': opportunity_rejected, 'opportunity_gate_acceptance_rate': float(opportunity_accepted / len(opportunity_rows)) if opportunity_rows else None, 'opportunity_entry_threshold_mean': float(np.mean(opportunity_entry_thresholds)) if opportunity_entry_thresholds else None, 'opportunity_exit_threshold_mean': float(np.mean(opportunity_exit_thresholds)) if opportunity_exit_thresholds else None, 'opportunity_gate_adaptive_refreshes': opportunity_adaptive_refreshes, 'opportunity_gate_regularized_sessions': opportunity_regularized_sessions, 'opportunity_target_horizon_sessions': int(round(float(np.mean(opportunity_target_horizons)))) if opportunity_target_horizons else None, 'cash_gate_changed_base_action_sessions': int(len(cash_gate_rows)), 'cash_gate_entries': cash_gate_entries, 'cash_gate_exits': cash_gate_exits, 'cash_gate_counterfactual_negative_sessions': int(sum(value < 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_counterfactual_positive_sessions': int(sum(value > 0.0 for value in cash_gate_counterfactual_returns)), 'cash_gate_avoided_loss_return_sum': cash_gate_avoided_loss_sum, 'cash_gate_missed_gain_return_sum': cash_gate_missed_gain_sum, 'cash_gate_net_avoided_return_sum': float(cash_gate_avoided_loss_sum - cash_gate_missed_gain_sum), 'simulated_buys': buys, 'simulated_sells': sells, 'capital_rotations': int(rotation_count), 'cycles_per_year': float(buys / years), 'average_holding_days': avg_holding, 'average_holding_bars': avg_holding, 'average_holding_minutes': None, 'geometric_trade_return': _geometric_trade_return(trades), 'total_transaction_fees': float(total_fees), 'turnover_ratio': float(turnover / max(initial, 1e-09)), 'test_start': execution_dates[0], 'test_end': execution_dates[-1], 'test_calendar_years': years}
     summary = '\n'.join(['COMPOUND CAPITAL ROTATION — SWING', '', f"Model: {metrics['strategy_label']}", f"Assets: {', '.join(symbols)}", 'Decision data: daily candles', f"Utility horizons: {', '.join(str(item) for item in config.rotation_target_horizons)} trading sessions", 'Capital pool: one shared account, reinvested after every exit/rotation', 'Decision objective: maximize smoother net compounded wealth, not predict exact tops.', f'Risk penalties: downside={config.rotation_downside_penalty:.3f}, drawdown={config.rotation_drawdown_penalty:.3f}', f'Validation: expanding walk-forward, purge={config.rotation_purge_days} sessions, fold test={config.rotation_walk_forward_test_days} sessions', '', 'OUT-OF-SAMPLE WALK-FORWARD', f'Initial capital: ${initial:,.2f}', f'Ending capital: ${ending:,.2f}', f"Total return: {metrics['strategy_return']:.2%}", f"CAGR: {metrics['strategy_cagr']:.2%}", f"Compound log growth: {metrics['compound_log_growth']:.6f}", f"Maximum drawdown: {metrics['strategy_maximum_drawdown']:.2%}", f"Sharpe estimate: {metrics['strategy_sharpe']:.3f}", f'Capital rotations: {rotation_count}', f'Buys: {buys}', f'Sells including final liquidation: {sells}', f"Cycles/year: {metrics['cycles_per_year']:.2f}", f'Average holding days: {avg_holding:.2f}', f'Time in market: {exposure:.2%}', f'Transaction fees: ${total_fees:,.2f}', '', 'BENCHMARK', 'Equal-weight buy-and-hold across assets with complete prices for the execution window.', f'Benchmark ending capital: ${benchmark_ending:,.2f}', f"Benchmark return: {metrics['buy_hold_return']:.2%}", f"Benchmark CAGR: {metrics['buy_hold_cagr']:.2%}", '', 'METHOD', '- Signals use information available at the current daily close.', '- Position changes execute at the next daily open.', (method_line or f"- LightGBM Utility predicts a weighted multi-horizon risk-adjusted utility across {config.rotation_target_horizons}."), '- Every fold is trained only on information available before that fold.', f'- A {config.rotation_purge_days}-session purge prevents forward labels from touching the next validation/test segment.', '- FINAL_LIQUIDATION is bookkeeping only and is not a model decision.'])
     return RotationRunResult(backend=backend, predictions=predictions, trades=trades, summary=summary, metrics=metrics)
 
@@ -2331,7 +2474,13 @@ def _analysis_decision_dates(
             if requested_end.tzinfo is None
             else requested_end.tz_convert('UTC')
         )
-        requested_execution_end = int(common_dates.searchsorted(requested_end, side='right'))
+        # analysis_end_date is an inclusive market date, not a UTC instant.
+        # Daily NYSE bars can be timestamped 04:00/05:00 UTC; comparing them
+        # with midnight UTC would drop the requested final session.
+        requested_end_exclusive = requested_end.normalize() + pd.Timedelta(days=1)
+        requested_execution_end = int(
+            common_dates.searchsorted(requested_end_exclusive, side='left')
+        )
         execution_end = min(champion_oos_end, requested_execution_end)
 
     if execution_start >= execution_end:
