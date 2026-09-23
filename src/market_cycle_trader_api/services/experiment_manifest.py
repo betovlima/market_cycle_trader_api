@@ -54,6 +54,19 @@ def build_experiment_manifest(
         "eligible_total_rows": metrics.get("eligible_total_rows"),
         "total_splits_applied": metrics.get("total_splits_applied"),
         "total_corporate_actions": metrics.get("total_corporate_actions"),
+        "total_dividend_events": metrics.get("total_dividend_events"),
+        "dividend_adjustment_applied": metrics.get(
+            "dividend_adjustment_applied"
+        ),
+        "dividend_events_used_by_model": metrics.get(
+            "dividend_events_used_by_model"
+        ),
+        "split_normalization_direction": metrics.get(
+            "split_normalization_direction"
+        ),
+        "split_normalization_uses_future_events": metrics.get(
+            "split_normalization_uses_future_events"
+        ),
         "runtime_fingerprint_sha256": metrics.get("runtime_fingerprint_sha256"),
         "git_commit": metrics.get("git_commit"),
         "engine_source_sha256": metrics.get("engine_source_sha256"),
