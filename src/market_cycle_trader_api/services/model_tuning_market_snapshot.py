@@ -3,7 +3,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from ..engine.market_data import load_market_bars, validate_and_clean_bars
+from ..engine.market_data import validate_and_clean_bars
+from ..engine.research_market_data import (
+    effective_research_config,
+    load_research_market_bars,
+)
 from ..engine.market_data_snapshot import (
     TUNING_MARKET_SNAPSHOT_SCHEMA_VERSION,
     encode_market_frame,
@@ -58,11 +62,13 @@ def freeze_tuning_market_snapshot(
     payload["research_market_data_mode"] = "database_only"
     payload["research_market_data_snapshot_id"] = None
     payload["expected_market_data_signature_sha256"] = None
-    config = BacktestExecutionRequest.model_validate(payload)
+    config = effective_research_config(
+        BacktestExecutionRequest.model_validate(payload)
+    )
 
     frames: dict[str, Any] = {}
     for symbol in config.assets:
-        raw = load_market_bars(symbol, config)
+        raw = load_research_market_bars(symbol, config)
         frames[symbol] = validate_and_clean_bars(raw, config)
 
     signature, manifests = market_data_manifest(frames)
@@ -135,6 +141,11 @@ def freeze_tuning_market_snapshot(
         "interval": config.timeframe,
         "feed": config.alpaca_historical_feed,
         "adjustment": config.alpaca_adjustment,
+        "research_market_data_protocol": getattr(
+            config,
+            "research_market_data_protocol",
+            "legacy_adjusted",
+        ),
         "market_data_manifests": bson_value(manifests),
         "created_at": now,
     }
