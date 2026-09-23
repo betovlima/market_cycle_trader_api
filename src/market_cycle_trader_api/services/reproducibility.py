@@ -195,6 +195,11 @@ def market_data_research_signature_from_manifests(
             "columns": list(item.get("columns") or []),
             "historical_feed": item.get("historical_feed"),
             "adjustment": item.get("adjustment"),
+            "research_market_data_protocol": item.get(
+                "research_market_data_protocol"
+            ),
+            "effective_adjustment": item.get("effective_adjustment"),
+            "splits_applied": int(item.get("splits_applied") or 0),
         }
     return _sha256_json(stable)
 
@@ -274,6 +279,21 @@ def market_data_manifest(
             "history_backfill_rows": provenance.get("history_backfill_rows"),
             "requested_start": provenance.get("requested_start"),
             "actual_start": provenance.get("actual_start"),
+            "research_market_data_protocol": provenance.get(
+                "research_market_data_protocol"
+            ),
+            "source_adjustment": provenance.get("source_adjustment"),
+            "effective_adjustment": provenance.get("effective_adjustment"),
+            "corporate_action_source": provenance.get(
+                "corporate_action_source"
+            ),
+            "corporate_action_count": provenance.get(
+                "corporate_action_count"
+            ),
+            "splits_applied": provenance.get("splits_applied"),
+            "structural_identity_verified": provenance.get(
+                "structural_identity_verified"
+            ),
         }
 
     return market_data_research_signature_from_manifests(manifests), manifests
@@ -355,4 +375,11 @@ def build_reproducibility_manifest(
         "alpaca_historical_feed": str(config.alpaca_historical_feed),
         "alpaca_live_feed": str(config.alpaca_live_feed),
         "alpaca_adjustment": str(config.alpaca_adjustment),
+        "research_market_data_protocol": str(
+            getattr(
+                config,
+                "research_market_data_protocol",
+                "legacy_adjusted",
+            )
+        ),
     }
