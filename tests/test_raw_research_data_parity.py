@@ -78,11 +78,49 @@ class RawResearchDataParityTests(unittest.TestCase):
         normalized, applied = split_normalize(frame, actions)
 
         self.assertEqual(len(applied), 1)
-        self.assertAlmostEqual(normalized.iloc[0]["open"], 100.0)
-        self.assertAlmostEqual(normalized.iloc[0]["close"], 100.5)
-        self.assertAlmostEqual(normalized.iloc[0]["volume"], 4_000.0)
-        self.assertAlmostEqual(normalized.iloc[1]["open"], 100.0)
-        self.assertAlmostEqual(normalized.iloc[2]["open"], 105.0)
+        self.assertAlmostEqual(normalized.iloc[0]["open"], 400.0)
+        self.assertAlmostEqual(normalized.iloc[0]["close"], 402.0)
+        self.assertAlmostEqual(normalized.iloc[0]["volume"], 1_000.0)
+        self.assertAlmostEqual(normalized.iloc[1]["open"], 400.0)
+        self.assertAlmostEqual(normalized.iloc[1]["close"], 408.0)
+        self.assertAlmostEqual(normalized.iloc[1]["volume"], 1_000.0)
+        self.assertAlmostEqual(normalized.iloc[2]["open"], 420.0)
+        self.assertAlmostEqual(normalized.iloc[2]["volume"], 1_250.0)
+        self.assertEqual(
+            applied[0]["normalization_direction"],
+            "event_date_forward",
+        )
+
+    def test_dividend_does_not_adjust_model_ohlcv(self) -> None:
+        index = pd.to_datetime(
+            [
+                "2024-01-02 05:00:00+00:00",
+                "2024-01-03 05:00:00+00:00",
+            ],
+            utc=True,
+        )
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 99.0],
+                "high": [101.0, 100.0],
+                "low": [98.0, 97.0],
+                "close": [100.0, 99.0],
+                "volume": [1_000.0, 1_100.0],
+            },
+            index=index,
+        )
+        actions = [
+            {
+                "action_type": "cash_dividend",
+                "ex_date": "2024-01-03",
+                "cash": 1.0,
+            }
+        ]
+
+        normalized, applied = split_normalize(frame, actions)
+
+        pd.testing.assert_frame_equal(normalized, frame)
+        self.assertEqual(applied, [])
 
     def test_structural_merger_excludes_acquiree_symbol(self) -> None:
         issue = structural_identity_issue(
@@ -146,6 +184,11 @@ class RawResearchDataParityTests(unittest.TestCase):
             "effective_adjustment": "raw_plus_causal_split_normalization",
             "corporate_action_count": 3,
             "splits_applied": 1,
+            "split_normalization_direction": "event_date_forward",
+            "split_normalization_uses_future_events": False,
+            "dividend_event_count": 2,
+            "dividend_adjustment_applied": False,
+            "dividend_events_used_by_model": False,
             "structural_identity_verified": True,
         }
 
@@ -162,6 +205,16 @@ class RawResearchDataParityTests(unittest.TestCase):
         )
         self.assertEqual(manifest["splits_applied"], 1)
         self.assertEqual(manifest["corporate_action_count"], 3)
+        self.assertEqual(
+            manifest["split_normalization_direction"],
+            "event_date_forward",
+        )
+        self.assertFalse(
+            manifest["split_normalization_uses_future_events"]
+        )
+        self.assertEqual(manifest["dividend_event_count"], 2)
+        self.assertFalse(manifest["dividend_adjustment_applied"])
+        self.assertFalse(manifest["dividend_events_used_by_model"])
 
 
 if __name__ == "__main__":
