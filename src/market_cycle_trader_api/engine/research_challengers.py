@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .capital_rotation import (
+    LEGACY_ROTATION_MODE,
     ROTATION_FEATURES,
     SUPPORTED_ROTATION_MODES,
     RotationRunResult,
@@ -1037,6 +1038,7 @@ def _run_lightgbm(
     (
         frames,
         common_dates,
+        calendar_source_asset,
         symbols,
         folds,
         all_decision_dates,
@@ -1048,6 +1050,12 @@ def _run_lightgbm(
     seed_step = int(config.rotation_seed_step)
     total_folds = len(folds)
     total_models = len(symbols)
+    soft = _soft_horizon_consensus_settings(config)
+    if bool(soft["enabled"]) and str(config.strategy_mode) != LEGACY_ROTATION_MODE:
+        raise ValueError(
+            "Soft Horizon Consensus is supported only by the base "
+            "single-position LightGBM rotation mode."
+        )
 
     def report(fraction: float, stage: str, completed: int) -> None:
         if progress_callback is not None:
@@ -1075,6 +1083,8 @@ def _run_lightgbm(
         cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
+        model_fold_diagnostics: list[dict[str, Any]] = []
+        inference_cache_profiles: list[dict[str, Any]] = []
         latest_final_models: dict[str, Any] = {}
         latest_final_fold_id: int | None = None
         latest_final_fold_position: int | None = None
@@ -1131,6 +1141,21 @@ def _run_lightgbm(
                 progress_callback=phase_progress("calibration training", 0.02, 0.38),
                 technical_log_callback=technical_log_callback,
             )
+            calibration_predictive_diagnostics = _evaluate_lightgbm_models_on_dates(
+                calibration_models,
+                frames,
+                symbols,
+                calibration_dates,
+                target_column="forward_risk_adjusted_utility",
+            )
+            model_fold_diagnostics.append(
+                _aggregate_lightgbm_model_diagnostics(
+                    calibration_models,
+                    fold_id=fold_id,
+                    validation=calibration_predictive_diagnostics,
+                )
+            )
+
             calibration_cash_edge_models = None
             if _risk_off_enabled(rep_config):
                 calibration_cash_edge_models = _lightgbm_fit_models(
@@ -1209,9 +1234,45 @@ def _run_lightgbm(
                 final_fit_dates,
                 rep_config,
                 phase=f"run_{run_index}_fold_{fold_position}_final",
-                progress_callback=phase_progress("final training", 0.50, 0.90),
+                progress_callback=phase_progress(
+                    "final training",
+                    0.50,
+                    0.78 if bool(soft["enabled"]) else 0.90,
+                ),
                 technical_log_callback=technical_log_callback,
             )
+            final_horizon_models: dict[int, dict[str, Any]] = {}
+            if bool(soft["enabled"]):
+                detail(
+                    run_index=run_index,
+                    run_count=repetitions,
+                    fold_index=fold_position,
+                    fold_count=total_folds,
+                    phase="Soft horizon consensus training",
+                    trained_models=0,
+                    total_models=(
+                        len(symbols)
+                        * len(rep_config.rotation_target_horizons)
+                    ),
+                    device="CPU",
+                )
+                final_horizon_models = _fit_horizon_models(
+                    frames,
+                    symbols,
+                    final_fit_dates,
+                    rep_config,
+                    phase=(
+                        f"run_{run_index}_fold_"
+                        f"{fold_position}_soft_horizon"
+                    ),
+                    progress_callback=phase_progress(
+                        "soft horizon consensus training",
+                        0.80,
+                        0.98,
+                    ),
+                    technical_log_callback=technical_log_callback,
+                )
+
             latest_final_models = final_models
             latest_final_fold_id = fold_id
             latest_final_fold_position = fold_position
@@ -2083,6 +2144,7 @@ def _run_iqn(
     (
         frames,
         common_dates,
+        calendar_source_asset,
         symbols,
         folds,
         all_decision_dates,
