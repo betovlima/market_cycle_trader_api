@@ -29,7 +29,12 @@ from ..infrastructure.persistence.mongo_repository import (
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
 from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
-from .market_data import load_market_bars, validate_and_clean_bars
+from .market_data import validate_and_clean_bars
+from .research_market_data import (
+    StructuralResearchAssetExclusion,
+    effective_research_config,
+    load_research_market_bars,
+)
 
 
 def configure_console_utf8() -> None:
@@ -231,79 +236,220 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def run_job(
+    job_id: str,
+    config: BacktestExecutionRequest,
+    db: Any,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, str]],
+    BacktestExecutionRequest,
+]:
+    effective_config = effective_research_config(config)
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
+    structural_exclusions: list[dict[str, Any]] = []
+
     emit_progress(2.0, "Preparing shared-capital rotation")
-    total_assets = max(1, len(config.assets))
-    calendar_anchor_assets = set(config.calendar_anchor_assets)
-    for asset_position, symbol in enumerate(config.assets, start=1):
+    total_assets = max(1, len(effective_config.assets))
+    calendar_anchor_assets = set(effective_config.calendar_anchor_assets)
+
+    for asset_position, symbol in enumerate(
+        effective_config.assets,
+        start=1,
+    ):
         emit_progress(
             3.0 + 12.0 * ((asset_position - 1) / total_assets),
             f"Loading market data {asset_position}/{total_assets} — {symbol}",
         )
         try:
             asset_config = (
-                config
+                effective_config
                 if symbol in calendar_anchor_assets
-                else config.model_copy(update={"market_data_require_complete_history": False})
+                else effective_config.model_copy(
+                    update={"market_data_require_complete_history": False}
+                )
             )
-            raw = load_market_bars(symbol, asset_config)
+            raw = load_research_market_bars(symbol, asset_config)
             cleaned = validate_and_clean_bars(raw, asset_config)
             bars_by_symbol[symbol] = cleaned
-            provenance = dict(cleaned.attrs.get("market_data_provenance", {}))
-            first_session = pd.Timestamp(cleaned.index.min()).date().isoformat()
-            last_session = pd.Timestamp(cleaned.index.max()).date().isoformat()
-            backfill_rows = int(provenance.get("history_backfill_rows") or 0)
+
+            provenance = dict(
+                cleaned.attrs.get("market_data_provenance", {})
+            )
+            first_session = (
+                pd.Timestamp(cleaned.index.min()).date().isoformat()
+            )
+            last_session = (
+                pd.Timestamp(cleaned.index.max()).date().isoformat()
+            )
+            backfill_rows = int(
+                provenance.get("history_backfill_rows") or 0
+            )
             source_label = str(
                 provenance.get("effective_provider")
                 or provenance.get("provider")
-                or config.market_data_provider
+                or effective_config.market_data_provider
             )
-            access_path = str(provenance.get("research_access_path") or "mongodb_only")
+            access_path = str(
+                provenance.get("research_access_path")
+                or "mongodb_only"
+            )
+            protocol = str(
+                provenance.get("research_market_data_protocol")
+                or getattr(
+                    effective_config,
+                    "research_market_data_protocol",
+                    "legacy_adjusted",
+                )
+            )
             print(
                 "MARKET_DATA|"
-                f"{symbol}|rows={len(cleaned)}|start={first_session}|end={last_session}|"
-                f"source={source_label}|access={access_path}|backfill_rows={backfill_rows}|"
+                f"{symbol}|rows={len(cleaned)}|"
+                f"start={first_session}|end={last_session}|"
+                f"source={source_label}|access={access_path}|"
+                f"protocol={protocol}|"
+                f"splits={int(provenance.get('splits_applied') or 0)}|"
+                f"backfill_rows={backfill_rows}|"
                 f"complete={bool(provenance.get('history_complete', True))}",
                 flush=True,
             )
             emit_progress(
                 3.0 + 12.0 * (asset_position / total_assets),
                 (
-                    f"Loaded market data {asset_position}/{total_assets} — {symbol} "
-                    f"({first_session} → {last_session}, {source_label})"
+                    f"Loaded market data {asset_position}/{total_assets} — "
+                    f"{symbol} ({first_session} → {last_session}, "
+                    f"{protocol})"
+                ),
+            )
+        except StructuralResearchAssetExclusion as exc:
+            structural_exclusions.append(dict(exc.details))
+            print(
+                "MARKET_DATA_EXCLUSION|"
+                f"{symbol}|reason={exc.details.get('reason')}|"
+                f"action={exc.details.get('action_type')}|"
+                f"acquirer={exc.details.get('acquirer_symbol')}",
+                flush=True,
+            )
+            emit_progress(
+                3.0 + 12.0 * (asset_position / total_assets),
+                (
+                    f"Excluded structural identity {asset_position}/"
+                    f"{total_assets} — {symbol}"
                 ),
             )
         except Exception as exc:
-            failures.append({"symbol": symbol, "backend": "data_load", "error": str(exc)})
-            print(f"ERROR loading {symbol}: {exc}", file=sys.stderr, flush=True)
-    missing_assets = [symbol for symbol in config.assets if symbol not in bars_by_symbol]
-    if missing_assets:
+            failures.append(
+                {
+                    "symbol": symbol,
+                    "backend": "data_load",
+                    "error": str(exc),
+                }
+            )
+            print(
+                f"ERROR loading {symbol}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    excluded_symbols = {
+        str(item.get("symbol") or "").strip().upper()
+        for item in structural_exclusions
+    }
+    hard_missing = [
+        symbol
+        for symbol in effective_config.assets
+        if symbol not in bars_by_symbol
+        and symbol not in excluded_symbols
+    ]
+    if hard_missing:
         raise ValueError(
-            "Research market data failed to load for the complete configured universe: "
-            + ", ".join(missing_assets)
+            "Research market data failed to load for the configured universe: "
+            + ", ".join(hard_missing)
         )
     if len(bars_by_symbol) < 2:
-        raise ValueError("Compound rotation needs at least two successfully loaded assets.")
-
-    
-    
-    
-    reproducibility = build_reproducibility_manifest(config, bars_by_symbol)
-    expected_signature = str(
-        getattr(config, "expected_market_data_signature_sha256", None) or ""
-    ).strip().lower()
-    actual_signature = str(reproducibility.get("market_data_signature_sha256") or "").strip().lower()
-    if expected_signature and actual_signature != expected_signature:
-        raise RuntimeError(
-            f"MarketDataSignatureMismatch: expected {expected_signature}, got {actual_signature or 'missing'}"
+        raise ValueError(
+            "Compound rotation needs at least two successfully loaded assets."
         )
 
-    emit_progress(17.0, "Building aligned daily panel and walk-forward folds")
+    eligible_assets = [
+        symbol
+        for symbol in effective_config.assets
+        if symbol in bars_by_symbol
+    ]
+    eligible_set = set(eligible_assets)
+
+    def _eligible(values: list[str]) -> list[str]:
+        return [
+            symbol
+            for symbol in values
+            if symbol in eligible_set
+        ]
+
+    effective_config = effective_config.model_copy(
+        update={
+            "assets": eligible_assets,
+            "calendar_anchor_assets": _eligible(
+                list(effective_config.calendar_anchor_assets)
+            ),
+            "research_reference_assets": _eligible(
+                list(effective_config.research_reference_assets)
+            ),
+            "research_candidate_assets": _eligible(
+                list(effective_config.research_candidate_assets)
+            ),
+        }
+    )
+
+    reproducibility = build_reproducibility_manifest(
+        effective_config,
+        bars_by_symbol,
+    )
+    reproducibility.update(
+        {
+            "research_market_data_protocol": str(
+                getattr(
+                    effective_config,
+                    "research_market_data_protocol",
+                    "legacy_adjusted",
+                )
+            ),
+            "research_source_adjustment": str(
+                effective_config.alpaca_adjustment
+            ),
+            "configured_asset_count": int(len(config.assets)),
+            "eligible_asset_count": int(len(eligible_assets)),
+            "structural_exclusions": structural_exclusions,
+            "structural_exclusion_count": int(
+                len(structural_exclusions)
+            ),
+        }
+    )
+
+    expected_signature = str(
+        getattr(
+            effective_config,
+            "expected_market_data_signature_sha256",
+            None,
+        )
+        or ""
+    ).strip().lower()
+    actual_signature = str(
+        reproducibility.get("market_data_signature_sha256") or ""
+    ).strip().lower()
+    if expected_signature and actual_signature != expected_signature:
+        raise RuntimeError(
+            "MarketDataSignatureMismatch: expected "
+            f"{expected_signature}, got {actual_signature or 'missing'}"
+        )
+
+    emit_progress(
+        17.0,
+        "Building aligned daily panel and walk-forward folds",
+    )
     results = run_rotation_models(
         bars_by_symbol,
-        config,
+        effective_config,
         calculate_reference_fees,
         apply_slippage,
         progress_callback=emit_progress,
@@ -311,33 +457,77 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
         progress_detail_callback=emit_progress_detail,
         technical_log_callback=emit_research_technical,
     )
+
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
         result.metrics.update(reproducibility)
         result.summary += "\n\nREPRODUCIBILITY\n"
         result.summary += (
-            f"Configuration SHA-256: {reproducibility['strategy_configuration_sha256']}\n"
+            "Configuration SHA-256: "
+            f"{reproducibility['strategy_configuration_sha256']}\n"
         )
         result.summary += (
-            f"Market data SHA-256: {reproducibility['market_data_signature_sha256']}\n"
+            "Market data SHA-256: "
+            f"{reproducibility['market_data_signature_sha256']}\n"
         )
         result.summary += (
-            f"Complete requested history: {reproducibility.get('market_data_history_complete')}\n"
+            "Research data protocol: "
+            f"{reproducibility['research_market_data_protocol']}\n"
+        )
+        result.summary += (
+            "Research source adjustment: "
+            f"{reproducibility['research_source_adjustment']}\n"
+        )
+        result.summary += (
+            "Eligible assets: "
+            f"{reproducibility['eligible_asset_count']}/"
+            f"{reproducibility['configured_asset_count']}\n"
+        )
+        if structural_exclusions:
+            result.summary += (
+                "Structural exclusions: "
+                + ", ".join(
+                    str(item.get("symbol") or "")
+                    for item in structural_exclusions
+                )
+                + "\n"
+            )
+        result.summary += (
+            "Complete requested history: "
+            f"{reproducibility.get('market_data_history_complete')}\n"
         )
         result.summary += (
             "Backfilled assets: "
             f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
         )
-        result.summary += f"Python: {reproducibility.get('python_version')}\n"
-        model_family = str(getattr(config, "research_model_family", "lightgbm_utility"))
+        result.summary += (
+            f"Python: {reproducibility.get('python_version')}\n"
+        )
+
+        model_family = str(
+            getattr(
+                effective_config,
+                "research_model_family",
+                "lightgbm_utility",
+            )
+        )
         if model_family == "lightgbm_utility":
-            result.summary += f"LightGBM: {reproducibility.get('lightgbm_version')}\n"
+            result.summary += (
+                f"LightGBM: {reproducibility.get('lightgbm_version')}\n"
+            )
         elif model_family == "iqn":
-            result.summary += f"PyTorch: {reproducibility.get('torch_version')}\n"
+            result.summary += (
+                f"PyTorch: {reproducibility.get('torch_version')}\n"
+            )
+
         emit_progress(
             92.0 + 6.0 * ((result_position - 1) / total_results),
-            f"Saving {result.metrics.get('strategy_label', result.backend)} results to MongoDB",
+            (
+                "Saving "
+                f"{result.metrics.get('strategy_label', result.backend)} "
+                "results to MongoDB"
+            ),
             len(results),
         )
         replace_run_result(
@@ -349,16 +539,24 @@ def run_job(job_id: str, config: BacktestExecutionRequest, db: Any) -> tuple[lis
             summary=result.summary,
             predictions=result.predictions,
             trades=result.trades,
-            batch_size=config.mongo_write_batch_size,
+            batch_size=effective_config.mongo_write_batch_size,
         )
-        comparisons.append(bson_value(flatten_rotation_metrics(result.metrics)))
+        comparisons.append(
+            bson_value(flatten_rotation_metrics(result.metrics))
+        )
         print(
-            f"PORTFOLIO/{result.backend}: Strategy={result.metrics['strategy_return']:.2%} | "
+            f"PORTFOLIO/{result.backend}: "
+            f"Strategy={result.metrics['strategy_return']:.2%} | "
             f"Benchmark={result.metrics['buy_hold_return']:.2%}",
             flush=True,
         )
-    emit_progress(99.0, "Finalizing comparison and reports", len(results))
-    return comparisons, failures
+
+    emit_progress(
+        99.0,
+        "Finalizing comparison and reports",
+        len(results),
+    )
+    return comparisons, failures, effective_config
 
 
 def main() -> None:
@@ -385,7 +583,9 @@ def main() -> None:
             flush=True,
         )
         print(
-            f"Research market data: mode={getattr(config, 'research_market_data_mode', 'database_only')}; "
+            "Research market data: "
+            f"mode={getattr(config, 'research_market_data_mode', 'database_only')}; "
+            f"protocol={getattr(config, 'research_market_data_protocol', 'raw_total_causal_v1')}; "
             f"cutoff={config.analysis_end_date or config.end_date or 'unresolved'}",
             flush=True,
         )
@@ -403,14 +603,22 @@ def main() -> None:
             "Champion walk-forward schedule and execution period are locked in MongoDB.",
             flush=True,
         )
-        comparisons, failures = run_job(args.job_id, config, db)
-        comparisons.sort(key=lambda item: str(item.get("backend", "")))
+        comparisons, failures, effective_config = run_job(
+            args.job_id,
+            config,
+            db,
+        )
+        comparisons.sort(
+            key=lambda item: str(item.get("backend", ""))
+        )
         replace_comparison(
             db,
             job_id=args.job_id,
             comparison=comparisons,
             failures=failures,
-            effective_config=bson_value(config.model_dump(mode="python")),
+            effective_config=bson_value(
+                effective_config.model_dump(mode="python")
+            ),
         )
         if not comparisons:
             raise SystemExit(1)
