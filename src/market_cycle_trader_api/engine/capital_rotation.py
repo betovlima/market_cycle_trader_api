@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 import math
+import time
 from typing import Any, Callable
 import numpy as np
 import pandas as pd
@@ -608,6 +609,7 @@ def _utility_policy(
             decision_diagnostics=cash_gate_base_diagnostics,
             fold_id=fold_id,
             calibrated_switch_margin=calibrated_switch_margin,
+            utility_cache=utility_cache,
         )
 
     def position_asset(position: int) -> str:
