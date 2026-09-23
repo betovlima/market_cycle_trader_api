@@ -414,6 +414,7 @@ def export_zip(job_id: str) -> Response:
                         "started_at": job.get("started_at"),
                         "finished_at": job.get("finished_at"),
                         "configuration": job.get("request"),
+                        "effective_configuration": comparison.get("effective_config"),
                     }
                 ),
                 indent=2,
@@ -423,7 +424,13 @@ def export_zip(job_id: str) -> Response:
         archive.writestr(
             "experiment_manifest.json",
             json.dumps(
-                iso_value(build_experiment_manifest(job, runs)),
+                iso_value(
+                    build_experiment_manifest(
+                        job,
+                        runs,
+                        effective_config=comparison.get("effective_config"),
+                    )
+                ),
                 indent=2,
                 ensure_ascii=False,
             ),
