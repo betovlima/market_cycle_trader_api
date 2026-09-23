@@ -25,20 +25,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install engine test dependencies
+      - name: Install API dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install \
-            numpy==2.5.1 \
-            pandas==3.0.5 \
-            scipy==1.18.0 \
-            scikit-learn==1.9.0 \
-            threadpoolctl==3.6.0 \
-            "lightgbm>=4.6,<5" \
-            "torch>=2.10,<3" \
-            "botorch>=0.18,<0.19" \
-            "gpytorch>=1.14,<2" \
-            "pydantic>=2,<3"
+          python -m pip install -r requirements.txt
 
       - name: Compile engine
         run: python -m compileall -q src tests
