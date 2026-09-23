@@ -8,12 +8,18 @@ from ..core.config import API_VERSION
 def build_experiment_manifest(
     job: dict[str, Any],
     runs: list[dict[str, Any]],
+    *,
+    effective_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     
 
     primary_run = runs[0] if runs else {}
     metrics = dict(primary_run.get("metrics") or {})
-    request = dict(job.get("request") or {})
+    request = dict(
+        effective_config
+        if isinstance(effective_config, dict)
+        else (job.get("request") or {})
+    )
     return {
         "schema_version": 2,
         "api_version": API_VERSION,
@@ -40,6 +46,11 @@ def build_experiment_manifest(
         "market_data_signature_sha256": metrics.get("market_data_signature_sha256"),
         "market_data_signatures": metrics.get("market_data_signatures") or {},
         "market_data_history_complete": metrics.get("market_data_history_complete"),
+        "research_market_data_protocol": metrics.get("research_market_data_protocol"),
+        "research_source_adjustment": metrics.get("research_source_adjustment"),
+        "configured_asset_count": metrics.get("configured_asset_count"),
+        "eligible_asset_count": metrics.get("eligible_asset_count"),
+        "structural_exclusions": metrics.get("structural_exclusions") or [],
         "runtime_fingerprint_sha256": metrics.get("runtime_fingerprint_sha256"),
         "git_commit": metrics.get("git_commit"),
         "engine_source_sha256": metrics.get("engine_source_sha256"),
