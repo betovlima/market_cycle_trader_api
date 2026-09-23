@@ -1040,7 +1040,20 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
         if signatures
         else summary.get("market_data_signature_sha256")
     )
-    request_snapshot = deepcopy(job["request"])
+    comparison = db[COMPARISONS_COLLECTION].find_one(
+        {"job_id": str(job_id)},
+        {"_id": 0, "effective_config": 1},
+    )
+    effective_config = (
+        comparison.get("effective_config")
+        if isinstance(comparison, dict)
+        else None
+    )
+    request_snapshot = deepcopy(
+        effective_config
+        if isinstance(effective_config, dict)
+        else job["request"]
+    )
     last_timestamp = summary.get("market_data_last_timestamp")
     cutoff_date = str(last_timestamp)[:10] if last_timestamp else None
     if cutoff_date:
