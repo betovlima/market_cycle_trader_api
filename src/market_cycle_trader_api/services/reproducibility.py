@@ -200,6 +200,21 @@ def market_data_research_signature_from_manifests(
             ),
             "effective_adjustment": item.get("effective_adjustment"),
             "splits_applied": int(item.get("splits_applied") or 0),
+            "split_normalization_direction": item.get(
+                "split_normalization_direction"
+            ),
+            "split_normalization_uses_future_events": bool(
+                item.get("split_normalization_uses_future_events", False)
+            ),
+            "dividend_event_count": int(
+                item.get("dividend_event_count") or 0
+            ),
+            "dividend_adjustment_applied": bool(
+                item.get("dividend_adjustment_applied", False)
+            ),
+            "dividend_events_used_by_model": bool(
+                item.get("dividend_events_used_by_model", False)
+            ),
         }
     return _sha256_json(stable)
 
@@ -291,6 +306,21 @@ def market_data_manifest(
                 "corporate_action_count"
             ),
             "splits_applied": provenance.get("splits_applied"),
+            "split_normalization_direction": provenance.get(
+                "split_normalization_direction"
+            ),
+            "split_normalization_uses_future_events": provenance.get(
+                "split_normalization_uses_future_events"
+            ),
+            "dividend_event_count": provenance.get(
+                "dividend_event_count"
+            ),
+            "dividend_adjustment_applied": provenance.get(
+                "dividend_adjustment_applied"
+            ),
+            "dividend_events_used_by_model": provenance.get(
+                "dividend_events_used_by_model"
+            ),
             "structural_identity_verified": provenance.get(
                 "structural_identity_verified"
             ),
