@@ -29,6 +29,8 @@ from .capital_rotation import (
     _training_transition_log_return,
     _utility_policy,
     _model_utilities,
+    _precompute_model_utilities,
+    _prepare_rotation_panel_with_source,
     prepare_rotation_panel,
 )
 from .optimized_allocation import fit_expected_return_calibrator
@@ -75,7 +77,9 @@ def _lightgbm_settings(config: Any) -> dict[str, Any]:
     missing = sorted(required.difference(lightgbm))
     if missing:
         raise ValueError("LightGBM research settings are incomplete: " + ", ".join(missing))
-    return dict(lightgbm)
+    resolved = dict(lightgbm)
+    resolved["early_stopping_enabled"] = False
+    return resolved
 
 
 def _build_execution_context(
@@ -84,6 +88,7 @@ def _build_execution_context(
 ) -> tuple[
     dict[str, pd.DataFrame],
     pd.DatetimeIndex,
+    str,
     list[str],
     list[dict[str, Any]],
     pd.DatetimeIndex,
@@ -92,7 +97,10 @@ def _build_execution_context(
 ]:
     if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
         raise ValueError(f"Unsupported research strategy mode: {config.strategy_mode}.")
-    frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
+    frames, common_dates, calendar_source_asset = _prepare_rotation_panel_with_source(
+        bars_by_symbol,
+        config,
+    )
     symbols = sorted(frames)
     folds = _build_walk_forward_folds(common_dates, config)
     all_decision_dates = _analysis_decision_dates(common_dates, folds, config)
@@ -110,6 +118,7 @@ def _build_execution_context(
     return (
         frames,
         common_dates,
+        calendar_source_asset,
         symbols,
         folds,
         all_decision_dates,
@@ -204,6 +213,243 @@ def _lightgbm_last_tree_snapshot(
     }
 
 
+def _regression_error_diagnostics(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+) -> dict[str, float | int | None]:
+    actual_values = np.asarray(actual, dtype=np.float64)
+    predicted_values = np.asarray(predicted, dtype=np.float64)
+    valid = np.isfinite(actual_values) & np.isfinite(predicted_values)
+    if not bool(valid.any()):
+        return {
+            "rows": 0,
+            "absolute_error_sum": 0.0,
+            "squared_error_sum": 0.0,
+            "mae": None,
+            "rmse": None,
+        }
+    residual = predicted_values[valid] - actual_values[valid]
+    abs_sum = float(np.abs(residual).sum())
+    sq_sum = float(np.square(residual).sum())
+    rows = int(valid.sum())
+    return {
+        "rows": rows,
+        "absolute_error_sum": abs_sum,
+        "squared_error_sum": sq_sum,
+        "mae": abs_sum / rows,
+        "rmse": math.sqrt(sq_sum / rows),
+    }
+
+def _lightgbm_model_fit_diagnostics(
+    model: Any,
+    train_frame: pd.DataFrame,
+    *,
+    target_column: str,
+    configured_estimators: int,
+) -> dict[str, Any]:
+    train_prediction = model.predict(train_frame[ROTATION_FEATURES])
+    train_diag = _regression_error_diagnostics(
+        train_frame[target_column].to_numpy(dtype=np.float64),
+        np.asarray(train_prediction, dtype=np.float64),
+    )
+
+    gain = np.asarray(
+        model.booster_.feature_importance(importance_type="gain"),
+        dtype=np.float64,
+    )
+    gain = np.where(np.isfinite(gain), gain, 0.0)
+    gain_total = float(gain.sum())
+    importance = {
+        feature: (float(value / gain_total) if gain_total > 0 else 0.0)
+        for feature, value in zip(ROTATION_FEATURES, gain)
+    }
+
+    return {
+        "configured_estimators": int(configured_estimators),
+        "best_iteration": int(configured_estimators),
+        "early_stopping_used": False,
+        "train": train_diag,
+        "feature_importance_gain": importance,
+    }
+
+def _evaluate_lightgbm_models_on_dates(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    dates: pd.DatetimeIndex,
+    *,
+    target_column: str = "forward_risk_adjusted_utility",
+) -> dict[str, float | int | None]:
+    actual_values: list[float] = []
+    predicted_values: list[float] = []
+
+    for symbol in symbols:
+        model = models.get(symbol)
+        frame = frames.get(symbol)
+        if model is None or frame is None or frame.empty:
+            continue
+        available_dates = pd.DatetimeIndex(dates).intersection(frame.index)
+        if len(available_dates) == 0:
+            continue
+        sample = frame.loc[available_dates].dropna(
+            subset=[target_column, *ROTATION_FEATURES]
+        )
+        if sample.empty:
+            continue
+        predicted = model.predict(sample[ROTATION_FEATURES])
+        actual_values.extend(
+            sample[target_column].to_numpy(dtype=np.float64).tolist()
+        )
+        predicted_values.extend(
+            np.asarray(predicted, dtype=np.float64).tolist()
+        )
+
+    return _regression_error_diagnostics(
+        np.asarray(actual_values, dtype=np.float64),
+        np.asarray(predicted_values, dtype=np.float64),
+    )
+
+def _aggregate_lightgbm_model_diagnostics(
+    models: dict[str, Any],
+    *,
+    fold_id: int,
+    validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    train_rows = 0
+    train_abs = 0.0
+    train_sq = 0.0
+    configured_estimators: list[int] = []
+    feature_gain = {feature: 0.0 for feature in ROTATION_FEATURES}
+
+    for model in models.values():
+        diag = getattr(model, "_fit_diagnostics", None)
+        if not isinstance(diag, dict):
+            continue
+        train = diag.get("train") or {}
+        train_rows += int(train.get("rows") or 0)
+        train_abs += float(train.get("absolute_error_sum") or 0.0)
+        train_sq += float(train.get("squared_error_sum") or 0.0)
+        configured_estimators.append(int(diag.get("configured_estimators") or 0))
+        for feature, value in (diag.get("feature_importance_gain") or {}).items():
+            if feature in feature_gain:
+                feature_gain[feature] += float(value or 0.0)
+
+    model_count = len(models)
+    feature_total = float(sum(feature_gain.values()))
+    normalized_gain = {
+        feature: (value / feature_total if feature_total > 0 else 0.0)
+        for feature, value in feature_gain.items()
+    }
+    top_features = [
+        {"feature": feature, "importance_gain": float(value)}
+        for feature, value in sorted(
+            normalized_gain.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+
+    train_rmse = math.sqrt(train_sq / train_rows) if train_rows else None
+    validation = dict(validation or {})
+    validation_rows = int(validation.get("rows") or 0)
+    validation_mae = (
+        float(validation.get("mae"))
+        if validation.get("mae") is not None
+        else None
+    )
+    validation_rmse = (
+        float(validation.get("rmse"))
+        if validation.get("rmse") is not None
+        else None
+    )
+
+    effective_estimators = (
+        float(np.mean(configured_estimators))
+        if configured_estimators
+        else None
+    )
+    return {
+        "fold_id": int(fold_id),
+        "model_count": int(model_count),
+        "early_stopping_model_count": 0,
+        "early_stopping_model_fraction": 0.0,
+        "best_iteration_mean": effective_estimators,
+        "best_iteration_median": (
+            float(np.median(configured_estimators))
+            if configured_estimators
+            else None
+        ),
+        "configured_estimators_mean": effective_estimators,
+        "train_rows": int(train_rows),
+        "train_mae": (train_abs / train_rows if train_rows else None),
+        "train_rmse": train_rmse,
+        "validation_rows": validation_rows,
+        "validation_mae": validation_mae,
+        "validation_rmse": validation_rmse,
+        "generalization_gap_rmse": (
+            float(validation_rmse) - float(train_rmse)
+            if train_rmse is not None and validation_rmse is not None
+            else None
+        ),
+        "validation_source": "existing_chronological_calibration_window",
+        "feature_importance_source": "calibration_models",
+        "feature_importance_gain": normalized_gain,
+        "top_features_by_gain": top_features,
+    }
+
+def _aggregate_lightgbm_fold_diagnostics(
+    folds: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not folds:
+        return {}
+    numeric_fields = (
+        "train_mae",
+        "train_rmse",
+        "validation_mae",
+        "validation_rmse",
+        "generalization_gap_rmse",
+        "best_iteration_mean",
+        "configured_estimators_mean",
+        "early_stopping_model_fraction",
+    )
+    output: dict[str, Any] = {"fold_count": len(folds)}
+    for field in numeric_fields:
+        values = [
+            float(item[field])
+            for item in folds
+            if item.get(field) is not None and np.isfinite(float(item[field]))
+        ]
+        output_key = (
+            field
+            if field in {"best_iteration_mean", "configured_estimators_mean"}
+            else f"{field}_mean"
+        )
+        output[output_key] = float(np.mean(values)) if values else None
+
+    feature_gain = {feature: 0.0 for feature in ROTATION_FEATURES}
+    for fold in folds:
+        for feature, value in (fold.get("feature_importance_gain") or {}).items():
+            if feature in feature_gain:
+                feature_gain[feature] += float(value or 0.0)
+    total = float(sum(feature_gain.values()))
+    normalized = {
+        feature: (value / total if total > 0 else 0.0)
+        for feature, value in feature_gain.items()
+    }
+    output["feature_importance_gain"] = normalized
+    output["top_features_by_gain"] = [
+        {"feature": feature, "importance_gain": float(value)}
+        for feature, value in sorted(
+            normalized.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    output["early_stopping_enabled"] = False
+    output["validation_source"] = "existing_chronological_calibration_window"
+    return output
+
+
 def _lightgbm_fit_models(
     frames: dict[str, pd.DataFrame],
     symbols: list[str],
@@ -220,7 +466,6 @@ def _lightgbm_fit_models(
     except ImportError as exc:
         raise RuntimeError("LightGBM research requires lightgbm. Install requirements.txt.") from exc
 
-    anchor_assets = set(getattr(config, "calendar_anchor_assets", []) or [])
     minimum_rows = int(config.rotation_minimum_training_rows)
     settings = _lightgbm_settings(config)
     fitted: dict[str, Any] = {}
@@ -233,18 +478,14 @@ def _lightgbm_fit_models(
     technical(
         f"model=lightgbm phase={phase} event=fit_start device=cpu "
         f"models={len(symbols)} train_sessions={len(train_dates)} "
-        f"estimators={int(settings['n_estimators'])} seed={int(config.random_state)}"
+        f"estimators={int(settings['n_estimators'])} "
+        f"seed={int(config.random_state)} early_stopping=false"
     )
     for position, symbol in enumerate(symbols, start=1):
         frame = frames[symbol].loc[train_dates].dropna(
             subset=[target_column, *ROTATION_FEATURES]
         )
         if len(frame) < minimum_rows:
-            if symbol in anchor_assets:
-                raise ValueError(
-                    f"{symbol}: only {len(frame)} utility rows are available; "
-                    f"{minimum_rows} are required for an anchor asset."
-                )
             if progress_callback is not None:
                 progress_callback(position, len(symbols), "cpu")
             continue
@@ -265,11 +506,18 @@ def _lightgbm_fit_models(
             max_bin=int(settings["max_bin"]),
             random_state=int(config.random_state),
             n_jobs=_effective_n_jobs(int(settings["n_jobs"])),
+            device_type="cpu",
             deterministic=bool(config.deterministic_execution),
             force_col_wise=bool(config.deterministic_execution),
             verbosity=-1,
         )
         model.fit(frame[ROTATION_FEATURES], frame[target_column])
+        model._fit_diagnostics = _lightgbm_model_fit_diagnostics(
+            model,
+            frame,
+            target_column=target_column,
+            configured_estimators=int(settings["n_estimators"]),
+        )
         fitted[symbol] = model
         if progress_callback is not None:
             progress_callback(position, len(symbols), "cpu")
@@ -278,6 +526,501 @@ def _lightgbm_fit_models(
         f"models={len(fitted)} duration_seconds={time.perf_counter() - started:.3f}"
     )
     return fitted
+
+
+def _horizon_settings(config: Any) -> dict[str, Any]:
+    horizons = [int(item) for item in config.rotation_target_horizons]
+    weights = np.asarray(
+        config.rotation_target_horizon_weights,
+        dtype=float,
+    )
+    if len(horizons) != len(weights):
+        raise ValueError(
+            "Soft horizon consensus requires one weight per target horizon."
+        )
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0:
+        raise ValueError(
+            "Soft horizon consensus requires finite positive horizon weights."
+        )
+    weights = weights / float(weights.sum())
+    return {
+        "horizons": horizons,
+        "weights": [float(item) for item in weights],
+    }
+
+
+def _fit_horizon_models(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    train_dates: pd.DatetimeIndex,
+    config: Any,
+    *,
+    phase: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    technical_log_callback: Callable[[str], None] | None = None,
+) -> dict[int, dict[str, Any]]:
+    settings = _horizon_settings(config)
+    horizons = list(settings["horizons"])
+    fitted: dict[int, dict[str, Any]] = {}
+    total = max(1, len(horizons) * len(symbols))
+
+    for horizon_index, horizon in enumerate(horizons):
+        def horizon_progress(
+            position: int,
+            symbol_total: int,
+            device: str,
+            *,
+            _index=horizon_index,
+        ) -> None:
+            if progress_callback is None:
+                return
+            completed = _index * len(symbols) + int(position)
+            progress_callback(completed, total, device)
+
+        target_column = f"forward_horizon_utility_{int(horizon)}"
+        fitted[int(horizon)] = _lightgbm_fit_models(
+            frames,
+            symbols,
+            train_dates,
+            config,
+            phase=f"{phase}_h{int(horizon)}",
+            progress_callback=horizon_progress,
+            technical_log_callback=technical_log_callback,
+            target_column=target_column,
+        )
+    return fitted
+
+
+def _soft_horizon_consensus_settings(config: Any) -> dict[str, Any]:
+    raw = (_research_settings(config).get("soft_horizon_consensus") or {})
+    horizon = _horizon_settings(config)
+    return {
+        "enabled": bool(raw.get("enabled", False))
+        if isinstance(raw, dict)
+        else False,
+        "penalty_strength": (
+            float(raw.get("penalty_strength", 1.0))
+            if isinstance(raw, dict)
+            else 1.0
+        ),
+        "horizons": list(horizon["horizons"]),
+        "weights": list(horizon["weights"]),
+        "mode": "weighted_rank_margin_modifier",
+    }
+
+def _horizon_rank_consensus_snapshot(
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamp: pd.Timestamp,
+    config: Any,
+    *,
+    base_target: int,
+    current_position: int,
+    horizon_utility_caches: dict[int, dict[pd.Timestamp, np.ndarray]] | None = None,
+) -> dict[str, Any]:
+    settings = _soft_horizon_consensus_settings(config)
+    aggregate = np.zeros(len(symbols) + 1, dtype=np.float64)
+    available_weight = 0.0
+    horizon_details: list[dict[str, Any]] = []
+
+    for horizon, weight in zip(
+        settings["horizons"],
+        settings["weights"],
+        strict=True,
+    ):
+        cache = (
+            (horizon_utility_caches or {}).get(int(horizon))
+            if horizon_utility_caches is not None
+            else None
+        )
+        utilities = _model_utilities(
+            horizon_models.get(int(horizon), {}),
+            frames,
+            symbols,
+            timestamp,
+            config,
+            utility_cache=cache,
+        )
+        ranked = sorted(
+            (
+                position
+                for position in range(1, len(utilities))
+                if np.isfinite(utilities[position])
+            ),
+            key=lambda position: (
+                -float(utilities[position]),
+                symbols[position - 1],
+            ),
+        )
+        if not ranked:
+            horizon_details.append(
+                {
+                    "horizon": int(horizon),
+                    "weight": float(weight),
+                    "available_assets": 0,
+                    "winner_asset": None,
+                    "base_target_rank": None,
+                    "base_target_rank_score": None,
+                    "current_position_rank": None,
+                    "current_position_rank_score": None,
+                }
+            )
+            continue
+
+        available_weight += float(weight)
+        denominator = max(1, len(ranked) - 1)
+        rank_scores: dict[int, float] = {}
+        for rank_index, position in enumerate(ranked):
+            rank_score = (
+                1.0
+                if len(ranked) == 1
+                else 1.0 - float(rank_index) / float(denominator)
+            )
+            rank_scores[int(position)] = float(rank_score)
+            aggregate[int(position)] += float(weight) * float(rank_score)
+
+        base_rank = (
+            ranked.index(int(base_target)) + 1
+            if int(base_target) in ranked
+            else None
+        )
+        current_rank = (
+            ranked.index(int(current_position)) + 1
+            if int(current_position) in ranked
+            else None
+        )
+        horizon_details.append(
+            {
+                "horizon": int(horizon),
+                "weight": float(weight),
+                "available_assets": int(len(ranked)),
+                "winner_asset": symbols[ranked[0] - 1],
+                "winner_score": float(utilities[ranked[0]]),
+                "base_target_rank": base_rank,
+                "base_target_rank_score": (
+                    rank_scores.get(int(base_target))
+                    if int(base_target) > 0
+                    else None
+                ),
+                "current_position_rank": current_rank,
+                "current_position_rank_score": (
+                    rank_scores.get(int(current_position))
+                    if int(current_position) > 0
+                    else None
+                ),
+            }
+        )
+
+    if available_weight > 0:
+        aggregate[1:] = aggregate[1:] / float(available_weight)
+
+    finite_positions = [
+        position
+        for position in range(1, len(aggregate))
+        if np.isfinite(aggregate[position])
+    ]
+    consensus_winner = (
+        max(
+            finite_positions,
+            key=lambda position: (
+                float(aggregate[position]),
+                -position,
+            ),
+        )
+        if finite_positions
+        else 0
+    )
+    base_score = (
+        float(aggregate[int(base_target)])
+        if int(base_target) > 0 and int(base_target) < len(aggregate)
+        else None
+    )
+    current_score = (
+        float(aggregate[int(current_position)])
+        if int(current_position) > 0 and int(current_position) < len(aggregate)
+        else None
+    )
+    if base_score is None:
+        support = None
+        relative_component = None
+    elif current_score is None:
+        relative_component = float(base_score)
+        support = float(base_score)
+    else:
+        relative_component = float(
+            np.clip(
+                0.5 + 0.5 * (float(base_score) - float(current_score)),
+                0.0,
+                1.0,
+            )
+        )
+        support = float(
+            0.5 * float(base_score) + 0.5 * relative_component
+        )
+
+    return {
+        "consensus_winner_position": int(consensus_winner),
+        "consensus_winner_asset": (
+            symbols[consensus_winner - 1]
+            if consensus_winner > 0
+            else None
+        ),
+        "consensus_winner_score": (
+            float(aggregate[consensus_winner])
+            if consensus_winner > 0
+            else None
+        ),
+        "base_target_rank_score": base_score,
+        "current_position_rank_score": current_score,
+        "relative_rank_component": relative_component,
+        "soft_support": support,
+        "available_horizon_weight": float(available_weight),
+        "aggregate_rank_scores": {
+            symbols[position - 1]: float(aggregate[position])
+            for position in range(1, len(aggregate))
+        },
+        "horizons": horizon_details,
+    }
+
+def _soft_horizon_consensus_policy(
+    base_policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    base_models: dict[str, Any],
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    *,
+    base_switch_margin: float,
+    base_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+    horizon_utility_caches: dict[int, dict[pd.Timestamp, np.ndarray]] | None = None,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+    settings = _soft_horizon_consensus_settings(config)
+    penalty_strength = max(0.0, float(settings["penalty_strength"]))
+
+    def policy(
+        timestamp: pd.Timestamp,
+        current_position: int,
+        holding_days: int,
+    ) -> tuple[int, float]:
+        base_target, base_score = base_policy(
+            timestamp,
+            current_position,
+            holding_days,
+        )
+        key = pd.Timestamp(timestamp)
+
+        if int(base_target) == 0:
+            if decision_diagnostics is not None:
+                decision_diagnostics.setdefault(key, {}).update(
+                    {
+                        "soft_horizon_consensus_enabled": True,
+                        "soft_horizon_consensus_mode": str(settings["mode"]),
+                        "soft_horizon_consensus_reason": "BASE_CASH_PRESERVED",
+                        "soft_horizon_consensus_changed_base_action": False,
+                    }
+                )
+            return 0, float(base_score)
+
+        snapshot = _horizon_rank_consensus_snapshot(
+            horizon_models,
+            frames,
+            symbols,
+            timestamp,
+            config,
+            base_target=int(base_target),
+            current_position=int(current_position),
+            horizon_utility_caches=horizon_utility_caches,
+        )
+
+        if int(base_target) == int(current_position):
+            final_target = int(base_target)
+            reason = "BASE_HOLD_PRESERVED"
+            base_gap = 0.0
+            margin_multiplier = 1.0
+            dynamic_margin = float(base_switch_margin)
+        else:
+            base_utilities = _model_utilities(
+                base_models,
+                frames,
+                symbols,
+                timestamp,
+                config,
+                utility_cache=base_utility_cache,
+            )
+            target_utility = (
+                float(base_utilities[int(base_target)])
+                if int(base_target) < len(base_utilities)
+                else float("nan")
+            )
+            current_utility = (
+                float(base_utilities[int(current_position)])
+                if 0 <= int(current_position) < len(base_utilities)
+                else 0.0
+            )
+            base_gap = target_utility - current_utility
+            support = snapshot.get("soft_support")
+            if support is None or not np.isfinite(float(support)):
+                margin_multiplier = 1.0
+            else:
+                margin_multiplier = 1.0 + penalty_strength * (
+                    1.0 - float(np.clip(float(support), 0.0, 1.0))
+                )
+            dynamic_margin = float(base_switch_margin) * float(
+                margin_multiplier
+            )
+
+            if not np.isfinite(base_gap):
+                final_target = int(base_target)
+                reason = "SOFT_CONSENSUS_NO_GAP_PRESERVE"
+            elif float(base_gap) + 1e-15 >= float(dynamic_margin):
+                final_target = int(base_target)
+                reason = "SOFT_CONSENSUS_ACCEPT"
+            else:
+                final_target = (
+                    int(current_position)
+                    if int(current_position) > 0
+                    else 0
+                )
+                reason = "SOFT_CONSENSUS_BLOCK_MARGINAL_SWITCH"
+
+        if decision_diagnostics is not None:
+            diagnostic = decision_diagnostics.setdefault(key, {})
+            diagnostic.update(
+                {
+                    "soft_horizon_consensus_enabled": True,
+                    "soft_horizon_consensus_mode": str(settings["mode"]),
+                    "soft_horizon_consensus_penalty_strength": float(
+                        penalty_strength
+                    ),
+                    "soft_horizon_consensus_base_target_asset": (
+                        symbols[int(base_target) - 1]
+                        if int(base_target) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_current_asset": (
+                        symbols[int(current_position) - 1]
+                        if int(current_position) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_winner_asset": snapshot.get(
+                        "consensus_winner_asset"
+                    ),
+                    "soft_horizon_consensus_winner_score": snapshot.get(
+                        "consensus_winner_score"
+                    ),
+                    "soft_horizon_consensus_base_target_rank_score": snapshot.get(
+                        "base_target_rank_score"
+                    ),
+                    "soft_horizon_consensus_current_rank_score": snapshot.get(
+                        "current_position_rank_score"
+                    ),
+                    "soft_horizon_consensus_relative_rank_component": snapshot.get(
+                        "relative_rank_component"
+                    ),
+                    "soft_horizon_consensus_support": snapshot.get(
+                        "soft_support"
+                    ),
+                    "soft_horizon_consensus_base_gap": (
+                        float(base_gap)
+                        if np.isfinite(float(base_gap))
+                        else None
+                    ),
+                    "soft_horizon_consensus_base_switch_margin": float(
+                        base_switch_margin
+                    ),
+                    "soft_horizon_consensus_margin_multiplier": float(
+                        margin_multiplier
+                    ),
+                    "soft_horizon_consensus_dynamic_margin": float(
+                        dynamic_margin
+                    ),
+                    "soft_horizon_consensus_horizons": list(
+                        snapshot["horizons"]
+                    ),
+                    "soft_horizon_consensus_final_action_asset": (
+                        symbols[int(final_target) - 1]
+                        if int(final_target) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_reason": reason,
+                    "soft_horizon_consensus_changed_base_action": (
+                        int(final_target) != int(base_target)
+                    ),
+                }
+            )
+        return int(final_target), float(base_score)
+
+    return policy
+
+def _soft_horizon_consensus_result_metrics(
+    result: RotationRunResult,
+) -> dict[str, Any]:
+    predictions = result.predictions
+    if not isinstance(predictions, pd.DataFrame) or predictions.empty:
+        return {}
+    column = "soft_horizon_consensus_enabled"
+    if column not in predictions.columns:
+        return {}
+    rows = predictions.loc[
+        predictions[column].fillna(False).astype(bool)
+    ]
+    if rows.empty:
+        return {}
+
+    reasons = rows.get(
+        "soft_horizon_consensus_reason",
+        pd.Series(dtype=object),
+    )
+    changed = rows.get(
+        "soft_horizon_consensus_changed_base_action",
+        pd.Series(dtype=bool),
+    ).fillna(False).astype(bool)
+    support = pd.to_numeric(
+        rows.get(
+            "soft_horizon_consensus_support",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    )
+    multiplier = pd.to_numeric(
+        rows.get(
+            "soft_horizon_consensus_margin_multiplier",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    )
+    return {
+        "soft_horizon_consensus_enabled": True,
+        "soft_horizon_consensus_decisions": int(len(rows)),
+        "soft_horizon_consensus_changed_base_actions": int(changed.sum()),
+        "soft_horizon_consensus_change_rate": float(changed.mean()),
+        "soft_horizon_consensus_blocked_marginal_switches": int(
+            (
+                reasons
+                == "SOFT_CONSENSUS_BLOCK_MARGINAL_SWITCH"
+            ).sum()
+        ),
+        "soft_horizon_consensus_accepts": int(
+            (reasons == "SOFT_CONSENSUS_ACCEPT").sum()
+        ),
+        "soft_horizon_consensus_average_support": (
+            float(support.dropna().mean())
+            if support.notna().any()
+            else None
+        ),
+        "soft_horizon_consensus_median_support": (
+            float(support.dropna().median())
+            if support.notna().any()
+            else None
+        ),
+        "soft_horizon_consensus_average_margin_multiplier": (
+            float(multiplier.dropna().mean())
+            if multiplier.notna().any()
+            else None
+        ),
+    }
 
 
 def _run_lightgbm(
