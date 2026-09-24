@@ -224,6 +224,10 @@ def flatten_rotation_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "market_data_history_complete",
         "market_data_incomplete_assets",
         "market_data_backfilled_assets",
+        "market_data_history_compared_asset_count",
+        "market_data_history_changed_asset_count",
+        "market_data_history_changed_assets",
+        "market_data_history_comparison_unavailable_assets",
         "python_version",
         "scikit_learn_version",
         "numpy_version",
@@ -314,6 +318,25 @@ def run_job(
                 f"complete={bool(provenance.get('history_complete', True))}",
                 flush=True,
             )
+            if provenance.get("history_comparison_available") is not None:
+                raw_sha = str(provenance.get("raw_sha256") or "")
+                previous_sha = str(
+                    provenance.get("previous_raw_sha256") or ""
+                )
+                print(
+                    "MARKET_DATA_DRIFT|"
+                    f"{symbol}|"
+                    f"compared={bool(provenance.get('history_comparison_available'))}|"
+                    f"changed={provenance.get('historical_data_changed')}|"
+                    f"changed_rows={int(provenance.get('changed_rows') or 0)}|"
+                    f"added_rows={int(provenance.get('added_rows') or 0)}|"
+                    f"removed_rows={int(provenance.get('removed_rows') or 0)}|"
+                    f"first_changed={provenance.get('first_changed_timestamp') or ''}|"
+                    f"last_changed={provenance.get('last_changed_timestamp') or ''}|"
+                    f"previous_raw_sha256={previous_sha}|"
+                    f"raw_sha256={raw_sha}",
+                    flush=True,
+                )
             emit_progress(
                 3.0 + 12.0 * (asset_position / total_assets),
                 (
@@ -553,6 +576,16 @@ def run_job(
         result.summary += (
             "Backfilled assets: "
             f"{', '.join(reproducibility.get('market_data_backfilled_assets') or []) or 'none'}\n"
+        )
+        result.summary += (
+            "Alpaca RAW history compared: "
+            f"{reproducibility.get('market_data_history_compared_asset_count', 0)}/"
+            f"{reproducibility.get('eligible_asset_count', 0)} assets\n"
+        )
+        result.summary += (
+            "Alpaca RAW history changed since previous cached snapshot: "
+            f"{reproducibility.get('market_data_history_changed_asset_count', 0)} assets"
+            f" ({', '.join(reproducibility.get('market_data_history_changed_assets') or []) or 'none'})\n"
         )
         result.summary += (
             f"Python: {reproducibility.get('python_version')}\n"
