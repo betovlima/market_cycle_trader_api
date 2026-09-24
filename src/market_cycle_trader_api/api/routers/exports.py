@@ -140,6 +140,47 @@ def _xgboost_decision_rows(predictions: list[dict[str, Any]]) -> list[dict[str, 
         if row.get("decision_diagnostics_schema_version") is not None
     ]
 
+
+def _switch_margin_candidate_rows(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for fold in metrics.get("walk_forward_folds") or []:
+        for item in fold.get("calibration_candidate_scores") or []:
+            rows.append(
+                {
+                    "fold_id": fold.get("fold_id"),
+                    "calibration_start": fold.get("calibration_start"),
+                    "calibration_end": fold.get("calibration_end"),
+                    "candidate_margin": item.get("margin"),
+                    "risk_adjusted_score": item.get("risk_adjusted_score"),
+                    "audit_trace_score": item.get("audit_trace_score"),
+                    "audit_score_delta": item.get("audit_score_delta"),
+                    "selected": (
+                        item.get("margin")
+                        == fold.get("calibrated_candidate_margin")
+                    ),
+                    "calibrated_candidate_margin": fold.get(
+                        "calibrated_candidate_margin"
+                    ),
+                    "effective_switch_margin": fold.get(
+                        "effective_switch_margin"
+                    ),
+                    "score_gap_best_vs_second": fold.get(
+                        "calibration_score_gap_best_vs_second"
+                    ),
+                }
+            )
+    return rows
+
+
+def _switch_margin_trace_rows(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in (
+            metrics.get("switch_margin_calibration_trace") or []
+        )
+    ]
+
+
 @router.get("/api/jobs/{job_id}/comparison.csv")
 def export_comparison(job_id: str) -> Response:
     require_job(job_id)
@@ -481,6 +522,18 @@ def export_zip(job_id: str) -> Response:
                 archive.writestr(
                     f"{folder}/{symbol}_{backend}_walk_forward_folds.csv",
                     csv_bytes(walk_forward_folds),
+                )
+            switch_margin_candidates = _switch_margin_candidate_rows(metrics)
+            if switch_margin_candidates:
+                archive.writestr(
+                    f"{folder}/{symbol}_{backend}_switch_margin_calibration_candidates.csv",
+                    csv_bytes(switch_margin_candidates),
+                )
+            switch_margin_trace = _switch_margin_trace_rows(metrics)
+            if switch_margin_trace:
+                archive.writestr(
+                    f"{folder}/{symbol}_{backend}_switch_margin_calibration_trace.csv",
+                    csv_bytes(switch_margin_trace),
                 )
             archive.writestr(
                 f"{folder}/{symbol}_{backend}_summary.txt",
