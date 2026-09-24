@@ -7,7 +7,10 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from market_cycle_trader_api.engine.market_data import _download_alpaca_bars
+from market_cycle_trader_api.engine.market_data import (
+    _download_alpaca_bars,
+    market_history_drift,
+)
 from market_cycle_trader_api.engine.research_market_data import (
     RAW_TOTAL_CAUSAL_PROTOCOL,
     effective_research_config,
@@ -219,6 +222,92 @@ class RawResearchDataParityTests(unittest.TestCase):
         )
         self.assertFalse(frame.attrs["research_bar_chunking"])
 
+    def test_alpaca_history_drift_detects_changed_added_and_removed_rows(self) -> None:
+        previous_index = pd.to_datetime(
+            [
+                "2024-01-02 05:00:00+00:00",
+                "2024-01-03 05:00:00+00:00",
+                "2024-01-04 05:00:00+00:00",
+            ],
+            utc=True,
+        )
+        current_index = pd.to_datetime(
+            [
+                "2024-01-02 05:00:00+00:00",
+                "2024-01-03 05:00:00+00:00",
+                "2024-01-05 05:00:00+00:00",
+            ],
+            utc=True,
+        )
+        previous = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [1000.0, 1100.0, 1200.0],
+            },
+            index=previous_index,
+        )
+        current = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 103.0],
+                "high": [101.0, 102.0, 104.0],
+                "low": [99.0, 100.0, 102.0],
+                "close": [100.5, 101.75, 103.5],
+                "volume": [1000.0, 1100.0, 1300.0],
+            },
+            index=current_index,
+        )
+
+        audit = market_history_drift(previous, current)
+
+        self.assertTrue(audit["history_comparison_available"])
+        self.assertTrue(audit["historical_data_changed"])
+        self.assertEqual(audit["changed_rows"], 1)
+        self.assertEqual(audit["added_rows"], 1)
+        self.assertEqual(audit["removed_rows"], 1)
+        self.assertEqual(
+            audit["first_changed_timestamp"],
+            "2024-01-03T05:00:00+00:00",
+        )
+        self.assertEqual(
+            audit["last_changed_timestamp"],
+            "2024-01-05T05:00:00+00:00",
+        )
+        self.assertNotEqual(
+            audit["previous_raw_sha256"],
+            audit["raw_sha256"],
+        )
+
+    def test_alpaca_history_drift_is_stable_for_identical_history(self) -> None:
+        index = pd.to_datetime(
+            [
+                "2024-01-02 05:00:00+00:00",
+                "2024-01-03 05:00:00+00:00",
+            ],
+            utc=True,
+        )
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.5, 101.5],
+                "volume": [1000.0, 1100.0],
+            },
+            index=index,
+        )
+
+        audit = market_history_drift(frame, frame.copy())
+
+        self.assertTrue(audit["history_comparison_available"])
+        self.assertFalse(audit["historical_data_changed"])
+        self.assertEqual(audit["changed_rows"], 0)
+        self.assertEqual(audit["added_rows"], 0)
+        self.assertEqual(audit["removed_rows"], 0)
+        self.assertEqual(audit["previous_raw_sha256"], audit["raw_sha256"])
+
     def test_split_normalization_matches_tcc_rule(self) -> None:
         index = pd.to_datetime(
             [
@@ -363,6 +452,19 @@ class RawResearchDataParityTests(unittest.TestCase):
             "dividend_adjustment_applied": False,
             "dividend_events_used_by_model": False,
             "structural_identity_verified": True,
+            "raw_sha256": "raw-current",
+            "raw_audit_sha256": "raw-audit-current",
+            "previous_raw_sha256": "raw-previous",
+            "previous_raw_audit_sha256": "raw-audit-previous",
+            "downloaded_at": "2026-09-24T16:00:00+00:00",
+            "history_audit_source": "alpaca_raw_pre_replace",
+            "history_comparison_available": True,
+            "historical_data_changed": True,
+            "changed_rows": 3,
+            "added_rows": 1,
+            "removed_rows": 0,
+            "first_changed_timestamp": "2024-01-02T00:00:00+00:00",
+            "last_changed_timestamp": "2024-01-04T00:00:00+00:00",
         }
 
         _, manifests = market_data_manifest({"AAA": frame})
@@ -388,6 +490,14 @@ class RawResearchDataParityTests(unittest.TestCase):
         self.assertEqual(manifest["dividend_event_count"], 2)
         self.assertFalse(manifest["dividend_adjustment_applied"])
         self.assertFalse(manifest["dividend_events_used_by_model"])
+        self.assertEqual(manifest["raw_sha256"], "raw-current")
+        self.assertEqual(manifest["previous_raw_sha256"], "raw-previous")
+        self.assertTrue(manifest["history_comparison_available"])
+        self.assertTrue(manifest["historical_data_changed"])
+        self.assertEqual(manifest["changed_rows"], 3)
+        self.assertEqual(manifest["added_rows"], 1)
+        self.assertEqual(manifest["removed_rows"], 0)
+        self.assertEqual(manifest["normalized_sha256"], manifest["sha256"])
 
 
 if __name__ == "__main__":
