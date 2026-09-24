@@ -79,16 +79,29 @@ class StructuralResearchAssetExclusion(RuntimeError):
 
 
 def effective_research_config(config: Any) -> Any:
-    """Return the research-effective config without mutating operational config."""
+    """Return the homologated research config without mutating operational config."""
     protocol = str(
         getattr(config, "research_market_data_protocol", RAW_TOTAL_CAUSAL_PROTOCOL)
         or RAW_TOTAL_CAUSAL_PROTOCOL
     )
     if protocol != RAW_TOTAL_CAUSAL_PROTOCOL:
         return config
-    if str(getattr(config, "alpaca_adjustment", "")).lower() == "raw":
-        return config
-    return config.model_copy(update={"alpaca_adjustment": "raw"})
+
+    settings = dict(getattr(config, "research_model_settings", {}) or {})
+    lightgbm = dict(settings.get("lightgbm") or {})
+    if lightgbm:
+        lightgbm["n_jobs"] = 1
+        lightgbm["early_stopping_enabled"] = False
+        settings["lightgbm"] = lightgbm
+
+    return config.model_copy(
+        update={
+            "alpaca_adjustment": "raw",
+            "deterministic_execution": True,
+            "numeric_thread_limit": 1,
+            "research_model_settings": settings,
+        }
+    )
 
 
 def _request_json(
