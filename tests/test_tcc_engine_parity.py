@@ -183,10 +183,13 @@ class TccEngineParityTests(unittest.TestCase):
         import inspect
 
         from market_cycle_trader_api.engine import research_challengers
+        from market_cycle_trader_api.services import asset_discovery_replay_cache
 
-        source = inspect.getsource(
-            research_challengers._lightgbm_fit_models
+        target = (
+            asset_discovery_replay_cache._ORIGINAL_FIT_MODELS
+            or research_challengers._lightgbm_fit_models
         )
+        source = inspect.getsource(target)
 
         self.assertIn(
             'n_jobs=int(settings["n_jobs"])',
