@@ -1172,7 +1172,7 @@ def _run_lightgbm(
         cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
-    switch_margin_calibration_trace: list[dict[str, Any]] = []
+        switch_margin_calibration_trace: list[dict[str, Any]] = []
         model_fold_diagnostics: list[dict[str, Any]] = []
         inference_cache_profiles: list[dict[str, Any]] = []
         latest_final_models: dict[str, Any] = {}
