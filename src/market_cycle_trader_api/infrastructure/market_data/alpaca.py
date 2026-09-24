@@ -138,6 +138,7 @@ def download_stock_bars(
     end: str | datetime | pd.Timestamp | None,
     feed: str,
     adjustment: str,
+    limit: int | None = None,
 ) -> pd.DataFrame:
     Adjustment, DataFeed, StockHistoricalDataClient, StockBarsRequest, TimeFrame, TimeFrameUnit = _require_alpaca()
 
@@ -147,14 +148,17 @@ def download_stock_bars(
         raise RuntimeError("Alpaca API credentials are not configured.")
 
     client = StockHistoricalDataClient(api_key_id, secret_key)
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=_timeframe_value(timeframe),
-        start=_utc_datetime(start),
-        end=_utc_datetime(end),
-        feed=_feed_value(feed),
-        adjustment=_adjustment_value(adjustment),
-    )
+    request_kwargs = {
+        "symbol_or_symbols": symbol,
+        "timeframe": _timeframe_value(timeframe),
+        "start": _utc_datetime(start),
+        "end": _utc_datetime(end),
+        "feed": _feed_value(feed),
+        "adjustment": _adjustment_value(adjustment),
+    }
+    if limit is not None:
+        request_kwargs["limit"] = int(limit)
+    request = StockBarsRequest(**request_kwargs)
     last_error: Exception | None = None
     for attempt in range(3):
         try:
