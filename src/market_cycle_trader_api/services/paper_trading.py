@@ -290,10 +290,29 @@ def refresh_trader_live_market_data(
                 cutoff=str(refreshed["live_market_cutoff"]),
                 source=source,
             )
+            history_audit = dict(
+                refreshed.get("history_audit_by_symbol") or {}
+            )
             db[STRATEGY_CONTROL_COLLECTION].update_one(
                 {"_id": "default"},
                 {
-                    "$set": {"live_market_refresh_last_success_at": utc_now()},
+                    "$set": {
+                        "live_market_refresh_last_success_at": utc_now(),
+                        "live_market_full_history_refresh": bool(
+                            refreshed.get("full_daily_history_refresh", False)
+                        ),
+                        "live_market_history_audit": bson_value(history_audit),
+                        "live_market_history_compared_asset_count": int(
+                            refreshed.get("history_compared_asset_count") or 0
+                        ),
+                        "live_market_history_changed_asset_count": int(
+                            refreshed.get("history_changed_asset_count") or 0
+                        ),
+                        "live_market_history_changed_assets": list(
+                            refreshed.get("history_changed_assets") or []
+                        ),
+                        "live_market_history_audit_at": utc_now(),
+                    },
                     "$unset": {
                         "live_market_refresh_next_retry_at": "",
                         "live_market_refresh_last_error": "",
