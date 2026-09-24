@@ -292,6 +292,13 @@ def market_data_manifest(
             "initial_rows": provenance.get("initial_rows"),
             "history_backfill_provider": provenance.get("history_backfill_provider"),
             "history_backfill_rows": provenance.get("history_backfill_rows"),
+            "research_access_path": provenance.get("research_access_path"),
+            "research_market_data_refresh_mode": provenance.get(
+                "research_market_data_refresh_mode"
+            ),
+            "full_refresh_performed": provenance.get(
+                "full_refresh_performed"
+            ),
             "requested_start": provenance.get("requested_start"),
             "actual_start": provenance.get("actual_start"),
             "research_market_data_protocol": provenance.get(
