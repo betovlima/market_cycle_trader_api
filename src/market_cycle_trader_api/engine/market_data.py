@@ -734,10 +734,57 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             name="uq_alpaca_market_bar",
         )
         identity = _market_data_identity(symbol, config)
-        first = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", 1)])
+        first = collection.find_one(
+            identity,
+            {"timestamp": 1, "_id": 0},
+            sort=[("timestamp", 1)],
+        )
         bootstrapped_rows = 0
+        full_refresh_performed = False
+        refresh_mode = str(
+            getattr(config, "research_market_data_refresh_mode", "reuse")
+        )
+        protocol = str(
+            getattr(config, "research_market_data_protocol", "")
+        )
+        force_full_refresh = bool(
+            allow_bootstrap
+            and refresh_mode == "full"
+            and protocol == "raw_total_causal_v1"
+        )
 
-        if first is None:
+        if force_full_refresh:
+            downloaded = _download_alpaca_bars(
+                symbol,
+                config,
+                config.start_date,
+                execution_end,
+            )
+            if downloaded is None or downloaded.empty:
+                raise RuntimeError(
+                    f"MarketDataFullRefreshFailed: Alpaca returned no full RAW "
+                    f"history for {symbol}."
+                )
+            time_filter: dict[str, Any] = {
+                "$gte": start.to_pydatetime(),
+            }
+            if end is not None:
+                time_filter["$lt"] = end.to_pydatetime()
+            collection.delete_many(
+                {
+                    **identity,
+                    "timestamp": time_filter,
+                }
+            )
+            _upsert_frame(
+                collection,
+                downloaded,
+                identity,
+                config.mongo_write_batch_size,
+            )
+            bootstrapped_rows = int(len(downloaded))
+            full_refresh_performed = True
+        elif first is None:
             if not allow_bootstrap:
                 raise RuntimeError(
                     f"MarketDataMissingInMongoDB: {symbol} has no cached {config.timeframe} "
@@ -809,14 +856,20 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         )
         provenance = dict(result.attrs.get("market_data_provenance", {}))
         provenance["research_access_path"] = (
-            "alpaca_refresh_then_mongodb"
-            if bootstrapped_rows and first is not None
+            "alpaca_full_refresh_then_mongodb"
+            if full_refresh_performed
             else (
-                "alpaca_bootstrap_then_mongodb"
-                if bootstrapped_rows
-                else "mongodb_only"
+                "alpaca_refresh_then_mongodb"
+                if bootstrapped_rows and first is not None
+                else (
+                    "alpaca_bootstrap_then_mongodb"
+                    if bootstrapped_rows
+                    else "mongodb_only"
+                )
             )
         )
+        provenance["research_market_data_refresh_mode"] = refresh_mode
+        provenance["full_refresh_performed"] = bool(full_refresh_performed)
         provenance["cache_bootstrap_rows"] = int(bootstrapped_rows)
         provenance["requested_end"] = normalize_end_date(execution_end)
         provenance["end_complete"] = _end_is_complete(result, config)
@@ -826,7 +879,7 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             raise RuntimeError(
                 f"MarketDataIncomplete: MongoDB market data for {symbol} ends at {last}; "
                 f"the frozen research cutoff is {provenance.get('requested_end')}. "
-                "Existing cached assets are never refreshed from Alpaca by a backtest or tuning run."
+                "The requested research refresh did not produce complete market data."
             )
         return result
     finally:
