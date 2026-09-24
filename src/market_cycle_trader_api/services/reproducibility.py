@@ -277,7 +277,31 @@ def market_data_manifest(
         provenance = dict(frame.attrs.get("market_data_provenance", {}))
         manifests[symbol] = {
             "sha256": digest,
+            "normalized_sha256": digest,
             "audit_sha256": audit_digest,
+            "raw_sha256": provenance.get("raw_sha256"),
+            "raw_audit_sha256": provenance.get("raw_audit_sha256"),
+            "previous_raw_sha256": provenance.get("previous_raw_sha256"),
+            "previous_raw_audit_sha256": provenance.get(
+                "previous_raw_audit_sha256"
+            ),
+            "downloaded_at": provenance.get("downloaded_at"),
+            "history_audit_source": provenance.get("history_audit_source"),
+            "history_comparison_available": provenance.get(
+                "history_comparison_available"
+            ),
+            "historical_data_changed": provenance.get(
+                "historical_data_changed"
+            ),
+            "changed_rows": int(provenance.get("changed_rows") or 0),
+            "added_rows": int(provenance.get("added_rows") or 0),
+            "removed_rows": int(provenance.get("removed_rows") or 0),
+            "first_changed_timestamp": provenance.get(
+                "first_changed_timestamp"
+            ),
+            "last_changed_timestamp": provenance.get(
+                "last_changed_timestamp"
+            ),
             "rows": int(len(canonical)),
             "first_timestamp": _series_timestamp(canonical.index.min()) if len(canonical) else None,
             "last_timestamp": _series_timestamp(canonical.index.max()) if len(canonical) else None,
@@ -364,6 +388,21 @@ def build_reproducibility_manifest(
         for symbol, item in data_manifests.items()
         if int(item.get("history_backfill_rows") or 0) > 0
     ]
+    history_compared_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if bool(item.get("history_comparison_available", False))
+    ]
+    history_changed_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if item.get("historical_data_changed") is True
+    ]
+    history_comparison_unavailable_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if not bool(item.get("history_comparison_available", False))
+    ]
     assets = list(getattr(config, "assets", []) or [])
     configured_reference_assets = list(
         getattr(config, "research_reference_assets", []) or []
@@ -399,6 +438,17 @@ def build_reproducibility_manifest(
         "market_data_history_complete": not incomplete_assets,
         "market_data_incomplete_assets": incomplete_assets,
         "market_data_backfilled_assets": backfilled_assets,
+        "market_data_history_compared_assets": history_compared_assets,
+        "market_data_history_compared_asset_count": int(
+            len(history_compared_assets)
+        ),
+        "market_data_history_changed_assets": history_changed_assets,
+        "market_data_history_changed_asset_count": int(
+            len(history_changed_assets)
+        ),
+        "market_data_history_comparison_unavailable_assets": (
+            history_comparison_unavailable_assets
+        ),
         "research_reference_assets": reference_assets,
         "research_candidate_assets": candidate_assets,
         "runtime_versions": versions,
