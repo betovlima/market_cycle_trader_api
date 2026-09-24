@@ -1197,6 +1197,7 @@ def _run_lightgbm(
             candidate_margins = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
             best_candidate = candidate_margins[0]
             best_score = float("-inf")
+            calibration_candidate_scores: list[dict[str, float]] = []
             margin_config = (
                 rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
                 if selective_opportunity_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)
@@ -1217,6 +1218,12 @@ def _run_lightgbm(
                     symbols,
                     calibration_dates,
                     rep_config,
+                )
+                calibration_candidate_scores.append(
+                    {
+                        "margin": float(candidate),
+                        "risk_adjusted_score": float(score),
+                    }
                 )
                 if score > best_score:
                     best_score = score
@@ -1475,6 +1482,29 @@ def _run_lightgbm(
                 "calibrated_candidate_margin": float(best_candidate),
                 "effective_switch_margin": float(effective_margin),
                 "calibration_risk_adjusted_score": float(best_score),
+                "calibration_candidate_scores": list(
+                    calibration_candidate_scores
+                ),
+                "calibration_score_gap_best_vs_second": (
+                    float(
+                        sorted(
+                            (
+                                item["risk_adjusted_score"]
+                                for item in calibration_candidate_scores
+                            ),
+                            reverse=True,
+                        )[0]
+                        - sorted(
+                            (
+                                item["risk_adjusted_score"]
+                                for item in calibration_candidate_scores
+                            ),
+                            reverse=True,
+                        )[1]
+                    )
+                    if len(calibration_candidate_scores) > 1
+                    else None
+                ),
             }
             if absolute_utility_cash_gate_enabled(rep_config):
                 margin_detail.update({
