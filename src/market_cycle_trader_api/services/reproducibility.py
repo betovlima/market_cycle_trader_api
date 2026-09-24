@@ -299,6 +299,18 @@ def market_data_manifest(
             "full_refresh_performed": provenance.get(
                 "full_refresh_performed"
             ),
+            "research_bar_loader": provenance.get(
+                "research_bar_loader"
+            ),
+            "research_bar_request_limit": provenance.get(
+                "research_bar_request_limit"
+            ),
+            "research_bar_end_mode": provenance.get(
+                "research_bar_end_mode"
+            ),
+            "research_bar_chunking": provenance.get(
+                "research_bar_chunking"
+            ),
             "requested_start": provenance.get("requested_start"),
             "actual_start": provenance.get("actual_start"),
             "research_market_data_protocol": provenance.get(
