@@ -458,8 +458,8 @@ def run_job(
             ),
             "dividend_adjustment_applied": False,
             "dividend_events_used_by_model": False,
-            "split_normalization_direction": "event_date_forward",
-            "split_normalization_uses_future_events": False,
+            "split_normalization_direction": "pre_ex_date_history",
+            "split_normalization_uses_future_events": True,
         }
     )
 
@@ -530,8 +530,7 @@ def run_job(
             f"{reproducibility['total_splits_applied']}\n"
         )
         result.summary += (
-            "Split normalization: event-date forward; "
-            "future events do not rewrite past rows\n"
+            "Split normalization: homologated TCC main pre-ex-date history\n"
         )
         result.summary += (
             "Dividend events: "
