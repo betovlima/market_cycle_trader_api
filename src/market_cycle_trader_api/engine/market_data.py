@@ -401,31 +401,117 @@ def refresh_market_data_to_live_cutoff(
             name="uq_alpaca_market_bar",
         )
 
+        full_daily_history_refresh = str(config.timeframe) == "1Day"
+        history_audit_by_symbol: dict[str, dict[str, Any]] = {}
+
         for symbol in assets:
             identity = _market_data_identity(symbol, config)
-            latest = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", -1)])
+
+            if full_daily_history_refresh:
+                start = pd.Timestamp(str(config.start_date), tz="UTC")
+                end = inclusive_end_exclusive_boundary(target_date)
+                previous_cached = _read_frame(
+                    collection,
+                    identity,
+                    start,
+                    end,
+                )
+                downloaded_at = datetime.now(timezone.utc).isoformat()
+                downloaded = _download_alpaca_bars(
+                    symbol,
+                    config,
+                    str(config.start_date),
+                    target_date,
+                    single_request_daily=True,
+                )
+                if downloaded is None or downloaded.empty:
+                    raise RuntimeError(
+                        "LiveMarketDataFullRefreshFailed: Alpaca returned no "
+                        f"daily history for {symbol}."
+                    )
+
+                audit = market_history_drift(previous_cached, downloaded)
+                audit.update(
+                    {
+                        "downloaded_at": downloaded_at,
+                        "history_audit_source": "alpaca_live_full_history_pre_replace",
+                        "rows": int(len(downloaded)),
+                        "first_timestamp": _timestamp_iso(downloaded.index.min()),
+                        "last_timestamp": _timestamp_iso(downloaded.index.max()),
+                    }
+                )
+                history_audit_by_symbol[symbol] = audit
+
+                time_filter: dict[str, Any] = {
+                    "$gte": start.to_pydatetime(),
+                }
+                if end is not None:
+                    time_filter["$lt"] = end.to_pydatetime()
+                collection.delete_many(
+                    {
+                        **identity,
+                        "timestamp": time_filter,
+                    }
+                )
+                _upsert_frame(
+                    collection,
+                    downloaded,
+                    identity,
+                    config.mongo_write_batch_size,
+                )
+                rows_by_symbol[symbol] = int(len(downloaded))
+                continue
+
+            latest = collection.find_one(
+                identity,
+                {"timestamp": 1, "_id": 0},
+                sort=[("timestamp", -1)],
+            )
             latest_session = None
             if latest and latest.get("timestamp") is not None:
                 latest_stamp = _utc_timestamp(latest["timestamp"])
                 latest_session = pd.Timestamp(
-                    calendar.date_to_session(pd.Timestamp(latest_stamp.date()), direction="previous")
+                    calendar.date_to_session(
+                        pd.Timestamp(latest_stamp.date()),
+                        direction="previous",
+                    )
                 )
-            if latest_session is not None and latest_session >= target and _cache_has_session(collection, identity, target):
+            if (
+                latest_session is not None
+                and latest_session >= target
+                and _cache_has_session(collection, identity, target)
+            ):
                 rows_by_symbol[symbol] = 0
                 continue
 
             if latest_session is None:
-                refresh_start = str(getattr(config, "start_date", None) or target_date)
+                refresh_start = str(
+                    getattr(config, "start_date", None) or target_date
+                )
             else:
-                # Re-fetch a small tail so the latest daily bar can be safely replaced
-                # if the provider revised it after the first observation.
+                # Intraday/non-daily fallback remains incremental.
                 refresh_start = max(
-                    pd.Timestamp(str(getattr(config, "start_date", None) or latest_session.date().isoformat())),
+                    pd.Timestamp(
+                        str(
+                            getattr(config, "start_date", None)
+                            or latest_session.date().isoformat()
+                        )
+                    ),
                     latest_session - pd.Timedelta(days=7),
                 ).date().isoformat()
-            downloaded = _download_alpaca_bars(symbol, config, refresh_start, target_date)
+            downloaded = _download_alpaca_bars(
+                symbol,
+                config,
+                refresh_start,
+                target_date,
+            )
             if downloaded is not None and not downloaded.empty:
-                _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
+                _upsert_frame(
+                    collection,
+                    downloaded,
+                    identity,
+                    config.mongo_write_batch_size,
+                )
                 rows_by_symbol[symbol] = int(len(downloaded))
             else:
                 rows_by_symbol[symbol] = 0
@@ -448,11 +534,30 @@ def refresh_market_data_to_live_cutoff(
     finally:
         client.close()
 
+    history_audit_by_symbol = locals().get(
+        "history_audit_by_symbol",
+        {},
+    )
+    history_changed_assets = sorted(
+        symbol
+        for symbol, audit in history_audit_by_symbol.items()
+        if audit.get("historical_data_changed") is True
+    )
+    history_compared_assets = sorted(
+        symbol
+        for symbol, audit in history_audit_by_symbol.items()
+        if bool(audit.get("history_comparison_available", False))
+    )
     return {
         "live_market_cutoff": target_date,
         "target_session": target_date,
         "rows_refreshed": rows_by_symbol,
         "data_delay_minutes": SAFE_DAILY_BAR_DELAY_MINUTES,
+        "full_daily_history_refresh": str(config.timeframe) == "1Day",
+        "history_audit_by_symbol": history_audit_by_symbol,
+        "history_compared_asset_count": int(len(history_compared_assets)),
+        "history_changed_asset_count": int(len(history_changed_assets)),
+        "history_changed_assets": history_changed_assets,
     }
 
 
@@ -716,6 +821,8 @@ def _download_alpaca_bars(
     config: Any,
     start_date: str,
     end_date: str | None,
+    *,
+    single_request_daily: bool = False,
 ) -> pd.DataFrame:
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
@@ -734,10 +841,16 @@ def _download_alpaca_bars(
         and protocol == "raw_total_causal_v1"
         and refresh_mode == "full"
     )
+    use_single_daily_request = bool(
+        config.timeframe == "1Day"
+        and (exact_tcc_loader or single_request_daily)
+    )
 
-    if exact_tcc_loader:
-        # Match the homologated TCC loader exactly:
-        # one request per symbol, RAW/SIP, UTC start, cutoff + 1 day, limit 10k.
+    if use_single_daily_request:
+        # Daily history remains below Alpaca's 10k limit for the supported
+        # research/operational windows. One request guarantees that a live
+        # refresh observes the provider's current full historical series.
+        # The research path preserves the exact homologated TCC request shape.
         api_end = (
             pd.Timestamp(normalized_end, tz="UTC")
             + pd.Timedelta(days=1)
@@ -762,9 +875,15 @@ def _download_alpaca_bars(
             config.timeframe,
         )
         provenance = dict(getattr(result, "attrs", {}) or {})
+        loader_name = (
+            "tcc_single_request_v1"
+            if exact_tcc_loader
+            else "alpaca_current_daily_single_request_v1"
+        )
         provenance.update(
             {
-                "research_bar_loader": "tcc_single_request_v1",
+                "market_bar_loader": loader_name,
+                "research_bar_loader": loader_name,
                 "research_bar_request_limit": 10_000,
                 "research_bar_end_mode": "cutoff_plus_one_day_utc",
                 "research_bar_chunking": False,
