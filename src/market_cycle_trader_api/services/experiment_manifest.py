@@ -21,7 +21,7 @@ def build_experiment_manifest(
         else (job.get("request") or {})
     )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "api_version": API_VERSION,
         "job_id": job.get("id"),
         "job_status": job.get("status"),
@@ -44,8 +44,26 @@ def build_experiment_manifest(
         "research_candidate_assets": job.get("research_candidate_assets") or metrics.get("research_candidate_assets") or [],
         "execution_calendar_anchor_assets": request.get("calendar_anchor_assets") or [],
         "market_data_signature_sha256": metrics.get("market_data_signature_sha256"),
+        "market_data_audit_signature_sha256": metrics.get(
+            "market_data_audit_signature_sha256"
+        ),
         "market_data_signatures": metrics.get("market_data_signatures") or {},
         "market_data_history_complete": metrics.get("market_data_history_complete"),
+        "market_data_history_compared_assets": metrics.get(
+            "market_data_history_compared_assets"
+        ) or [],
+        "market_data_history_compared_asset_count": metrics.get(
+            "market_data_history_compared_asset_count"
+        ),
+        "market_data_history_changed_assets": metrics.get(
+            "market_data_history_changed_assets"
+        ) or [],
+        "market_data_history_changed_asset_count": metrics.get(
+            "market_data_history_changed_asset_count"
+        ),
+        "market_data_history_comparison_unavailable_assets": metrics.get(
+            "market_data_history_comparison_unavailable_assets"
+        ) or [],
         "research_market_data_protocol": metrics.get("research_market_data_protocol"),
         "research_source_adjustment": metrics.get("research_source_adjustment"),
         "configured_asset_count": metrics.get("configured_asset_count"),
