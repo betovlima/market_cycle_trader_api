@@ -17,6 +17,7 @@ from market_cycle_trader_api.engine.capital_rotation import (
 )
 from market_cycle_trader_api.engine.research_challengers import (
     _soft_horizon_consensus_settings,
+    _switch_margin_calibration_trace,
 )
 
 
@@ -198,6 +199,51 @@ class TccEngineParityTests(unittest.TestCase):
         self.assertNotIn(
             '_effective_n_jobs(int(settings["n_jobs"]))',
             source,
+        )
+
+    def test_switch_margin_calibration_trace_is_diagnostic_only(self) -> None:
+        index = pd.to_datetime(
+            [
+                "2020-01-02T05:00:00Z",
+                "2020-01-03T05:00:00Z",
+                "2020-01-06T05:00:00Z",
+            ],
+            utc=True,
+        )
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 103.0],
+                "close": [100.5, 102.0, 104.0],
+            },
+            index=index,
+        )
+        config = SimpleNamespace(
+            slippage_bps=0.0,
+            commission_rate=0.0,
+            rotation_downside_penalty=0.20,
+            rotation_drawdown_penalty=0.35,
+        )
+
+        score, rows = _switch_margin_calibration_trace(
+            lambda timestamp, position, holding: (1, 0.42),
+            {"AAA": frame},
+            ["AAA"],
+            index,
+            config,
+            fold_id=1,
+            candidate_margin=0.01,
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["fold_id"], 1)
+        self.assertEqual(rows[0]["candidate_margin"], 0.01)
+        self.assertEqual(rows[0]["from_asset"], "CASH")
+        self.assertEqual(rows[0]["to_asset"], "AAA")
+        self.assertTrue(rows[0]["position_changed"])
+        self.assertAlmostEqual(
+            score,
+            rows[-1]["cumulative_risk_adjusted_score"],
+            places=15,
         )
 
     def test_soft_horizon_consensus_is_opt_in(self) -> None:
