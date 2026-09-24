@@ -90,15 +90,14 @@ def effective_research_config(config: Any) -> Any:
     settings = dict(getattr(config, "research_model_settings", {}) or {})
     lightgbm = dict(settings.get("lightgbm") or {})
     if lightgbm:
-        lightgbm["n_jobs"] = 1
+        lightgbm["n_jobs"] = -1
         lightgbm["early_stopping_enabled"] = False
         settings["lightgbm"] = lightgbm
 
     return config.model_copy(
         update={
             "alpaca_adjustment": "raw",
-            "deterministic_execution": True,
-            "numeric_thread_limit": 1,
+            "deterministic_execution": False,
             "research_model_settings": settings,
             "research_market_data_refresh_mode": "full",
         }
