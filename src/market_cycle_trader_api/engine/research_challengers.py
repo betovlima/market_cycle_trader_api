@@ -1682,6 +1682,11 @@ def _run_lightgbm(
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
+                "lightgbm_effective_n_jobs": int(
+                    _lightgbm_settings(rep_config)["n_jobs"]
+                ),
+                "lightgbm_thread_override_ignored": True,
+                "lightgbm_thread_contract": "tcc_snapshot_exact",
                 "latest_research_tree": latest_tree,
             }
         )
