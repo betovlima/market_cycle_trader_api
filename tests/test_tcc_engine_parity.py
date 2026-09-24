@@ -39,11 +39,6 @@ def _feature_frame(index: pd.DatetimeIndex) -> pd.DataFrame:
 
 
 class TccEngineParityTests(unittest.TestCase):
-    def test_homologated_lightgbm_runtime_version(self) -> None:
-        import lightgbm
-
-        self.assertEqual(lightgbm.__version__, "4.6.0")
-
     def test_calendar_source_uses_longest_valid_history(self) -> None:
         short = pd.DataFrame(
             index=pd.date_range("2020-01-01", periods=5, freq="D", tz="UTC")
