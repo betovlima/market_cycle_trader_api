@@ -22,6 +22,9 @@ from market_cycle_trader_api.services.reproducibility import (
 class _Config:
     alpaca_adjustment: str = "all"
     research_market_data_protocol: str = RAW_TOTAL_CAUSAL_PROTOCOL
+    deterministic_execution: bool = False
+    numeric_thread_limit: int = 8
+    research_model_settings: dict[str, object] | None = None
 
     def model_copy(self, *, update: dict[str, object]):
         return replace(self, **update)
