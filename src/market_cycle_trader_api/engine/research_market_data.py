@@ -454,6 +454,13 @@ def load_research_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             "effective_adjustment": "raw_plus_causal_split_normalization",
             "corporate_action_source": "alpaca",
             "corporate_action_count": int(len(actions)),
+            "corporate_actions_refresh_mode": str(
+                getattr(
+                    raw_config,
+                    "research_market_data_refresh_mode",
+                    "reuse",
+                )
+            ),
             "splits_applied": int(len(applied)),
             "split_events": applied,
             "split_normalization_direction": "pre_ex_date_history",
