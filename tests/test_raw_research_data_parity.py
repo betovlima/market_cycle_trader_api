@@ -26,6 +26,8 @@ from market_cycle_trader_api.services.reproducibility import (
 @dataclass(frozen=True)
 class _Config:
     alpaca_adjustment: str = "all"
+    alpaca_historical_feed: str = "sip"
+    timeframe: str = "1Day"
     research_market_data_protocol: str = RAW_TOTAL_CAUSAL_PROTOCOL
     deterministic_execution: bool = False
     numeric_thread_limit: int = 8
@@ -226,6 +228,66 @@ class RawResearchDataParityTests(unittest.TestCase):
         self.assertEqual(
             frame.attrs["research_bar_loader"],
             "tcc_single_request_v1",
+        )
+        self.assertFalse(frame.attrs["research_bar_chunking"])
+
+    def test_operational_daily_refresh_uses_one_full_history_request(self) -> None:
+        config = _Config(
+            alpaca_adjustment="all",
+            research_market_data_protocol="legacy_adjusted",
+            research_market_data_refresh_mode="reuse",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_download_stock_bars(**kwargs):
+            captured.update(kwargs)
+            index = pd.to_datetime(
+                [
+                    "2016-01-04 05:00:00+00:00",
+                    "2026-09-17 04:00:00+00:00",
+                ],
+                utc=True,
+            )
+            return pd.DataFrame(
+                {
+                    "open": [100.0, 110.0],
+                    "high": [101.0, 111.0],
+                    "low": [99.0, 109.0],
+                    "close": [100.5, 110.5],
+                    "volume": [1000.0, 1100.0],
+                },
+                index=index,
+            )
+
+        with patch(
+            "market_cycle_trader_api.engine.market_data.get_alpaca_credentials",
+            return_value={"api_key_id": "k", "secret_key": "s"},
+        ), patch(
+            "market_cycle_trader_api.engine.market_data.download_stock_bars",
+            side_effect=fake_download_stock_bars,
+        ):
+            frame = _download_alpaca_bars(
+                "AAPL",
+                config,
+                "2016-01-01",
+                "2026-09-17",
+                single_request_daily=True,
+            )
+
+        self.assertEqual(captured["limit"], 10_000)
+        self.assertEqual(captured["feed"], "sip")
+        self.assertEqual(captured["adjustment"], "all")
+        self.assertEqual(
+            pd.Timestamp(captured["start"]),
+            pd.Timestamp("2016-01-01 00:00:00+00:00"),
+        )
+        self.assertEqual(
+            pd.Timestamp(captured["end"]),
+            pd.Timestamp("2026-09-18 00:00:00+00:00"),
+        )
+        self.assertEqual(
+            frame.attrs["market_bar_loader"],
+            "alpaca_current_daily_single_request_v1",
         )
         self.assertFalse(frame.attrs["research_bar_chunking"])
 
