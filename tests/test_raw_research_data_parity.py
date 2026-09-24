@@ -25,6 +25,7 @@ class _Config:
     deterministic_execution: bool = False
     numeric_thread_limit: int = 8
     research_model_settings: dict[str, object] | None = None
+    research_market_data_refresh_mode: str = "reuse"
 
     def model_copy(self, *, update: dict[str, object]):
         return replace(self, **update)
@@ -47,6 +48,10 @@ class RawResearchDataParityTests(unittest.TestCase):
         self.assertEqual(
             effective.research_market_data_protocol,
             RAW_TOTAL_CAUSAL_PROTOCOL,
+        )
+        self.assertEqual(
+            effective.research_market_data_refresh_mode,
+            "full",
         )
 
     def test_real_request_forces_homologated_deterministic_lightgbm(self) -> None:
@@ -76,6 +81,10 @@ class RawResearchDataParityTests(unittest.TestCase):
         effective = effective_research_config(request)
 
         self.assertTrue(effective.deterministic_execution)
+        self.assertEqual(
+            effective.research_market_data_refresh_mode,
+            "full",
+        )
         self.assertEqual(effective.numeric_thread_limit, 1)
         self.assertEqual(
             effective.research_model_settings["lightgbm"]["n_jobs"],
