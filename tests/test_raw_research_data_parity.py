@@ -78,17 +78,17 @@ class RawResearchDataParityTests(unittest.TestCase):
         normalized, applied = split_normalize(frame, actions)
 
         self.assertEqual(len(applied), 1)
-        self.assertAlmostEqual(normalized.iloc[0]["open"], 400.0)
-        self.assertAlmostEqual(normalized.iloc[0]["close"], 402.0)
-        self.assertAlmostEqual(normalized.iloc[0]["volume"], 1_000.0)
-        self.assertAlmostEqual(normalized.iloc[1]["open"], 400.0)
-        self.assertAlmostEqual(normalized.iloc[1]["close"], 408.0)
-        self.assertAlmostEqual(normalized.iloc[1]["volume"], 1_000.0)
-        self.assertAlmostEqual(normalized.iloc[2]["open"], 420.0)
-        self.assertAlmostEqual(normalized.iloc[2]["volume"], 1_250.0)
+        self.assertAlmostEqual(normalized.iloc[0]["open"], 100.0)
+        self.assertAlmostEqual(normalized.iloc[0]["close"], 100.5)
+        self.assertAlmostEqual(normalized.iloc[0]["volume"], 4_000.0)
+        self.assertAlmostEqual(normalized.iloc[1]["open"], 100.0)
+        self.assertAlmostEqual(normalized.iloc[1]["close"], 102.0)
+        self.assertAlmostEqual(normalized.iloc[1]["volume"], 4_000.0)
+        self.assertAlmostEqual(normalized.iloc[2]["open"], 105.0)
+        self.assertAlmostEqual(normalized.iloc[2]["volume"], 5_000.0)
         self.assertEqual(
             applied[0]["normalization_direction"],
-            "event_date_forward",
+            "pre_ex_date_history",
         )
 
     def test_dividend_does_not_adjust_model_ohlcv(self) -> None:
@@ -184,8 +184,8 @@ class RawResearchDataParityTests(unittest.TestCase):
             "effective_adjustment": "raw_plus_causal_split_normalization",
             "corporate_action_count": 3,
             "splits_applied": 1,
-            "split_normalization_direction": "event_date_forward",
-            "split_normalization_uses_future_events": False,
+            "split_normalization_direction": "pre_ex_date_history",
+            "split_normalization_uses_future_events": True,
             "dividend_event_count": 2,
             "dividend_adjustment_applied": False,
             "dividend_events_used_by_model": False,
@@ -207,9 +207,9 @@ class RawResearchDataParityTests(unittest.TestCase):
         self.assertEqual(manifest["corporate_action_count"], 3)
         self.assertEqual(
             manifest["split_normalization_direction"],
-            "event_date_forward",
+            "pre_ex_date_history",
         )
-        self.assertFalse(
+        self.assertTrue(
             manifest["split_normalization_uses_future_events"]
         )
         self.assertEqual(manifest["dividend_event_count"], 2)
