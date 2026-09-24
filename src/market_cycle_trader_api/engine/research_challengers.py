@@ -83,6 +83,95 @@ def _lightgbm_settings(config: Any) -> dict[str, Any]:
     return resolved
 
 
+def _switch_margin_calibration_trace(
+    policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    decision_dates: pd.DatetimeIndex,
+    config: Any,
+    *,
+    fold_id: int,
+    candidate_margin: float,
+) -> tuple[float, list[dict[str, Any]]]:
+    """Replay one calibration candidate without affecting candidate selection."""
+    if len(decision_dates) < 2:
+        return float("-inf"), []
+
+    wealth = 1.0
+    peak = 1.0
+    position = 0
+    holding = 0
+    cumulative_score = 0.0
+    rows: list[dict[str, Any]] = []
+
+    for step in range(len(decision_dates) - 1):
+        now = pd.Timestamp(decision_dates[step])
+        nxt = pd.Timestamp(decision_dates[step + 1])
+        from_position = int(position)
+        holding_before = int(holding)
+        action, policy_score = policy(now, position, holding)
+        action = int(action)
+
+        log_return = _training_transition_log_return(
+            frames,
+            symbols,
+            now,
+            nxt,
+            from_position,
+            action,
+            config,
+        )
+        reward, wealth_after, peak_after = _risk_adjusted_reward(
+            log_return,
+            wealth,
+            peak,
+            config,
+        )
+        cumulative_score += float(reward)
+
+        rows.append(
+            {
+                "fold_id": int(fold_id),
+                "candidate_margin": float(candidate_margin),
+                "step": int(step),
+                "decision_date": now,
+                "next_date": nxt,
+                "from_position": from_position,
+                "from_asset": (
+                    symbols[from_position - 1]
+                    if from_position > 0
+                    else "CASH"
+                ),
+                "to_position": action,
+                "to_asset": (
+                    symbols[action - 1]
+                    if action > 0
+                    else "CASH"
+                ),
+                "holding_days_before": holding_before,
+                "policy_score": float(policy_score),
+                "log_return": float(log_return),
+                "risk_adjusted_reward": float(reward),
+                "cumulative_risk_adjusted_score": float(cumulative_score),
+                "wealth_before": float(wealth),
+                "wealth_after": float(wealth_after),
+                "peak_before": float(peak),
+                "peak_after": float(peak_after),
+                "position_changed": bool(action != from_position),
+            }
+        )
+
+        wealth = float(wealth_after)
+        peak = float(peak_after)
+        if action == from_position:
+            holding = holding + 1 if action > 0 else 0
+        else:
+            position = action
+            holding = 1 if action > 0 else 0
+
+    return float(cumulative_score), rows
+
+
 def _build_execution_context(
     bars_by_symbol: dict[str, pd.DataFrame],
     config: Any,
@@ -1083,6 +1172,7 @@ def _run_lightgbm(
         cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
+    switch_margin_calibration_trace: list[dict[str, Any]] = []
         model_fold_diagnostics: list[dict[str, Any]] = []
         inference_cache_profiles: list[dict[str, Any]] = []
         latest_final_models: dict[str, Any] = {}
@@ -1194,6 +1284,7 @@ def _run_lightgbm(
             best_candidate = candidate_margins[0]
             best_score = float("-inf")
             calibration_candidate_scores: list[dict[str, float]] = []
+            calibration_trace_rows: list[dict[str, Any]] = []
             margin_config = (
                 rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
                 if selective_opportunity_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)
@@ -1215,10 +1306,30 @@ def _run_lightgbm(
                     calibration_dates,
                     rep_config,
                 )
+                trace_policy = _utility_policy(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    margin_config,
+                    candidate,
+                    cash_edge_models=calibration_cash_edge_models,
+                )
+                trace_score, trace_rows = _switch_margin_calibration_trace(
+                    trace_policy,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    rep_config,
+                    fold_id=fold_id,
+                    candidate_margin=float(candidate),
+                )
+                calibration_trace_rows.extend(trace_rows)
                 calibration_candidate_scores.append(
                     {
                         "margin": float(candidate),
                         "risk_adjusted_score": float(score),
+                        "audit_trace_score": float(trace_score),
+                        "audit_score_delta": float(trace_score - score),
                     }
                 )
                 if score > best_score:
@@ -1464,6 +1575,15 @@ def _run_lightgbm(
                     )
                 else:
                     policies[fold_id] = base_policy
+            selected_trace_rows = [
+                row
+                for row in calibration_trace_rows
+                if abs(
+                    float(row.get("candidate_margin") or 0.0)
+                    - float(best_candidate)
+                )
+                < 1e-15
+            ]
             margin_detail = {
                 "fold_id": fold_id,
                 "soft_horizon_consensus_enabled": bool(soft["enabled"]),
@@ -1501,7 +1621,24 @@ def _run_lightgbm(
                     if len(calibration_candidate_scores) > 1
                     else None
                 ),
+                "calibration_start": (
+                    pd.Timestamp(calibration_dates[0])
+                    if len(calibration_dates)
+                    else None
+                ),
+                "calibration_end": (
+                    pd.Timestamp(calibration_dates[-1])
+                    if len(calibration_dates)
+                    else None
+                ),
+                "calibration_session_count": int(len(calibration_dates)),
+                "selected_candidate_trace_rows": int(
+                    len(selected_trace_rows)
+                ),
             }
+            switch_margin_calibration_trace.extend(
+                calibration_trace_rows
+            )
             if absolute_utility_cash_gate_enabled(rep_config):
                 margin_detail.update({
                     "absolute_utility_entry_threshold": float(rep_config.opportunity_utility_entry_threshold),
@@ -1688,6 +1825,14 @@ def _run_lightgbm(
                 "lightgbm_thread_override_ignored": True,
                 "lightgbm_thread_contract": "tcc_snapshot_exact",
                 "latest_research_tree": latest_tree,
+                "switch_margin_calibration_trace_schema_version": 1,
+                "switch_margin_calibration_trace_rows": int(
+                    len(switch_margin_calibration_trace)
+                ),
+                "switch_margin_calibration_trace": [
+                    dict(row)
+                    for row in switch_margin_calibration_trace
+                ],
             }
         )
         margin_by_fold = {item["fold_id"]: item for item in margin_details}
