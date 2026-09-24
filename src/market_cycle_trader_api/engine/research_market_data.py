@@ -100,6 +100,7 @@ def effective_research_config(config: Any) -> Any:
             "deterministic_execution": True,
             "numeric_thread_limit": 1,
             "research_model_settings": settings,
+            "research_market_data_refresh_mode": "full",
         }
     )
 
@@ -256,7 +257,16 @@ def _load_research_corporate_actions(
             {"symbol": normalized, "protocol": protocol},
             {"_id": 0},
         )
-        if cached is not None:
+        access_mode = str(
+            getattr(config, "research_market_data_mode", "database_only")
+        )
+        refresh_mode = str(
+            getattr(config, "research_market_data_refresh_mode", "reuse")
+        )
+        if cached is not None and (
+            access_mode != "backtest_bootstrap_missing"
+            or refresh_mode != "full"
+        ):
             cached_end = str(cached.get("query_end") or "")
             if cached_end and cached_end >= target_end:
                 return [
@@ -265,9 +275,6 @@ def _load_research_corporate_actions(
                     if isinstance(item, dict)
                 ]
 
-        access_mode = str(
-            getattr(config, "research_market_data_mode", "database_only")
-        )
         if access_mode != "backtest_bootstrap_missing":
             raise RuntimeError(
                 "CorporateActionsMissingInMongoDB: RAW total-causal research "
