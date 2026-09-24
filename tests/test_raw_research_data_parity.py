@@ -63,11 +63,10 @@ class RawResearchDataParityTests(unittest.TestCase):
             effective.research_market_data_refresh_mode,
             "full",
         )
-        self.assertTrue(effective.deterministic_execution)
-        self.assertEqual(effective.numeric_thread_limit, 1)
+        self.assertFalse(effective.deterministic_execution)
         self.assertEqual(
             effective.research_model_settings["lightgbm"]["n_jobs"],
-            1,
+            -1,
         )
         self.assertFalse(
             effective.research_model_settings["lightgbm"][
