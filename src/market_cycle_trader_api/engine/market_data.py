@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import hashlib
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,136 @@ from ..infrastructure.persistence.mongo_repository import (
 
 BAR_COLUMNS = ("open", "high", "low", "close", "volume", "vwap", "trade_count")
 REQUIRED_BAR_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def _canonical_history_frame(
+    frame: pd.DataFrame | None,
+    *,
+    columns: tuple[str, ...] = REQUIRED_BAR_COLUMNS,
+) -> pd.DataFrame:
+    """Canonicalize provider bars for content hashing and drift comparison."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=list(columns))
+
+    available = [column for column in columns if column in frame.columns]
+    canonical = frame[available].copy()
+    canonical.index = pd.to_datetime(canonical.index, utc=True, errors="coerce")
+    canonical = canonical.loc[~canonical.index.isna()]
+    canonical = canonical[~canonical.index.duplicated(keep="last")].sort_index()
+    try:
+        canonical.index = canonical.index.as_unit("ns")
+    except AttributeError:
+        canonical.index = pd.DatetimeIndex(
+            canonical.index.to_numpy(dtype="datetime64[ns]"),
+            tz="UTC",
+        )
+    for column in available:
+        canonical[column] = pd.to_numeric(
+            canonical[column],
+            errors="coerce",
+        ).astype(np.float64, copy=False)
+    return canonical
+
+
+def _history_frame_sha256(
+    frame: pd.DataFrame | None,
+    *,
+    columns: tuple[str, ...] = REQUIRED_BAR_COLUMNS,
+) -> str:
+    canonical = _canonical_history_frame(frame, columns=columns)
+    row_hashes = pd.util.hash_pandas_object(
+        canonical,
+        index=True,
+    ).to_numpy(dtype=np.uint64, copy=False)
+    return hashlib.sha256(row_hashes.tobytes()).hexdigest()
+
+
+def _timestamp_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    stamp = pd.Timestamp(value)
+    if pd.isna(stamp):
+        return None
+    stamp = (
+        stamp.tz_localize("UTC")
+        if stamp.tzinfo is None
+        else stamp.tz_convert("UTC")
+    )
+    return stamp.isoformat()
+
+
+def market_history_drift(
+    previous: pd.DataFrame | None,
+    current: pd.DataFrame | None,
+) -> dict[str, Any]:
+    """Describe model-input RAW drift between two Alpaca history snapshots.
+
+    Comparison is intentionally exact for the OHLCV values consumed by the
+    research engine. vwap/trade_count receive separate audit hashes but do not
+    affect historical_data_changed.
+    """
+    previous_model = _canonical_history_frame(previous)
+    current_model = _canonical_history_frame(current)
+    comparison_available = not previous_model.empty
+
+    previous_raw_sha256 = (
+        _history_frame_sha256(previous_model)
+        if comparison_available
+        else None
+    )
+    raw_sha256 = _history_frame_sha256(current_model)
+    previous_audit_sha256 = (
+        _history_frame_sha256(previous, columns=BAR_COLUMNS)
+        if comparison_available
+        else None
+    )
+    raw_audit_sha256 = _history_frame_sha256(current, columns=BAR_COLUMNS)
+
+    added_index = current_model.index.difference(previous_model.index)
+    removed_index = previous_model.index.difference(current_model.index)
+    changed_index = pd.DatetimeIndex([], tz="UTC")
+
+    if comparison_available:
+        shared_index = previous_model.index.intersection(current_model.index)
+        shared_columns = [
+            column
+            for column in REQUIRED_BAR_COLUMNS
+            if column in previous_model.columns and column in current_model.columns
+        ]
+        if len(shared_index) and shared_columns:
+            old_values = previous_model.loc[shared_index, shared_columns]
+            new_values = current_model.loc[shared_index, shared_columns]
+            equal = old_values.eq(new_values) | (
+                old_values.isna() & new_values.isna()
+            )
+            changed_index = pd.DatetimeIndex(
+                shared_index[~equal.all(axis=1)],
+            )
+
+    divergent = added_index.union(removed_index).union(changed_index)
+    historical_data_changed: bool | None = None
+    if comparison_available:
+        historical_data_changed = bool(
+            previous_raw_sha256 != raw_sha256
+        )
+
+    return {
+        "history_comparison_available": comparison_available,
+        "previous_raw_sha256": previous_raw_sha256,
+        "raw_sha256": raw_sha256,
+        "previous_raw_audit_sha256": previous_audit_sha256,
+        "raw_audit_sha256": raw_audit_sha256,
+        "historical_data_changed": historical_data_changed,
+        "changed_rows": int(len(changed_index)),
+        "added_rows": int(len(added_index)) if comparison_available else 0,
+        "removed_rows": int(len(removed_index)) if comparison_available else 0,
+        "first_changed_timestamp": (
+            _timestamp_iso(divergent.min()) if len(divergent) else None
+        ),
+        "last_changed_timestamp": (
+            _timestamp_iso(divergent.max()) if len(divergent) else None
+        ),
+    }
 
 
 def effective_execution_end_date(config: Any) -> str | None:
@@ -807,6 +938,13 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         )
 
         if force_full_refresh:
+            downloaded_at = datetime.now(timezone.utc).isoformat()
+            previous_cached = _read_frame(
+                collection,
+                identity,
+                start,
+                end,
+            )
             downloaded = _download_alpaca_bars(
                 symbol,
                 config,
@@ -820,6 +958,13 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
                 )
             refresh_download_provenance = dict(
                 getattr(downloaded, "attrs", {}) or {}
+            )
+            refresh_download_provenance.update(
+                market_history_drift(previous_cached, downloaded)
+            )
+            refresh_download_provenance["downloaded_at"] = downloaded_at
+            refresh_download_provenance["history_audit_source"] = (
+                "alpaca_raw_pre_replace"
             )
             time_filter: dict[str, Any] = {
                 "$gte": start.to_pydatetime(),
