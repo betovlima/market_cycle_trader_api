@@ -18,6 +18,7 @@ AlpacaAdjustment = Literal["raw", "split", "dividend", "all"]
 HistoryBackfillProvider = Literal["alpaca"]
 ResearchMarketDataMode = Literal["backtest_bootstrap_missing", "database_only"]
 ResearchMarketDataProtocol = Literal["raw_total_causal_v1", "legacy_adjusted"]
+ResearchMarketDataRefreshMode = Literal["full", "reuse"]
 RotationModel = Literal["xgboost_utility"]
 RotationAccelerator = Literal["auto", "cpu", "cuda"]
 
@@ -267,6 +268,7 @@ class BacktestExecutionRequest(BacktestRequest):
     research_model_settings: dict[str, object] = Field(default_factory=dict)
     research_market_data_mode: ResearchMarketDataMode = "database_only"
     research_market_data_protocol: ResearchMarketDataProtocol = "raw_total_causal_v1"
+    research_market_data_refresh_mode: ResearchMarketDataRefreshMode = "full"
     expected_market_data_signature_sha256: str | None = None
     research_market_data_snapshot_id: str | None = None
     walk_forward_fold_count_override: int | None = Field(default=None, ge=2)
