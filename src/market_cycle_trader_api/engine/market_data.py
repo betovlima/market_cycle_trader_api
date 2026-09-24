@@ -586,23 +586,72 @@ def _download_alpaca_bars(
     start_date: str,
     end_date: str | None,
 ) -> pd.DataFrame:
-    
-
-
-
-
-
-
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
     normalized_end = normalize_end_date(end_date)
     if normalized_end is None:
         normalized_end = latest_completed_xnys_session().date().isoformat()
+
+    protocol = str(
+        getattr(config, "research_market_data_protocol", "")
+    )
+    refresh_mode = str(
+        getattr(config, "research_market_data_refresh_mode", "reuse")
+    )
+    exact_tcc_loader = bool(
+        config.timeframe == "1Day"
+        and protocol == "raw_total_causal_v1"
+        and refresh_mode == "full"
+    )
+
+    if exact_tcc_loader:
+        # Match the homologated TCC loader exactly:
+        # one request per symbol, RAW/SIP, UTC start, cutoff + 1 day, limit 10k.
+        api_end = (
+            pd.Timestamp(normalized_end, tz="UTC")
+            + pd.Timedelta(days=1)
+        ).to_pydatetime()
+        frame = download_stock_bars(
+            api_key_id=credentials["api_key_id"],
+            secret_key=credentials["secret_key"],
+            symbol=symbol,
+            timeframe=config.timeframe,
+            start=requested_start.to_pydatetime(),
+            end=api_end,
+            feed=config.alpaca_historical_feed,
+            adjustment=config.alpaca_adjustment,
+            limit=10_000,
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        result = trim_downloaded_range(
+            frame,
+            start_date,
+            end_date,
+            config.timeframe,
+        )
+        provenance = dict(getattr(result, "attrs", {}) or {})
+        provenance.update(
+            {
+                "research_bar_loader": "tcc_single_request_v1",
+                "research_bar_request_limit": 10_000,
+                "research_bar_end_mode": "cutoff_plus_one_day_utc",
+                "research_bar_chunking": False,
+            }
+        )
+        result.attrs.update(provenance)
+        return result
+
     calendar = xcals.get_calendar("XNYS")
     session = pd.Timestamp(
-        calendar.date_to_session(pd.Timestamp(normalized_end), direction="previous")
+        calendar.date_to_session(
+            pd.Timestamp(normalized_end),
+            direction="previous",
+        )
     )
-    requested_end = pd.Timestamp(calendar.session_close(session)).tz_convert("UTC")
+    requested_end = pd.Timestamp(
+        calendar.session_close(session)
+    ).tz_convert("UTC")
     if requested_end <= requested_start:
         return pd.DataFrame()
 
@@ -614,7 +663,10 @@ def _download_alpaca_bars(
     frames: list[pd.DataFrame] = []
     cursor = requested_start
     while cursor < requested_end:
-        chunk_end = min(cursor + pd.Timedelta(days=chunk_days), requested_end)
+        chunk_end = min(
+            cursor + pd.Timedelta(days=chunk_days),
+            requested_end,
+        )
         frame = download_stock_bars(
             api_key_id=credentials["api_key_id"],
             secret_key=credentials["secret_key"],
@@ -741,6 +793,7 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         )
         bootstrapped_rows = 0
         full_refresh_performed = False
+        refresh_download_provenance: dict[str, Any] = {}
         refresh_mode = str(
             getattr(config, "research_market_data_refresh_mode", "reuse")
         )
@@ -765,6 +818,9 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
                     f"MarketDataFullRefreshFailed: Alpaca returned no full RAW "
                     f"history for {symbol}."
                 )
+            refresh_download_provenance = dict(
+                getattr(downloaded, "attrs", {}) or {}
+            )
             time_filter: dict[str, Any] = {
                 "$gte": start.to_pydatetime(),
             }
@@ -870,6 +926,7 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         )
         provenance["research_market_data_refresh_mode"] = refresh_mode
         provenance["full_refresh_performed"] = bool(full_refresh_performed)
+        provenance.update(refresh_download_provenance)
         provenance["cache_bootstrap_rows"] = int(bootstrapped_rows)
         provenance["requested_end"] = normalize_end_date(execution_end)
         provenance["end_complete"] = _end_is_complete(result, config)
