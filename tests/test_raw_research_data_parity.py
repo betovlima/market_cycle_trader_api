@@ -46,6 +46,44 @@ class RawResearchDataParityTests(unittest.TestCase):
             RAW_TOTAL_CAUSAL_PROTOCOL,
         )
 
+    def test_real_request_forces_homologated_deterministic_lightgbm(self) -> None:
+        request = BacktestExecutionRequest(
+            assets=["AAPL", "MSFT"],
+            deterministic_execution=False,
+            numeric_thread_limit=8,
+            research_model_settings={
+                "lightgbm": {
+                    "n_estimators": 329,
+                    "learning_rate": 0.020731,
+                    "max_depth": 3,
+                    "num_leaves": 6,
+                    "min_child_samples": 18,
+                    "min_child_weight": 5.0,
+                    "subsample": 0.85,
+                    "subsample_freq": 0,
+                    "colsample_bytree": 0.88067,
+                    "reg_alpha": 0.050837,
+                    "reg_lambda": 3.596305,
+                    "max_bin": 255,
+                    "n_jobs": -1,
+                }
+            },
+        )
+
+        effective = effective_research_config(request)
+
+        self.assertTrue(effective.deterministic_execution)
+        self.assertEqual(effective.numeric_thread_limit, 1)
+        self.assertEqual(
+            effective.research_model_settings["lightgbm"]["n_jobs"],
+            1,
+        )
+        self.assertFalse(
+            effective.research_model_settings["lightgbm"][
+                "early_stopping_enabled"
+            ]
+        )
+
     def test_split_normalization_matches_tcc_rule(self) -> None:
         index = pd.to_datetime(
             [
