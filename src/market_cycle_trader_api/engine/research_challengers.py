@@ -506,7 +506,11 @@ def _lightgbm_fit_models(
             reg_lambda=float(settings["reg_lambda"]),
             max_bin=int(settings["max_bin"]),
             random_state=int(config.random_state),
-            n_jobs=_effective_n_jobs(int(settings["n_jobs"])),
+            n_jobs=(
+                1
+                if bool(config.deterministic_execution)
+                else _effective_n_jobs(int(settings["n_jobs"]))
+            ),
             device_type="cpu",
             deterministic=bool(config.deterministic_execution),
             force_col_wise=bool(config.deterministic_execution),
