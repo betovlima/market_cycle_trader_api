@@ -179,6 +179,24 @@ class TccEngineParityTests(unittest.TestCase):
             )
             np.testing.assert_allclose(cached, direct)
 
+    def test_lightgbm_uses_snapshot_n_jobs_without_environment_override(self) -> None:
+        import inspect
+
+        from market_cycle_trader_api.engine import research_challengers
+
+        source = inspect.getsource(
+            research_challengers._lightgbm_fit_models
+        )
+
+        self.assertIn(
+            'n_jobs=int(settings["n_jobs"])',
+            source,
+        )
+        self.assertNotIn(
+            '_effective_n_jobs(int(settings["n_jobs"]))',
+            source,
+        )
+
     def test_soft_horizon_consensus_is_opt_in(self) -> None:
         base = SimpleNamespace(
             rotation_target_horizons=(5, 10, 20),
