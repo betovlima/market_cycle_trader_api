@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -32,6 +36,26 @@ class Fold1CalibrationParityTests(unittest.TestCase):
     def test_mismatched_dimension(self):
         result = _status_pair(np.ones((3, 2)), np.ones((3, 3)))
         self.assertEqual(result["status"], "SHAPE_MISMATCH")
+
+    def test_direct_script_help_without_repository_on_pythonpath(self):
+        root = Path(__file__).resolve().parents[1]
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(root / "src")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(root / "scripts" / "audit_tcc_v106_fold1_calibration_parity.py"),
+                "--help",
+            ],
+            cwd=root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--input-audit-zip", completed.stdout)
 
     def test_mongo_env_initialized_early(self):
         from pathlib import Path
