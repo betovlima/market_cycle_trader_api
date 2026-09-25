@@ -343,6 +343,14 @@ def split_normalize(
     """Replicate the split normalization used by the homologated TCC main."""
     result = raw.copy()
     source_attrs = dict(getattr(raw, "attrs", {}))
+    # A 3:2 split, for example, converts an integral pre-split volume into
+    # a fractional value. Keep OHLCV as float64 before assignments to avoid
+    # pandas >= 2 rejecting a float write into an inferred int64 column.
+    # This preserves values already stored as float64 in the Mongo RAW cache.
+    for column in ("open", "high", "low", "close", "volume"):
+        result[column] = pd.to_numeric(
+            result[column], errors="coerce"
+        ).astype("float64")
     session_dates = pd.DatetimeIndex(result.index).tz_convert("UTC").normalize()
     applied: list[dict[str, Any]] = []
 
