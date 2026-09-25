@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -143,6 +144,47 @@ class TCCFrozenInputTests(unittest.TestCase):
             )
             with self.assertRaises(StructuralResearchAssetExclusion):
                 load_frozen_tcc_main_symbol(root, "DOC", manifest)
+
+    def test_reference_runner_uses_frozen_loader_only_when_opted_in(self):
+        from market_cycle_trader_api.engine import tcc_v106_reference_backtest as job
+        from market_cycle_trader_api.tcc_v106_reference.config import (
+            ASSETS as REFERENCE_ASSETS,
+        )
+        config = SimpleNamespace(
+            assets=list(REFERENCE_ASSETS),
+            start_date="2016-01-01",
+            analysis_end_date="2026-09-17",
+            end_date="2026-09-17",
+            calendar_anchor_assets=(),
+        )
+
+        def frozen_loader(root, symbol, manifest):
+            if symbol == "DOC":
+                raise StructuralResearchAssetExclusion({
+                    "symbol": symbol, "action_type": "stock_merger",
+                    "acquirer_symbol": "NEXT",
+                })
+            return pd.DataFrame({
+                "open": [1.0], "high": [1.0], "low": [1.0],
+                "close": [1.0], "volume": [1.0],
+            }, index=pd.to_datetime(["2020-01-02"], utc=True))
+
+        with (
+            patch.object(job, "effective_research_config", return_value=config),
+            patch.object(job, "selected_tcc_reference_input_source", return_value=FROZEN_SOURCE),
+            patch.object(job, "frozen_tcc_root_from_environment", return_value=Path("/unused")),
+            patch.object(job, "validate_frozen_tcc_main", return_value={"assets": list(REFERENCE_ASSETS)}) as verify,
+            patch.object(job, "load_frozen_tcc_main_symbol", side_effect=frozen_loader) as frozen,
+            patch.object(job, "load_research_market_bars") as operational,
+            patch.object(job, "validate_and_clean_bars", side_effect=lambda bars, _: bars),
+            patch.object(job, "emit_progress"),
+        ):
+            frames, exclusions, _ = job._load_mct_market_frames(config)
+            self.assertEqual(len(frames), 55)
+            self.assertEqual([row["symbol"] for row in exclusions], ["DOC"])
+            self.assertEqual(frozen.call_count, 56)
+            verify.assert_called_once()
+            operational.assert_not_called()
 
     def test_default_split_normalizer_handles_inferred_integer_volume(self):
         index = pd.to_datetime(["2020-01-02", "2020-01-06"], utc=True)
