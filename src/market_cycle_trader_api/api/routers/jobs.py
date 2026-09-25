@@ -19,7 +19,12 @@ from ...infrastructure.persistence.mongo_repository import (
 )
 from ...schemas.requests import BacktestExecutionRequest
 from ...engine.market_data import resolve_backtest_analysis_end_date
-from ...services.jobs import public_job, require_job, run_job
+from ...services.jobs import (
+    TCC_V106_REFERENCE_ENGINE_MODULE,
+    public_job,
+    require_job,
+    run_job,
+)
 from ...services.system_settings import apply_training_runtime_settings, get_system_settings
 from ...services.strategy_lab import (
     get_research_reference_context,
@@ -192,8 +197,20 @@ def queue_backtest_job(
     request_payload = request.model_dump(mode="python")
     payload = bson_value(request_payload)
     lifecycle = strategy_lifecycle(payload["strategy_mode"])
-    total_runs = int(payload["rotation_xgb_repetitions"])
-    research_label = model_label(research_model_family)
+    engine_binding = str(
+        selected_strategy.get("backtest_engine_binding") or ""
+    ).strip()
+    is_tcc_v106_reference = engine_binding == "tcc_v106_reference"
+    total_runs = (
+        2
+        if is_tcc_v106_reference
+        else int(payload["rotation_xgb_repetitions"])
+    )
+    research_label = (
+        "TCC v1.0.6 Control + Soft Horizon Consensus"
+        if is_tcc_v106_reference
+        else model_label(research_model_family)
+    )
     model_snapshot = selected_model_snapshot
     job = {
         "id": job_id,
@@ -242,6 +259,32 @@ def queue_backtest_job(
         "tuning_candidate_id": tuning_candidate_id,
         "runtime_thread_limit": max(1, int(runtime_thread_limit)) if runtime_thread_limit else None,
         "execution_worker_id": str(execution_worker_id or "").strip() or None,
+        "backtest_engine_binding": engine_binding or None,
+        "engine_module_override": (
+            TCC_V106_REFERENCE_ENGINE_MODULE
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_engine_id": (
+            selected_strategy.get("reference_engine_id")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_source_repository": (
+            selected_strategy.get("reference_source_repository")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_source_tag": (
+            selected_strategy.get("reference_source_tag")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_source_commit": (
+            selected_strategy.get("reference_source_commit")
+            if is_tcc_v106_reference
+            else None
+        ),
     }
     db[JOBS_COLLECTION].insert_one(job)
     if start_thread:
