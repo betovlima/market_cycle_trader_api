@@ -11,6 +11,21 @@ from scripts.audit_tcc_v106_fold1_data_parity import (
 
 
 class FrozenTccDataAuditTests(unittest.TestCase):
+    def test_environment_is_loaded_before_mongo_import(self) -> None:
+        """Mongo connection settings are cached by mongo_repository on import."""
+        from pathlib import Path
+
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "audit_tcc_v106_fold1_data_parity.py"
+        ).read_text(encoding="utf-8")
+        setup = script.index("load_project_environment()")
+        dependent_import = script.index(
+            "from market_cycle_trader_api.engine.market_data import"
+        )
+        self.assertLess(setup, dependent_import)
+
     def test_reference_hash_is_locked(self) -> None:
         self.assertEqual(
             TCC_FROZEN_MANIFEST_SHA,
