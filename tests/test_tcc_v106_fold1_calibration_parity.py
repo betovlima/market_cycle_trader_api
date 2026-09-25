@@ -1,17 +1,61 @@
 from __future__ import annotations
 
 import unittest
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from zipfile import ZipFile
 
 import numpy as np
 
-from scripts.audit_tcc_v106_fold1_calibration_parity import _status_pair
+from scripts.audit_tcc_v106_fold1_calibration_parity import (
+    _load_completed_audit_report,
+    _status_pair,
+)
 
 
 class Fold1CalibrationParityTests(unittest.TestCase):
+    def test_generated_root_level_report_is_accepted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "generated_audit.zip"
+            with ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "report.json", json.dumps({
+                        "audit_status": "COMPLETED",
+                        "fully_audited_assets": 55,
+                    })
+                )
+            report = _load_completed_audit_report(path)
+        self.assertEqual(report["audit_status"], "COMPLETED")
+        self.assertEqual(report["fully_audited_assets"], 55)
+
+    def test_folder_prefixed_report_is_accepted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "folder_archive.zip"
+            with ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "output/tcc_v106_fold1_parity_audit/report.json",
+                    '{"audit_status": "COMPLETED"}',
+                )
+            report = _load_completed_audit_report(path)
+        self.assertEqual(report["audit_status"], "COMPLETED")
+
+    def test_missing_or_duplicate_report_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bad_audit.zip"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("summary.csv", "symbol,status\\n")
+            with self.assertRaisesRegex(ValueError, "exactly one report.json"):
+                _load_completed_audit_report(path)
+            with ZipFile(path, "w") as archive:
+                archive.writestr("report.json", "{}")
+                archive.writestr("nested/report.json", "{}")
+            with self.assertRaisesRegex(ValueError, "exactly one report.json"):
+                _load_completed_audit_report(path)
+
     def test_exact_match(self):
         x = np.array([[0.0, 0.4, -np.inf], [0.0, np.nan, 0.3]])
         result = _status_pair(x, x.copy())
