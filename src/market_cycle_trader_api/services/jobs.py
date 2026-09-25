@@ -131,6 +131,8 @@ PUBLIC_JOB_FIELDS = frozenset({
     "strategy_profile_name",
     "strategy_profile_revision",
     "strategy_configuration_hash",
+    "backtest_engine_binding",
+    "reference_engine_id",
     "progress_detail",
 })
 
