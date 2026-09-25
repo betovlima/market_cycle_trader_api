@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from ...auth.security import SessionIdentity, require_admin_session
 
 from ...core.runtime import database
 from ...infrastructure.persistence.mongo_repository import (
@@ -15,11 +17,21 @@ from ...services.jobs import (
     public_job,
     run_job,
 )
-from ...services.strategy_lab import get_research_strategy_context
+from ...services.strategy_lab import (
+    StrategyLabConflict,
+    StrategyLabError,
+    StrategyLabNotFound,
+    get_research_strategy_context,
+    get_research_strategy_model_snapshot,
+)
+from ...services.tcc_v106_reference_strategy import (
+    install_tcc_v106_research_strategy,
+)
 from ...tcc_v106_reference.config import ASSETS as TCC_V106_ASSETS
 from .jobs import queue_backtest_job
 
 router = APIRouter(prefix="/api/research/tcc-v106", tags=["tcc-v106-reference"])
+AdminIdentity = Annotated[SessionIdentity, Depends(require_admin_session)]
 
 SOURCE_REPOSITORY = "betovlima/tcc_mba_usp_data_science_analytics"
 SOURCE_TAG = "v1.0.6"
@@ -46,6 +58,26 @@ def get_reference_engine() -> dict[str, Any]:
     }
 
 
+@router.post("/strategy")
+def install_reference_strategy(
+    identity: AdminIdentity,
+) -> dict[str, Any]:
+    """Create/reuse the TCC reference Strategy and select it for Research."""
+    try:
+        return install_tcc_v106_research_strategy(
+            database(),
+            actor_email=identity.email,
+        )
+    except StrategyLabConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except StrategyLabNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StrategyLabError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/jobs", status_code=202)
 def create_reference_job() -> dict[str, Any]:
     db = database()
@@ -68,14 +100,13 @@ def create_reference_job() -> dict[str, Any]:
             ),
         )
 
-    if str(selected_configuration.strategy_mode) != (
-        "COMPOUND_ROTATION_SWING_LIGHTGBM"
-    ):
+    selected_model = get_research_strategy_model_snapshot(db)
+    if str(selected_model.get("family") or "") != "lightgbm_utility":
         raise HTTPException(
             status_code=409,
             detail=(
-                "Select the LightGBM compound-rotation Strategy before "
-                "starting the TCC v1.0.6 reference API."
+                "Select a LightGBM Utility Strategy before starting the "
+                "TCC v1.0.6 reference API."
             ),
         )
 
