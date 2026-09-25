@@ -468,6 +468,14 @@ def audit(
     report = {
         "schema_version": 1,
         "audit": "tcc_v106_fold1_parity_read_only",
+        "audit_status": (
+            "INCOMPLETE" if errors or stale_assets else "COMPLETED"
+        ),
+        "fully_audited_assets": len({
+            row["symbol"] for row in summaries
+            if row["stage"] == "fold1_features_targets"
+        }),
+        "requested_eligible_assets": len(symbols),
         "tcc_source_commit": TCC_SOURCE_COMMIT,
         "tcc_source_engine_tag": TCC_SOURCE_ENGINE,
         "tcc_snapshot_sha256": TCC_FROZEN_MANIFEST_SHA,
@@ -535,6 +543,9 @@ def main() -> None:
             ),
             "mct_stale_assets": result["mct_stale_assets"],
             "stage_status_counts": result["stage_status_counts"],
+            "audit_status": result["audit_status"],
+            "fully_audited_assets": result["fully_audited_assets"],
+            "requested_eligible_assets": result["requested_eligible_assets"],
             "errors": result["errors"],
         }, ensure_ascii=False, indent=2,
     ))
