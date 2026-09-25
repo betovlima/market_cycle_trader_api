@@ -28,6 +28,7 @@ from .tcc_frozen_reference_source import (
     FROZEN_SOURCE,
     FROZEN_TCC_END,
     FROZEN_TCC_MAIN_SHA256,
+    FROZEN_TCC_MAIN_COMMIT,
     FROZEN_TCC_START,
     frozen_tcc_root_from_environment,
     load_frozen_tcc_main_symbol,
@@ -368,6 +369,9 @@ def run_reference_job(
         "input_source": input_source,
         "tcc_frozen_snapshot_sha256": (
             FROZEN_TCC_MAIN_SHA256 if frozen_tcc_used else None
+        ),
+        "tcc_frozen_snapshot_source_commit": (
+            FROZEN_TCC_MAIN_COMMIT if frozen_tcc_used else None
         ),
         "structural_exclusions": deepcopy(exclusions),
         "eligible_asset_count": int(len(frames)),
