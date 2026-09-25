@@ -20,6 +20,12 @@ import numpy as np
 import pandas as pd
 
 from market_cycle_trader_api.core.environment import load_project_environment
+
+# mongo_repository resolves MONGO_URI/MONGO_DATABASE at import time.
+# Load the same local environment as the API BEFORE importing engine modules,
+# which import mongo_repository transitively.
+load_project_environment()
+
 from market_cycle_trader_api.engine.market_data import (
     REQUIRED_BAR_COLUMNS,
     _history_frame_sha256,
@@ -276,7 +282,7 @@ def audit(
     start = pd.Timestamp("2016-01-01", tz="UTC")
     end = inclusive_end_exclusive_boundary(CUTOFF)
 
-    load_project_environment()
+    # Environment was initialized before mongo_repository was imported above.
     client = create_client()
     try:
         db = get_database(client)
