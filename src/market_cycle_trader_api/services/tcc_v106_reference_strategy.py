@@ -276,6 +276,14 @@ def install_tcc_v106_research_strategy(
             "$set": {
                 "backtest_engine_binding": TCC_V106_BACKTEST_ENGINE_BINDING,
                 "reference_engine_id": REFERENCE_ENGINE_ID,
+                "description": (
+                    "TCC v1.0.6 frozen reference engine "
+                    f"({SOURCE_COMMIT[:12]})"
+                ),
+                "source_git_commit_message": (
+                    "TCC v1.0.6 frozen reference engine "
+                    f"({SOURCE_COMMIT[:12]})"
+                ),
                 "reference_source_repository": SOURCE_REPOSITORY,
                 "reference_source_tag": SOURCE_TAG,
                 "reference_source_commit": SOURCE_COMMIT,
