@@ -11,6 +11,7 @@ from ..schemas.model_research import LightGBMResearchSettings
 from ..schemas.requests import BacktestRequest
 from ..tcc_v106_reference.config import (
     CONFIG as TCC_V106_CONFIG,
+    REFERENCE_ASSETS as TCC_V106_REFERENCE_ASSETS,
     build_control_config,
 )
 from .strategy_lab import (
@@ -275,6 +276,11 @@ def install_tcc_v106_research_strategy(
         {
             "$set": {
                 "backtest_engine_binding": TCC_V106_BACKTEST_ENGINE_BINDING,
+                "strategy_kind": "standard",
+                "tuning_target": "model_strategy",
+                "research_reference_assets": list(
+                    TCC_V106_REFERENCE_ASSETS
+                ),
                 "reference_engine_id": REFERENCE_ENGINE_ID,
                 "description": (
                     "TCC v1.0.6 frozen reference engine "
@@ -292,7 +298,20 @@ def install_tcc_v106_research_strategy(
                 "reference_strategy_installed_at": now,
                 "reference_strategy_installed_by": actor,
                 "updated_at": now,
-            }
+            },
+            "$unset": {
+                "source_temporal_run_id": "",
+                "source_temporal_experiment": "",
+                "temporal_strategy_variant": "",
+                "source_stateful_replay_id": "",
+                "source_stateful_processing_id": "",
+                "stateful_candidate_key": "",
+                "stateful_candidate_label": "",
+                "temporal_policy_revision": "",
+                "temporal_policy_snapshot": "",
+                "derived_policy_invalidated_at": "",
+                "derived_policy_invalidated_reason": "",
+            },
         },
     )
 
