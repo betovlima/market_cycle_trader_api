@@ -24,6 +24,16 @@ from ..infrastructure.persistence.mongo_repository import (
 from ..schemas.requests import BacktestExecutionRequest
 from ..services.reproducibility import build_reproducibility_manifest
 from .market_data import validate_and_clean_bars
+from .tcc_frozen_reference_source import (
+    FROZEN_SOURCE,
+    FROZEN_TCC_END,
+    FROZEN_TCC_MAIN_SHA256,
+    FROZEN_TCC_START,
+    frozen_tcc_root_from_environment,
+    load_frozen_tcc_main_symbol,
+    selected_tcc_reference_input_source,
+    validate_frozen_tcc_main,
+)
 from .research_market_data import (
     StructuralResearchAssetExclusion,
     effective_research_config,
@@ -132,6 +142,24 @@ def _load_mct_market_frames(
             f"missing={missing or 'none'} extra={extra or 'none'}"
         )
 
+    source = selected_tcc_reference_input_source()
+    frozen_root = None
+    frozen_manifest = None
+    if source == FROZEN_SOURCE:
+        if (
+            str(effective_config.start_date) != FROZEN_TCC_START
+            or str(effective_config.analysis_end_date or effective_config.end_date)
+            != FROZEN_TCC_END
+        ):
+            raise ValueError(
+                "Frozen TCC reference input requires exactly the pinned "
+                "2016-01-01 through 2026-09-17 research window."
+            )
+        frozen_root = frozen_tcc_root_from_environment()
+        frozen_manifest = validate_frozen_tcc_main(
+            frozen_root, assets=expected_assets,
+        )
+
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     exclusions: list[dict[str, Any]] = []
     anchors = set(effective_config.calendar_anchor_assets)
@@ -150,7 +178,12 @@ def _load_mct_market_frames(
                     update={"market_data_require_complete_history": False}
                 )
             )
-            raw = load_research_market_bars(symbol, asset_config)
+            if frozen_manifest is not None and frozen_root is not None:
+                raw = load_frozen_tcc_main_symbol(
+                    frozen_root, symbol, frozen_manifest,
+                )
+            else:
+                raw = load_research_market_bars(symbol, asset_config)
             bars_by_symbol[symbol] = validate_and_clean_bars(raw, asset_config)
         except StructuralResearchAssetExclusion as exc:
             exclusions.append(dict(exc.details))
@@ -317,15 +350,25 @@ def run_reference_job(
         effective_mct_config,
         frames,
     )
+    input_source = selected_tcc_reference_input_source()
+    frozen_tcc_used = input_source == FROZEN_SOURCE
+    data_contract = (
+        "pinned-tcc-main-raw-csv+tcc-v1.0.6-engine"
+        if frozen_tcc_used else DATA_CONTRACT
+    )
     provenance = {
         "reference_engine_id": REFERENCE_ENGINE_ID,
         "reference_source_repository": TCC_SOURCE_REPOSITORY,
         "reference_source_tag": TCC_SOURCE_TAG,
         "reference_source_commit": TCC_SOURCE_COMMIT,
         "reference_engine_code": "verbatim-vendored-copy",
-        "data_contract": DATA_CONTRACT,
-        "mct_data_transport_only": True,
-        "tcc_frozen_snapshot_used": False,
+        "data_contract": data_contract,
+        "mct_data_transport_only": not frozen_tcc_used,
+        "tcc_frozen_snapshot_used": frozen_tcc_used,
+        "input_source": input_source,
+        "tcc_frozen_snapshot_sha256": (
+            FROZEN_TCC_MAIN_SHA256 if frozen_tcc_used else None
+        ),
         "structural_exclusions": deepcopy(exclusions),
         "eligible_asset_count": int(len(frames)),
         "configured_asset_count": int(len(TCC_V106_ASSETS)),
@@ -356,8 +399,8 @@ def run_reference_job(
         "\n\nTCC V1.0.6 REFERENCE API\n"
         f"Source tag: {TCC_SOURCE_TAG}\n"
         f"Source commit: {TCC_SOURCE_COMMIT}\n"
-        f"Data contract: {DATA_CONTRACT}\n"
-        "TCC frozen snapshot used: false\n"
+        f"Data contract: {data_contract}\n"
+        f"TCC frozen snapshot used: {str(frozen_tcc_used).lower()}\n"
     )
 
     emit_progress(54.0, "Running TCC v1.0.6 Soft Horizon Consensus")
@@ -379,8 +422,8 @@ def run_reference_job(
         "\n\nTCC V1.0.6 REFERENCE API\n"
         f"Source tag: {TCC_SOURCE_TAG}\n"
         f"Source commit: {TCC_SOURCE_COMMIT}\n"
-        f"Data contract: {DATA_CONTRACT}\n"
-        "TCC frozen snapshot used: false\n"
+        f"Data contract: {data_contract}\n"
+        f"TCC frozen snapshot used: {str(frozen_tcc_used).lower()}\n"
     )
 
     batch_size = int(effective_mct_config.mongo_write_batch_size)
