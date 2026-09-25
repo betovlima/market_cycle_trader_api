@@ -138,11 +138,6 @@ class TCCFrozenInputTests(unittest.TestCase):
             self.assertEqual(frame["volume"].dtype, np.dtype("float64"))
             self.assertAlmostEqual(float(frame["volume"].iloc[0]), 15001.5)
             self.assertEqual(
-                frame.attrs["market_data_provenance"]["research_source_snapshot_id"],
-                manifest["snapshot_sha256"],
-            ) if manifest["snapshot_sha256"] == (
-                "4e2fd225cc0ea05da56dad8f0628ca989ad332812a5fa3a7dc796b2b8a6d5128"
-            ) else self.assertEqual(
                 frame.attrs["market_data_provenance"]["research_access_path"],
                 "verified_frozen_tcc_main_csv",
             )
