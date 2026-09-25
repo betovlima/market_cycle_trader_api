@@ -96,7 +96,7 @@ def _status_pair(a: np.ndarray, b: np.ndarray) -> dict:
     unequal = np.flatnonzero(~same.ravel())
     return {
         "status": (
-            "DIFFERENT" if bad else "PRECISION_ONLY" if unequal else "MATCH"
+            "DIFFERENT" if bad.size else "PRECISION_ONLY" if unequal.size else "MATCH"
         ),
         "exact_different_values": int(len(unequal)),
         "substantial_different_values": int(len(bad)),
