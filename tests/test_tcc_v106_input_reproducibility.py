@@ -157,6 +157,7 @@ class TCCFrozenInputTests(unittest.TestCase):
             end_date="2026-09-17",
             calendar_anchor_assets=(),
         )
+        config.model_copy = lambda update: config
 
         def frozen_loader(root, symbol, manifest):
             if symbol == "DOC":
