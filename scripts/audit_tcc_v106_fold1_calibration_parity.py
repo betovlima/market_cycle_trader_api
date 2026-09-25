@@ -325,6 +325,28 @@ def _compare_training_matrices(
     return result
 
 
+def _load_completed_audit_report(path: Path) -> dict:
+    """Read either the generated root-level report or a directory-prefixed copy.
+
+    v10.8.28 writes report.json at ZIP root; a user-compressed output folder
+    instead stores output/tcc_v106_fold1_parity_audit/report.json.
+    """
+    with ZipFile(path) as source:
+        members = [
+            name for name in source.namelist()
+            if name == "report.json" or name.endswith("/report.json")
+        ]
+        if len(members) != 1:
+            raise ValueError(
+                f"Expected exactly one report.json in {path}; found "
+                f"{len(members)}. ZIP entries: {source.namelist()[:12]!r}"
+            )
+        report = json.loads(source.read(members[0]))
+    if not isinstance(report, dict):
+        raise ValueError(f"Audit report in {path} must be a JSON object.")
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tcc-data", type=Path, required=True)
@@ -341,14 +363,7 @@ def main() -> None:
     args = parser.parse_args()
 
     _assert_reference_files(args.tcc_data)
-    with ZipFile(args.input_audit_zip) as source:
-        report_name = next(
-            (x for x in source.namelist() if x.endswith("/report.json")),
-            None,
-        )
-        if report_name is None:
-            raise ValueError("Input audit ZIP has no report.json.")
-        audited = json.loads(source.read(report_name))
+    audited = _load_completed_audit_report(args.input_audit_zip)
     if (
         audited.get("audit_status") != "COMPLETED"
         or audited.get("fully_audited_assets") != 55
