@@ -198,6 +198,8 @@ def main() -> None:
         raise ValueError("Fold-1 asset/date ordering differs.")
     left = tcc_frames[SYMBOL]
     right = mct_frames[SYMBOL]
+    if not left.index.equals(right.index):
+        raise ValueError("Full CLMT feature-frame dates/order differ across sources.")
     columns = [*ROTATION_FEATURES, TARGET]
     a = left.loc[tcc_train].dropna(subset=columns)
     b = right.loc[mct_train].dropna(subset=columns)
