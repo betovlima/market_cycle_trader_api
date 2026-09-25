@@ -151,6 +151,18 @@ _SAFE_PROGRESS_PATTERNS = (
         re.compile(r"^LightGBM Utility run \d+/\d+ completed$"),
     re.compile(r"^IQN run \d+/\d+ completed$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — IQN training \d+%$"),
+    re.compile(
+        r"^TCC v1\.0\.6 (?:CONTROL|SOFT_HORIZON_CONSENSUS) — .+$"
+    ),
+    re.compile(
+        r"^TCC v1\.0\.6 loading market data \d+/\d+ — [A-Z0-9.\-]+$"
+    ),
+    re.compile(r"^Preparing TCC v1\.0\.6 reference engine$"),
+    re.compile(
+        r"^Running TCC v1\.0\.6 (?:Control|Soft Horizon Consensus)$"
+    ),
+    re.compile(r"^Saving tcc_v106_(?:control|soft)$"),
+    re.compile(r"^Finalizing TCC v1\.0\.6 comparison$"),
 )
 _PROGRESS_DETAIL_FIELDS = frozenset({
     "run_index",
