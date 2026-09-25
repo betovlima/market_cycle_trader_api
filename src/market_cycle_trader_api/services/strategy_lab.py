@@ -50,6 +50,7 @@ STRATEGY_CATALOG_COMMIT_FALLBACK = "feat: add modular MILP decision optimization
 CATALOG_STATUS_SAVED = "saved"
 CATALOG_STATUS_RESEARCH = "research"
 CATALOG_STATUS_WINNER = "winner"
+TCC_V106_BACKTEST_ENGINE_BINDING = "tcc_v106_reference"
 
 
 @lru_cache(maxsize=1)
@@ -571,7 +572,35 @@ def _milp_identity_overlay(document: dict[str, Any]) -> bool:
 
 
 def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
+    engine_binding = str(
+        document.get("backtest_engine_binding") or ""
+    ).strip()
     strategy_kind = str(document.get("strategy_kind") or "standard").strip().lower()
+    if engine_binding:
+        return {
+            "eligible": False,
+            "code": "research_reference_engine_not_live",
+            "reason": (
+                "This Strategy is bound to an isolated research reference "
+                "engine and cannot be promoted to the protected live Trader."
+            ),
+            "strategy_kind": strategy_kind,
+            "model_family": (
+                str(
+                    (
+                        document.get("research_model_snapshot")
+                        if isinstance(
+                            document.get("research_model_snapshot"),
+                            dict,
+                        )
+                        else {}
+                    ).get("family")
+                    or ""
+                )
+                or None
+            ),
+            "backtest_engine_binding": engine_binding,
+        }
     variant = str(document.get("temporal_strategy_variant") or "").strip().lower()
     snapshot = (
         document.get("research_model_snapshot")
@@ -673,6 +702,16 @@ def _public_profile(document: dict[str, Any], *, include_configuration: bool = T
         "source_strategy_revision": document.get("source_strategy_revision"),
         "strategy_kind": str(document.get("strategy_kind") or "standard"),
         "tuning_target": str(document.get("tuning_target") or "model_strategy"),
+        "backtest_engine_binding": (
+            str(document.get("backtest_engine_binding") or "").strip()
+            or None
+        ),
+        "reference_engine_id": document.get("reference_engine_id"),
+        "reference_source_repository": document.get(
+            "reference_source_repository"
+        ),
+        "reference_source_tag": document.get("reference_source_tag"),
+        "reference_source_commit": document.get("reference_source_commit"),
         "trader_compatibility": _trader_runtime_compatibility(document),
         "source_temporal_run_id": document.get("source_temporal_run_id"),
         "source_temporal_experiment": document.get("source_temporal_experiment"),
@@ -2175,6 +2214,53 @@ def _is_stateful_temporal_strategy(profile: dict[str, Any] | None) -> bool:
     )
 
 
+def select_research_strategy_only(
+    db: Any,
+    strategy_id: str,
+    *,
+    expected_control_revision: int,
+    note: str,
+    actor_email: str | None,
+) -> dict[str, Any]:
+    """Select a Strategy for Backtest/Research without changing Model Tuning."""
+    _assert_no_active_backtest(db)
+    control = ensure_strategy_catalog(db)
+    current_revision = int(control.get("revision") or 1)
+    if current_revision != int(expected_control_revision):
+        raise StrategyLabConflict(
+            f"Expected selection revision {expected_control_revision}, "
+            f"current revision {current_revision}."
+        )
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one(
+        {"_id": str(strategy_id)}
+    )
+    if profile is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
+    now = utc_now()
+    updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {"_id": CONTROL_ID, "revision": current_revision},
+        {
+            "$set": {
+                "research_strategy_id": str(strategy_id),
+                "updated_at": now,
+                "updated_by": (
+                    (actor_email or "").strip().lower() or None
+                ),
+                "last_selection_note": note,
+                "last_strategy_research_selection_note": note,
+            },
+            "$inc": {"revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated_control is None:
+        raise StrategyLabConflict(
+            "Strategy selection changed before this update was applied."
+        )
+    _normalize_catalog_roles(db, updated_control)
+    return _control_response(db, updated_control)
+
+
 def select_model_tuning_strategy(
     db: Any,
     strategy_id: str,
@@ -2183,6 +2269,15 @@ def select_model_tuning_strategy(
     note: str,
     actor_email: str | None,
 ) -> dict[str, Any]:
+    profile = db[STRATEGY_PROFILES_COLLECTION].find_one(
+        {"_id": str(strategy_id)}
+    )
+    if profile is None:
+        raise StrategyLabNotFound("Strategy profile not found.")
+    if str(profile.get("backtest_engine_binding") or "").strip():
+        raise StrategyLabConflict(
+            "Reference-engine Strategies cannot be selected for Model Tuning."
+        )
     return select_research_strategy(
         db,
         strategy_id,
