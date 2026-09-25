@@ -22,6 +22,15 @@ logger = logging.getLogger("uvicorn.error")
 
 
 WINNER_ENGINE_COMPATIBILITY = "api-v1.13.16"
+TCC_V106_REFERENCE_ENGINE_MODULE = (
+    "market_cycle_trader_api.engine.tcc_v106_reference_backtest"
+)
+_ALLOWED_ENGINE_MODULES = frozenset(
+    {
+        ENGINE_MODULE,
+        TCC_V106_REFERENCE_ENGINE_MODULE,
+    }
+)
 _NUMERIC_THREAD_ENVIRONMENT_KEYS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -439,7 +448,24 @@ def run_job(job_id: str) -> None:
     existing_python_path = os.environ.get("PYTHONPATH", "")
     if existing_python_path:
         python_path = python_path + os.pathsep + existing_python_path
-    command = [sys.executable, "-u", "-m", ENGINE_MODULE, "--job-id", job_id]
+    engine_module = str(
+        job_document.get("engine_module_override") or ENGINE_MODULE
+    ).strip()
+    if engine_module not in _ALLOWED_ENGINE_MODULES:
+        raise RuntimeError(
+            f"Unsupported backtest engine module: {engine_module}"
+        )
+    if engine_module == ENGINE_MODULE:
+        engine_path = ENGINE_PATH
+    else:
+        engine_path = (
+            SOURCE_ROOT
+            / "market_cycle_trader_api"
+            / "engine"
+            / "tcc_v106_reference_backtest.py"
+        )
+
+    command = [sys.executable, "-u", "-m", engine_module, "--job-id", job_id]
     numeric_environment = numeric_thread_environment(request_payload)
     runtime_thread_limit = int(job_document.get("runtime_thread_limit") or 0)
     if runtime_thread_limit > 0:
@@ -450,8 +476,8 @@ def run_job(job_id: str) -> None:
         **numeric_environment,
     })
     engine_identity = {
-        "engine_module": ENGINE_MODULE,
-        "engine_path": str(ENGINE_PATH),
+        "engine_module": engine_module,
+        "engine_path": str(engine_path),
         "python_executable": sys.executable,
         "winner_engine_compatibility": WINNER_ENGINE_COMPATIBILITY,
         "numeric_thread_environment_applied": bool(numeric_environment),
@@ -465,7 +491,7 @@ def run_job(job_id: str) -> None:
             },
             "$push": {
                 "logs": {
-                    "$each": [f"Backtest engine: {ENGINE_MODULE}"],
+                    "$each": [f"Backtest engine: {engine_module}"],
                     "$slice": -400,
                 }
             },
