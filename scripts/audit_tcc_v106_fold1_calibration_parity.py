@@ -12,6 +12,7 @@ import io
 import json
 import os
 import platform
+import sys
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -22,6 +23,12 @@ from market_cycle_trader_api.core.environment import load_project_environment
 
 # mongo_repository caches MONGO_URL/MONGO_DATABASE at import time.
 load_project_environment()
+
+# Direct invocation (python scripts/xxx.py) puts scripts/, not the repository
+# root, on sys.path. Make the sibling audit import work both there and in CI.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.audit_tcc_v106_fold1_data_parity import (
     CUTOFF,
