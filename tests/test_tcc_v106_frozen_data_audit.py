@@ -7,10 +7,45 @@ import pandas as pd
 from scripts.audit_tcc_v106_fold1_data_parity import (
     TCC_FROZEN_MANIFEST_SHA,
     _compare_numeric_frames,
+    _split_safe_float_frame,
+    _clean_actions,
 )
+from market_cycle_trader_api.tcc_v106_reference.config import CONFIG as TCC_CONFIG
+from market_cycle_trader_api.engine.research_market_data import split_normalize
 
 
 class FrozenTccDataAuditTests(unittest.TestCase):
+    def test_split_normalization_accepts_integer_csv_volume(self) -> None:
+        dates = pd.to_datetime(["2020-01-02", "2020-01-06"], utc=True)
+        raw = pd.DataFrame(
+            {"open": [100, 50], "high": [101, 51], "low": [99, 49],
+             "close": [100, 50], "volume": [10001, 20003]},
+            index=dates,
+        )
+        splits = [{
+            "action_type": "forward_split", "ex_date": "2020-01-06",
+            "old_rate": "2", "new_rate": "3",
+        }]
+        frame, events = split_normalize(_split_safe_float_frame(raw), splits)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(frame["volume"].dtype.kind, "f")
+        self.assertAlmostEqual(float(frame["volume"].iloc[0]), 15001.5)
+        self.assertEqual(int(raw["volume"].iloc[0]), 10001)
+
+    def test_ca_rate_formatting_is_not_a_difference(self) -> None:
+        fields = ["id", "action_type", "old_rate", "new_rate", "cusip"]
+        frozen = [{
+            "id": "one", "action_type": "forward_split",
+            "old_rate": "1.0", "new_rate": "4.0", "cusip": "000123",
+        }]
+        mongo = [{
+            "id": "one", "action_type": "forward_split",
+            "old_rate": 1, "new_rate": 4, "cusip": "000123",
+        }]
+        self.assertEqual(
+            _clean_actions(frozen, fields), _clean_actions(mongo, fields)
+        )
+
     def test_environment_is_loaded_before_mongo_import(self) -> None:
         """Mongo connection settings are cached by mongo_repository on import."""
         from pathlib import Path
