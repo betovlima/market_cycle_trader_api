@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from decimal import Decimal, InvalidOperation
 import hashlib
 import io
 import json
@@ -116,20 +117,56 @@ def _frozen_actions(root: Path, symbol: str) -> list[dict[str, Any]]:
         return [dict(item) for item in csv.DictReader(stream)]
 
 
+def _canonical_ca_value(key: str, value: Any) -> str:
+    """Compare numerical Corporate Action fields by value, not CSV formatting."""
+    if value is None or (
+        isinstance(value, float) and not math.isfinite(value)
+    ):
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    # Keep identifiers, dates and ticker symbols as text. E.g. a CUSIP
+    # may have significant leading zeroes and must never be parsed as float.
+    numeric = (
+        key in {"rate", "new_rate", "old_rate", "acquirer_rate", "acquiree_rate"}
+        or key.endswith(("_amount", "_ratio", "_percent", "_percentage"))
+    )
+    if numeric:
+        try:
+            number = Decimal(raw)
+            if number.is_finite():
+                return format(number.normalize(), "f")
+        except InvalidOperation:
+            pass
+    return raw
+
+
 def _clean_actions(actions: list[dict[str, Any]], fields: list[str]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for action in actions:
-        row: dict[str, str] = {}
-        for key in fields:
-            value = action.get(key)
-            if value is None or (
-                isinstance(value, float) and not math.isfinite(value)
-            ):
-                row[key] = ""
-            else:
-                row[key] = str(value).strip()
+        row: dict[str, str] = {
+            key: _canonical_ca_value(key, action.get(key))
+            for key in fields
+        }
         rows.append(row)
     return sorted(rows, key=lambda x: json.dumps(x, sort_keys=True))
+
+
+def _split_safe_float_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Prevent pandas >= 2 raising when fractional split volumes hit int64.
+
+    This only casts audit-local copies; it neither edits the TCC files nor
+    alters the frozen v1.0.6 split-normalization implementation.
+    """
+    converted = frame.copy()
+    for column in REQUIRED_BAR_COLUMNS:
+        if column in converted:
+            converted[column] = pd.to_numeric(
+                converted[column], errors="coerce"
+            ).astype(np.float64)
+    converted.attrs.update(getattr(frame, "attrs", {}))
+    return converted
 
 
 def _compare_numeric_frames(
@@ -361,10 +398,10 @@ def audit(
                 })
 
                 frozen_normalized, frozen_splits = split_normalize(
-                    tcc_raw, tcc_actions,
+                    _split_safe_float_frame(tcc_raw), tcc_actions,
                 )
                 mct_normalized, mct_splits = split_normalize(
-                    raw, mct_actions,
+                    _split_safe_float_frame(raw), mct_actions,
                 )
                 frozen_normalized = validate_and_clean_bars(
                     frozen_normalized, config,
@@ -418,7 +455,12 @@ def audit(
                     columns=features, details=details,
                 ))
             except Exception as exc:
-                errors.append({"symbol": symbol, "error": repr(exc)})
+                # Pandas includes entire vectors in dtype errors; report a
+                # bounded message so status JSON stays useful/readable.
+                errors.append({
+                    "symbol": symbol,
+                    "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                })
 
     finally:
         client.close()
