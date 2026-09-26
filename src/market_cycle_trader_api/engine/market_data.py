@@ -321,9 +321,17 @@ def resolve_backtest_analysis_end_date(
     config: Any,
     *,
     now: datetime | pd.Timestamp | None = None,
+    require_cached_common_session: bool = True,
 ) -> str:
+    """Resolve an XNYS session, never a wall-clock date or in-flight daily bar.
+
+    A read-only job must use a common available MongoDB session. A new
+    bootstrap/full-refresh Simulation instead uses the latest safely closed
+    session even when the old MongoDB cache ends earlier: Alpaca must then
+    supply the missing data or the job fails explicitly.
+    """
     calendar = xcals.get_calendar("XNYS")
-    latest_closed = latest_completed_xnys_session(now)
+    latest_closed = latest_safe_completed_xnys_session(now)
     requested = normalize_end_date(getattr(config, "end_date", None))
     if requested:
         requested_session = pd.Timestamp(
@@ -332,6 +340,9 @@ def resolve_backtest_analysis_end_date(
         target = min(requested_session, latest_closed)
     else:
         target = latest_closed
+
+    if not require_cached_common_session:
+        return target.date().isoformat()
 
     client = create_client()
     try:
