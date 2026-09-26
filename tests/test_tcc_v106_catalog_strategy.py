@@ -97,7 +97,10 @@ def test_catalog_strategy_mirrors_tcc_v106_contract() -> None:
 
     assert config.assets == list(ASSETS)
     assert config.start_date == TCC_CONFIG.start_date
-    assert config.end_date == TCC_CONFIG.analysis_end_date
+    # Operational research advances to the last safely closed XNYS session.
+    # The scientific snapshot's pinned end date remains in the TCC config.
+    assert config.end_date is None
+    assert TCC_CONFIG.analysis_end_date == "2026-09-17"
     assert config.rotation_target_horizons == [5, 10, 20, 40, 60]
     assert config.rotation_switch_margin == 0.0005
     assert config.rotation_switch_margin_candidates == [0.0, 0.0025, 0.005, 0.01]
