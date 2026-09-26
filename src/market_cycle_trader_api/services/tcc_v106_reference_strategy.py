@@ -59,8 +59,10 @@ def _mct_configuration_for_tcc(
             # LightGBM compound-rotation strategy-mode identifier.
             "strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST",
             "start_date": str(tcc.start_date),
-            # Lock the normal MCT Simulation to the same scientific cutoff.
-            "end_date": str(tcc.analysis_end_date),
+            # New operational MCT research uses a session-based dynamic cutoff.
+            # Only explicit frozen-TCC parity jobs lock the 2026-09-17 date.
+            # Existing installed profiles are handled at job queue time.
+            "end_date": None,
             "timeframe": str(tcc.timeframe),
             "market_data_provider": str(tcc.market_data_provider),
             "alpaca_historical_feed": str(tcc.alpaca_historical_feed),
