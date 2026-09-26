@@ -143,7 +143,7 @@ def _load_mct_market_frames(
             f"missing={missing or 'none'} extra={extra or 'none'}"
         )
 
-    source = selected_tcc_reference_input_source()
+    source = selected_tcc_reference_input_source(effective_config)
     frozen_root = None
     frozen_manifest = None
     if source == FROZEN_SOURCE:
@@ -351,7 +351,7 @@ def run_reference_job(
         effective_mct_config,
         frames,
     )
-    input_source = selected_tcc_reference_input_source()
+    input_source = selected_tcc_reference_input_source(effective_mct_config)
     frozen_tcc_used = input_source == FROZEN_SOURCE
     data_contract = (
         "pinned-tcc-main-raw-csv+tcc-v1.0.6-engine"
