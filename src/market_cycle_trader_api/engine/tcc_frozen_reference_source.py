@@ -38,11 +38,13 @@ DEFAULT_SOURCE = "mct_current"
 FROZEN_SOURCE = "tcc_frozen_main"
 
 
-def selected_tcc_reference_input_source() -> str:
-    source = (os.getenv(DATA_SOURCE_ENV) or DEFAULT_SOURCE).strip().lower()
+def selected_tcc_reference_input_source(config: Any | None = None) -> str:
+    """Use the immutable job's data-source choice before the server default."""
+    pinned = getattr(config, "tcc_reference_input_source", None)
+    source = str(pinned or os.getenv(DATA_SOURCE_ENV) or DEFAULT_SOURCE).strip().lower()
     if source not in {DEFAULT_SOURCE, FROZEN_SOURCE}:
         raise ValueError(
-            f"Unsupported {DATA_SOURCE_ENV}={source!r}; "
+            f"Unsupported TCC reference input source {source!r}; "
             f"choose {DEFAULT_SOURCE!r} or {FROZEN_SOURCE!r}."
         )
     return source
