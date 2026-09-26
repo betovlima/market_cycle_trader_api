@@ -271,6 +271,9 @@ class BacktestExecutionRequest(BacktestRequest):
     research_market_data_refresh_mode: ResearchMarketDataRefreshMode = "full"
     expected_market_data_signature_sha256: str | None = None
     research_market_data_snapshot_id: str | None = None
+    # Store the TCC-reference input choice in the immutable job request;
+    # a subsequent environment change must not switch sources mid-queue.
+    tcc_reference_input_source: Literal["mct_current", "tcc_frozen_main"] | None = None
     walk_forward_fold_count_override: int | None = Field(default=None, ge=2)
 
     @field_validator("calendar_anchor_assets")
