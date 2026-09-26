@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import unittest
 
 from market_cycle_trader_api.tcc_v106_reference import config as tcc_config
 from market_cycle_trader_api.services import jobs as jobs_service
@@ -68,3 +69,19 @@ def test_tcc_v106_reference_engine_module_is_allowlisted() -> None:
         jobs_service.TCC_V106_REFERENCE_ENGINE_MODULE
         in jobs_service._ALLOWED_ENGINE_MODULES
     )
+
+
+
+class FrozenVendoredEngineRegressionTests(unittest.TestCase):
+    """Exercise the source-integrity guard under unittest-based GitHub CI."""
+
+    def test_every_vendored_source_matches_exact_tcc_v106_blob(self) -> None:
+        actual = {
+            name: _git_blob_sha(VENDORED / name)
+            for name in EXPECTED_GIT_BLOBS
+        }
+        self.assertEqual(actual, EXPECTED_GIT_BLOBS)
+
+    def test_scientific_config_stays_frozen(self) -> None:
+        self.assertEqual(tcc_config.EXPERIMENT_VERSION, "1.0.6")
+        self.assertEqual(tcc_config.CONFIG.analysis_end_date, "2026-09-17")
