@@ -208,7 +208,17 @@ def _load_mct_market_frames(
 
 def _tcc_variant_configs(
     frames: dict[str, pd.DataFrame],
+    *,
+    analysis_end_date: str,
 ) -> tuple[Any, Any]:
+    """Reuse frozen TCC policy but take the actual job's research cutoff.
+
+    The vendored scientific CONFIG remains unchanged. Both Control and Soft
+    get the *same* immutable execution cutoff, whether a pinned TCC CSV or
+    refreshed MCT market-data job was chosen at queue time.
+    """
+    if not analysis_end_date:
+        raise ValueError("TCC reference job requires a resolved analysis_end_date.")
     eligible = tuple(symbol for symbol in TCC_V106_ASSETS if symbol in frames)
     base = TCC_V106_CONFIG
     anchors = tuple(
@@ -230,6 +240,7 @@ def _tcc_variant_configs(
     prepared = base.model_copy(
         update={
             "assets": eligible,
+            "analysis_end_date": str(analysis_end_date),
             "calendar_anchor_assets": anchors,
             "research_reference_assets": references,
             "research_candidate_assets": candidates,
@@ -333,7 +344,9 @@ def _comparison_row(result: Any, label: str) -> dict[str, Any]:
             "reference_engine_id": REFERENCE_ENGINE_ID,
             "reference_source_tag": TCC_SOURCE_TAG,
             "reference_source_commit": TCC_SOURCE_COMMIT,
-            "data_contract": DATA_CONTRACT,
+            "data_contract": metrics.get("data_contract", DATA_CONTRACT),
+            "requested_analysis_cutoff": metrics.get("requested_analysis_cutoff"),
+            "effective_analysis_cutoff": metrics.get("effective_analysis_cutoff"),
         }
     )
 
@@ -345,7 +358,18 @@ def run_reference_job(
 ) -> tuple[list[dict[str, Any]], BacktestExecutionRequest]:
     emit_progress(1.0, "Preparing TCC v1.0.6 reference engine")
     frames, exclusions, effective_mct_config = _load_mct_market_frames(request)
-    control_config, soft_config = _tcc_variant_configs(frames)
+    # v10.8.34 resolved the correct XNYS cutoff and refreshed RAW bars, but
+    # omitted propagation to the vendored TCC runner configuration. Without
+    # this value, the v1.0.6 scientific default (2026-09-17) truncates the
+    # simulation even when the job loaded later bars.
+    cutoff = str(
+        effective_mct_config.analysis_end_date
+        or effective_mct_config.end_date
+        or ""
+    )
+    control_config, soft_config = _tcc_variant_configs(
+        frames, analysis_end_date=cutoff,
+    )
 
     reproducibility = build_reproducibility_manifest(
         effective_mct_config,
@@ -367,6 +391,8 @@ def run_reference_job(
         "mct_data_transport_only": not frozen_tcc_used,
         "tcc_frozen_snapshot_used": frozen_tcc_used,
         "input_source": input_source,
+        "requested_analysis_cutoff": cutoff,
+        "effective_analysis_cutoff": str(control_config.analysis_end_date),
         "tcc_frozen_snapshot_sha256": (
             FROZEN_TCC_MAIN_SHA256 if frozen_tcc_used else None
         ),
