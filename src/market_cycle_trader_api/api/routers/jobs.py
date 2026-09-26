@@ -19,6 +19,11 @@ from ...infrastructure.persistence.mongo_repository import (
 )
 from ...schemas.requests import BacktestExecutionRequest
 from ...engine.market_data import resolve_backtest_analysis_end_date
+from ...engine.tcc_frozen_reference_source import (
+    FROZEN_SOURCE,
+    FROZEN_TCC_END,
+    selected_tcc_reference_input_source,
+)
 from ...services.jobs import (
     TCC_V106_REFERENCE_ENGINE_MODULE,
     public_job,
@@ -41,6 +46,24 @@ from ...services.model_research import (
 )
 
 router = APIRouter(tags=["jobs"])
+
+
+def _reference_execution_window(
+    configuration: Any,
+    selected_strategy: dict[str, Any],
+) -> tuple[Any, str | None]:
+    """Keep the scientific TCC cutoff separate from current MCT research.
+
+    Old installed Strategy #12 profiles also carry the 2026-09-17 cutoff,
+    so the effective request must be resolved from the selected *data source*
+    rather than inherit that obsolete profile end date.
+    """
+    if str(selected_strategy.get("backtest_engine_binding") or "") != "tcc_v106_reference":
+        return configuration, None
+
+    source = selected_tcc_reference_input_source()
+    target = FROZEN_TCC_END if source == FROZEN_SOURCE else None
+    return configuration.model_copy(update={"end_date": target}), source
 
 
 def queue_backtest_job(
@@ -167,6 +190,9 @@ def queue_backtest_job(
                 research_model_family,
                 research_model_settings,
             )
+            locked_configuration, tcc_reference_source = _reference_execution_window(
+                locked_configuration, selected_strategy,
+            )
             selected_assets = set(locked_configuration.assets)
             calendar_anchor_assets = [symbol for symbol in winner_configuration.assets if symbol in selected_assets]
             if len(calendar_anchor_assets) < 2:
@@ -176,7 +202,12 @@ def queue_backtest_job(
                 research_reference_assets = list(locked_configuration.assets)
             research_reference_set = set(research_reference_assets)
             research_candidate_assets = [symbol for symbol in locked_configuration.assets if symbol not in research_reference_set]
-            resolved_analysis_end = resolve_backtest_analysis_end_date(locked_configuration)
+            # This is a new Simulation, not a read-only tuning candidate.
+            # Resolve against XNYS's safely closed session *before* refresh;
+            # old Mongo rows must never pull the requested cutoff backwards.
+            resolved_analysis_end = resolve_backtest_analysis_end_date(
+                locked_configuration, require_cached_common_session=False,
+            )
             request = BacktestExecutionRequest.model_validate(
                 {
                     **locked_configuration.model_dump(mode="python"),
@@ -188,6 +219,7 @@ def queue_backtest_job(
                     "research_model_family": research_model_family,
                     "research_model_settings": dict(research_model_settings or {}),
                     "research_market_data_mode": "backtest_bootstrap_missing",
+                    "tcc_reference_input_source": tcc_reference_source,
                 }
             )
     except (RuntimeError, ValidationError) as exc:
@@ -285,6 +317,8 @@ def queue_backtest_job(
             if is_tcc_v106_reference
             else None
         ),
+        "tcc_reference_input_source": request.tcc_reference_input_source,
+        "requested_analysis_cutoff": request.analysis_end_date,
     }
     db[JOBS_COLLECTION].insert_one(job)
     if start_thread:
