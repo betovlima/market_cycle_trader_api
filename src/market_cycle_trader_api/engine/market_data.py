@@ -192,6 +192,54 @@ def inclusive_end_exclusive_boundary(value: str | None) -> pd.Timestamp | None:
     return pd.Timestamp(normalized, tz="UTC") + pd.Timedelta(days=1)
 
 
+def daily_historical_api_end(
+    cutoff: str,
+    *,
+    feed: str,
+    now: datetime | pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, str]:
+    """Bound recent SIP daily requests without changing the scientific cutoff.
+
+    The existing TCC one-shot historical request uses midnight UTC *after*
+    the requested session. For a recent session, that boundary may be in the
+    future (or within Alpaca's restricted last 15 minutes), despite the
+    actual XNYS daily bar already being complete. Historical SIP accounts
+    reject the whole request in that case.
+
+    Keep the original request for older research windows, and for IEX. Only
+    recent SIP requests end at the requested XNYS session's actual close.
+    The independent 20-minute buffer ensures the session is complete and
+    the end itself is older than Alpaca's restricted 15-minute window.
+    """
+    next_utc_midnight = inclusive_end_exclusive_boundary(cutoff)
+    if next_utc_midnight is None:
+        raise ValueError("A daily historical API request requires a cutoff.")
+
+    if str(feed or "").strip().lower() != "sip":
+        return next_utc_midnight, "cutoff_plus_one_day_utc"
+
+    stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    if next_utc_midnight <= stamp - pd.Timedelta(minutes=15):
+        return next_utc_midnight, "cutoff_plus_one_day_utc"
+
+    calendar = xcals.get_calendar("XNYS")
+    session = calendar.date_to_session(
+        pd.Timestamp(normalize_end_date(cutoff)), direction="previous",
+    )
+    close_at = calendar.session_close(session).tz_convert("UTC")
+    safe_at = close_at + pd.Timedelta(minutes=SAFE_DAILY_BAR_DELAY_MINUTES)
+    if stamp < safe_at:
+        raise RuntimeError(
+            "RecentSIPDailyBarNotYetSafe: the requested XNYS daily session "
+            f"{session.date().isoformat()} closes at {close_at.isoformat()}; "
+            f"wait until {safe_at.isoformat()} before downloading its "
+            "complete SIP daily bar."
+        )
+
+    return close_at, "completed_xnys_session_close_utc"
+
+
 def latest_completed_xnys_session(now: datetime | pd.Timestamp | None = None) -> pd.Timestamp:
     
 
@@ -862,17 +910,17 @@ def _download_alpaca_bars(
         # research/operational windows. One request guarantees that a live
         # refresh observes the provider's current full historical series.
         # The research path preserves the exact homologated TCC request shape.
-        api_end = (
-            pd.Timestamp(normalized_end, tz="UTC")
-            + pd.Timedelta(days=1)
-        ).to_pydatetime()
+        api_end, request_end_mode = daily_historical_api_end(
+            normalized_end,
+            feed=config.alpaca_historical_feed,
+        )
         frame = download_stock_bars(
             api_key_id=credentials["api_key_id"],
             secret_key=credentials["secret_key"],
             symbol=symbol,
             timeframe=config.timeframe,
             start=requested_start.to_pydatetime(),
-            end=api_end,
+            end=api_end.to_pydatetime(),
             feed=config.alpaca_historical_feed,
             adjustment=config.alpaca_adjustment,
             limit=10_000,
@@ -896,7 +944,8 @@ def _download_alpaca_bars(
                 "market_bar_loader": loader_name,
                 "research_bar_loader": loader_name,
                 "research_bar_request_limit": 10_000,
-                "research_bar_end_mode": "cutoff_plus_one_day_utc",
+                "research_bar_end_mode": request_end_mode,
+                "research_bar_api_end_utc": api_end.isoformat(),
                 "research_bar_chunking": False,
             }
         )
