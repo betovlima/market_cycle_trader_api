@@ -32,6 +32,7 @@ from .api.routers import (
     strategy_configuration,
     strategy_lab,
     system_settings,
+    tcc_v106_reference,
     temporal_intelligence,
     temporal_research_settings,
     temporal_rotation_quality,
@@ -110,6 +111,10 @@ def create_app() -> FastAPI:
     application.include_router(jobs.router, dependencies=backtest_access)
     application.include_router(model_research.router, dependencies=research_access)
     application.include_router(model_tuning.router, dependencies=research_access)
+    application.include_router(
+        tcc_v106_reference.router,
+        dependencies=research_access,
+    )
     application.include_router(temporal_intelligence.router)
     application.include_router(milp_decision_router)
     application.include_router(decision_science_router)

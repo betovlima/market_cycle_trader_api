@@ -21,3 +21,5 @@ requests>=2.32,<3
 
 lightgbm>=4.6,<5
 torch>=2.10,<3
+botorch>=0.18,<0.19
+gpytorch>=1.14,<2

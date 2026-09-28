@@ -26,6 +26,7 @@ TRADES_COLLECTION = "backtest_trades"
 COMPARISONS_COLLECTION = "backtest_comparisons"
 FAILURES_COLLECTION = "backtest_failures"
 ALPACA_MARKET_BARS_COLLECTION = "alpaca_market_bars"
+ALPACA_CORPORATE_ACTIONS_COLLECTION = "alpaca_corporate_actions"
 MARKET_BARS_COLLECTION = "market_bars"
 INTEGRATIONS_COLLECTION = "integrations"
 ALPACA_INTEGRATION_ID = "alpaca"
@@ -169,6 +170,11 @@ def ensure_database(db: Database) -> None:
         [("job_id", ASCENDING), ("symbol", ASCENDING), ("backend", ASCENDING)],
         unique=True,
         name="uq_backtest_failure",
+    )
+    db[ALPACA_CORPORATE_ACTIONS_COLLECTION].create_index(
+        [("symbol", ASCENDING), ("protocol", ASCENDING)],
+        unique=True,
+        name="uq_alpaca_corporate_actions",
     )
     db[SETTINGS_HISTORY_COLLECTION].create_index(
         [("captured_at", DESCENDING)],

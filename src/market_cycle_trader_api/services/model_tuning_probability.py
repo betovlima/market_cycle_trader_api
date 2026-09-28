@@ -3,18 +3,16 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
-import warnings
+import os
 from typing import Any
 
 import numpy as np
 from scipy.stats import qmc
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
 from .model_tuning_space import settings_from_unit_point as _settings_from_unit_point
 from .model_tuning_ranking import candidate_economic_sort_key
 
-PROBABILITY_MODEL = "gaussian_process_unified_exploration_trust_region_cei_v4"
+PROBABILITY_MODEL = "botorch_single_task_gp_unified_exploration_trust_region_cei_v5"
 _METRIC_COUNT = 4
 _MONTE_CARLO_SCENARIOS = 512
 _TRUST_REGION_INITIAL = 0.20
@@ -29,11 +27,15 @@ _ANCHOR_LOCAL_FRACTION = 0.50
 _UNIFIED_SPACE_FILLING_POOL_SIZE = 1024
 _UNIFIED_INITIAL_EXPLORATION_FRACTION = 0.45
 _UNIFIED_MIN_EXPLORATION_FRACTION = 0.20
-_UNIFIED_STAGNATION_RECOVERY_TRIALS = 4
+_UNIFIED_STAGNATION_RECOVERY_TRIALS = 8
 _UNIFIED_RECOVERY_COOLDOWN_TRIALS = 2
 _UNIFIED_READINESS_MEAN_SPAN_MIN = 0.50
 _UNIFIED_READINESS_BROAD_DIMENSION_FRACTION = 0.70
 _UNIFIED_READINESS_DIMENSION_SPAN_MIN = 0.45
+_LOW_CONFIDENCE_P_BEAT_CHAMPION = 0.10
+_LOCAL_RADIUS_MULTIPLIER = 1.50
+_LOCAL_RADIUS_MIN = 0.08
+_LOCAL_MIN_POOL = 64
 
 
 def _settings_hash(values: dict[str, Any]) -> str:
@@ -533,35 +535,84 @@ def propose_unified_space_filling_candidate(document: dict[str, Any]) -> dict[st
     }
 
 
-def _fit_gaussian_processes(
+def _botorch_device():
+    import torch
+
+    requested = str(os.getenv("MCT_BOTORCH_DEVICE") or "cpu").strip().lower()
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "MCT_BOTORCH_DEVICE=cuda was requested but CUDA is unavailable."
+            )
+        return torch.device("cuda")
+    if requested == "auto" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _fit_botorch_surrogates(
     x_train: np.ndarray,
     y_train: np.ndarray,
     *,
     seed: int,
-) -> list[GaussianProcessRegressor]:
-    dimensions = int(x_train.shape[1])
-    models: list[GaussianProcessRegressor] = []
+) -> tuple[list[Any], str]:
+    import torch
+    from botorch.fit import fit_gpytorch_mll
+    from botorch.models import SingleTaskGP
+    from botorch.models.transforms.outcome import Standardize
+    from gpytorch.mlls import ExactMarginalLogLikelihood
+
+    device = _botorch_device()
+    dtype = torch.double
+    train_x = torch.as_tensor(
+        np.asarray(x_train, dtype=float),
+        dtype=dtype,
+        device=device,
+    )
+    models: list[Any] = []
     for metric_index in range(_METRIC_COUNT):
-        kernel = (
-            ConstantKernel(1.0, (1e-2, 1e2))
-            * Matern(
-                length_scale=np.full(dimensions, 0.35, dtype=float),
-                length_scale_bounds=(0.05, 5.0),
-                nu=2.5,
-            )
-            + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-6, 0.2))
+        torch.manual_seed(int(seed) + metric_index * 1543)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(int(seed) + metric_index * 1543)
+        train_y = torch.as_tensor(
+            np.asarray(y_train[:, metric_index], dtype=float).reshape(-1, 1),
+            dtype=dtype,
+            device=device,
         )
-        model = GaussianProcessRegressor(
-            kernel=kernel,
-            normalize_y=True,
-            random_state=seed + metric_index * 1543,
-            n_restarts_optimizer=0,
+        model = SingleTaskGP(
+            train_x,
+            train_y,
+            outcome_transform=Standardize(m=1),
         )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model.fit(x_train, y_train[:, metric_index])
+        mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        fit_gpytorch_mll(mll)
+        model.eval()
         models.append(model)
-    return models
+    return models, str(device)
+
+
+def _botorch_posterior_stats(
+    model: Any,
+    x: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    import torch
+
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    values = torch.as_tensor(
+        np.asarray(x, dtype=float),
+        dtype=dtype,
+        device=device,
+    )
+    with torch.no_grad():
+        posterior = model.posterior(values)
+        mean = posterior.mean.squeeze(-1)
+        std = posterior.variance.squeeze(-1).clamp_min(1e-12).sqrt()
+    return (
+        mean.detach().cpu().numpy().astype(float),
+        std.detach().cpu().numpy().astype(float),
+    )
+
 
 
 def _outcome_correlation(y_train: np.ndarray) -> np.ndarray:
@@ -589,7 +640,7 @@ def _probabilistic_acquisition(
     y_train: np.ndarray,
     seed: int,
     exploration_weight: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     rng = np.random.default_rng(seed)
     correlation = _outcome_correlation(y_train)
     try:
@@ -603,7 +654,10 @@ def _probabilistic_acquisition(
     chunk_size = 1024
     for start in range(0, len(means), chunk_size):
         stop = min(len(means), start + chunk_size)
-        scenarios = means[None, start:stop, :] + stds[None, start:stop, :] * z[:, None, :]
+        scenarios = (
+            means[None, start:stop, :]
+            + stds[None, start:stop, :] * z[:, None, :]
+        )
         capital = scenarios[:, :, 0]
         risk_ok = (
             (scenarios[:, :, 1] >= thresholds["sharpe"])
@@ -612,20 +666,38 @@ def _probabilistic_acquisition(
         )
         beats = risk_ok & (capital >= thresholds["capital"])
         probability[start:stop] = beats.mean(axis=0)
-        positive = np.maximum(capital - thresholds["capital"], 0.0) / thresholds["baseline_capital"]
+        positive = (
+            np.maximum(capital - thresholds["capital"], 0.0)
+            / thresholds["baseline_capital"]
+        )
         expected_improvement[start:stop] = (positive * risk_ok).mean(axis=0)
 
-    normalized_uncertainty = stds[:, 0] / thresholds["baseline_capital"]
-    
-    
-    
-    feasibility_weight = 0.25 + 0.75 * probability
-    acquisition = (
-        expected_improvement
-        + exploration_weight * normalized_uncertainty * feasibility_weight
-        + 0.02 * probability
+    normalized_uncertainty = (
+        stds[:, 0] / max(thresholds["baseline_capital"], 1e-12)
     )
-    return probability, expected_improvement, acquisition
+    uncertainty_scale = float(np.quantile(normalized_uncertainty, 0.90))
+    if not np.isfinite(uncertainty_scale) or uncertainty_scale <= 1e-12:
+        uncertainty_scale = 1.0
+    exploration = normalized_uncertainty / uncertainty_scale
+
+    # CARO-BoTorch v2.1 principle: uncertainty can modulate a promising
+    # proposal, but it cannot win by itself when expected improvement is weak.
+    acquisition = expected_improvement * (
+        1.0 + float(exploration_weight) * exploration
+    )
+    acquisition_mode = "multiplicative_constrained_ei"
+
+    # If constrained EI collapses across the whole pool, fall back to the
+    # probability of beating the current Champion, still using uncertainty
+    # only as a multiplicative modifier.
+    if float(np.nanmax(acquisition)) <= 1e-12:
+        acquisition = probability * (
+            1.0 + 0.25 * float(exploration_weight) * exploration
+        )
+        acquisition_mode = "probability_fallback"
+
+    return probability, expected_improvement, acquisition, acquisition_mode
+
 
 
 def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str, Any]:
@@ -673,18 +745,27 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
         raise RuntimeError("Unable to generate a sufficiently diverse probabilistic candidate pool.")
 
     x_pool = np.asarray(proposal_vectors, dtype=float)
-    models = _fit_gaussian_processes(x_train, y_train, seed=seed + next_id * 104729)
+    models, botorch_device = _fit_botorch_surrogates(
+        x_train,
+        y_train,
+        seed=seed + next_id * 104729,
+    )
     means: list[np.ndarray] = []
     stds: list[np.ndarray] = []
     for model in models:
-        mean, std = model.predict(x_pool, return_std=True)
+        mean, std = _botorch_posterior_stats(model, x_pool)
         means.append(mean)
         stds.append(np.maximum(std, 1e-12))
     mean_matrix = np.stack(means, axis=1)
     std_matrix = np.stack(stds, axis=1)
 
     thresholds = _baseline_thresholds(document)
-    probability, constrained_expected_improvement, acquisition = _probabilistic_acquisition(
+    (
+        probability,
+        constrained_expected_improvement,
+        acquisition,
+        acquisition_mode,
+    ) = _probabilistic_acquisition(
         mean_matrix,
         std_matrix,
         thresholds=thresholds,
@@ -692,11 +773,58 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
         seed=seed + next_id * 65537,
         exploration_weight=exploration_weight,
     )
-    selected_index = int(np.argmax(acquisition))
+    anchor = (
+        document.get("probability_anchor")
+        if isinstance(document.get("probability_anchor"), dict)
+        else {}
+    )
+    anchor_settings = (
+        dict(anchor.get("settings") or {})
+        if isinstance(anchor.get("settings"), dict)
+        else dict(base_values)
+    )
+    anchor_vector = np.asarray(
+        _normalized_vector(anchor_settings, search_space),
+        dtype=float,
+    )
+    distances = np.max(
+        np.abs(x_pool - anchor_vector[None, :]),
+        axis=1,
+    )
+    trust_region_radius = float(pool_metadata["trust_region_radius"])
+    local_radius = max(
+        _LOCAL_RADIUS_MIN,
+        trust_region_radius * _LOCAL_RADIUS_MULTIPLIER,
+    )
+    max_probability = float(np.nanmax(probability))
+    low_confidence_local_mode = (
+        max_probability < _LOW_CONFIDENCE_P_BEAT_CHAMPION
+    )
+    eligible_indices = np.arange(len(proposal_settings))
+    if low_confidence_local_mode:
+        local_mask = distances <= local_radius
+        if int(local_mask.sum()) < _LOCAL_MIN_POOL:
+            nearest = np.argsort(distances)[
+                : min(_LOCAL_MIN_POOL, len(distances))
+            ]
+            local_mask = np.zeros(len(distances), dtype=bool)
+            local_mask[nearest] = True
+        eligible_indices = np.flatnonzero(local_mask)
+        if len(eligible_indices) == 0:
+            eligible_indices = np.arange(len(proposal_settings))
+
+    local_position = int(np.argmax(acquisition[eligible_indices]))
+    selected_index = int(eligible_indices[local_position])
     selected_settings = proposal_settings[selected_index]
 
-    top_count = max(12, min(64, max(1, len(proposal_settings) // 40)))
-    top_indices = np.argsort(acquisition)[-top_count:]
+    top_count = max(
+        12,
+        min(64, max(1, len(eligible_indices) // 40)),
+    )
+    eligible_order = eligible_indices[
+        np.argsort(acquisition[eligible_indices])
+    ]
+    top_indices = eligible_order[-top_count:]
     promising_region: dict[str, dict[str, float | int]] = {}
     for spec in search_space:
         values = np.asarray([float(proposal_settings[int(index)][spec["name"]]) for index in top_indices], dtype=float)
@@ -718,6 +846,9 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
         "proposal": {
             "proposal_mode": "adaptive_probability",
             "probability_model": PROBABILITY_MODEL,
+            "surrogate": "botorch_single_task_gp",
+            "gp_backend": "gpytorch",
+            "botorch_device": botorch_device,
             "observation_count": int(len(x_train)),
             "candidate_pool_size": int(len(proposal_settings)),
             "estimated_probability_beats_champion": float(probability[selected_index]),
@@ -728,14 +859,21 @@ def propose_champion_probability_candidate(document: dict[str, Any]) -> dict[str
             "estimated_maximum_drawdown_mean": float(mean_matrix[selected_index, 2]),
             "estimated_worst_fold_mean": float(mean_matrix[selected_index, 3]),
             "acquisition_score": float(acquisition[selected_index]),
+            "acquisition_mode": acquisition_mode,
             "exploration_weight": exploration_weight,
+            "low_confidence_local_mode": bool(low_confidence_local_mode),
+            "max_pool_probability_beats_champion": max_probability,
+            "distance_to_champion_chebyshev": float(distances[selected_index]),
+            "local_radius": float(local_radius),
+            "low_confidence_threshold": _LOW_CONFIDENCE_P_BEAT_CHAMPION,
             "monte_carlo_scenarios": _MONTE_CARLO_SCENARIOS,
             "pool_composition": {
                 "global_fraction": float(pool_metadata["global_fraction"]),
                 "anchor_local_fraction": float(pool_metadata["anchor_fraction"]),
                 "top_regions_fraction": float(pool_metadata["top_regions_fraction"]),
             },
-            "trust_region_radius": float(pool_metadata["trust_region_radius"]),
+            "trust_region_radius": trust_region_radius,
+            "candidate_pool_size_eligible": int(len(eligible_indices)),
             "champion_revision": int(_probability_state(document)["champion_revision"]),
             "champion_candidate_id": (document.get("probability_anchor") or {}).get("candidate_id"),
             "promising_region": promising_region,

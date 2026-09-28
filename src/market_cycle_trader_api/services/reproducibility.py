@@ -195,6 +195,26 @@ def market_data_research_signature_from_manifests(
             "columns": list(item.get("columns") or []),
             "historical_feed": item.get("historical_feed"),
             "adjustment": item.get("adjustment"),
+            "research_market_data_protocol": item.get(
+                "research_market_data_protocol"
+            ),
+            "effective_adjustment": item.get("effective_adjustment"),
+            "splits_applied": int(item.get("splits_applied") or 0),
+            "split_normalization_direction": item.get(
+                "split_normalization_direction"
+            ),
+            "split_normalization_uses_future_events": bool(
+                item.get("split_normalization_uses_future_events", False)
+            ),
+            "dividend_event_count": int(
+                item.get("dividend_event_count") or 0
+            ),
+            "dividend_adjustment_applied": bool(
+                item.get("dividend_adjustment_applied", False)
+            ),
+            "dividend_events_used_by_model": bool(
+                item.get("dividend_events_used_by_model", False)
+            ),
         }
     return _sha256_json(stable)
 
@@ -257,7 +277,31 @@ def market_data_manifest(
         provenance = dict(frame.attrs.get("market_data_provenance", {}))
         manifests[symbol] = {
             "sha256": digest,
+            "normalized_sha256": digest,
             "audit_sha256": audit_digest,
+            "raw_sha256": provenance.get("raw_sha256"),
+            "raw_audit_sha256": provenance.get("raw_audit_sha256"),
+            "previous_raw_sha256": provenance.get("previous_raw_sha256"),
+            "previous_raw_audit_sha256": provenance.get(
+                "previous_raw_audit_sha256"
+            ),
+            "downloaded_at": provenance.get("downloaded_at"),
+            "history_audit_source": provenance.get("history_audit_source"),
+            "history_comparison_available": provenance.get(
+                "history_comparison_available"
+            ),
+            "historical_data_changed": provenance.get(
+                "historical_data_changed"
+            ),
+            "changed_rows": int(provenance.get("changed_rows") or 0),
+            "added_rows": int(provenance.get("added_rows") or 0),
+            "removed_rows": int(provenance.get("removed_rows") or 0),
+            "first_changed_timestamp": provenance.get(
+                "first_changed_timestamp"
+            ),
+            "last_changed_timestamp": provenance.get(
+                "last_changed_timestamp"
+            ),
             "rows": int(len(canonical)),
             "first_timestamp": _series_timestamp(canonical.index.min()) if len(canonical) else None,
             "last_timestamp": _series_timestamp(canonical.index.max()) if len(canonical) else None,
@@ -272,8 +316,57 @@ def market_data_manifest(
             "initial_rows": provenance.get("initial_rows"),
             "history_backfill_provider": provenance.get("history_backfill_provider"),
             "history_backfill_rows": provenance.get("history_backfill_rows"),
+            "research_access_path": provenance.get("research_access_path"),
+            "research_market_data_refresh_mode": provenance.get(
+                "research_market_data_refresh_mode"
+            ),
+            "full_refresh_performed": provenance.get(
+                "full_refresh_performed"
+            ),
+            "research_bar_loader": provenance.get(
+                "research_bar_loader"
+            ),
+            "research_bar_request_limit": provenance.get(
+                "research_bar_request_limit"
+            ),
+            "research_bar_end_mode": provenance.get(
+                "research_bar_end_mode"
+            ),
+            "research_bar_chunking": provenance.get(
+                "research_bar_chunking"
+            ),
             "requested_start": provenance.get("requested_start"),
             "actual_start": provenance.get("actual_start"),
+            "research_market_data_protocol": provenance.get(
+                "research_market_data_protocol"
+            ),
+            "source_adjustment": provenance.get("source_adjustment"),
+            "effective_adjustment": provenance.get("effective_adjustment"),
+            "corporate_action_source": provenance.get(
+                "corporate_action_source"
+            ),
+            "corporate_action_count": provenance.get(
+                "corporate_action_count"
+            ),
+            "splits_applied": provenance.get("splits_applied"),
+            "split_normalization_direction": provenance.get(
+                "split_normalization_direction"
+            ),
+            "split_normalization_uses_future_events": provenance.get(
+                "split_normalization_uses_future_events"
+            ),
+            "dividend_event_count": provenance.get(
+                "dividend_event_count"
+            ),
+            "dividend_adjustment_applied": provenance.get(
+                "dividend_adjustment_applied"
+            ),
+            "dividend_events_used_by_model": provenance.get(
+                "dividend_events_used_by_model"
+            ),
+            "structural_identity_verified": provenance.get(
+                "structural_identity_verified"
+            ),
         }
 
     return market_data_research_signature_from_manifests(manifests), manifests
@@ -294,6 +387,21 @@ def build_reproducibility_manifest(
         symbol
         for symbol, item in data_manifests.items()
         if int(item.get("history_backfill_rows") or 0) > 0
+    ]
+    history_compared_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if bool(item.get("history_comparison_available", False))
+    ]
+    history_changed_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if item.get("historical_data_changed") is True
+    ]
+    history_comparison_unavailable_assets = [
+        symbol
+        for symbol, item in data_manifests.items()
+        if not bool(item.get("history_comparison_available", False))
     ]
     assets = list(getattr(config, "assets", []) or [])
     configured_reference_assets = list(
@@ -330,6 +438,17 @@ def build_reproducibility_manifest(
         "market_data_history_complete": not incomplete_assets,
         "market_data_incomplete_assets": incomplete_assets,
         "market_data_backfilled_assets": backfilled_assets,
+        "market_data_history_compared_assets": history_compared_assets,
+        "market_data_history_compared_asset_count": int(
+            len(history_compared_assets)
+        ),
+        "market_data_history_changed_assets": history_changed_assets,
+        "market_data_history_changed_asset_count": int(
+            len(history_changed_assets)
+        ),
+        "market_data_history_comparison_unavailable_assets": (
+            history_comparison_unavailable_assets
+        ),
         "research_reference_assets": reference_assets,
         "research_candidate_assets": candidate_assets,
         "runtime_versions": versions,
@@ -355,4 +474,11 @@ def build_reproducibility_manifest(
         "alpaca_historical_feed": str(config.alpaca_historical_feed),
         "alpaca_live_feed": str(config.alpaca_live_feed),
         "alpaca_adjustment": str(config.alpaca_adjustment),
+        "research_market_data_protocol": str(
+            getattr(
+                config,
+                "research_market_data_protocol",
+                "legacy_adjusted",
+            )
+        ),
     }
