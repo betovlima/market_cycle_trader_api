@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from market_cycle_trader_api.engine import tcc_v106_reference_backtest as reference
+from market_cycle_trader_api.tcc_v106_reference import capital_rotation as scientific_rotation
 from market_cycle_trader_api.services import model_tuning, strategy_lab
 
 
@@ -23,9 +24,34 @@ class TCCExecutionCutoffTests(unittest.TestCase):
     def test_current_source_extends_both_variants_without_mutating_frozen_engine(self):
         scientific_end = reference.TCC_V106_CONFIG.analysis_end_date
         control, soft = reference._tcc_variant_configs({}, self._request("mct_current"))
-        self.assertEqual(control.analysis_end_date, "2026-09-28")
-        self.assertEqual(soft.analysis_end_date, "2026-09-28")
+        self.assertEqual(pd.Timestamp(control.analysis_end_date).date().isoformat(), "2026-09-28")
+        self.assertEqual(pd.Timestamp(soft.analysis_end_date).date().isoformat(), "2026-09-28")
+        self.assertEqual(pd.Timestamp(control.analysis_end_date), pd.Timestamp("2026-09-28T23:59:59Z"))
         self.assertEqual(reference.TCC_V106_CONFIG.analysis_end_date, scientific_end)
+
+    def test_unmodified_tcc_execution_includes_last_alpaca_daily_bar(self):
+        # Alpaca 1Day timestamps are session-start UTC, not date-only midnight.
+        dates = pd.to_datetime([
+            "2026-09-16T04:00:00Z",
+            "2026-09-17T04:00:00Z",
+            "2026-09-28T04:00:00Z",
+        ], utc=True)
+        folds = [{"test_start_index": 1, "test_end_index": len(dates)}]
+        current, _ = reference._tcc_variant_configs({}, self._request("mct_current"))
+        # The boundary must be losslessly comparable to ns/us/ms indexes:
+        # pandas raises on a nanosecond boundary with microsecond-index data.
+        for unit in ("ns", "us", "ms"):
+            actual_dates = scientific_rotation._analysis_decision_dates(
+                dates.as_unit(unit), folds, current,
+            )
+            self.assertEqual(actual_dates[-1].date().isoformat(), "2026-09-28")
+            self.assertEqual(len(actual_dates), 3)
+
+        # Reproduce the v10.8.37 defect: midnight excludes the cutoff day's
+        # 04:00 daily candle even though the source frame contains it.
+        naive_cutoff = current.model_copy(update={"analysis_end_date": "2026-09-28"})
+        truncated = scientific_rotation._analysis_decision_dates(dates, folds, naive_cutoff)
+        self.assertEqual(truncated[-1].date().isoformat(), "2026-09-17")
 
     def test_explicit_frozen_source_preserves_scientific_window(self):
         control, soft = reference._tcc_variant_configs({}, self._request("tcc_frozen_main"))
