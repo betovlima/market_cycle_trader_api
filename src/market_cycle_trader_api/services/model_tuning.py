@@ -595,7 +595,7 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
             "global_exploration_never_zero": True,
             "default_initial_exploration_fraction": 0.45,
             "default_minimum_exploration_fraction": 0.20,
-            "default_stagnation_recovery_trials": 4,
+            "default_stagnation_recovery_trials": 8,
             "champion_policy": "promote_only_after_observed_champion_gate_pass",
             "default_min_capital_improvement": 0.03,
             "default_sharpe_tolerance": 0.05,
@@ -1040,7 +1040,20 @@ def _frozen_execution_context_from_job(db: Any, job_id: str) -> dict[str, Any]:
         if signatures
         else summary.get("market_data_signature_sha256")
     )
-    request_snapshot = deepcopy(job["request"])
+    comparison = db[COMPARISONS_COLLECTION].find_one(
+        {"job_id": str(job_id)},
+        {"_id": 0, "effective_config": 1},
+    )
+    effective_config = (
+        comparison.get("effective_config")
+        if isinstance(comparison, dict)
+        else None
+    )
+    request_snapshot = deepcopy(
+        effective_config
+        if isinstance(effective_config, dict)
+        else job["request"]
+    )
     last_timestamp = summary.get("market_data_last_timestamp")
     cutoff_date = str(last_timestamp)[:10] if last_timestamp else None
     if cutoff_date:
@@ -2176,7 +2189,7 @@ def _start_temporal_tuning(
             "exploration_weight": float(probability_input.get("exploration_weight", 0.15)),
             "initial_exploration_fraction": float(probability_input.get("initial_exploration_fraction", 0.45)),
             "minimum_exploration_fraction": float(probability_input.get("minimum_exploration_fraction", 0.20)),
-            "stagnation_recovery_trials": int(probability_input.get("stagnation_recovery_trials", 4)),
+            "stagnation_recovery_trials": int(probability_input.get("stagnation_recovery_trials", 8)),
             "adaptive_stopping_enabled": bool(probability_input.get("adaptive_stopping_enabled", True)),
             "no_improvement_trial_limit": int(probability_input.get("no_improvement_trial_limit", DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT)),
             "minimum_meaningful_improvement": float(probability_input.get("minimum_meaningful_improvement", DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT)),
@@ -2494,7 +2507,7 @@ def start_model_tuning(
             "exploration_weight": float(probability.get("exploration_weight", 0.15)),
             "initial_exploration_fraction": float(probability.get("initial_exploration_fraction", 0.45)),
             "minimum_exploration_fraction": float(probability.get("minimum_exploration_fraction", 0.20)),
-            "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 4)),
+            "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 8)),
             "adaptive_stopping_enabled": bool(probability.get("adaptive_stopping_enabled", True)),
             "no_improvement_trial_limit": int(probability.get("no_improvement_trial_limit", DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT)),
             "minimum_meaningful_improvement": float(probability.get("minimum_meaningful_improvement", DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT)),
@@ -2559,7 +2572,7 @@ def start_model_tuning(
                 "exploration_weight": float(probability.get("exploration_weight", 0.15)),
                 "initial_exploration_fraction": float(probability.get("initial_exploration_fraction", 0.45)),
                 "minimum_exploration_fraction": float(probability.get("minimum_exploration_fraction", 0.20)),
-                "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 4)),
+                "stagnation_recovery_trials": int(probability.get("stagnation_recovery_trials", 8)),
                 "adaptive_stopping_enabled": bool(probability.get("adaptive_stopping_enabled", True)),
                 "no_improvement_trial_limit": int(probability.get("no_improvement_trial_limit", DEFAULT_NO_IMPROVEMENT_TRIAL_LIMIT)),
                 "minimum_meaningful_improvement": float(probability.get("minimum_meaningful_improvement", DEFAULT_MINIMUM_MEANINGFUL_IMPROVEMENT)),

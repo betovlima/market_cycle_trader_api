@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import hashlib
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,136 @@ from ..infrastructure.persistence.mongo_repository import (
 
 BAR_COLUMNS = ("open", "high", "low", "close", "volume", "vwap", "trade_count")
 REQUIRED_BAR_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def _canonical_history_frame(
+    frame: pd.DataFrame | None,
+    *,
+    columns: tuple[str, ...] = REQUIRED_BAR_COLUMNS,
+) -> pd.DataFrame:
+    """Canonicalize provider bars for content hashing and drift comparison."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=list(columns))
+
+    available = [column for column in columns if column in frame.columns]
+    canonical = frame[available].copy()
+    canonical.index = pd.to_datetime(canonical.index, utc=True, errors="coerce")
+    canonical = canonical.loc[~canonical.index.isna()]
+    canonical = canonical[~canonical.index.duplicated(keep="last")].sort_index()
+    try:
+        canonical.index = canonical.index.as_unit("ns")
+    except AttributeError:
+        canonical.index = pd.DatetimeIndex(
+            canonical.index.to_numpy(dtype="datetime64[ns]"),
+            tz="UTC",
+        )
+    for column in available:
+        canonical[column] = pd.to_numeric(
+            canonical[column],
+            errors="coerce",
+        ).astype(np.float64, copy=False)
+    return canonical
+
+
+def _history_frame_sha256(
+    frame: pd.DataFrame | None,
+    *,
+    columns: tuple[str, ...] = REQUIRED_BAR_COLUMNS,
+) -> str:
+    canonical = _canonical_history_frame(frame, columns=columns)
+    row_hashes = pd.util.hash_pandas_object(
+        canonical,
+        index=True,
+    ).to_numpy(dtype=np.uint64, copy=False)
+    return hashlib.sha256(row_hashes.tobytes()).hexdigest()
+
+
+def _timestamp_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    stamp = pd.Timestamp(value)
+    if pd.isna(stamp):
+        return None
+    stamp = (
+        stamp.tz_localize("UTC")
+        if stamp.tzinfo is None
+        else stamp.tz_convert("UTC")
+    )
+    return stamp.isoformat()
+
+
+def market_history_drift(
+    previous: pd.DataFrame | None,
+    current: pd.DataFrame | None,
+) -> dict[str, Any]:
+    """Describe model-input RAW drift between two Alpaca history snapshots.
+
+    Comparison is intentionally exact for the OHLCV values consumed by the
+    research engine. vwap/trade_count receive separate audit hashes but do not
+    affect historical_data_changed.
+    """
+    previous_model = _canonical_history_frame(previous)
+    current_model = _canonical_history_frame(current)
+    comparison_available = not previous_model.empty
+
+    previous_raw_sha256 = (
+        _history_frame_sha256(previous_model)
+        if comparison_available
+        else None
+    )
+    raw_sha256 = _history_frame_sha256(current_model)
+    previous_audit_sha256 = (
+        _history_frame_sha256(previous, columns=BAR_COLUMNS)
+        if comparison_available
+        else None
+    )
+    raw_audit_sha256 = _history_frame_sha256(current, columns=BAR_COLUMNS)
+
+    added_index = current_model.index.difference(previous_model.index)
+    removed_index = previous_model.index.difference(current_model.index)
+    changed_index = pd.DatetimeIndex([], tz="UTC")
+
+    if comparison_available:
+        shared_index = previous_model.index.intersection(current_model.index)
+        shared_columns = [
+            column
+            for column in REQUIRED_BAR_COLUMNS
+            if column in previous_model.columns and column in current_model.columns
+        ]
+        if len(shared_index) and shared_columns:
+            old_values = previous_model.loc[shared_index, shared_columns]
+            new_values = current_model.loc[shared_index, shared_columns]
+            equal = old_values.eq(new_values) | (
+                old_values.isna() & new_values.isna()
+            )
+            changed_index = pd.DatetimeIndex(
+                shared_index[~equal.all(axis=1)],
+            )
+
+    divergent = added_index.union(removed_index).union(changed_index)
+    historical_data_changed: bool | None = None
+    if comparison_available:
+        historical_data_changed = bool(
+            previous_raw_sha256 != raw_sha256
+        )
+
+    return {
+        "history_comparison_available": comparison_available,
+        "previous_raw_sha256": previous_raw_sha256,
+        "raw_sha256": raw_sha256,
+        "previous_raw_audit_sha256": previous_audit_sha256,
+        "raw_audit_sha256": raw_audit_sha256,
+        "historical_data_changed": historical_data_changed,
+        "changed_rows": int(len(changed_index)),
+        "added_rows": int(len(added_index)) if comparison_available else 0,
+        "removed_rows": int(len(removed_index)) if comparison_available else 0,
+        "first_changed_timestamp": (
+            _timestamp_iso(divergent.min()) if len(divergent) else None
+        ),
+        "last_changed_timestamp": (
+            _timestamp_iso(divergent.max()) if len(divergent) else None
+        ),
+    }
 
 
 def effective_execution_end_date(config: Any) -> str | None:
@@ -190,9 +321,17 @@ def resolve_backtest_analysis_end_date(
     config: Any,
     *,
     now: datetime | pd.Timestamp | None = None,
+    require_cached_common_session: bool = True,
 ) -> str:
+    """Resolve an XNYS session, never a wall-clock date or in-flight daily bar.
+
+    A read-only job must use a common available MongoDB session. A new
+    bootstrap/full-refresh Simulation instead uses the latest safely closed
+    session even when the old MongoDB cache ends earlier: Alpaca must then
+    supply the missing data or the job fails explicitly.
+    """
     calendar = xcals.get_calendar("XNYS")
-    latest_closed = latest_completed_xnys_session(now)
+    latest_closed = latest_safe_completed_xnys_session(now)
     requested = normalize_end_date(getattr(config, "end_date", None))
     if requested:
         requested_session = pd.Timestamp(
@@ -201,6 +340,9 @@ def resolve_backtest_analysis_end_date(
         target = min(requested_session, latest_closed)
     else:
         target = latest_closed
+
+    if not require_cached_common_session:
+        return target.date().isoformat()
 
     client = create_client()
     try:
@@ -270,31 +412,117 @@ def refresh_market_data_to_live_cutoff(
             name="uq_alpaca_market_bar",
         )
 
+        full_daily_history_refresh = str(config.timeframe) == "1Day"
+        history_audit_by_symbol: dict[str, dict[str, Any]] = {}
+
         for symbol in assets:
             identity = _market_data_identity(symbol, config)
-            latest = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", -1)])
+
+            if full_daily_history_refresh:
+                start = pd.Timestamp(str(config.start_date), tz="UTC")
+                end = inclusive_end_exclusive_boundary(target_date)
+                previous_cached = _read_frame(
+                    collection,
+                    identity,
+                    start,
+                    end,
+                )
+                downloaded_at = datetime.now(timezone.utc).isoformat()
+                downloaded = _download_alpaca_bars(
+                    symbol,
+                    config,
+                    str(config.start_date),
+                    target_date,
+                    single_request_daily=True,
+                )
+                if downloaded is None or downloaded.empty:
+                    raise RuntimeError(
+                        "LiveMarketDataFullRefreshFailed: Alpaca returned no "
+                        f"daily history for {symbol}."
+                    )
+
+                audit = market_history_drift(previous_cached, downloaded)
+                audit.update(
+                    {
+                        "downloaded_at": downloaded_at,
+                        "history_audit_source": "alpaca_live_full_history_pre_replace",
+                        "rows": int(len(downloaded)),
+                        "first_timestamp": _timestamp_iso(downloaded.index.min()),
+                        "last_timestamp": _timestamp_iso(downloaded.index.max()),
+                    }
+                )
+                history_audit_by_symbol[symbol] = audit
+
+                time_filter: dict[str, Any] = {
+                    "$gte": start.to_pydatetime(),
+                }
+                if end is not None:
+                    time_filter["$lt"] = end.to_pydatetime()
+                collection.delete_many(
+                    {
+                        **identity,
+                        "timestamp": time_filter,
+                    }
+                )
+                _upsert_frame(
+                    collection,
+                    downloaded,
+                    identity,
+                    config.mongo_write_batch_size,
+                )
+                rows_by_symbol[symbol] = int(len(downloaded))
+                continue
+
+            latest = collection.find_one(
+                identity,
+                {"timestamp": 1, "_id": 0},
+                sort=[("timestamp", -1)],
+            )
             latest_session = None
             if latest and latest.get("timestamp") is not None:
                 latest_stamp = _utc_timestamp(latest["timestamp"])
                 latest_session = pd.Timestamp(
-                    calendar.date_to_session(pd.Timestamp(latest_stamp.date()), direction="previous")
+                    calendar.date_to_session(
+                        pd.Timestamp(latest_stamp.date()),
+                        direction="previous",
+                    )
                 )
-            if latest_session is not None and latest_session >= target and _cache_has_session(collection, identity, target):
+            if (
+                latest_session is not None
+                and latest_session >= target
+                and _cache_has_session(collection, identity, target)
+            ):
                 rows_by_symbol[symbol] = 0
                 continue
 
             if latest_session is None:
-                refresh_start = str(getattr(config, "start_date", None) or target_date)
+                refresh_start = str(
+                    getattr(config, "start_date", None) or target_date
+                )
             else:
-                # Re-fetch a small tail so the latest daily bar can be safely replaced
-                # if the provider revised it after the first observation.
+                # Intraday/non-daily fallback remains incremental.
                 refresh_start = max(
-                    pd.Timestamp(str(getattr(config, "start_date", None) or latest_session.date().isoformat())),
+                    pd.Timestamp(
+                        str(
+                            getattr(config, "start_date", None)
+                            or latest_session.date().isoformat()
+                        )
+                    ),
                     latest_session - pd.Timedelta(days=7),
                 ).date().isoformat()
-            downloaded = _download_alpaca_bars(symbol, config, refresh_start, target_date)
+            downloaded = _download_alpaca_bars(
+                symbol,
+                config,
+                refresh_start,
+                target_date,
+            )
             if downloaded is not None and not downloaded.empty:
-                _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
+                _upsert_frame(
+                    collection,
+                    downloaded,
+                    identity,
+                    config.mongo_write_batch_size,
+                )
                 rows_by_symbol[symbol] = int(len(downloaded))
             else:
                 rows_by_symbol[symbol] = 0
@@ -317,11 +545,30 @@ def refresh_market_data_to_live_cutoff(
     finally:
         client.close()
 
+    history_audit_by_symbol = locals().get(
+        "history_audit_by_symbol",
+        {},
+    )
+    history_changed_assets = sorted(
+        symbol
+        for symbol, audit in history_audit_by_symbol.items()
+        if audit.get("historical_data_changed") is True
+    )
+    history_compared_assets = sorted(
+        symbol
+        for symbol, audit in history_audit_by_symbol.items()
+        if bool(audit.get("history_comparison_available", False))
+    )
     return {
         "live_market_cutoff": target_date,
         "target_session": target_date,
         "rows_refreshed": rows_by_symbol,
         "data_delay_minutes": SAFE_DAILY_BAR_DELAY_MINUTES,
+        "full_daily_history_refresh": str(config.timeframe) == "1Day",
+        "history_audit_by_symbol": history_audit_by_symbol,
+        "history_compared_asset_count": int(len(history_compared_assets)),
+        "history_changed_asset_count": int(len(history_changed_assets)),
+        "history_changed_assets": history_changed_assets,
     }
 
 
@@ -585,24 +832,87 @@ def _download_alpaca_bars(
     config: Any,
     start_date: str,
     end_date: str | None,
+    *,
+    single_request_daily: bool = False,
 ) -> pd.DataFrame:
-    
-
-
-
-
-
-
     credentials = get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
     normalized_end = normalize_end_date(end_date)
     if normalized_end is None:
         normalized_end = latest_completed_xnys_session().date().isoformat()
+
+    protocol = str(
+        getattr(config, "research_market_data_protocol", "")
+    )
+    refresh_mode = str(
+        getattr(config, "research_market_data_refresh_mode", "reuse")
+    )
+    exact_tcc_loader = bool(
+        config.timeframe == "1Day"
+        and protocol == "raw_total_causal_v1"
+        and refresh_mode == "full"
+    )
+    use_single_daily_request = bool(
+        config.timeframe == "1Day"
+        and (exact_tcc_loader or single_request_daily)
+    )
+
+    if use_single_daily_request:
+        # Daily history remains below Alpaca's 10k limit for the supported
+        # research/operational windows. One request guarantees that a live
+        # refresh observes the provider's current full historical series.
+        # The research path preserves the exact homologated TCC request shape.
+        api_end = (
+            pd.Timestamp(normalized_end, tz="UTC")
+            + pd.Timedelta(days=1)
+        ).to_pydatetime()
+        frame = download_stock_bars(
+            api_key_id=credentials["api_key_id"],
+            secret_key=credentials["secret_key"],
+            symbol=symbol,
+            timeframe=config.timeframe,
+            start=requested_start.to_pydatetime(),
+            end=api_end,
+            feed=config.alpaca_historical_feed,
+            adjustment=config.alpaca_adjustment,
+            limit=10_000,
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        result = trim_downloaded_range(
+            frame,
+            start_date,
+            end_date,
+            config.timeframe,
+        )
+        provenance = dict(getattr(result, "attrs", {}) or {})
+        loader_name = (
+            "tcc_single_request_v1"
+            if exact_tcc_loader
+            else "alpaca_current_daily_single_request_v1"
+        )
+        provenance.update(
+            {
+                "market_bar_loader": loader_name,
+                "research_bar_loader": loader_name,
+                "research_bar_request_limit": 10_000,
+                "research_bar_end_mode": "cutoff_plus_one_day_utc",
+                "research_bar_chunking": False,
+            }
+        )
+        result.attrs.update(provenance)
+        return result
+
     calendar = xcals.get_calendar("XNYS")
     session = pd.Timestamp(
-        calendar.date_to_session(pd.Timestamp(normalized_end), direction="previous")
+        calendar.date_to_session(
+            pd.Timestamp(normalized_end),
+            direction="previous",
+        )
     )
-    requested_end = pd.Timestamp(calendar.session_close(session)).tz_convert("UTC")
+    requested_end = pd.Timestamp(
+        calendar.session_close(session)
+    ).tz_convert("UTC")
     if requested_end <= requested_start:
         return pd.DataFrame()
 
@@ -614,7 +924,10 @@ def _download_alpaca_bars(
     frames: list[pd.DataFrame] = []
     cursor = requested_start
     while cursor < requested_end:
-        chunk_end = min(cursor + pd.Timedelta(days=chunk_days), requested_end)
+        chunk_end = min(
+            cursor + pd.Timedelta(days=chunk_days),
+            requested_end,
+        )
         frame = download_stock_bars(
             api_key_id=credentials["api_key_id"],
             secret_key=credentials["secret_key"],
@@ -734,10 +1047,75 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             name="uq_alpaca_market_bar",
         )
         identity = _market_data_identity(symbol, config)
-        first = collection.find_one(identity, {"timestamp": 1, "_id": 0}, sort=[("timestamp", 1)])
+        first = collection.find_one(
+            identity,
+            {"timestamp": 1, "_id": 0},
+            sort=[("timestamp", 1)],
+        )
         bootstrapped_rows = 0
+        full_refresh_performed = False
+        refresh_download_provenance: dict[str, Any] = {}
+        refresh_mode = str(
+            getattr(config, "research_market_data_refresh_mode", "reuse")
+        )
+        protocol = str(
+            getattr(config, "research_market_data_protocol", "")
+        )
+        force_full_refresh = bool(
+            allow_bootstrap
+            and refresh_mode == "full"
+            and protocol == "raw_total_causal_v1"
+        )
 
-        if first is None:
+        if force_full_refresh:
+            downloaded_at = datetime.now(timezone.utc).isoformat()
+            previous_cached = _read_frame(
+                collection,
+                identity,
+                start,
+                end,
+            )
+            downloaded = _download_alpaca_bars(
+                symbol,
+                config,
+                config.start_date,
+                execution_end,
+            )
+            if downloaded is None or downloaded.empty:
+                raise RuntimeError(
+                    f"MarketDataFullRefreshFailed: Alpaca returned no full RAW "
+                    f"history for {symbol}."
+                )
+            refresh_download_provenance = dict(
+                getattr(downloaded, "attrs", {}) or {}
+            )
+            refresh_download_provenance.update(
+                market_history_drift(previous_cached, downloaded)
+            )
+            refresh_download_provenance["downloaded_at"] = downloaded_at
+            refresh_download_provenance["history_audit_source"] = (
+                "alpaca_raw_pre_replace"
+            )
+            time_filter: dict[str, Any] = {
+                "$gte": start.to_pydatetime(),
+            }
+            if end is not None:
+                time_filter["$lt"] = end.to_pydatetime()
+            collection.delete_many(
+                {
+                    **identity,
+                    "timestamp": time_filter,
+                }
+            )
+            _upsert_frame(
+                collection,
+                downloaded,
+                identity,
+                config.mongo_write_batch_size,
+            )
+            bootstrapped_rows = int(len(downloaded))
+            full_refresh_performed = True
+        elif first is None:
             if not allow_bootstrap:
                 raise RuntimeError(
                     f"MarketDataMissingInMongoDB: {symbol} has no cached {config.timeframe} "
@@ -756,6 +1134,42 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
                 )
             _upsert_frame(collection, downloaded, identity, config.mongo_write_batch_size)
             bootstrapped_rows = len(downloaded)
+        elif allow_bootstrap and execution_end:
+            latest = collection.find_one(
+                identity,
+                {"timestamp": 1, "_id": 0},
+                sort=[("timestamp", -1)],
+            )
+            latest_stamp = (
+                _optional_utc_timestamp(latest.get("timestamp"))
+                if latest is not None
+                else None
+            )
+            target_end = date.fromisoformat(str(execution_end))
+            if latest_stamp is None or latest_stamp.date() < target_end:
+                overlap_days = max(
+                    0,
+                    int(getattr(config, "mongo_refresh_overlap_days", 0)),
+                )
+                refresh_start = (
+                    (latest_stamp - pd.Timedelta(days=overlap_days)).date().isoformat()
+                    if latest_stamp is not None
+                    else config.start_date
+                )
+                downloaded = _download_alpaca_bars(
+                    symbol,
+                    config,
+                    refresh_start,
+                    execution_end,
+                )
+                if downloaded is not None and not downloaded.empty:
+                    _upsert_frame(
+                        collection,
+                        downloaded,
+                        identity,
+                        config.mongo_write_batch_size,
+                    )
+                    bootstrapped_rows += int(len(downloaded))
 
         cached = _read_frame(collection, identity, start, end)
         if cached.empty:
@@ -773,8 +1187,21 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
         )
         provenance = dict(result.attrs.get("market_data_provenance", {}))
         provenance["research_access_path"] = (
-            "alpaca_bootstrap_then_mongodb" if bootstrapped_rows else "mongodb_only"
+            "alpaca_full_refresh_then_mongodb"
+            if full_refresh_performed
+            else (
+                "alpaca_refresh_then_mongodb"
+                if bootstrapped_rows and first is not None
+                else (
+                    "alpaca_bootstrap_then_mongodb"
+                    if bootstrapped_rows
+                    else "mongodb_only"
+                )
+            )
         )
+        provenance["research_market_data_refresh_mode"] = refresh_mode
+        provenance["full_refresh_performed"] = bool(full_refresh_performed)
+        provenance.update(refresh_download_provenance)
         provenance["cache_bootstrap_rows"] = int(bootstrapped_rows)
         provenance["requested_end"] = normalize_end_date(execution_end)
         provenance["end_complete"] = _end_is_complete(result, config)
@@ -784,7 +1211,7 @@ def load_mongo_market_bars(symbol: str, config: Any) -> pd.DataFrame:
             raise RuntimeError(
                 f"MarketDataIncomplete: MongoDB market data for {symbol} ends at {last}; "
                 f"the frozen research cutoff is {provenance.get('requested_end')}. "
-                "Existing cached assets are never refreshed from Alpaca by a backtest or tuning run."
+                "The requested research refresh did not produce complete market data."
             )
         return result
     finally:

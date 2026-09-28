@@ -22,6 +22,15 @@ logger = logging.getLogger("uvicorn.error")
 
 
 WINNER_ENGINE_COMPATIBILITY = "api-v1.13.16"
+TCC_V106_REFERENCE_ENGINE_MODULE = (
+    "market_cycle_trader_api.engine.tcc_v106_reference_backtest"
+)
+_ALLOWED_ENGINE_MODULES = frozenset(
+    {
+        ENGINE_MODULE,
+        TCC_V106_REFERENCE_ENGINE_MODULE,
+    }
+)
 _NUMERIC_THREAD_ENVIRONMENT_KEYS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -122,6 +131,8 @@ PUBLIC_JOB_FIELDS = frozenset({
     "strategy_profile_name",
     "strategy_profile_revision",
     "strategy_configuration_hash",
+    "backtest_engine_binding",
+    "reference_engine_id",
     "progress_detail",
 })
 
@@ -142,6 +153,18 @@ _SAFE_PROGRESS_PATTERNS = (
         re.compile(r"^LightGBM Utility run \d+/\d+ completed$"),
     re.compile(r"^IQN run \d+/\d+ completed$"),
     re.compile(r"^Run \d+/\d+ — fold \d+/\d+ — IQN training \d+%$"),
+    re.compile(
+        r"^TCC v1\.0\.6 (?:CONTROL|SOFT_HORIZON_CONSENSUS) — .+$"
+    ),
+    re.compile(
+        r"^TCC v1\.0\.6 loading market data \d+/\d+ — [A-Z0-9.\-]+$"
+    ),
+    re.compile(r"^Preparing TCC v1\.0\.6 reference engine$"),
+    re.compile(
+        r"^Running TCC v1\.0\.6 (?:Control|Soft Horizon Consensus)$"
+    ),
+    re.compile(r"^Saving tcc_v106_(?:control|soft)$"),
+    re.compile(r"^Finalizing TCC v1\.0\.6 comparison$"),
 )
 _PROGRESS_DETAIL_FIELDS = frozenset({
     "run_index",
@@ -439,7 +462,24 @@ def run_job(job_id: str) -> None:
     existing_python_path = os.environ.get("PYTHONPATH", "")
     if existing_python_path:
         python_path = python_path + os.pathsep + existing_python_path
-    command = [sys.executable, "-u", "-m", ENGINE_MODULE, "--job-id", job_id]
+    engine_module = str(
+        job_document.get("engine_module_override") or ENGINE_MODULE
+    ).strip()
+    if engine_module not in _ALLOWED_ENGINE_MODULES:
+        raise RuntimeError(
+            f"Unsupported backtest engine module: {engine_module}"
+        )
+    if engine_module == ENGINE_MODULE:
+        engine_path = ENGINE_PATH
+    else:
+        engine_path = (
+            SOURCE_ROOT
+            / "market_cycle_trader_api"
+            / "engine"
+            / "tcc_v106_reference_backtest.py"
+        )
+
+    command = [sys.executable, "-u", "-m", engine_module, "--job-id", job_id]
     numeric_environment = numeric_thread_environment(request_payload)
     runtime_thread_limit = int(job_document.get("runtime_thread_limit") or 0)
     if runtime_thread_limit > 0:
@@ -450,8 +490,8 @@ def run_job(job_id: str) -> None:
         **numeric_environment,
     })
     engine_identity = {
-        "engine_module": ENGINE_MODULE,
-        "engine_path": str(ENGINE_PATH),
+        "engine_module": engine_module,
+        "engine_path": str(engine_path),
         "python_executable": sys.executable,
         "winner_engine_compatibility": WINNER_ENGINE_COMPATIBILITY,
         "numeric_thread_environment_applied": bool(numeric_environment),
@@ -465,7 +505,7 @@ def run_job(job_id: str) -> None:
             },
             "$push": {
                 "logs": {
-                    "$each": [f"Backtest engine: {ENGINE_MODULE}"],
+                    "$each": [f"Backtest engine: {engine_module}"],
                     "$slice": -400,
                 }
             },

@@ -19,7 +19,17 @@ from ...infrastructure.persistence.mongo_repository import (
 )
 from ...schemas.requests import BacktestExecutionRequest
 from ...engine.market_data import resolve_backtest_analysis_end_date
-from ...services.jobs import public_job, require_job, run_job
+from ...engine.tcc_frozen_reference_source import (
+    FROZEN_SOURCE,
+    FROZEN_TCC_END,
+    selected_tcc_reference_input_source,
+)
+from ...services.jobs import (
+    TCC_V106_REFERENCE_ENGINE_MODULE,
+    public_job,
+    require_job,
+    run_job,
+)
 from ...services.system_settings import apply_training_runtime_settings, get_system_settings
 from ...services.strategy_lab import (
     get_research_reference_context,
@@ -36,6 +46,24 @@ from ...services.model_research import (
 )
 
 router = APIRouter(tags=["jobs"])
+
+
+def _reference_execution_window(
+    configuration: Any,
+    selected_strategy: dict[str, Any],
+) -> tuple[Any, str | None]:
+    """Keep the scientific TCC cutoff separate from current MCT research.
+
+    Old installed Strategy #12 profiles also carry the 2026-09-17 cutoff,
+    so the effective request must be resolved from the selected *data source*
+    rather than inherit that obsolete profile end date.
+    """
+    if str(selected_strategy.get("backtest_engine_binding") or "") != "tcc_v106_reference":
+        return configuration, None
+
+    source = selected_tcc_reference_input_source()
+    target = FROZEN_TCC_END if source == FROZEN_SOURCE else None
+    return configuration.model_copy(update={"end_date": target}), source
 
 
 def queue_backtest_job(
@@ -162,6 +190,9 @@ def queue_backtest_job(
                 research_model_family,
                 research_model_settings,
             )
+            locked_configuration, tcc_reference_source = _reference_execution_window(
+                locked_configuration, selected_strategy,
+            )
             selected_assets = set(locked_configuration.assets)
             calendar_anchor_assets = [symbol for symbol in winner_configuration.assets if symbol in selected_assets]
             if len(calendar_anchor_assets) < 2:
@@ -171,7 +202,12 @@ def queue_backtest_job(
                 research_reference_assets = list(locked_configuration.assets)
             research_reference_set = set(research_reference_assets)
             research_candidate_assets = [symbol for symbol in locked_configuration.assets if symbol not in research_reference_set]
-            resolved_analysis_end = resolve_backtest_analysis_end_date(locked_configuration)
+            # This is a new Simulation, not a read-only tuning candidate.
+            # Resolve against XNYS's safely closed session *before* refresh;
+            # old Mongo rows must never pull the requested cutoff backwards.
+            resolved_analysis_end = resolve_backtest_analysis_end_date(
+                locked_configuration, require_cached_common_session=False,
+            )
             request = BacktestExecutionRequest.model_validate(
                 {
                     **locked_configuration.model_dump(mode="python"),
@@ -183,6 +219,7 @@ def queue_backtest_job(
                     "research_model_family": research_model_family,
                     "research_model_settings": dict(research_model_settings or {}),
                     "research_market_data_mode": "backtest_bootstrap_missing",
+                    "tcc_reference_input_source": tcc_reference_source,
                 }
             )
     except (RuntimeError, ValidationError) as exc:
@@ -192,8 +229,20 @@ def queue_backtest_job(
     request_payload = request.model_dump(mode="python")
     payload = bson_value(request_payload)
     lifecycle = strategy_lifecycle(payload["strategy_mode"])
-    total_runs = int(payload["rotation_xgb_repetitions"])
-    research_label = model_label(research_model_family)
+    engine_binding = str(
+        selected_strategy.get("backtest_engine_binding") or ""
+    ).strip()
+    is_tcc_v106_reference = engine_binding == "tcc_v106_reference"
+    total_runs = (
+        2
+        if is_tcc_v106_reference
+        else int(payload["rotation_xgb_repetitions"])
+    )
+    research_label = (
+        "TCC v1.0.6 Control + Soft Horizon Consensus"
+        if is_tcc_v106_reference
+        else model_label(research_model_family)
+    )
     model_snapshot = selected_model_snapshot
     job = {
         "id": job_id,
@@ -242,6 +291,34 @@ def queue_backtest_job(
         "tuning_candidate_id": tuning_candidate_id,
         "runtime_thread_limit": max(1, int(runtime_thread_limit)) if runtime_thread_limit else None,
         "execution_worker_id": str(execution_worker_id or "").strip() or None,
+        "backtest_engine_binding": engine_binding or None,
+        "engine_module_override": (
+            TCC_V106_REFERENCE_ENGINE_MODULE
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_engine_id": (
+            selected_strategy.get("reference_engine_id")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_source_repository": (
+            selected_strategy.get("reference_source_repository")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_source_tag": (
+            selected_strategy.get("reference_source_tag")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "reference_source_commit": (
+            selected_strategy.get("reference_source_commit")
+            if is_tcc_v106_reference
+            else None
+        ),
+        "tcc_reference_input_source": request.tcc_reference_input_source,
+        "requested_analysis_cutoff": request.analysis_end_date,
     }
     db[JOBS_COLLECTION].insert_one(job)
     if start_thread:

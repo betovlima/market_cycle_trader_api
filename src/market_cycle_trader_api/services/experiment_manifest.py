@@ -8,14 +8,20 @@ from ..core.config import API_VERSION
 def build_experiment_manifest(
     job: dict[str, Any],
     runs: list[dict[str, Any]],
+    *,
+    effective_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     
 
     primary_run = runs[0] if runs else {}
     metrics = dict(primary_run.get("metrics") or {})
-    request = dict(job.get("request") or {})
+    request = dict(
+        effective_config
+        if isinstance(effective_config, dict)
+        else (job.get("request") or {})
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "api_version": API_VERSION,
         "job_id": job.get("id"),
         "job_status": job.get("status"),
@@ -38,8 +44,47 @@ def build_experiment_manifest(
         "research_candidate_assets": job.get("research_candidate_assets") or metrics.get("research_candidate_assets") or [],
         "execution_calendar_anchor_assets": request.get("calendar_anchor_assets") or [],
         "market_data_signature_sha256": metrics.get("market_data_signature_sha256"),
+        "market_data_audit_signature_sha256": metrics.get(
+            "market_data_audit_signature_sha256"
+        ),
         "market_data_signatures": metrics.get("market_data_signatures") or {},
         "market_data_history_complete": metrics.get("market_data_history_complete"),
+        "market_data_history_compared_assets": metrics.get(
+            "market_data_history_compared_assets"
+        ) or [],
+        "market_data_history_compared_asset_count": metrics.get(
+            "market_data_history_compared_asset_count"
+        ),
+        "market_data_history_changed_assets": metrics.get(
+            "market_data_history_changed_assets"
+        ) or [],
+        "market_data_history_changed_asset_count": metrics.get(
+            "market_data_history_changed_asset_count"
+        ),
+        "market_data_history_comparison_unavailable_assets": metrics.get(
+            "market_data_history_comparison_unavailable_assets"
+        ) or [],
+        "research_market_data_protocol": metrics.get("research_market_data_protocol"),
+        "research_source_adjustment": metrics.get("research_source_adjustment"),
+        "configured_asset_count": metrics.get("configured_asset_count"),
+        "eligible_asset_count": metrics.get("eligible_asset_count"),
+        "structural_exclusions": metrics.get("structural_exclusions") or [],
+        "eligible_total_rows": metrics.get("eligible_total_rows"),
+        "total_splits_applied": metrics.get("total_splits_applied"),
+        "total_corporate_actions": metrics.get("total_corporate_actions"),
+        "total_dividend_events": metrics.get("total_dividend_events"),
+        "dividend_adjustment_applied": metrics.get(
+            "dividend_adjustment_applied"
+        ),
+        "dividend_events_used_by_model": metrics.get(
+            "dividend_events_used_by_model"
+        ),
+        "split_normalization_direction": metrics.get(
+            "split_normalization_direction"
+        ),
+        "split_normalization_uses_future_events": metrics.get(
+            "split_normalization_uses_future_events"
+        ),
         "runtime_fingerprint_sha256": metrics.get("runtime_fingerprint_sha256"),
         "git_commit": metrics.get("git_commit"),
         "engine_source_sha256": metrics.get("engine_source_sha256"),

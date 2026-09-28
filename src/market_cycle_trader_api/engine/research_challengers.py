@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .capital_rotation import (
+    LEGACY_ROTATION_MODE,
     ROTATION_FEATURES,
     SUPPORTED_ROTATION_MODES,
     RotationRunResult,
@@ -29,6 +30,8 @@ from .capital_rotation import (
     _training_transition_log_return,
     _utility_policy,
     _model_utilities,
+    _precompute_model_utilities,
+    _prepare_rotation_panel_with_source,
     prepare_rotation_panel,
 )
 from .optimized_allocation import fit_expected_return_calibrator
@@ -75,7 +78,98 @@ def _lightgbm_settings(config: Any) -> dict[str, Any]:
     missing = sorted(required.difference(lightgbm))
     if missing:
         raise ValueError("LightGBM research settings are incomplete: " + ", ".join(missing))
-    return dict(lightgbm)
+    resolved = dict(lightgbm)
+    resolved["early_stopping_enabled"] = False
+    return resolved
+
+
+def _switch_margin_calibration_trace(
+    policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    decision_dates: pd.DatetimeIndex,
+    config: Any,
+    *,
+    fold_id: int,
+    candidate_margin: float,
+) -> tuple[float, list[dict[str, Any]]]:
+    """Replay one calibration candidate without affecting candidate selection."""
+    if len(decision_dates) < 2:
+        return float("-inf"), []
+
+    wealth = 1.0
+    peak = 1.0
+    position = 0
+    holding = 0
+    cumulative_score = 0.0
+    rows: list[dict[str, Any]] = []
+
+    for step in range(len(decision_dates) - 1):
+        now = pd.Timestamp(decision_dates[step])
+        nxt = pd.Timestamp(decision_dates[step + 1])
+        from_position = int(position)
+        holding_before = int(holding)
+        action, policy_score = policy(now, position, holding)
+        action = int(action)
+
+        log_return = _training_transition_log_return(
+            frames,
+            symbols,
+            now,
+            nxt,
+            from_position,
+            action,
+            config,
+        )
+        reward, wealth_after, peak_after = _risk_adjusted_reward(
+            log_return,
+            wealth,
+            peak,
+            config,
+        )
+        cumulative_score += float(reward)
+
+        rows.append(
+            {
+                "fold_id": int(fold_id),
+                "candidate_margin": float(candidate_margin),
+                "step": int(step),
+                "decision_date": now,
+                "next_date": nxt,
+                "from_position": from_position,
+                "from_asset": (
+                    symbols[from_position - 1]
+                    if from_position > 0
+                    else "CASH"
+                ),
+                "to_position": action,
+                "to_asset": (
+                    symbols[action - 1]
+                    if action > 0
+                    else "CASH"
+                ),
+                "holding_days_before": holding_before,
+                "policy_score": float(policy_score),
+                "log_return": float(log_return),
+                "risk_adjusted_reward": float(reward),
+                "cumulative_risk_adjusted_score": float(cumulative_score),
+                "wealth_before": float(wealth),
+                "wealth_after": float(wealth_after),
+                "peak_before": float(peak),
+                "peak_after": float(peak_after),
+                "position_changed": bool(action != from_position),
+            }
+        )
+
+        wealth = float(wealth_after)
+        peak = float(peak_after)
+        if action == from_position:
+            holding = holding + 1 if action > 0 else 0
+        else:
+            position = action
+            holding = 1 if action > 0 else 0
+
+    return float(cumulative_score), rows
 
 
 def _build_execution_context(
@@ -84,6 +178,7 @@ def _build_execution_context(
 ) -> tuple[
     dict[str, pd.DataFrame],
     pd.DatetimeIndex,
+    str,
     list[str],
     list[dict[str, Any]],
     pd.DatetimeIndex,
@@ -92,7 +187,10 @@ def _build_execution_context(
 ]:
     if config.strategy_mode not in SUPPORTED_ROTATION_MODES:
         raise ValueError(f"Unsupported research strategy mode: {config.strategy_mode}.")
-    frames, common_dates = prepare_rotation_panel(bars_by_symbol, config)
+    frames, common_dates, calendar_source_asset = _prepare_rotation_panel_with_source(
+        bars_by_symbol,
+        config,
+    )
     symbols = sorted(frames)
     folds = _build_walk_forward_folds(common_dates, config)
     all_decision_dates = _analysis_decision_dates(common_dates, folds, config)
@@ -110,6 +208,7 @@ def _build_execution_context(
     return (
         frames,
         common_dates,
+        calendar_source_asset,
         symbols,
         folds,
         all_decision_dates,
@@ -204,6 +303,243 @@ def _lightgbm_last_tree_snapshot(
     }
 
 
+def _regression_error_diagnostics(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+) -> dict[str, float | int | None]:
+    actual_values = np.asarray(actual, dtype=np.float64)
+    predicted_values = np.asarray(predicted, dtype=np.float64)
+    valid = np.isfinite(actual_values) & np.isfinite(predicted_values)
+    if not bool(valid.any()):
+        return {
+            "rows": 0,
+            "absolute_error_sum": 0.0,
+            "squared_error_sum": 0.0,
+            "mae": None,
+            "rmse": None,
+        }
+    residual = predicted_values[valid] - actual_values[valid]
+    abs_sum = float(np.abs(residual).sum())
+    sq_sum = float(np.square(residual).sum())
+    rows = int(valid.sum())
+    return {
+        "rows": rows,
+        "absolute_error_sum": abs_sum,
+        "squared_error_sum": sq_sum,
+        "mae": abs_sum / rows,
+        "rmse": math.sqrt(sq_sum / rows),
+    }
+
+def _lightgbm_model_fit_diagnostics(
+    model: Any,
+    train_frame: pd.DataFrame,
+    *,
+    target_column: str,
+    configured_estimators: int,
+) -> dict[str, Any]:
+    train_prediction = model.predict(train_frame[ROTATION_FEATURES])
+    train_diag = _regression_error_diagnostics(
+        train_frame[target_column].to_numpy(dtype=np.float64),
+        np.asarray(train_prediction, dtype=np.float64),
+    )
+
+    gain = np.asarray(
+        model.booster_.feature_importance(importance_type="gain"),
+        dtype=np.float64,
+    )
+    gain = np.where(np.isfinite(gain), gain, 0.0)
+    gain_total = float(gain.sum())
+    importance = {
+        feature: (float(value / gain_total) if gain_total > 0 else 0.0)
+        for feature, value in zip(ROTATION_FEATURES, gain)
+    }
+
+    return {
+        "configured_estimators": int(configured_estimators),
+        "best_iteration": int(configured_estimators),
+        "early_stopping_used": False,
+        "train": train_diag,
+        "feature_importance_gain": importance,
+    }
+
+def _evaluate_lightgbm_models_on_dates(
+    models: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    dates: pd.DatetimeIndex,
+    *,
+    target_column: str = "forward_risk_adjusted_utility",
+) -> dict[str, float | int | None]:
+    actual_values: list[float] = []
+    predicted_values: list[float] = []
+
+    for symbol in symbols:
+        model = models.get(symbol)
+        frame = frames.get(symbol)
+        if model is None or frame is None or frame.empty:
+            continue
+        available_dates = pd.DatetimeIndex(dates).intersection(frame.index)
+        if len(available_dates) == 0:
+            continue
+        sample = frame.loc[available_dates].dropna(
+            subset=[target_column, *ROTATION_FEATURES]
+        )
+        if sample.empty:
+            continue
+        predicted = model.predict(sample[ROTATION_FEATURES])
+        actual_values.extend(
+            sample[target_column].to_numpy(dtype=np.float64).tolist()
+        )
+        predicted_values.extend(
+            np.asarray(predicted, dtype=np.float64).tolist()
+        )
+
+    return _regression_error_diagnostics(
+        np.asarray(actual_values, dtype=np.float64),
+        np.asarray(predicted_values, dtype=np.float64),
+    )
+
+def _aggregate_lightgbm_model_diagnostics(
+    models: dict[str, Any],
+    *,
+    fold_id: int,
+    validation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    train_rows = 0
+    train_abs = 0.0
+    train_sq = 0.0
+    configured_estimators: list[int] = []
+    feature_gain = {feature: 0.0 for feature in ROTATION_FEATURES}
+
+    for model in models.values():
+        diag = getattr(model, "_fit_diagnostics", None)
+        if not isinstance(diag, dict):
+            continue
+        train = diag.get("train") or {}
+        train_rows += int(train.get("rows") or 0)
+        train_abs += float(train.get("absolute_error_sum") or 0.0)
+        train_sq += float(train.get("squared_error_sum") or 0.0)
+        configured_estimators.append(int(diag.get("configured_estimators") or 0))
+        for feature, value in (diag.get("feature_importance_gain") or {}).items():
+            if feature in feature_gain:
+                feature_gain[feature] += float(value or 0.0)
+
+    model_count = len(models)
+    feature_total = float(sum(feature_gain.values()))
+    normalized_gain = {
+        feature: (value / feature_total if feature_total > 0 else 0.0)
+        for feature, value in feature_gain.items()
+    }
+    top_features = [
+        {"feature": feature, "importance_gain": float(value)}
+        for feature, value in sorted(
+            normalized_gain.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+
+    train_rmse = math.sqrt(train_sq / train_rows) if train_rows else None
+    validation = dict(validation or {})
+    validation_rows = int(validation.get("rows") or 0)
+    validation_mae = (
+        float(validation.get("mae"))
+        if validation.get("mae") is not None
+        else None
+    )
+    validation_rmse = (
+        float(validation.get("rmse"))
+        if validation.get("rmse") is not None
+        else None
+    )
+
+    effective_estimators = (
+        float(np.mean(configured_estimators))
+        if configured_estimators
+        else None
+    )
+    return {
+        "fold_id": int(fold_id),
+        "model_count": int(model_count),
+        "early_stopping_model_count": 0,
+        "early_stopping_model_fraction": 0.0,
+        "best_iteration_mean": effective_estimators,
+        "best_iteration_median": (
+            float(np.median(configured_estimators))
+            if configured_estimators
+            else None
+        ),
+        "configured_estimators_mean": effective_estimators,
+        "train_rows": int(train_rows),
+        "train_mae": (train_abs / train_rows if train_rows else None),
+        "train_rmse": train_rmse,
+        "validation_rows": validation_rows,
+        "validation_mae": validation_mae,
+        "validation_rmse": validation_rmse,
+        "generalization_gap_rmse": (
+            float(validation_rmse) - float(train_rmse)
+            if train_rmse is not None and validation_rmse is not None
+            else None
+        ),
+        "validation_source": "existing_chronological_calibration_window",
+        "feature_importance_source": "calibration_models",
+        "feature_importance_gain": normalized_gain,
+        "top_features_by_gain": top_features,
+    }
+
+def _aggregate_lightgbm_fold_diagnostics(
+    folds: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not folds:
+        return {}
+    numeric_fields = (
+        "train_mae",
+        "train_rmse",
+        "validation_mae",
+        "validation_rmse",
+        "generalization_gap_rmse",
+        "best_iteration_mean",
+        "configured_estimators_mean",
+        "early_stopping_model_fraction",
+    )
+    output: dict[str, Any] = {"fold_count": len(folds)}
+    for field in numeric_fields:
+        values = [
+            float(item[field])
+            for item in folds
+            if item.get(field) is not None and np.isfinite(float(item[field]))
+        ]
+        output_key = (
+            field
+            if field in {"best_iteration_mean", "configured_estimators_mean"}
+            else f"{field}_mean"
+        )
+        output[output_key] = float(np.mean(values)) if values else None
+
+    feature_gain = {feature: 0.0 for feature in ROTATION_FEATURES}
+    for fold in folds:
+        for feature, value in (fold.get("feature_importance_gain") or {}).items():
+            if feature in feature_gain:
+                feature_gain[feature] += float(value or 0.0)
+    total = float(sum(feature_gain.values()))
+    normalized = {
+        feature: (value / total if total > 0 else 0.0)
+        for feature, value in feature_gain.items()
+    }
+    output["feature_importance_gain"] = normalized
+    output["top_features_by_gain"] = [
+        {"feature": feature, "importance_gain": float(value)}
+        for feature, value in sorted(
+            normalized.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    output["early_stopping_enabled"] = False
+    output["validation_source"] = "existing_chronological_calibration_window"
+    return output
+
+
 def _lightgbm_fit_models(
     frames: dict[str, pd.DataFrame],
     symbols: list[str],
@@ -220,7 +556,6 @@ def _lightgbm_fit_models(
     except ImportError as exc:
         raise RuntimeError("LightGBM research requires lightgbm. Install requirements.txt.") from exc
 
-    anchor_assets = set(getattr(config, "calendar_anchor_assets", []) or [])
     minimum_rows = int(config.rotation_minimum_training_rows)
     settings = _lightgbm_settings(config)
     fitted: dict[str, Any] = {}
@@ -233,18 +568,14 @@ def _lightgbm_fit_models(
     technical(
         f"model=lightgbm phase={phase} event=fit_start device=cpu "
         f"models={len(symbols)} train_sessions={len(train_dates)} "
-        f"estimators={int(settings['n_estimators'])} seed={int(config.random_state)}"
+        f"estimators={int(settings['n_estimators'])} "
+        f"seed={int(config.random_state)} early_stopping=false"
     )
     for position, symbol in enumerate(symbols, start=1):
         frame = frames[symbol].loc[train_dates].dropna(
             subset=[target_column, *ROTATION_FEATURES]
         )
         if len(frame) < minimum_rows:
-            if symbol in anchor_assets:
-                raise ValueError(
-                    f"{symbol}: only {len(frame)} utility rows are available; "
-                    f"{minimum_rows} are required for an anchor asset."
-                )
             if progress_callback is not None:
                 progress_callback(position, len(symbols), "cpu")
             continue
@@ -264,12 +595,19 @@ def _lightgbm_fit_models(
             reg_lambda=float(settings["reg_lambda"]),
             max_bin=int(settings["max_bin"]),
             random_state=int(config.random_state),
-            n_jobs=_effective_n_jobs(int(settings["n_jobs"])),
+            n_jobs=int(settings["n_jobs"]),
+            device_type="cpu",
             deterministic=bool(config.deterministic_execution),
             force_col_wise=bool(config.deterministic_execution),
             verbosity=-1,
         )
         model.fit(frame[ROTATION_FEATURES], frame[target_column])
+        model._fit_diagnostics = _lightgbm_model_fit_diagnostics(
+            model,
+            frame,
+            target_column=target_column,
+            configured_estimators=int(settings["n_estimators"]),
+        )
         fitted[symbol] = model
         if progress_callback is not None:
             progress_callback(position, len(symbols), "cpu")
@@ -278,6 +616,501 @@ def _lightgbm_fit_models(
         f"models={len(fitted)} duration_seconds={time.perf_counter() - started:.3f}"
     )
     return fitted
+
+
+def _horizon_settings(config: Any) -> dict[str, Any]:
+    horizons = [int(item) for item in config.rotation_target_horizons]
+    weights = np.asarray(
+        config.rotation_target_horizon_weights,
+        dtype=float,
+    )
+    if len(horizons) != len(weights):
+        raise ValueError(
+            "Soft horizon consensus requires one weight per target horizon."
+        )
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0:
+        raise ValueError(
+            "Soft horizon consensus requires finite positive horizon weights."
+        )
+    weights = weights / float(weights.sum())
+    return {
+        "horizons": horizons,
+        "weights": [float(item) for item in weights],
+    }
+
+
+def _fit_horizon_models(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    train_dates: pd.DatetimeIndex,
+    config: Any,
+    *,
+    phase: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    technical_log_callback: Callable[[str], None] | None = None,
+) -> dict[int, dict[str, Any]]:
+    settings = _horizon_settings(config)
+    horizons = list(settings["horizons"])
+    fitted: dict[int, dict[str, Any]] = {}
+    total = max(1, len(horizons) * len(symbols))
+
+    for horizon_index, horizon in enumerate(horizons):
+        def horizon_progress(
+            position: int,
+            symbol_total: int,
+            device: str,
+            *,
+            _index=horizon_index,
+        ) -> None:
+            if progress_callback is None:
+                return
+            completed = _index * len(symbols) + int(position)
+            progress_callback(completed, total, device)
+
+        target_column = f"forward_horizon_utility_{int(horizon)}"
+        fitted[int(horizon)] = _lightgbm_fit_models(
+            frames,
+            symbols,
+            train_dates,
+            config,
+            phase=f"{phase}_h{int(horizon)}",
+            progress_callback=horizon_progress,
+            technical_log_callback=technical_log_callback,
+            target_column=target_column,
+        )
+    return fitted
+
+
+def _soft_horizon_consensus_settings(config: Any) -> dict[str, Any]:
+    raw = (_research_settings(config).get("soft_horizon_consensus") or {})
+    horizon = _horizon_settings(config)
+    return {
+        "enabled": bool(raw.get("enabled", False))
+        if isinstance(raw, dict)
+        else False,
+        "penalty_strength": (
+            float(raw.get("penalty_strength", 1.0))
+            if isinstance(raw, dict)
+            else 1.0
+        ),
+        "horizons": list(horizon["horizons"]),
+        "weights": list(horizon["weights"]),
+        "mode": "weighted_rank_margin_modifier",
+    }
+
+def _horizon_rank_consensus_snapshot(
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    timestamp: pd.Timestamp,
+    config: Any,
+    *,
+    base_target: int,
+    current_position: int,
+    horizon_utility_caches: dict[int, dict[pd.Timestamp, np.ndarray]] | None = None,
+) -> dict[str, Any]:
+    settings = _soft_horizon_consensus_settings(config)
+    aggregate = np.zeros(len(symbols) + 1, dtype=np.float64)
+    available_weight = 0.0
+    horizon_details: list[dict[str, Any]] = []
+
+    for horizon, weight in zip(
+        settings["horizons"],
+        settings["weights"],
+        strict=True,
+    ):
+        cache = (
+            (horizon_utility_caches or {}).get(int(horizon))
+            if horizon_utility_caches is not None
+            else None
+        )
+        utilities = _model_utilities(
+            horizon_models.get(int(horizon), {}),
+            frames,
+            symbols,
+            timestamp,
+            config,
+            utility_cache=cache,
+        )
+        ranked = sorted(
+            (
+                position
+                for position in range(1, len(utilities))
+                if np.isfinite(utilities[position])
+            ),
+            key=lambda position: (
+                -float(utilities[position]),
+                symbols[position - 1],
+            ),
+        )
+        if not ranked:
+            horizon_details.append(
+                {
+                    "horizon": int(horizon),
+                    "weight": float(weight),
+                    "available_assets": 0,
+                    "winner_asset": None,
+                    "base_target_rank": None,
+                    "base_target_rank_score": None,
+                    "current_position_rank": None,
+                    "current_position_rank_score": None,
+                }
+            )
+            continue
+
+        available_weight += float(weight)
+        denominator = max(1, len(ranked) - 1)
+        rank_scores: dict[int, float] = {}
+        for rank_index, position in enumerate(ranked):
+            rank_score = (
+                1.0
+                if len(ranked) == 1
+                else 1.0 - float(rank_index) / float(denominator)
+            )
+            rank_scores[int(position)] = float(rank_score)
+            aggregate[int(position)] += float(weight) * float(rank_score)
+
+        base_rank = (
+            ranked.index(int(base_target)) + 1
+            if int(base_target) in ranked
+            else None
+        )
+        current_rank = (
+            ranked.index(int(current_position)) + 1
+            if int(current_position) in ranked
+            else None
+        )
+        horizon_details.append(
+            {
+                "horizon": int(horizon),
+                "weight": float(weight),
+                "available_assets": int(len(ranked)),
+                "winner_asset": symbols[ranked[0] - 1],
+                "winner_score": float(utilities[ranked[0]]),
+                "base_target_rank": base_rank,
+                "base_target_rank_score": (
+                    rank_scores.get(int(base_target))
+                    if int(base_target) > 0
+                    else None
+                ),
+                "current_position_rank": current_rank,
+                "current_position_rank_score": (
+                    rank_scores.get(int(current_position))
+                    if int(current_position) > 0
+                    else None
+                ),
+            }
+        )
+
+    if available_weight > 0:
+        aggregate[1:] = aggregate[1:] / float(available_weight)
+
+    finite_positions = [
+        position
+        for position in range(1, len(aggregate))
+        if np.isfinite(aggregate[position])
+    ]
+    consensus_winner = (
+        max(
+            finite_positions,
+            key=lambda position: (
+                float(aggregate[position]),
+                -position,
+            ),
+        )
+        if finite_positions
+        else 0
+    )
+    base_score = (
+        float(aggregate[int(base_target)])
+        if int(base_target) > 0 and int(base_target) < len(aggregate)
+        else None
+    )
+    current_score = (
+        float(aggregate[int(current_position)])
+        if int(current_position) > 0 and int(current_position) < len(aggregate)
+        else None
+    )
+    if base_score is None:
+        support = None
+        relative_component = None
+    elif current_score is None:
+        relative_component = float(base_score)
+        support = float(base_score)
+    else:
+        relative_component = float(
+            np.clip(
+                0.5 + 0.5 * (float(base_score) - float(current_score)),
+                0.0,
+                1.0,
+            )
+        )
+        support = float(
+            0.5 * float(base_score) + 0.5 * relative_component
+        )
+
+    return {
+        "consensus_winner_position": int(consensus_winner),
+        "consensus_winner_asset": (
+            symbols[consensus_winner - 1]
+            if consensus_winner > 0
+            else None
+        ),
+        "consensus_winner_score": (
+            float(aggregate[consensus_winner])
+            if consensus_winner > 0
+            else None
+        ),
+        "base_target_rank_score": base_score,
+        "current_position_rank_score": current_score,
+        "relative_rank_component": relative_component,
+        "soft_support": support,
+        "available_horizon_weight": float(available_weight),
+        "aggregate_rank_scores": {
+            symbols[position - 1]: float(aggregate[position])
+            for position in range(1, len(aggregate))
+        },
+        "horizons": horizon_details,
+    }
+
+def _soft_horizon_consensus_policy(
+    base_policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    base_models: dict[str, Any],
+    horizon_models: dict[int, dict[str, Any]],
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    config: Any,
+    *,
+    base_switch_margin: float,
+    base_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None,
+    horizon_utility_caches: dict[int, dict[pd.Timestamp, np.ndarray]] | None = None,
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = None,
+) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+    settings = _soft_horizon_consensus_settings(config)
+    penalty_strength = max(0.0, float(settings["penalty_strength"]))
+
+    def policy(
+        timestamp: pd.Timestamp,
+        current_position: int,
+        holding_days: int,
+    ) -> tuple[int, float]:
+        base_target, base_score = base_policy(
+            timestamp,
+            current_position,
+            holding_days,
+        )
+        key = pd.Timestamp(timestamp)
+
+        if int(base_target) == 0:
+            if decision_diagnostics is not None:
+                decision_diagnostics.setdefault(key, {}).update(
+                    {
+                        "soft_horizon_consensus_enabled": True,
+                        "soft_horizon_consensus_mode": str(settings["mode"]),
+                        "soft_horizon_consensus_reason": "BASE_CASH_PRESERVED",
+                        "soft_horizon_consensus_changed_base_action": False,
+                    }
+                )
+            return 0, float(base_score)
+
+        snapshot = _horizon_rank_consensus_snapshot(
+            horizon_models,
+            frames,
+            symbols,
+            timestamp,
+            config,
+            base_target=int(base_target),
+            current_position=int(current_position),
+            horizon_utility_caches=horizon_utility_caches,
+        )
+
+        if int(base_target) == int(current_position):
+            final_target = int(base_target)
+            reason = "BASE_HOLD_PRESERVED"
+            base_gap = 0.0
+            margin_multiplier = 1.0
+            dynamic_margin = float(base_switch_margin)
+        else:
+            base_utilities = _model_utilities(
+                base_models,
+                frames,
+                symbols,
+                timestamp,
+                config,
+                utility_cache=base_utility_cache,
+            )
+            target_utility = (
+                float(base_utilities[int(base_target)])
+                if int(base_target) < len(base_utilities)
+                else float("nan")
+            )
+            current_utility = (
+                float(base_utilities[int(current_position)])
+                if 0 <= int(current_position) < len(base_utilities)
+                else 0.0
+            )
+            base_gap = target_utility - current_utility
+            support = snapshot.get("soft_support")
+            if support is None or not np.isfinite(float(support)):
+                margin_multiplier = 1.0
+            else:
+                margin_multiplier = 1.0 + penalty_strength * (
+                    1.0 - float(np.clip(float(support), 0.0, 1.0))
+                )
+            dynamic_margin = float(base_switch_margin) * float(
+                margin_multiplier
+            )
+
+            if not np.isfinite(base_gap):
+                final_target = int(base_target)
+                reason = "SOFT_CONSENSUS_NO_GAP_PRESERVE"
+            elif float(base_gap) + 1e-15 >= float(dynamic_margin):
+                final_target = int(base_target)
+                reason = "SOFT_CONSENSUS_ACCEPT"
+            else:
+                final_target = (
+                    int(current_position)
+                    if int(current_position) > 0
+                    else 0
+                )
+                reason = "SOFT_CONSENSUS_BLOCK_MARGINAL_SWITCH"
+
+        if decision_diagnostics is not None:
+            diagnostic = decision_diagnostics.setdefault(key, {})
+            diagnostic.update(
+                {
+                    "soft_horizon_consensus_enabled": True,
+                    "soft_horizon_consensus_mode": str(settings["mode"]),
+                    "soft_horizon_consensus_penalty_strength": float(
+                        penalty_strength
+                    ),
+                    "soft_horizon_consensus_base_target_asset": (
+                        symbols[int(base_target) - 1]
+                        if int(base_target) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_current_asset": (
+                        symbols[int(current_position) - 1]
+                        if int(current_position) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_winner_asset": snapshot.get(
+                        "consensus_winner_asset"
+                    ),
+                    "soft_horizon_consensus_winner_score": snapshot.get(
+                        "consensus_winner_score"
+                    ),
+                    "soft_horizon_consensus_base_target_rank_score": snapshot.get(
+                        "base_target_rank_score"
+                    ),
+                    "soft_horizon_consensus_current_rank_score": snapshot.get(
+                        "current_position_rank_score"
+                    ),
+                    "soft_horizon_consensus_relative_rank_component": snapshot.get(
+                        "relative_rank_component"
+                    ),
+                    "soft_horizon_consensus_support": snapshot.get(
+                        "soft_support"
+                    ),
+                    "soft_horizon_consensus_base_gap": (
+                        float(base_gap)
+                        if np.isfinite(float(base_gap))
+                        else None
+                    ),
+                    "soft_horizon_consensus_base_switch_margin": float(
+                        base_switch_margin
+                    ),
+                    "soft_horizon_consensus_margin_multiplier": float(
+                        margin_multiplier
+                    ),
+                    "soft_horizon_consensus_dynamic_margin": float(
+                        dynamic_margin
+                    ),
+                    "soft_horizon_consensus_horizons": list(
+                        snapshot["horizons"]
+                    ),
+                    "soft_horizon_consensus_final_action_asset": (
+                        symbols[int(final_target) - 1]
+                        if int(final_target) > 0
+                        else "CASH"
+                    ),
+                    "soft_horizon_consensus_reason": reason,
+                    "soft_horizon_consensus_changed_base_action": (
+                        int(final_target) != int(base_target)
+                    ),
+                }
+            )
+        return int(final_target), float(base_score)
+
+    return policy
+
+def _soft_horizon_consensus_result_metrics(
+    result: RotationRunResult,
+) -> dict[str, Any]:
+    predictions = result.predictions
+    if not isinstance(predictions, pd.DataFrame) or predictions.empty:
+        return {}
+    column = "soft_horizon_consensus_enabled"
+    if column not in predictions.columns:
+        return {}
+    rows = predictions.loc[
+        predictions[column].fillna(False).astype(bool)
+    ]
+    if rows.empty:
+        return {}
+
+    reasons = rows.get(
+        "soft_horizon_consensus_reason",
+        pd.Series(dtype=object),
+    )
+    changed = rows.get(
+        "soft_horizon_consensus_changed_base_action",
+        pd.Series(dtype=bool),
+    ).fillna(False).astype(bool)
+    support = pd.to_numeric(
+        rows.get(
+            "soft_horizon_consensus_support",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    )
+    multiplier = pd.to_numeric(
+        rows.get(
+            "soft_horizon_consensus_margin_multiplier",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    )
+    return {
+        "soft_horizon_consensus_enabled": True,
+        "soft_horizon_consensus_decisions": int(len(rows)),
+        "soft_horizon_consensus_changed_base_actions": int(changed.sum()),
+        "soft_horizon_consensus_change_rate": float(changed.mean()),
+        "soft_horizon_consensus_blocked_marginal_switches": int(
+            (
+                reasons
+                == "SOFT_CONSENSUS_BLOCK_MARGINAL_SWITCH"
+            ).sum()
+        ),
+        "soft_horizon_consensus_accepts": int(
+            (reasons == "SOFT_CONSENSUS_ACCEPT").sum()
+        ),
+        "soft_horizon_consensus_average_support": (
+            float(support.dropna().mean())
+            if support.notna().any()
+            else None
+        ),
+        "soft_horizon_consensus_median_support": (
+            float(support.dropna().median())
+            if support.notna().any()
+            else None
+        ),
+        "soft_horizon_consensus_average_margin_multiplier": (
+            float(multiplier.dropna().mean())
+            if multiplier.notna().any()
+            else None
+        ),
+    }
 
 
 def _run_lightgbm(
@@ -294,6 +1127,7 @@ def _run_lightgbm(
     (
         frames,
         common_dates,
+        calendar_source_asset,
         symbols,
         folds,
         all_decision_dates,
@@ -305,6 +1139,12 @@ def _run_lightgbm(
     seed_step = int(config.rotation_seed_step)
     total_folds = len(folds)
     total_models = len(symbols)
+    soft = _soft_horizon_consensus_settings(config)
+    if bool(soft["enabled"]) and str(config.strategy_mode) != LEGACY_ROTATION_MODE:
+        raise ValueError(
+            "Soft Horizon Consensus is supported only by the base "
+            "single-position LightGBM rotation mode."
+        )
 
     def report(fraction: float, stage: str, completed: int) -> None:
         if progress_callback is not None:
@@ -332,6 +1172,9 @@ def _run_lightgbm(
         cash_gate_oos_history: list[dict[str, Any]] = []
         diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
         margin_details: list[dict[str, Any]] = []
+        switch_margin_calibration_trace: list[dict[str, Any]] = []
+        model_fold_diagnostics: list[dict[str, Any]] = []
+        inference_cache_profiles: list[dict[str, Any]] = []
         latest_final_models: dict[str, Any] = {}
         latest_final_fold_id: int | None = None
         latest_final_fold_position: int | None = None
@@ -388,6 +1231,21 @@ def _run_lightgbm(
                 progress_callback=phase_progress("calibration training", 0.02, 0.38),
                 technical_log_callback=technical_log_callback,
             )
+            calibration_predictive_diagnostics = _evaluate_lightgbm_models_on_dates(
+                calibration_models,
+                frames,
+                symbols,
+                calibration_dates,
+                target_column="forward_risk_adjusted_utility",
+            )
+            model_fold_diagnostics.append(
+                _aggregate_lightgbm_model_diagnostics(
+                    calibration_models,
+                    fold_id=fold_id,
+                    validation=calibration_predictive_diagnostics,
+                )
+            )
+
             calibration_cash_edge_models = None
             if _risk_off_enabled(rep_config):
                 calibration_cash_edge_models = _lightgbm_fit_models(
@@ -425,6 +1283,8 @@ def _run_lightgbm(
             candidate_margins = tuple(float(value) for value in rep_config.rotation_switch_margin_candidates)
             best_candidate = candidate_margins[0]
             best_score = float("-inf")
+            calibration_candidate_scores: list[dict[str, float]] = []
+            calibration_trace_rows: list[dict[str, Any]] = []
             margin_config = (
                 rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
                 if selective_opportunity_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)
@@ -446,6 +1306,32 @@ def _run_lightgbm(
                     calibration_dates,
                     rep_config,
                 )
+                trace_policy = _utility_policy(
+                    calibration_models,
+                    frames,
+                    symbols,
+                    margin_config,
+                    candidate,
+                    cash_edge_models=calibration_cash_edge_models,
+                )
+                trace_score, trace_rows = _switch_margin_calibration_trace(
+                    trace_policy,
+                    frames,
+                    symbols,
+                    calibration_dates,
+                    rep_config,
+                    fold_id=fold_id,
+                    candidate_margin=float(candidate),
+                )
+                calibration_trace_rows.extend(trace_rows)
+                calibration_candidate_scores.append(
+                    {
+                        "margin": float(candidate),
+                        "risk_adjusted_score": float(score),
+                        "audit_trace_score": float(trace_score),
+                        "audit_score_delta": float(trace_score - score),
+                    }
+                )
                 if score > best_score:
                     best_score = score
                     best_candidate = candidate
@@ -466,9 +1352,45 @@ def _run_lightgbm(
                 final_fit_dates,
                 rep_config,
                 phase=f"run_{run_index}_fold_{fold_position}_final",
-                progress_callback=phase_progress("final training", 0.50, 0.90),
+                progress_callback=phase_progress(
+                    "final training",
+                    0.50,
+                    0.78 if bool(soft["enabled"]) else 0.90,
+                ),
                 technical_log_callback=technical_log_callback,
             )
+            final_horizon_models: dict[int, dict[str, Any]] = {}
+            if bool(soft["enabled"]):
+                detail(
+                    run_index=run_index,
+                    run_count=repetitions,
+                    fold_index=fold_position,
+                    fold_count=total_folds,
+                    phase="Soft horizon consensus training",
+                    trained_models=0,
+                    total_models=(
+                        len(symbols)
+                        * len(rep_config.rotation_target_horizons)
+                    ),
+                    device="CPU",
+                )
+                final_horizon_models = _fit_horizon_models(
+                    frames,
+                    symbols,
+                    final_fit_dates,
+                    rep_config,
+                    phase=(
+                        f"run_{run_index}_fold_"
+                        f"{fold_position}_soft_horizon"
+                    ),
+                    progress_callback=phase_progress(
+                        "soft horizon consensus training",
+                        0.80,
+                        0.98,
+                    ),
+                    technical_log_callback=technical_log_callback,
+                )
+
             latest_final_models = final_models
             latest_final_fold_id = fold_id
             latest_final_fold_position = fold_position
@@ -484,6 +1406,86 @@ def _run_lightgbm(
                     technical_log_callback=technical_log_callback,
                     target_column="forward_cash_edge",
                 )
+            fold_decision_dates = pd.DatetimeIndex(fold["decision_dates"])
+            base_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None
+            cash_edge_utility_cache: dict[pd.Timestamp, np.ndarray] | None = None
+            horizon_utility_caches: dict[
+                int,
+                dict[pd.Timestamp, np.ndarray],
+            ] = {}
+
+            uses_single_position_utility_policy = (
+                not compound_risk_overlay_enabled(rep_config)
+                and not portfolio_allocation_enabled(rep_config)
+            )
+            if uses_single_position_utility_policy:
+                base_utility_cache, base_cache_profile = _precompute_model_utilities(
+                    final_models,
+                    frames,
+                    symbols,
+                    fold_decision_dates,
+                    rep_config,
+                )
+                base_cache_profile.update(
+                    {
+                        "fold_id": int(fold_id),
+                        "model_role": "weighted_utility",
+                    }
+                )
+                inference_cache_profiles.append(base_cache_profile)
+
+                if final_cash_edge_models is not None:
+                    (
+                        cash_edge_utility_cache,
+                        cash_edge_cache_profile,
+                    ) = _precompute_model_utilities(
+                        final_cash_edge_models,
+                        frames,
+                        symbols,
+                        fold_decision_dates,
+                        rep_config,
+                    )
+                    cash_edge_cache_profile.update(
+                        {
+                            "fold_id": int(fold_id),
+                            "model_role": "cash_edge",
+                        }
+                    )
+                    inference_cache_profiles.append(cash_edge_cache_profile)
+
+                for horizon, horizon_models in final_horizon_models.items():
+                    cache, cache_profile = _precompute_model_utilities(
+                        horizon_models,
+                        frames,
+                        symbols,
+                        fold_decision_dates,
+                        rep_config,
+                    )
+                    horizon_utility_caches[int(horizon)] = cache
+                    cache_profile.update(
+                        {
+                            "fold_id": int(fold_id),
+                            "model_role": f"horizon_{int(horizon)}",
+                            "horizon": int(horizon),
+                        }
+                    )
+                    inference_cache_profiles.append(cache_profile)
+
+                if technical_log_callback is not None:
+                    fold_profiles = [
+                        item
+                        for item in inference_cache_profiles
+                        if int(item.get("fold_id") or 0) == int(fold_id)
+                    ]
+                    technical_log_callback(
+                        "model=lightgbm event=oos_inference_cache_ready "
+                        f"fold={fold_id} roles={len(fold_profiles)} "
+                        "seconds="
+                        f"{sum(float(item.get('cache_build_seconds') or 0.0) for item in fold_profiles):.3f} "
+                        "predict_calls="
+                        f"{sum(int(item.get('cache_predict_calls') or 0) for item in fold_profiles)}"
+                    )
+
             effective_margin = max(float(rep_config.rotation_switch_margin), float(best_candidate))
             if opportunity_cash_gate_enabled(rep_config):
                 gate_base_config = rep_config.model_copy(update={"strategy_mode": "COMPOUND_ROTATION_SWING_XGBOOST"})
@@ -536,7 +1538,7 @@ def _run_lightgbm(
                     fold_id=fold_id,
                 )
             else:
-                policies[fold_id] = _utility_policy(
+                base_policy = _utility_policy(
                     final_models,
                     frames,
                     symbols,
@@ -544,17 +1546,99 @@ def _run_lightgbm(
                     effective_margin,
                     cash_edge_models=final_cash_edge_models,
                     opportunity_gate=opportunity_gate,
-                    cash_gate_base_state=cash_gate_base_state if (opportunity_cash_gate_enabled(rep_config) or absolute_utility_cash_gate_enabled(rep_config)) else None,
+                    cash_gate_base_state=(
+                        cash_gate_base_state
+                        if (
+                            opportunity_cash_gate_enabled(rep_config)
+                            or absolute_utility_cash_gate_enabled(rep_config)
+                        )
+                        else None
+                    ),
                     decision_diagnostics=diagnostics,
                     fold_id=fold_id,
                     calibrated_switch_margin=float(best_candidate),
+                    utility_cache=base_utility_cache,
+                    cash_edge_utility_cache=cash_edge_utility_cache,
                 )
+                if bool(soft["enabled"]):
+                    policies[fold_id] = _soft_horizon_consensus_policy(
+                        base_policy,
+                        final_models,
+                        final_horizon_models,
+                        frames,
+                        symbols,
+                        rep_config,
+                        base_switch_margin=float(effective_margin),
+                        base_utility_cache=base_utility_cache,
+                        horizon_utility_caches=horizon_utility_caches,
+                        decision_diagnostics=diagnostics,
+                    )
+                else:
+                    policies[fold_id] = base_policy
+            selected_trace_rows = [
+                row
+                for row in calibration_trace_rows
+                if abs(
+                    float(row.get("candidate_margin") or 0.0)
+                    - float(best_candidate)
+                )
+                < 1e-15
+            ]
             margin_detail = {
                 "fold_id": fold_id,
+                "soft_horizon_consensus_enabled": bool(soft["enabled"]),
+                "soft_horizon_consensus_mode": (
+                    str(soft["mode"]) if bool(soft["enabled"]) else None
+                ),
+                "soft_horizon_consensus_penalty_strength": (
+                    float(soft["penalty_strength"])
+                    if bool(soft["enabled"])
+                    else None
+                ),
                 "calibrated_candidate_margin": float(best_candidate),
                 "effective_switch_margin": float(effective_margin),
                 "calibration_risk_adjusted_score": float(best_score),
+                "calibration_candidate_scores": list(
+                    calibration_candidate_scores
+                ),
+                "calibration_score_gap_best_vs_second": (
+                    float(
+                        sorted(
+                            (
+                                item["risk_adjusted_score"]
+                                for item in calibration_candidate_scores
+                            ),
+                            reverse=True,
+                        )[0]
+                        - sorted(
+                            (
+                                item["risk_adjusted_score"]
+                                for item in calibration_candidate_scores
+                            ),
+                            reverse=True,
+                        )[1]
+                    )
+                    if len(calibration_candidate_scores) > 1
+                    else None
+                ),
+                "calibration_start": (
+                    pd.Timestamp(calibration_dates[0])
+                    if len(calibration_dates)
+                    else None
+                ),
+                "calibration_end": (
+                    pd.Timestamp(calibration_dates[-1])
+                    if len(calibration_dates)
+                    else None
+                ),
+                "calibration_session_count": int(len(calibration_dates)),
+                "selected_candidate_trace_rows": int(
+                    len(selected_trace_rows)
+                ),
             }
+            switch_margin_calibration_trace.extend(
+                calibration_trace_rows
+            )
             if absolute_utility_cash_gate_enabled(rep_config):
                 margin_detail.update({
                     "absolute_utility_entry_threshold": float(rep_config.opportunity_utility_entry_threshold),
@@ -650,6 +1734,24 @@ def _run_lightgbm(
         )
         backend = "lightgbm_utility" if repetitions <= 1 else f"lightgbm_utility_seed_{seed}"
         result.backend = backend
+        if bool(soft["enabled"]):
+            result.metrics.update(_soft_horizon_consensus_result_metrics(result))
+
+        predictive_diagnostics = _aggregate_lightgbm_fold_diagnostics(
+            model_fold_diagnostics
+        )
+        cache_build_seconds = float(
+            sum(
+                float(item.get("cache_build_seconds") or 0.0)
+                for item in inference_cache_profiles
+            )
+        )
+        cache_predict_calls = int(
+            sum(
+                int(item.get("cache_predict_calls") or 0)
+                for item in inference_cache_profiles
+            )
+        )
 
         latest_asset = None
         if isinstance(result.predictions, pd.DataFrame) and not result.predictions.empty:
@@ -684,6 +1786,20 @@ def _run_lightgbm(
                 "repetition_count": repetitions,
                 "walk_forward_fold_count": len(folds),
                 "walk_forward_folds": _fold_performance(result.predictions, folds, float(rep_config.initial_capital)),
+                "calendar_source_asset": calendar_source_asset,
+                "lightgbm_predictive_diagnostics": predictive_diagnostics,
+                "oos_inference_cache_profiles": list(inference_cache_profiles),
+                "oos_inference_cache_build_seconds": cache_build_seconds,
+                "oos_inference_cache_predict_calls": cache_predict_calls,
+                "soft_horizon_consensus_enabled": bool(soft["enabled"]),
+                "soft_horizon_consensus_mode": (
+                    str(soft["mode"]) if bool(soft["enabled"]) else None
+                ),
+                "soft_horizon_consensus_penalty_strength": (
+                    float(soft["penalty_strength"])
+                    if bool(soft["enabled"])
+                    else None
+                ),
                 "effective_switch_margin": float(np.mean([item["effective_switch_margin"] for item in margin_details])),
                 "effective_switch_margin_mean": float(np.mean([item["effective_switch_margin"] for item in margin_details])),
                 "calibrated_switch_margin": float(np.mean([item["calibrated_candidate_margin"] for item in margin_details])),
@@ -703,7 +1819,20 @@ def _run_lightgbm(
                 "decision_diagnostics_rows": len(diagnostics),
                 "lightgbm_settings_revision": _research_settings(rep_config).get("settings_revision"),
                 "lightgbm_profile_id": _research_settings(rep_config).get("profile_id"),
+                "lightgbm_effective_n_jobs": int(
+                    _lightgbm_settings(rep_config)["n_jobs"]
+                ),
+                "lightgbm_thread_override_ignored": True,
+                "lightgbm_thread_contract": "tcc_snapshot_exact",
                 "latest_research_tree": latest_tree,
+                "switch_margin_calibration_trace_schema_version": 1,
+                "switch_margin_calibration_trace_rows": int(
+                    len(switch_margin_calibration_trace)
+                ),
+                "switch_margin_calibration_trace": [
+                    dict(row)
+                    for row in switch_margin_calibration_trace
+                ],
             }
         )
         margin_by_fold = {item["fold_id"]: item for item in margin_details}
@@ -1340,6 +2469,7 @@ def _run_iqn(
     (
         frames,
         common_dates,
+        calendar_source_asset,
         symbols,
         folds,
         all_decision_dates,
@@ -1490,6 +2620,7 @@ def _run_iqn(
                 "repetition_count": repetitions,
                 "walk_forward_fold_count": len(folds),
                 "walk_forward_folds": _fold_performance(result.predictions, folds, float(rep_config.initial_capital)),
+                "calendar_source_asset": calendar_source_asset,
                 "effective_compute_device": device,
                 "gpu_name": gpu_name,
                 "framework_version": torch_version,
