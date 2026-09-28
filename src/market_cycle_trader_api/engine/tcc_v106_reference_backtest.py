@@ -208,9 +208,21 @@ def _load_mct_market_frames(
 
 def _tcc_variant_configs(
     frames: dict[str, pd.DataFrame],
+    execution_config: BacktestExecutionRequest,
 ) -> tuple[Any, Any]:
+    """Extend only current MCT research; keep frozen TCC science pinned."""
     eligible = tuple(symbol for symbol in TCC_V106_ASSETS if symbol in frames)
     base = TCC_V106_CONFIG
+    source = selected_tcc_reference_input_source(execution_config)
+    if source != FROZEN_SOURCE:
+        cutoff = str(
+            execution_config.analysis_end_date or execution_config.end_date or ""
+        ).strip()
+        if not cutoff:
+            raise RuntimeError(
+                "Current MCT reference job requires an explicit locked XNYS cutoff."
+            )
+        base = base.model_copy(update={"analysis_end_date": cutoff})
     anchors = tuple(
         symbol
         for symbol in base.calendar_anchor_assets
@@ -338,6 +350,27 @@ def _comparison_row(result: Any, label: str) -> dict[str, Any]:
     )
 
 
+def _verify_reference_execution_cutoff(
+    result: Any,
+    *,
+    expected_date: str,
+    variant: str,
+) -> str:
+    """Fail if a current-data simulation silently truncates its OOS replay."""
+    predictions = result.predictions
+    if predictions is None or predictions.empty:
+        raise RuntimeError(f"{variant}: reference OOS execution is empty.")
+    actual = pd.Timestamp(predictions.index.max()).date().isoformat()
+    expected = pd.Timestamp(expected_date).date().isoformat()
+    if actual != expected:
+        raise RuntimeError(
+            f"{variant}: reference OOS execution ended on {actual}, "
+            f"but the locked current MCT cutoff is {expected}. "
+            "Refusing a completed result with stale scientific execution dates."
+        )
+    return actual
+
+
 def run_reference_job(
     job_id: str,
     request: BacktestExecutionRequest,
@@ -345,7 +378,7 @@ def run_reference_job(
 ) -> tuple[list[dict[str, Any]], BacktestExecutionRequest]:
     emit_progress(1.0, "Preparing TCC v1.0.6 reference engine")
     frames, exclusions, effective_mct_config = _load_mct_market_frames(request)
-    control_config, soft_config = _tcc_variant_configs(frames)
+    control_config, soft_config = _tcc_variant_configs(frames, effective_mct_config)
 
     reproducibility = build_reproducibility_manifest(
         effective_mct_config,
@@ -393,6 +426,11 @@ def run_reference_job(
         progress_start=16.0,
         progress_end=53.0,
     )
+    if not frozen_tcc_used:
+        control.metrics["last_oos_execution_date"] = _verify_reference_execution_cutoff(
+            control, expected_date=str(control_config.analysis_end_date), variant="CONTROL",
+        )
+    control.metrics["effective_analysis_end_date"] = control_config.analysis_end_date
     control.metrics.update(deepcopy(provenance))
     control.metrics["walk_forward_folds"] = _fold_rows(
         control,
@@ -416,6 +454,11 @@ def run_reference_job(
         progress_start=54.0,
         progress_end=91.0,
     )
+    if not frozen_tcc_used:
+        soft.metrics["last_oos_execution_date"] = _verify_reference_execution_cutoff(
+            soft, expected_date=str(soft_config.analysis_end_date), variant="SOFT",
+        )
+    soft.metrics["effective_analysis_end_date"] = soft_config.analysis_end_date
     soft.metrics.update(deepcopy(provenance))
     soft.metrics["walk_forward_folds"] = _fold_rows(
         soft,
