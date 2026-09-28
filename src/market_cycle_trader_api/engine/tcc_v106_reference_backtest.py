@@ -232,7 +232,7 @@ def _tcc_variant_configs(
         inclusive_boundary = (
             pd.Timestamp(cutoff_day, tz="UTC")
             + pd.Timedelta(days=1)
-            - pd.Timedelta(nanoseconds=1)
+            - pd.Timedelta(seconds=1)
         ).isoformat()
         base = base.model_copy(update={"analysis_end_date": inclusive_boundary})
     anchors = tuple(

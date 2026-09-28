@@ -26,7 +26,7 @@ class TCCExecutionCutoffTests(unittest.TestCase):
         control, soft = reference._tcc_variant_configs({}, self._request("mct_current"))
         self.assertEqual(pd.Timestamp(control.analysis_end_date).date().isoformat(), "2026-09-28")
         self.assertEqual(pd.Timestamp(soft.analysis_end_date).date().isoformat(), "2026-09-28")
-        self.assertEqual(pd.Timestamp(control.analysis_end_date), pd.Timestamp("2026-09-28T23:59:59.999999999Z"))
+        self.assertEqual(pd.Timestamp(control.analysis_end_date), pd.Timestamp("2026-09-28T23:59:59Z"))
         self.assertEqual(reference.TCC_V106_CONFIG.analysis_end_date, scientific_end)
 
     def test_unmodified_tcc_execution_includes_last_alpaca_daily_bar(self):
@@ -38,9 +38,14 @@ class TCCExecutionCutoffTests(unittest.TestCase):
         ], utc=True)
         folds = [{"test_start_index": 1, "test_end_index": len(dates)}]
         current, _ = reference._tcc_variant_configs({}, self._request("mct_current"))
-        actual_dates = scientific_rotation._analysis_decision_dates(dates, folds, current)
-        self.assertEqual(actual_dates[-1].date().isoformat(), "2026-09-28")
-        self.assertEqual(len(actual_dates), 3)
+        # The boundary must be losslessly comparable to ns/us/ms indexes:
+        # pandas raises on a nanosecond boundary with microsecond-index data.
+        for unit in ("ns", "us", "ms"):
+            actual_dates = scientific_rotation._analysis_decision_dates(
+                dates.as_unit(unit), folds, current,
+            )
+            self.assertEqual(actual_dates[-1].date().isoformat(), "2026-09-28")
+            self.assertEqual(len(actual_dates), 3)
 
         # Reproduce the v10.8.37 defect: midnight excludes the cutoff day's
         # 04:00 daily candle even though the source frame contains it.
