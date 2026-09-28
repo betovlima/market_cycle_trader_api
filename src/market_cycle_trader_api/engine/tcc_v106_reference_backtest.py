@@ -222,7 +222,19 @@ def _tcc_variant_configs(
             raise RuntimeError(
                 "Current MCT reference job requires an explicit locked XNYS cutoff."
             )
-        base = base.model_copy(update={"analysis_end_date": cutoff})
+        # The unchanged TCC engine treats analysis_end_date as a UTC instant.
+        # Alpaca daily bars are stamped at session start (e.g. 04:00 UTC
+        # during EDT), so a date-only midnight would exclude the requested
+        # session from its searchsorted(..., side="right") OOS interval.
+        # Translate the inclusive MCT session date into its inclusive
+        # end-of-day UTC boundary at the adapter, not in the vendored engine.
+        cutoff_day = pd.Timestamp(cutoff).date().isoformat()
+        inclusive_boundary = (
+            pd.Timestamp(cutoff_day, tz="UTC")
+            + pd.Timedelta(days=1)
+            - pd.Timedelta(nanoseconds=1)
+        ).isoformat()
+        base = base.model_copy(update={"analysis_end_date": inclusive_boundary})
     anchors = tuple(
         symbol
         for symbol in base.calendar_anchor_assets
@@ -430,7 +442,10 @@ def run_reference_job(
         control.metrics["last_oos_execution_date"] = _verify_reference_execution_cutoff(
             control, expected_date=str(control_config.analysis_end_date), variant="CONTROL",
         )
-    control.metrics["effective_analysis_end_date"] = control_config.analysis_end_date
+    control.metrics["effective_analysis_end_date"] = (
+        pd.Timestamp(control_config.analysis_end_date).date().isoformat()
+    )
+    control.metrics["reference_execution_end_boundary_utc"] = control_config.analysis_end_date
     control.metrics.update(deepcopy(provenance))
     control.metrics["walk_forward_folds"] = _fold_rows(
         control,
@@ -458,7 +473,10 @@ def run_reference_job(
         soft.metrics["last_oos_execution_date"] = _verify_reference_execution_cutoff(
             soft, expected_date=str(soft_config.analysis_end_date), variant="SOFT",
         )
-    soft.metrics["effective_analysis_end_date"] = soft_config.analysis_end_date
+    soft.metrics["effective_analysis_end_date"] = (
+        pd.Timestamp(soft_config.analysis_end_date).date().isoformat()
+    )
+    soft.metrics["reference_execution_end_boundary_utc"] = soft_config.analysis_end_date
     soft.metrics.update(deepcopy(provenance))
     soft.metrics["walk_forward_folds"] = _fold_rows(
         soft,
