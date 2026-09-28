@@ -1169,16 +1169,25 @@ def _normalize_stateful_temporal_profiles(db: Any) -> None:
 def _normalize_model_tuning_selection(db: Any, control: dict[str, Any]) -> dict[str, Any]:
     research_id = str(control.get("research_strategy_id") or "").strip()
     selected_id = str(control.get("model_tuning_strategy_id") or "").strip()
-    if not research_id or selected_id == research_id:
+    # Independent selection: never overwrite an explicit tuning target on a
+    # catalog read, particularly after selecting a TCC research-only profile.
+    if selected_id or not research_id:
+        return control
+    research = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": research_id})
+    if research is None or str(research.get("backtest_engine_binding") or "").strip():
         return control
     now = utc_now()
     updated = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
-        {"_id": CONTROL_ID, "revision": int(control.get("revision") or 1)},
+        {
+            "_id": CONTROL_ID,
+            "revision": int(control.get("revision") or 1),
+            "model_tuning_strategy_id": {"$in": [None, ""]},
+        },
         {
             "$set": {
                 "model_tuning_strategy_id": research_id,
                 "updated_at": now,
-                "last_model_tuning_selection_note": "Synchronized with the shared Strategy Research selection.",
+                "last_model_tuning_selection_note": "Initialized from a compatible Strategy Research selection.",
             },
             "$inc": {"revision": 1},
         },
@@ -2180,18 +2189,23 @@ def select_research_strategy(
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
     now = utc_now()
+    reference_only = bool(str(profile.get("backtest_engine_binding") or "").strip())
+    selection_updates = {
+        "research_strategy_id": strategy_id,
+        "updated_at": now,
+        "updated_by": (actor_email or "").strip().lower() or None,
+        "last_selection_note": note,
+        "last_strategy_research_selection_note": note,
+    }
+    if not reference_only:
+        selection_updates.update({
+            "model_tuning_strategy_id": strategy_id,
+            "last_model_tuning_selection_note": note,
+        })
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},
         {
-            "$set": {
-                "research_strategy_id": strategy_id,
-                "model_tuning_strategy_id": strategy_id,
-                "updated_at": now,
-                "updated_by": (actor_email or "").strip().lower() or None,
-                "last_selection_note": note,
-                "last_strategy_research_selection_note": note,
-                "last_model_tuning_selection_note": note,
-            },
+            "$set": selection_updates,
             "$inc": {"revision": 1},
         },
         return_document=ReturnDocument.AFTER,
@@ -2269,6 +2283,14 @@ def select_model_tuning_strategy(
     note: str,
     actor_email: str | None,
 ) -> dict[str, Any]:
+    """Select only Model Tuning; do not change Research or protected Winner."""
+    _assert_no_active_backtest(db)
+    control = ensure_strategy_catalog(db)
+    revision = int(control.get("revision") or 1)
+    if revision != int(expected_control_revision):
+        raise StrategyLabConflict(
+            f"Expected selection revision {expected_control_revision}, current revision {revision}."
+        )
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one(
         {"_id": str(strategy_id)}
     )
@@ -2276,15 +2298,32 @@ def select_model_tuning_strategy(
         raise StrategyLabNotFound("Strategy profile not found.")
     if str(profile.get("backtest_engine_binding") or "").strip():
         raise StrategyLabConflict(
-            "Reference-engine Strategies cannot be selected for Model Tuning."
+            "Reference-engine Strategies are Research/Backtest-only. "
+            "Select an ordinary LightGBM or supported Temporal Strategy for Model Tuning."
         )
-    return select_research_strategy(
-        db,
-        strategy_id,
-        expected_control_revision=expected_control_revision,
-        note=note,
-        actor_email=actor_email,
+    if (
+        str(profile.get("strategy_kind") or "") != "temporal_intelligence"
+        and str(_resolved_strategy_model_snapshot(db, profile).get("family") or "")
+        != "lightgbm_utility"
+    ):
+        raise StrategyLabConflict("Model Tuning requires a LightGBM Strategy.")
+    now = utc_now()
+    updated = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
+        {"_id": CONTROL_ID, "revision": revision},
+        {
+            "$set": {
+                "model_tuning_strategy_id": str(strategy_id),
+                "updated_at": now,
+                "updated_by": (actor_email or "").strip().lower() or None,
+                "last_model_tuning_selection_note": note,
+            },
+            "$inc": {"revision": 1},
+        },
+        return_document=ReturnDocument.AFTER,
     )
+    if updated is None:
+        raise StrategyLabConflict("Strategy selection changed before this update was applied.")
+    return _control_response(db, updated)
 
 
 def create_tuned_temporal_strategy(

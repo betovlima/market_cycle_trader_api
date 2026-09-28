@@ -93,7 +93,7 @@ PROBABILITY_METHOD = "champion_probability"
 PIPELINE_METHOD = "latin_hypercube_then_caro"
 _ADAPTIVE_METHODS = {PROBABILITY_METHOD, PIPELINE_METHOD}
 TUNING_MODEL_FAMILY = "lightgbm_utility"
-TUNING_SCHEMA_VERSION = 16
+TUNING_SCHEMA_VERSION = 17
 DEFAULT_CANDIDATE_COUNT = 20
 DEFAULT_SEED = 42
 TECHNICAL_RESEARCH_SEGMENT_MAX = 2000
@@ -169,16 +169,15 @@ class ModelTuningNotFound(RuntimeError):
 
 def _tuning_target_strategy(db: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
     control = get_strategy_control(db)
-    strategy_id = str(
-        control.get("strategy_research_strategy_id")
-        or control.get("research_strategy_id")
-        or ""
-    ).strip()
+    strategy_id = str(control.get("model_tuning_strategy_id") or "").strip()
     if not strategy_id:
-        raise ModelTuningConflict("No Strategy is selected for Strategy Research.")
+        raise ModelTuningConflict(
+            "No Model Tuning Strategy is selected. Choose a compatible Strategy "
+            "in the Model Tuning baseline panel."
+        )
     strategy = get_strategy(db, strategy_id)
     model_snapshot = get_strategy_model_snapshot(db, strategy_id)
-    return strategy, model_snapshot, "strategy_research_selection"
+    return strategy, model_snapshot, "model_tuning_selection"
 
 
 def _tuning_target_allows_locked_strategy(strategy: dict[str, Any]) -> bool:
@@ -490,7 +489,16 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     if db is not None:
         try:
             selected_strategy, _, _ = _tuning_target_strategy(db)
-            if str(selected_strategy.get("tuning_target") or "") == "decision_optimization":
+            if str(selected_strategy.get("backtest_engine_binding") or "").strip():
+                strategy_compatibility = {
+                    "eligible": False,
+                    "reason": (
+                        "The TCC reference engine is Research/Backtest-only and "
+                        "cannot be tuned by the ordinary LightGBM worker. "
+                        "Choose a compatible Strategy for Model Tuning."
+                    ),
+                }
+            elif str(selected_strategy.get("tuning_target") or "") == "decision_optimization":
                 strategy_compatibility = {
                     "eligible": False,
                     "reason": "MILP Decision Optimization is research-only and is not supported by the current Model Tuning engine.",
@@ -509,7 +517,7 @@ def tuning_catalog(db: Any | None = None) -> dict[str, Any]:
     return {
         "schema_version": TUNING_SCHEMA_VERSION,
         "start_request_contract_version": 1,
-        "strategy_selection_source": "strategy_research_selection",
+        "strategy_selection_source": "model_tuning_selection",
         "strategy_compatibility": strategy_compatibility,
         "method": PROBABILITY_METHOD,
         "methods": [
@@ -863,7 +871,14 @@ def _refresh_campaign_ranking(db: Any, run_id: str) -> None:
 
 
 def list_model_tuning_baselines(db: Any, *, limit: int = 20) -> list[dict[str, Any]]:
-    strategy, model_snapshot, target_source = _tuning_target_strategy(db)
+    try:
+        strategy, model_snapshot, target_source = _tuning_target_strategy(db)
+    except ModelTuningConflict:
+        # Let the UI show the compatible-strategy selector when no tuning
+        # target has been chosen; starting a campaign remains forbidden.
+        return []
+    if str(strategy.get("backtest_engine_binding") or "").strip():
+        return []
     if str(strategy.get("tuning_target") or "") == "decision_optimization":
         raise ModelTuningConflict(
             "The selected MILP Decision Strategy is research-only and is not a target for the current Model Tuning engine."
@@ -2391,6 +2406,12 @@ def start_model_tuning(
         )
 
     strategy, model_snapshot, tuning_target_source = _tuning_target_strategy(db)
+    if str(strategy.get("backtest_engine_binding") or "").strip():
+        raise ModelTuningConflict(
+            "Reference-engine Strategies are Research/Backtest-only. "
+            "The ordinary LightGBM tuning worker does not run the TCC engine. "
+            "Select a compatible Strategy for Model Tuning."
+        )
     if str(strategy.get("tuning_target") or "") == "decision_optimization":
         raise ModelTuningConflict(
             "The selected MILP Decision Strategy is research-only and is not a target for the current Model Tuning engine."
