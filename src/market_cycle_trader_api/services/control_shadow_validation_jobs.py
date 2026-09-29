@@ -6,13 +6,17 @@ again, writes solely to the dedicated diagnostics collection and local files.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import uuid
 from typing import Any
 
 from pymongo.errors import DuplicateKeyError
 
-from ..engine.control_snapshot_validation import run_control_snapshot_validation
+from ..engine.control_snapshot_validation import (
+    read_verified_control_snapshot,
+    run_control_snapshot_validation,
+)
 from ..infrastructure.persistence.mongo_repository import utc_now
 from .control_shadow_jobs import (
     COLLECTION as SOURCE_COLLECTION,
@@ -41,6 +45,7 @@ def _public(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "job_id": str(job["_id"]),
         "source_job_id": job["source_job_id"],
+        "source_registry_mode": job.get("source_registry_mode", "mongodb"),
         "snapshot_sha256": job["snapshot_sha256"],
         "completed_session": job["completed_session"],
         "status": job["status"],
@@ -99,6 +104,7 @@ def _run_job(
     expected_sha256: str,
     original_calibration_score: float | None,
     original_candidate_margin: float | None,
+    source_registry_mode: str = "mongodb",
 ) -> None:
     collection = db[COLLECTION]
     try:
@@ -109,6 +115,15 @@ def _run_job(
         )
         _log(db, job_id, "Verifying existing MCT RAW/SIP snapshot; NO download or orders.",
              stage="verify_snapshot", progress=1)
+        if source_registry_mode == "local_snapshot_sha_pinned":
+            _log(
+                db, job_id,
+                "Source MongoDB job unavailable; local snapshot accepted only "
+                "after independently pinned SHA-256 and all source files were checked. "
+                "Original calibration reference is unavailable; it will not be "
+                "reported as a reproduction failure.",
+                stage="verify_snapshot",
+            )
         last_mark: dict[str, int] = {}
         def progress(stage: str, completed: int, total: int) -> None:
             fraction = completed / max(1, total)
@@ -137,6 +152,7 @@ def _run_job(
             original_candidate_margin=original_candidate_margin,
             progress=progress,
         )
+        report["source_registry_mode"] = source_registry_mode
         _log(
             db, job_id,
             f"Completed: source={source_job_id}, margins=4, "
@@ -170,33 +186,89 @@ def _run_job(
         _THREADS.pop(job_id, None)
 
 
-def start_snapshot_validation(db: Any, *, source_job_id: str) -> dict[str, Any]:
+def start_snapshot_validation(
+    db: Any,
+    *,
+    source_job_id: str,
+    expected_snapshot_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Accept Mongo source metadata or a locally pinned immutable snapshot.
+
+    A disk-only recovery MUST supply an independent checksum previously
+    recorded by the original job. A failed Mongo source must never fall back.
+    The source document is not reconstructed or modified.
+    """
     _require_enabled()
-    original = db[SOURCE_COLLECTION].find_one({"_id": source_job_id})
-    if not original:
-        raise SnapshotValidationNotFound("Control Shadow source job was not found.")
-    if (
-        original.get("status") != "completed"
-        or original.get("source_kind") not in (
-            None, "fresh_alpaca_raw_sip_local_mct_snapshot",
+    provided_sha = str(expected_snapshot_sha256 or "").strip().lower()
+    if provided_sha and not re.fullmatch(r"[a-f0-9]{64}", provided_sha):
+        raise SnapshotValidationInvalid(
+            "expected_snapshot_sha256 must be an independent 64-character SHA-256."
         )
-        or original.get("error")
-    ):
-        raise SnapshotValidationInvalid("A successfully completed fresh-Alpaca source job is required.")
-    result = original.get("result") or {}
-    audit = result.get("input_audit") or {}
-    if (
-        result.get("status") != "shadow_only"
-        or result.get("order_submission") != "never"
-        or audit.get("source_kind") != "fresh_alpaca_raw_sip_local_mct_snapshot"
-    ):
-        raise SnapshotValidationInvalid("Original job does not contain the expected fresh-Alpaca audit.")
-    sha = str(audit.get("snapshot_sha256") or "")
-    if len(sha) != 64 or sha != str(original.get("snapshot_sha256")):
-        raise SnapshotValidationInvalid("Source job snapshot SHA is missing or inconsistent.")
-    completed = str(original.get("completed_session") or "")
-    if completed != str(result.get("decision_date")):
-        raise SnapshotValidationInvalid("Source job cutoff differs from its Control decision date.")
+    original = db[SOURCE_COLLECTION].find_one({"_id": source_job_id})
+    source_registry_mode = "mongodb"
+    if original is None:
+        if not provided_sha:
+            raise SnapshotValidationNotFound(
+                "Control Shadow source job is not in this MongoDB. Supply "
+                "expected_snapshot_sha256 from the original completed result "
+                "to verify its existing local snapshot without downloading."
+            )
+        # This loads and verifies manifest, RAW bars, corporate actions and
+        # normalized CSVs before accepting a disk-only recovered source.
+        try:
+            _, manifest, _ = read_verified_control_snapshot(
+                source_job_id, expected_sha256=provided_sha,
+            )
+        except FileNotFoundError as exc:
+            raise SnapshotValidationNotFound(
+                "The source MongoDB record and MCT local snapshot are missing. "
+                "Check the API's dados/control_shadow/snapshots directory; "
+                "do not redownload or silently substitute a different source."
+            ) from exc
+        except (ValueError, KeyError, OSError, TypeError) as exc:
+            raise SnapshotValidationInvalid(
+                "Local source snapshot failed independent SHA-256 or data-contract "
+                f"verification: {type(exc).__name__}: {str(exc)[:240]}"
+            ) from exc
+        sha = str(manifest["snapshot_sha256"])
+        completed = str(manifest["completed_session"])
+        original_result = {}
+        source_registry_mode = "local_snapshot_sha_pinned"
+    else:
+        if (
+            original.get("status") != "completed"
+            or original.get("source_kind") not in (
+                None, "fresh_alpaca_raw_sip_local_mct_snapshot",
+            )
+            or original.get("error")
+        ):
+            raise SnapshotValidationInvalid(
+                "A successfully completed fresh-Alpaca source job is required."
+            )
+        original_result = original.get("result") or {}
+        audit = original_result.get("input_audit") or {}
+        if (
+            original_result.get("status") != "shadow_only"
+            or original_result.get("order_submission") != "never"
+            or audit.get("source_kind") != "fresh_alpaca_raw_sip_local_mct_snapshot"
+        ):
+            raise SnapshotValidationInvalid(
+                "Original job does not contain the expected fresh-Alpaca audit."
+            )
+        sha = str(audit.get("snapshot_sha256") or "")
+        if not re.fullmatch(r"[a-f0-9]{64}", sha) or sha != str(original.get("snapshot_sha256")):
+            raise SnapshotValidationInvalid(
+                "Source job snapshot SHA is missing or inconsistent."
+            )
+        if provided_sha and provided_sha != sha:
+            raise SnapshotValidationInvalid(
+                "Provided independent SHA-256 disagrees with original MongoDB source."
+            )
+        completed = str(original.get("completed_session") or "")
+        if completed != str(original_result.get("decision_date")):
+            raise SnapshotValidationInvalid(
+                "Source job cutoff differs from its Control decision date."
+            )
 
     collection = db[COLLECTION]
     collection.create_index("active_key", unique=True, sparse=True)
@@ -206,6 +278,7 @@ def start_snapshot_validation(db: Any, *, source_job_id: str) -> dict[str, Any]:
         "_id": job_id, "active_key": ACTIVE_KEY, "status": "queued",
         "stage": "queued", "progress": 0, "source_job_id": source_job_id,
         "snapshot_sha256": sha, "completed_session": completed,
+        "source_registry_mode": source_registry_mode,
         "created_at": now, "updated_at": now, "logs": [],
         "result": None, "error": None,
     }
@@ -220,8 +293,9 @@ def start_snapshot_validation(db: Any, *, source_job_id: str) -> dict[str, Any]:
         kwargs={
             "db": db, "job_id": job_id, "source_job_id": source_job_id,
             "expected_sha256": sha,
-            "original_calibration_score": result.get("calibration_score"),
-            "original_candidate_margin": result.get("calibrated_candidate_margin"),
+            "original_calibration_score": original_result.get("calibration_score"),
+            "original_candidate_margin": original_result.get("calibrated_candidate_margin"),
+            "source_registry_mode": source_registry_mode,
         },
         name=job_id, daemon=True,
     )
