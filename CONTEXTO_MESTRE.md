@@ -32,12 +32,13 @@
 - Causa: o motor de referência científica não é o runtime de Trader e não é elegível para promoção.
 - Implementado até aqui: teste isolado de paridade da regra de decisão Control vs política live, incluindo caso de ausência da barra futura; documentação do contrato de migração.
 - Incremento seguinte no mesmo branch: `engine/operational_control_contract.py` usa painel do Control científico v1.0.6 em modo isolado e sem ordens. Testes verificam igualdade de features em OHLCV idêntico, calendário ancorado vs o atual calendário automático, ausência de barra futura e indisponibilidade de âncora.
-- Não implementado: equivalência ponta a ponta da fonte Alpaca e corporate actions, modelos e treinamento, geração completa de decisão sem ordens, novo binding operacional, alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado por estes commits.
+- Incremento seguinte: `engine/operational_control_preview.py` monta decisão shadow de Control com treino/calibração congelados e política live, sem ordens; `scripts/control_shadow_preview.py` consome snapshot CSV SHA-verificado local, registra exclusões estruturais e produz JSON em `output/`. Testes cobrem janelas/ações/falhas e CLI. O snapshot CLI não é série atual Alpaca.
+- Não implementado: equivalência ponta a ponta na fonte Alpaca atual e corporate actions; prova de identidade numérica em sessão a sessão com o backtest v1.0.6; novo binding operacional e integração à cadeia real Paper/Trader; alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado por estes commits.
 - Status: a CI do commit inicial `66e31f6f0be882b5bb3980776d8240c0e29a30ab` passou em Python 3.12. Após erro de importação no Spyder/Python 3.14.2, o teste foi corrigido para inserir `<API>/src` no `sys.path` a partir de `__file__`; aguardar CI do novo commit. Não afirmar paridade operacional completa com base no teste de política.
 - Erro local original: `ModuleNotFoundError: No module named 'market_cycle_trader_api'`, durante importação, antes de qualquer teste. Não indica divergência Control vs live; preferir Python 3.12 para ambiente de referência.
 
 ## Próximos passos
-1. Confirmar CI do novo teste e baseline de regressão.
+1. Confirmar CI de toda a branch, especialmente o novo shadow preview e CLI.
 2. Isolar o contrato de dados/treinamento/decisão Control v1.0.6 e comparar com o live na mesma janela congelada.
 3. Implantar modo de ensaio sem ordens, com resultado sessão a sessão e auditoria de divergência.
 4. Criar novo perfil operacional somente após paridade aprovada, mantendo Strategy #28 original imutável.
