@@ -61,7 +61,10 @@ def _volume_capacity(frame: pd.DataFrame, date: pd.Timestamp, config: dict[str, 
         frame["volume"].iloc[max(0, i - int(config["prior_volume_lookback"])):i],
         errors="coerce",
     )
-    prior = prior[np.isfinite(prior) & (prior > 0)]
+    # Zero-volume sessions are real evidence of illiquidity, not missing
+    # observations. Include them in the historical median; only NaN/negative
+    # input rows are discarded.
+    prior = prior[np.isfinite(prior) & (prior >= 0)]
     realized = _nonnegative(frame["volume"].iloc[i])
     usable = len(prior) >= int(config["minimum_prior_volume_observations"])
     historical = float(prior.median()) if usable else 0.0
