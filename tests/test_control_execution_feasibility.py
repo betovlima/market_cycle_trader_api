@@ -5,6 +5,7 @@ These tests do not download Alpaca data, submit orders or alter production.
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -21,6 +22,7 @@ if str(SRC) not in sys.path:
 from market_cycle_trader_api.api.routers.control_shadow import StartControlExecutionRequest
 from market_cycle_trader_api.engine import control_execution_feasibility as execution
 from market_cycle_trader_api.engine import control_execution_adapter as adapter
+from market_cycle_trader_api.engine import control_execution_research as research
 from market_cycle_trader_api.tcc_v106_reference import research_challengers as scientific
 from types import FunctionType
 from market_cycle_trader_api.services import control_shadow_execution_jobs as service
@@ -180,6 +182,106 @@ class ControlExecutionFeasibilityTests(TestCase):
                 "expected_snapshot_sha256": SHA,
                 "data_directory": "C:/user-selected-unsafe-path",
             })
+
+    def test_isolated_report_keeps_source_untouched_and_reconciles_folds(self):
+        dates = pd.bdate_range("2026-09-24", periods=3, tz="UTC")
+        rows = pd.DataFrame({
+            "strategy_equity": [1000.0, 1002.0, 1001.0],
+            "buy_hold_equity": [1000.0, 1000.0, 1000.0],
+            "signal_asset": ["AAA", "AAA", "AAA"],
+            "previous_asset": ["CASH", "AAA", "AAA"],
+            "selected_asset": ["AAA", "AAA", "AAA"],
+            "cash": [900., 800., 700.],
+            "shares": [10, 20, 30],
+            "cash_weight": [0.9, 0.8, 0.7],
+            "requested_quantity": [100, 90, 80],
+            "executed_quantity": [10, 10, 10],
+            "unfilled_quantity": [90, 80, 70],
+            "trade_action": ["BUY", "BUY", "BUY"],
+            "trade_reason": ["PARTIAL_BUY"] * 3,
+            "walk_forward_fold": [1, 1, 1],
+            "decision_date": dates,
+            "actual_position_used_in_policy": [True] * 3,
+            "mark_stale": [False] * 3,
+        }, index=dates)
+        keys = (
+            "initial_capital", "strategy_ending_capital", "strategy_return",
+            "strategy_cagr", "strategy_sharpe", "strategy_maximum_drawdown",
+            "risk_adjusted_compound_score", "buy_hold_ending_capital",
+            "market_exposure", "cash_weight_mean", "cash_days",
+            "capital_rotations", "policy_target_changes", "simulated_buys",
+            "simulated_sells", "blocked_sessions", "partial_sessions",
+            "zero_volume_block_sessions", "unfilled_requested_shares",
+            "modeled_price_cost_usd", "total_transaction_fees",
+            "terminal_holdings_shares", "terminal_cash",
+            "stale_mark_sessions", "session_count",
+        )
+        metrics = {key: 0 for key in keys}
+        metrics.update({
+            "initial_capital": 1000.0,
+            "strategy_ending_capital": 1001.0,
+            "session_count": 3,
+            "terminal_holdings_asset": "AAA",
+            "walk_forward_fold_count": 1,
+            "walk_forward_folds": [{
+                "fold_id": 1,
+                "test_start": dates[0], "test_end": dates[-1],
+                "strategy_starting_capital": 1000.0,
+                "strategy_ending_capital": 1001.0,
+                "strategy_return": .001,
+                "benchmark_return": 0.0,
+                "sessions": 3,
+            }],
+        })
+        baseline = {
+            "source_snapshot_sha256": SHA,
+            "snapshot_assets": 2,
+            "numeric_input_integrity": {"status": "verified", "checked_assets": 2},
+            "original_shadow": {"reproduced": True},
+            "oos": {
+                "strategy_ending_capital": 2000.0,
+                "strategy_cagr": .2,
+                "strategy_sharpe": 1.,
+                "strategy_maximum_drawdown": -.3,
+                "capital_rotations": 3,
+                "walk_forward_fold_count": 1,
+                "walk_forward_folds": [{
+                    "test_start": dates[0].isoformat(),
+                    "test_end": dates[-1].isoformat(),
+                    "sessions": 3,
+                }],
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "control-shadow-870fb66e1bdc4fd0"
+            source.mkdir()
+            (source / "manifest.json").write_text("immutable sentinel", encoding="utf8")
+            with (
+                patch.object(research, "read_verified_control_snapshot",
+                             return_value=({}, {"completed_session": "2026-09-28"}, source)),
+                patch.object(research, "prepare_operational_control_panel",
+                             return_value=({}, dates, SimpleNamespace(calendar_sessions=2500))),
+                patch.object(research, "run_feasible_lightgbm",
+                             return_value=[SimpleNamespace(
+                                 predictions=rows, trades=pd.DataFrame(),
+                                 metrics=metrics,
+                             )]),
+            ):
+                report = research.run_control_execution_feasibility(
+                    source_job_id="control-shadow-870fb66e1bdc4fd0",
+                    validation_job_id=SOURCE_VALIDATION,
+                    execution_job_id="control-execution-aaaaaaaaaaaaaaaa",
+                    expected_sha256=SHA,
+                    baseline=baseline,
+                )
+            self.assertEqual((source / "manifest.json").read_text(), "immutable sentinel")
+            self.assertEqual(report["source_verified_control"]["strategy_ending_capital"], 2000.)
+            self.assertEqual(report["feasible_oos"]["strategy_ending_capital"], 1001.)
+            self.assertEqual(report["capital_delta_vs_unconstrained_usd"], -999.)
+            self.assertFalse(report["order_eligible"])
+            self.assertEqual(report["order_submission"], "never")
+            for file in report["artifacts"]:
+                self.assertTrue((Path(report["report_directory"]) / file).exists())
 
     def test_cannot_queue_unverified_or_different_source(self):
         db = MagicMock()
