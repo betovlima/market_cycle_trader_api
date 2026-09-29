@@ -275,10 +275,17 @@ def run_control_snapshot_validation(
         None if original_calibration_score is None
         else chosen["risk_adjusted_score"] - float(original_calibration_score)
     )
-    original_match = (
+    original_reference_available = (
         original_candidate_margin is not None
-        and float(original_candidate_margin) == chosen["candidate_margin"]
-        and score_difference is not None and abs(score_difference) <= 1e-8
+        and original_calibration_score is not None
+    )
+    original_match = (
+        bool(
+            float(original_candidate_margin) == chosen["candidate_margin"]
+            and score_difference is not None
+            and abs(score_difference) <= 1e-8
+        )
+        if original_reference_available else None
     )
 
     emit("oos_replay", 0, 100)
@@ -342,7 +349,8 @@ def run_control_snapshot_validation(
             "calibration_score": original_calibration_score,
             "calibrated_candidate_margin": original_candidate_margin,
             "score_difference": score_difference,
-            "reproduced": bool(original_match),
+            "reference_available": original_reference_available,
+            "reproduced": original_match,
         },
         "oos": metrics,
         "caveats": [
