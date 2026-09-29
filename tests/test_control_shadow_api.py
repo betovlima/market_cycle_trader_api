@@ -1,10 +1,8 @@
-"""Swagger, auth, input and queue guards for frozen Control shadow."""
+"""Swagger, auth, input and queue guards for fresh Alpaca Control shadow."""
 from __future__ import annotations
 
 import os
 import sys
-import tempfile
-from pathlib import Path
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
@@ -45,7 +43,7 @@ class ControlShadowApiTests(TestCase):
     def test_body_does_not_accept_server_paths_or_unconfirmed_execution(self):
         with self.assertRaises(ValidationError):
             StartControlShadowRequest.model_validate({
-                "confirm": "RUN_FROZEN_SHADOW_NO_ORDERS",
+                "confirm": "REFRESH_ALPACA_CONTROL_SHADOW_NO_ORDERS",
                 "frozen_root": "C:/arbitrary/path",
             })
         with self.assertRaises(ValidationError):
@@ -53,36 +51,26 @@ class ControlShadowApiTests(TestCase):
                 "confirm": "EXECUTE_REAL_ORDER",
             })
 
-    def test_disabled_by_default_even_if_directory_exists(self):
-        with tempfile.TemporaryDirectory() as folder:
-            Path(folder, "manifest.json").write_text("{}", encoding="utf-8")
-            with patch.dict(os.environ, {
-                jobs.ENABLED_ENV: "false",
-                jobs.ROOT_ENV: folder,
-            }):
-                with self.assertRaises(jobs.ControlShadowUnavailable):
-                    jobs.start_control_shadow_job(
-                        MagicMock(), current_asset="CASH", holding_sessions=0
-                    )
+    def test_disabled_by_default_without_requiring_an_existing_dados_directory(self):
+        with patch.dict(os.environ, {jobs.ENABLED_ENV: "false"}):
+            with self.assertRaises(jobs.ControlShadowUnavailable):
+                jobs.start_control_shadow_job(
+                    MagicMock(), current_asset="CASH", holding_sessions=0
+                )
 
     def test_queue_is_unique_and_has_no_order_or_promotion_fields(self):
-        with tempfile.TemporaryDirectory() as folder:
-            Path(folder, "manifest.json").write_text("{}", encoding="utf-8")
-            db = MagicMock()
-            collection = db[jobs.COLLECTION]
-            with (
-                patch.dict(os.environ, {
-                    jobs.ENABLED_ENV: "true",
-                    jobs.ROOT_ENV: folder,
-                }),
-                patch.object(jobs.threading, "Thread") as thread,
-            ):
-                queued = jobs.start_control_shadow_job(
-                    db, current_asset="CASH", holding_sessions=0
-                )
+        db = MagicMock()
+        collection = db[jobs.COLLECTION]
+        with (
+            patch.dict(os.environ, {jobs.ENABLED_ENV: "true"}),
+            patch.object(jobs.threading, "Thread") as thread,
+        ):
+            queued = jobs.start_control_shadow_job(
+                db, current_asset="CASH", holding_sessions=0
+            )
             thread.return_value.start.assert_called_once()
             self.assertEqual(queued["status"], "queued")
-            self.assertEqual(queued["source_kind"], "verified_frozen_tcc_snapshot")
+            self.assertEqual(queued["source_kind"], "fresh_alpaca_raw_sip_local_mct_snapshot")
             self.assertFalse(queued["order_eligible"])
             self.assertEqual(queued["order_submission"], "never")
             collection.create_index.assert_called_once_with(
@@ -95,18 +83,13 @@ class ControlShadowApiTests(TestCase):
             jobs._ACTIVE_THREADS.pop(queued["job_id"], None)
 
     def test_second_job_fails_on_unique_active_key(self):
-        with tempfile.TemporaryDirectory() as folder:
-            Path(folder, "manifest.json").write_text("{}", encoding="utf-8")
-            db = MagicMock()
-            db[jobs.COLLECTION].insert_one.side_effect = DuplicateKeyError("duplicate")
-            with patch.dict(os.environ, {
-                jobs.ENABLED_ENV: "true",
-                jobs.ROOT_ENV: folder,
-            }):
-                with self.assertRaises(jobs.ControlShadowConflict):
-                    jobs.start_control_shadow_job(
-                        db, current_asset="CASH", holding_sessions=0
-                    )
+        db = MagicMock()
+        db[jobs.COLLECTION].insert_one.side_effect = DuplicateKeyError("duplicate")
+        with patch.dict(os.environ, {jobs.ENABLED_ENV: "true"}):
+            with self.assertRaises(jobs.ControlShadowConflict):
+                jobs.start_control_shadow_job(
+                    db, current_asset="CASH", holding_sessions=0
+                )
 
     def test_missing_job_is_not_found(self):
         db = MagicMock()
