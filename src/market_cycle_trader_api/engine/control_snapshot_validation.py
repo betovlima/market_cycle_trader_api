@@ -404,11 +404,14 @@ def run_control_snapshot_validation(
     fig.savefig(output / "oos_drawdown.png", dpi=140)
     plt.close(fig)
 
+    report["report_directory"] = str(output)
+    report["artifacts"] = sorted([
+        *(x.name for x in output.iterdir() if x.is_file()),
+        "summary.json",
+    ])
     (output / "summary.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    report["report_directory"] = str(output)
-    report["artifacts"] = sorted(x.name for x in output.iterdir())
     emit("completed", 1)
     return report
