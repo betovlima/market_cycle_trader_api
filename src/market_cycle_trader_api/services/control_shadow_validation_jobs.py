@@ -131,6 +131,7 @@ def _run_job(
 
         report = run_control_snapshot_validation(
             source_job_id=source_job_id,
+            validation_job_id=job_id,
             expected_sha256=expected_sha256,
             original_calibration_score=original_calibration_score,
             original_candidate_margin=original_candidate_margin,
