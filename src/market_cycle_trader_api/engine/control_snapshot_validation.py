@@ -190,6 +190,7 @@ def _json_float(v: Any) -> float | None:
 def run_control_snapshot_validation(
     *,
     source_job_id: str,
+    validation_job_id: str,
     expected_sha256: str,
     original_calibration_score: float | None,
     original_candidate_margin: float | None,
@@ -201,6 +202,8 @@ def run_control_snapshot_validation(
         if progress is not None:
             progress(stage, completed, total)
 
+    if not re.fullmatch(r"control-validation-[a-f0-9]{16}", validation_job_id):
+        raise ValueError("Expected server-generated validation job ID.")
     emit("verify_snapshot", 0)
     bars, manifest, directory = read_verified_control_snapshot(
         source_job_id, snapshot_root=snapshot_root, expected_sha256=expected_sha256,
@@ -315,6 +318,7 @@ def run_control_snapshot_validation(
     report = {
         "schema_version": 1,
         "source_job_id": source_job_id,
+        "validation_job_id": validation_job_id,
         "source_snapshot_sha256": manifest["snapshot_sha256"],
         "source_kind": "fresh_alpaca_raw_sip_local_mct_snapshot",
         "completed_session": completed_session,
@@ -349,8 +353,8 @@ def run_control_snapshot_validation(
     }
 
     # Write reports only after all provenance checks and scientific simulations pass.
-    output = directory / "validation" / "v10.8.40"
-    output.mkdir(parents=True, exist_ok=True)
+    output = directory / "validation" / "v10.8.40" / validation_job_id
+    output.mkdir(parents=True, exist_ok=False)
     pd.concat(calibration_paths, ignore_index=True).to_csv(
         output / "calibration_curves.csv", index=False, float_format="%.17g",
     )
@@ -360,6 +364,43 @@ def run_control_snapshot_validation(
     oos_curve.to_csv(output / "oos_capital_curve.csv", float_format="%.17g")
     replay.predictions.to_csv(output / "oos_decisions.csv", float_format="%.17g")
     replay.trades.to_csv(output / "oos_trades.csv", index=False, float_format="%.17g")
+    # Static PNGs allow review without requiring a running browser or notebook.
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    calibration_plot = pd.concat(calibration_paths, ignore_index=True)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for candidate, rows in calibration_plot.groupby("candidate_margin", sort=True):
+        ax.plot(pd.to_datetime(rows["date"]), rows["equity"], label=f"margin={candidate:g}")
+    ax.set_title("Control calibration — equity by candidate margin (selection window)")
+    ax.set_ylabel("Simulated equity (USD)")
+    ax.set_xlabel("Execution session")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output / "calibration_capital.png", dpi=140)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(oos_curve.index, oos_curve["strategy_equity"], label="Control OOS")
+    ax.plot(oos_curve.index, oos_curve["buy_hold_equity"], label="Equal-weight buy-and-hold")
+    ax.set_title("Control scientific expanding walk-forward OOS")
+    ax.set_ylabel("Equity (USD)")
+    ax.set_xlabel("Execution session")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output / "oos_capital.png", dpi=140)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(oos_curve.index, 100 * oos_curve["drawdown"])
+    ax.set_title("Control OOS drawdown")
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_xlabel("Execution session")
+    fig.tight_layout()
+    fig.savefig(output / "oos_drawdown.png", dpi=140)
+    plt.close(fig)
+
     (output / "summary.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
