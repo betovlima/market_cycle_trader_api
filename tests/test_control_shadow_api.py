@@ -11,7 +11,6 @@ API_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(API_SRC) not in sys.path:
     sys.path.insert(0, str(API_SRC))
 
-from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from pymongo.errors import DuplicateKeyError
 
@@ -31,8 +30,7 @@ class ControlShadowApiTests(TestCase):
         self.assertIn("/api/admin/control-shadow/jobs/{job_id}/logs", documented)
         routes = [
             route for route in app.routes
-            if isinstance(route, APIRoute)
-            and route.path.startswith("/api/admin/control-shadow")
+            if getattr(route, "path", "").startswith("/api/admin/control-shadow")
         ]
         self.assertEqual(len(routes), 3)
         for route in routes:
