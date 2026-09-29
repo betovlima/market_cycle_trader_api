@@ -31,7 +31,8 @@
 - Branch: `feature/v10.8.39-control-operational-parity` a partir de `main` API v10.8.38.
 - Causa: o motor de referência científica não é o runtime de Trader e não é elegível para promoção.
 - Implementado até aqui: teste isolado de paridade da regra de decisão Control vs política live, incluindo caso de ausência da barra futura; documentação do contrato de migração.
-- Não implementado: equivalência ponta a ponta de dados, features, modelos e treinamento, execução isolada, novo binding operacional, alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado por estes commits.
+- Incremento seguinte no mesmo branch: `engine/operational_control_contract.py` usa painel do Control científico v1.0.6 em modo isolado e sem ordens. Testes verificam igualdade de features em OHLCV idêntico, calendário ancorado vs o atual calendário automático, ausência de barra futura e indisponibilidade de âncora.
+- Não implementado: equivalência ponta a ponta da fonte Alpaca e corporate actions, modelos e treinamento, geração completa de decisão sem ordens, novo binding operacional, alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado por estes commits.
 - Status: a CI do commit inicial `66e31f6f0be882b5bb3980776d8240c0e29a30ab` passou em Python 3.12. Após erro de importação no Spyder/Python 3.14.2, o teste foi corrigido para inserir `<API>/src` no `sys.path` a partir de `__file__`; aguardar CI do novo commit. Não afirmar paridade operacional completa com base no teste de política.
 - Erro local original: `ModuleNotFoundError: No module named 'market_cycle_trader_api'`, durante importação, antes de qualquer teste. Não indica divergência Control vs live; preferir Python 3.12 para ambiente de referência.
 
