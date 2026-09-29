@@ -7,7 +7,7 @@ It is intentionally NOT plugged into the protected Trader scheduler.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,7 @@ def build_control_shadow_decision(
     completed_session: str,
     current_asset: str | None,
     holding_sessions: int,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Calculate one prospective Control action without preparing any order.
 
@@ -102,7 +103,17 @@ def build_control_shadow_decision(
     decision_date = pd.Timestamp(common_dates[decision_index])
 
     calibration_models = scientific_fit_models(
-        frames, symbols, train_dates, config, phase="control_shadow_calibration",
+        frames,
+        symbols,
+        train_dates,
+        config,
+        phase="control_shadow_calibration",
+        progress_callback=(
+            (lambda completed, total, _device: progress_callback(
+                "calibration", completed, total
+            ))
+            if progress_callback is not None else None
+        ),
     )
     if not calibration_models:
         raise ValueError("No calibrated Control LightGBM models available.")
@@ -125,7 +136,17 @@ def build_control_shadow_decision(
         raise ValueError("Control calibration produced no finite score.")
 
     final_models = scientific_fit_models(
-        frames, symbols, final_fit_dates, config, phase="control_shadow_final",
+        frames,
+        symbols,
+        final_fit_dates,
+        config,
+        phase="control_shadow_final",
+        progress_callback=(
+            (lambda completed, total, _device: progress_callback(
+                "final", completed, total
+            ))
+            if progress_callback is not None else None
+        ),
     )
     if not final_models:
         raise ValueError("No final Control LightGBM models available.")
