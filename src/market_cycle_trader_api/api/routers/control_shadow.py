@@ -1,7 +1,7 @@
-"""Swagger /docs endpoints for frozen TCC Control shadow jobs.
+"""Swagger /docs endpoints for refreshed Alpaca Control shadow jobs.
 
 All routes are admin-only via main.py's router dependency. This preview runs
-with verified frozen CSV input on the API server, and cannot submit orders.
+using newly downloaded RAW/SIP files in MCT dados and cannot submit orders.
 """
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ router = APIRouter(
 class StartControlShadowRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    confirm: Literal["RUN_FROZEN_SHADOW_NO_ORDERS"] = Field(
-        description="Explicitly confirm frozen-input preview without Alpaca orders."
+    confirm: Literal["REFRESH_ALPACA_CONTROL_SHADOW_NO_ORDERS"] = Field(
+        description="Explicitly confirm fresh Alpaca data download for a no-order preview."
     )
     current_asset: str = Field(
         default="CASH",
@@ -50,13 +50,14 @@ class StartControlShadowRequest(BaseModel):
 @router.post(
     "/jobs",
     status_code=202,
-    summary="Start frozen Control shadow job (no orders)",
+    summary="Download fresh Alpaca data and run Control shadow (no orders)",
     description=(
-        "Run the TCC v1.0.6 Control training/calibration and calculate one "
-        "hypothetical decision. The API reads only a server-configured, "
-        "SHA-verified frozen snapshot. Its progress is printed in the Uvicorn "
-        "console and saved for polling. No HTTP input can select a filesystem "
-        "path, an Alpaca account or a production Strategy."
+        "Download NEW Alpaca RAW/SIP daily bars and corporate actions for the "
+        "Control v1.0.6 universe; create MCT API dados/control_shadow/snapshots "
+        "automatically and calculate one hypothetical decision. Progress is "
+        "printed in the PyCharm/Uvicorn console and saved for polling. HTTP "
+        "input cannot select a filesystem path, account or production Strategy. "
+        "This endpoint never submits trading orders."
     ),
 )
 def start_shadow_job(payload: StartControlShadowRequest) -> dict[str, Any]:
