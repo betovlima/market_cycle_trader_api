@@ -143,6 +143,7 @@ def simulate_feasible_control(
     method_line: str | None = None,
     simulation_progress_callback: Callable[[float, str], None] | None = None,
     scenario_override: dict[str, Any] | None = None,
+    decision_prepare: Callable[[pd.Timestamp, int, int, float, int, float], None] | None = None,
 ) -> RotationRunResult:
     """Model-policy counterfactual, not a fixed tape of original decisions.
 
@@ -184,6 +185,18 @@ def simulate_feasible_control(
     last_price: dict[str, float] = {}
     for i, (decision_date, execution_date) in enumerate(zip(decision_dates[:-1], execution_dates)):
         old_position = position
+        if decision_prepare is not None:
+            # Only the completed decision-date close may mark the held shares.
+            # No execution-session open, close or volume is visible here.
+            decision_equity = float(cash)
+            if position > 0 and qty > 0:
+                known_close = _nonnegative(frames[symbols[position-1]].loc[decision_date, "close"])
+                if known_close <= 0:
+                    raise ValueError("Liquidity-aware policy lacks completed-session position close.")
+                decision_equity += qty * known_close
+            if not math.isfinite(decision_equity) or decision_equity <= 0:
+                raise ValueError("Invalid known equity at decision time.")
+            decision_prepare(decision_date, position, holding, cash, qty, decision_equity)
         chosen_position, score = policy(decision_date, position, holding)
         if not isinstance(chosen_position, (int, np.integer)) or not 0 <= chosen_position <= len(symbols):
             raise ValueError("Control policy returned invalid target.")
