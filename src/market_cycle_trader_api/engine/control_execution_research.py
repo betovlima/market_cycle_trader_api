@@ -17,8 +17,8 @@ import pandas as pd
 
 from ..tcc_v106_reference.config import CONFIG, build_control_config
 from ..tcc_v106_reference.execution import apply_slippage, calculate_reference_fees
-from ..tcc_v106_reference.research_challengers import run_research_challenger
-from .control_execution_feasibility import SCENARIO, simulate_feasible_control
+from .control_execution_feasibility import SCENARIO
+from .control_execution_adapter import run_feasible_lightgbm
 from .control_snapshot_validation import read_verified_control_snapshot
 from .operational_control_contract import prepare_operational_control_panel
 
@@ -75,11 +75,9 @@ def run_control_execution_feasibility(
     def on_progress(percentage: float, stage: str, _completed: int) -> None:
         if progress is not None:
             progress(str(stage)[:160], max(0, min(100, int(percentage))), 100)
-    results = run_research_challenger(
-        "lightgbm_utility", bars, config,
-        calculate_reference_fees, apply_slippage,
+    results = run_feasible_lightgbm(
+        bars, config, calculate_reference_fees, apply_slippage,
         progress_callback=on_progress,
-        execution_simulator=simulate_feasible_control,
     )
     if len(results) != 1 or results[0].predictions.empty:
         raise ValueError("Control feasibility OOS did not yield a complete single-run replay.")
