@@ -32,7 +32,8 @@
 - Causa: o motor de referência científica não é o runtime de Trader e não é elegível para promoção.
 - Implementado até aqui: teste isolado de paridade da regra de decisão Control vs política live, incluindo caso de ausência da barra futura; documentação do contrato de migração.
 - Não implementado: equivalência ponta a ponta de dados, features, modelos e treinamento, execução isolada, novo binding operacional, alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado por estes commits.
-- Status: aguarda resultado da CI e demais testes de integração. Não afirmar paridade operacional completa com base no teste de política.
+- Status: a CI do commit inicial `66e31f6f0be882b5bb3980776d8240c0e29a30ab` passou em Python 3.12. Após erro de importação no Spyder/Python 3.14.2, o teste foi corrigido para inserir `<API>/src` no `sys.path` a partir de `__file__`; aguardar CI do novo commit. Não afirmar paridade operacional completa com base no teste de política.
+- Erro local original: `ModuleNotFoundError: No module named 'market_cycle_trader_api'`, durante importação, antes de qualquer teste. Não indica divergência Control vs live; preferir Python 3.12 para ambiente de referência.
 
 ## Próximos passos
 1. Confirmar CI do novo teste e baseline de regressão.
