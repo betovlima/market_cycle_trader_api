@@ -305,7 +305,10 @@ def run_control_snapshot_validation(
                 "fold_id", "test_start", "test_end", "train_end",
                 "calibration_start", "calibration_end", "calibrated_candidate_margin",
                 "effective_switch_margin", "calibration_risk_adjusted_score",
-                "ending_capital", "return", "max_drawdown", "sharpe",
+                "model_test_start", "model_test_end", "purge_start", "purge_end",
+                "strategy_starting_capital", "strategy_ending_capital",
+                "strategy_return", "benchmark_return", "excess_return",
+                "maximum_drawdown", "sessions",
             }
         }
         for row in replay.metrics["walk_forward_folds"]
