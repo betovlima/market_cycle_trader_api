@@ -34,6 +34,7 @@ FEATURES = (
 )
 TARGET = "forward_risk_adjusted_utility"
 WINDOW = 40
+TRAIN_STRIDE = 3  # fixed before OOS: reduce overlapping train windows
 HIDDEN = 16
 DILATIONS = (1, 2, 4, 8, 16)
 EPOCHS = 8
@@ -125,6 +126,7 @@ def _dataset_rows(
     *,
     maturity_before: pd.Timestamp,
     horizon: int,
+    stride: int = 1,
 ) -> list[tuple[str, int]]:
     """A sample is trainable only if its COMPLETE horizon ends before cutoff.
 
@@ -141,6 +143,10 @@ def _dataset_rows(
         x = _feature_matrix(frame)
         y = pd.to_numeric(frame[TARGET], errors="coerce").to_numpy(dtype=float)
         for loc in range(WINDOW - 1, len(frame) - horizon):
+            if stride < 1:
+                raise ValueError("Training stride must be positive.")
+            if loc % stride != 0:
+                continue
             date = pd.Timestamp(frame.index[loc])
             if date not in accepted:
                 continue
@@ -328,6 +334,7 @@ def run_tcn_challenger(
         training = _dataset_rows(
             frames, symbols, train_dates,
             maturity_before=fold["calibration_start"], horizon=horizon,
+            stride=TRAIN_STRIDE,
         )
         validation = _dataset_rows(
             frames, symbols, calibration_dates,
@@ -344,6 +351,7 @@ def run_tcn_challenger(
         final_training = _dataset_rows(
             frames, symbols, final_dates,
             maturity_before=fold["test_start"], horizon=horizon,
+            stride=TRAIN_STRIDE,
         )
         final_scale = _scaling(frames, symbols, final_dates, final_training)
         xfinal, yfinal = _arrays(frames, symbols, final_scale)
@@ -407,6 +415,7 @@ def run_tcn_challenger(
             "train_rows": len(training),
             "calibration_rows": len(validation),
             "final_train_rows": len(final_training),
+            "training_stride": TRAIN_STRIDE,
             "chosen_epochs_calibration_only": chosen_epochs,
             "calibration_huber_normalized": loss,
             "test_start": pd.Timestamp(fold["test_start"]).isoformat(),
