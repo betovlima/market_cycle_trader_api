@@ -168,7 +168,7 @@ class ControlSnapshotValidationTests(TestCase):
                              return_value=lambda t, p, h: (0, 0.0)),
                 patch.object(engine, "_simple_policy_growth", return_value=0.0003),
                 patch.object(engine, "_calibration_curve",
-                             return_value=(curve, actions, 0.0003)),
+                             side_effect=lambda *a, **k: (curve.copy(), actions.copy(), 0.0003)),
                 patch.object(engine, "run_research_challenger", return_value=[original]) as replay,
             ):
                 report = engine.run_control_snapshot_validation(
