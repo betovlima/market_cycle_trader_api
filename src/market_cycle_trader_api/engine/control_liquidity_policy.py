@@ -144,11 +144,11 @@ class _CapitalAwareUtilityCache(dict):
             ),
             "incumbent_exit_fraction": float(incumbent_exit),
             "raw_best_asset": (
-                self._symbols[int(np.argmax(raw[1:]))] if np.isfinite(raw[1:]).any()
+                self._symbols[int(np.argmax(np.where(np.isfinite(raw[1:]), raw[1:], -np.inf)))] if np.isfinite(raw[1:]).any()
                 else None
             ),
             "adjusted_best_asset": (
-                self._symbols[int(np.argmax(effective[1:]))] if np.isfinite(effective[1:]).any()
+                self._symbols[int(np.argmax(np.where(np.isfinite(effective[1:]), effective[1:], -np.inf)))] if np.isfinite(effective[1:]).any()
                 else None
             ),
             "raw_positive_candidate_count": int((raw[1:] > 0).sum()),
