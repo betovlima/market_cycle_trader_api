@@ -76,12 +76,14 @@ def build_control_shadow_decision(
     calibration_days = int(config.rotation_walk_forward_calibration_days)
     minimum_training_rows = int(config.rotation_minimum_training_rows)
     decision_index = len(common_dates) - 1
-    # The next open has not happened yet. Treat this last known session as the
-    # prospective OOS decision, without leaking its future label into fit.
-    calibration_end_index = decision_index - purge
+    # The next open has not happened yet. The prospective execution row is
+    # *after* the final known candle. This matches the scientific fold's
+    # test_start index for a next-open action, without using a future candle.
+    prospective_execution_index = len(common_dates)
+    calibration_end_index = prospective_execution_index - purge
     calibration_start_index = calibration_end_index - calibration_days
     train_end_index = calibration_start_index - purge
-    final_fit_end_index = decision_index - purge
+    final_fit_end_index = prospective_execution_index - purge
     if (
         train_end_index < minimum_training_rows
         or calibration_start_index < 0
