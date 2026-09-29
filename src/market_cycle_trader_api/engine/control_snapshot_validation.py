@@ -206,8 +206,14 @@ def run_control_snapshot_validation(
         source_job_id, snapshot_root=snapshot_root, expected_sha256=expected_sha256,
     )
     completed_session = str(manifest["completed_session"])
+    # Scientific analysis_end_date is a UTC instant, whereas MCT cutoff is
+    # an inclusive XNYS session DATE. Use the v10.8.38 adapter convention.
+    inclusive_utc = (
+        pd.Timestamp(completed_session, tz="UTC")
+        + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    ).isoformat()
     config = build_control_config(CONFIG).model_copy(update={
-        "analysis_end_date": completed_session,
+        "analysis_end_date": inclusive_utc,
         "end_date": completed_session,
     })
     frames, dates, audit = prepare_operational_control_panel(
