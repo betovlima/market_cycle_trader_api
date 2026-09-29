@@ -180,6 +180,7 @@ class ControlSnapshotValidationTests(TestCase):
                 )
             self.assertEqual((source / "manifest.json").read_text(), "source sentinel")
             self.assertTrue(report["original_shadow"]["reproduced"])
+            self.assertTrue(report["original_shadow"]["reference_available"])
             self.assertFalse(report["order_eligible"])
             self.assertEqual(report["order_submission"], "never")
             self.assertEqual(len(report["margin_candidates"]), 4)
@@ -197,6 +198,18 @@ class ControlSnapshotValidationTests(TestCase):
             "confirm": "VALIDATE_EXISTING_CONTROL_SNAPSHOT_NO_ORDERS",
             "source_job_id": ID,
         })
+        validated = StartControlValidationRequest.model_validate({
+            "confirm": "VALIDATE_EXISTING_CONTROL_SNAPSHOT_NO_ORDERS",
+            "source_job_id": ID,
+            "expected_snapshot_sha256": "a" * 64,
+        })
+        self.assertEqual(validated.expected_snapshot_sha256, "a" * 64)
+        with self.assertRaises(ValidationError):
+            StartControlValidationRequest.model_validate({
+                "confirm": "VALIDATE_EXISTING_CONTROL_SNAPSHOT_NO_ORDERS",
+                "source_job_id": ID,
+                "expected_snapshot_sha256": "invalid",
+            })
         with self.assertRaises(ValidationError):
             StartControlValidationRequest.model_validate({
                 "confirm": "VALIDATE_EXISTING_CONTROL_SNAPSHOT_NO_ORDERS",
@@ -208,6 +221,60 @@ class ControlSnapshotValidationTests(TestCase):
                 "confirm": "REFRESH_ALPACA_CONTROL_SHADOW_NO_ORDERS",
                 "source_job_id": ID,
             })
+
+    def test_missing_mongo_job_recovers_only_with_independent_local_snapshot_hash(self):
+        db = MagicMock()
+        db[service.SOURCE_COLLECTION].find_one.return_value = None
+        with patch.object(service, "_require_enabled"):
+            with self.assertRaisesRegex(service.SnapshotValidationNotFound, "expected_snapshot_sha256"):
+                service.start_snapshot_validation(db, source_job_id=ID)
+        expected = "a" * 64
+        with (
+            patch.object(service, "_require_enabled"),
+            patch.object(service, "read_verified_control_snapshot",
+                         return_value=({}, {
+                             "snapshot_sha256": expected,
+                             "completed_session": "2026-09-28",
+                         }, Path("data"))) as verify,
+            patch.object(service.threading, "Thread") as worker,
+        ):
+            queued = service.start_snapshot_validation(
+                db, source_job_id=ID, expected_snapshot_sha256=expected,
+            )
+        verify.assert_called_once_with(ID, expected_sha256=expected)
+        worker.return_value.start.assert_called_once()
+        self.assertEqual(queued["source_registry_mode"], "local_snapshot_sha_pinned")
+        self.assertEqual(queued["source_download"], "never")
+        self.assertFalse(queued["order_eligible"])
+        kwargs = worker.call_args.kwargs["kwargs"]
+        self.assertIsNone(kwargs["original_calibration_score"])
+        self.assertIsNone(kwargs["original_candidate_margin"])
+        self.assertEqual(kwargs["expected_sha256"], expected)
+        self.assertEqual(kwargs["source_registry_mode"], "local_snapshot_sha_pinned")
+        service._THREADS.pop(queued["job_id"], None)
+
+    def test_corrupt_or_missing_local_snapshot_cannot_be_queued(self):
+        db = MagicMock()
+        db[service.SOURCE_COLLECTION].find_one.return_value = None
+        with (
+            patch.object(service, "_require_enabled"),
+            patch.object(service, "read_verified_control_snapshot",
+                         side_effect=FileNotFoundError("missing")),
+        ):
+            with self.assertRaisesRegex(service.SnapshotValidationNotFound, "local snapshot"):
+                service.start_snapshot_validation(
+                    db, source_job_id=ID, expected_snapshot_sha256="a" * 64,
+                )
+        with (
+            patch.object(service, "_require_enabled"),
+            patch.object(service, "read_verified_control_snapshot",
+                         side_effect=ValueError("Control snapshot SHA-256 manifest mismatch")),
+        ):
+            with self.assertRaisesRegex(service.SnapshotValidationInvalid, "SHA-256"):
+                service.start_snapshot_validation(
+                    db, source_job_id=ID, expected_snapshot_sha256="a" * 64,
+                )
+        db[service.COLLECTION].insert_one.assert_not_called()
 
     def test_source_job_must_be_completed_fresh_and_sha_pinned(self):
         db = MagicMock()
@@ -234,6 +301,7 @@ class ControlSnapshotValidationTests(TestCase):
         self.assertEqual(created["status"], "queued")
         self.assertEqual(created["source_job_id"], ID)
         self.assertEqual(created["source_download"], "never")
+        self.assertEqual(created["source_registry_mode"], "mongodb")
         self.assertFalse(created["order_eligible"])
         self.assertEqual(created["order_submission"], "never")
         thread.return_value.start.assert_called_once()
