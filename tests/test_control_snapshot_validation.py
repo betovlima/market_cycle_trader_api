@@ -25,6 +25,7 @@ from pymongo.errors import DuplicateKeyError
 
 from market_cycle_trader_api.api.routers.control_shadow import StartControlValidationRequest
 from market_cycle_trader_api.engine import control_snapshot_validation as engine
+from market_cycle_trader_api.engine.market_data import _history_frame_sha256
 from market_cycle_trader_api.services import control_shadow_validation_jobs as service
 
 
@@ -47,8 +48,12 @@ def _snapshot(root: Path) -> tuple[Path, dict]:
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(payload)
             hashes[name] = hashlib.sha256(payload).hexdigest()
+        normalized = pd.read_csv(directory / f"normalized_bars/{symbol}.csv",
+                                 index_col="timestamp", float_precision="round_trip")
+        normalized.index = pd.to_datetime(normalized.index, utc=True)
         records[symbol] = {
             "status": "eligible", "normalized_rows": 1,
+            "normalized_history_sha256": _history_frame_sha256(normalized),
             "first_session": "2026-09-28", "last_session": "2026-09-28",
         }
     manifest = {
@@ -93,6 +98,82 @@ class ControlSnapshotValidationTests(TestCase):
                     )
         with self.assertRaisesRegex(ValueError, "server-generated"):
             engine.read_verified_control_snapshot("../other")
+
+    def test_fails_closed_when_original_in_memory_numeric_hash_is_different(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory, manifest = _snapshot(root)
+            manifest["per_asset"]["AAPL"]["normalized_history_sha256"] = "f" * 64
+            canonical = {
+                key: value for key, value in manifest.items()
+                if key != "snapshot_sha256"
+            }
+            manifest["snapshot_sha256"] = hashlib.sha256(
+                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with (
+                patch.object(engine, "ASSETS", ("AAPL", "NVDA")),
+                patch.object(engine, "REFERENCE_ASSETS", ("AAPL", "NVDA")),
+            ):
+                with self.assertRaisesRegex(ValueError, "model-input hash changed"):
+                    engine.read_verified_control_snapshot(
+                        ID, snapshot_root=root,
+                        expected_sha256=manifest["snapshot_sha256"],
+                    )
+
+    def test_binary64_round_trip_parser_recovers_written_control_model_inputs(self):
+        # The independent original in-memory float64 fingerprint is required,
+        # not merely the SHA-256 of CSV text (which a lossy parser also passes).
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory, manifest = _snapshot(root)
+            original = pd.DataFrame(
+                {
+                    "open": [0.12345678901234566, 17.000000000000004],
+                    "high": [0.7654321098765432, 18.000000000000004],
+                    "low": [0.10000000000000002, 16.000000000000004],
+                    "close": [0.31415926535897931, 17.000000000000004],
+                    "volume": [123.0, 234.0],
+                },
+                index=pd.DatetimeIndex([
+                    "2026-09-25T04:00:00+00:00",
+                    "2026-09-28T04:00:00+00:00",
+                ], name="timestamp"),
+            )
+            payload = engine._bars_payload(original)
+            assert payload is not None
+            normalized_path = directory / "normalized_bars" / "AAPL.csv"
+            normalized_path.write_bytes(payload)
+            manifest["file_hashes"]["normalized_bars/AAPL.csv"] = hashlib.sha256(payload).hexdigest()
+            manifest["per_asset"]["AAPL"].update({
+                "normalized_rows": 2, "first_session": "2026-09-25",
+                "normalized_history_sha256": _history_frame_sha256(original),
+            })
+            canonical = {
+                key: value for key, value in manifest.items()
+                if key != "snapshot_sha256"
+            }
+            manifest["snapshot_sha256"] = hashlib.sha256(
+                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with (
+                patch.object(engine, "ASSETS", ("AAPL", "NVDA")),
+                patch.object(engine, "REFERENCE_ASSETS", ("AAPL", "NVDA")),
+            ):
+                frames, _, _ = engine.read_verified_control_snapshot(
+                    ID, snapshot_root=root,
+                    expected_sha256=manifest["snapshot_sha256"],
+                )
+            reloaded = frames["AAPL"]
+            self.assertEqual(
+                _history_frame_sha256(reloaded), _history_frame_sha256(original),
+            )
+            self.assertTrue(np.array_equal(
+                reloaded[["open", "high", "low", "close", "volume"]].to_numpy(np.float64).view(np.uint64),
+                original[["open", "high", "low", "close", "volume"]].to_numpy(np.float64).view(np.uint64),
+            ))
 
     def test_calibration_curve_is_risk_adjusted_not_percent_return(self):
         dates = pd.date_range("2026-01-01", periods=3, tz="UTC")

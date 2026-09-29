@@ -30,7 +30,8 @@ from ..tcc_v106_reference.research_challengers import (
     _lightgbm_fit_models,
     run_research_challenger,
 )
-from .control_shadow_market_data import DATA_DIRECTORY, SOURCE_CONTRACT
+from .control_shadow_market_data import DATA_DIRECTORY, SOURCE_CONTRACT, _bars_payload
+from .market_data import _history_frame_sha256
 from .operational_control_contract import prepare_operational_control_panel
 
 Progress = Callable[[str, int, int], None]
@@ -114,7 +115,15 @@ def read_verified_control_snapshot(
             raise ValueError(f"Snapshot file hash changed: {relative}.")
     frames = {}
     for symbol in eligible:
-        frame = pd.read_csv(source / f"normalized_bars/{symbol}.csv", index_col="timestamp")
+        # CSV values were written with %.17g, but pandas' default "high"
+        # parser need not preserve their original binary64 representation.
+        # Use the round-trip parser and require the original in-memory model
+        # OHLCV hash from the immutable download manifest to match exactly.
+        frame = pd.read_csv(
+            source / f"normalized_bars/{symbol}.csv",
+            index_col="timestamp",
+            float_precision="round_trip",
+        )
         frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
         frame.index.name = "timestamp"
         if frame.empty or frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
@@ -122,6 +131,15 @@ def read_verified_control_snapshot(
         if frame.index[-1].date() > stamp.date():
             raise ValueError(f"{symbol}: future bars in normalized snapshot.")
         record = records[symbol]
+        original_numeric_hash = str(record.get("normalized_history_sha256") or "")
+        if not re.fullmatch(r"[a-f0-9]{64}", original_numeric_hash):
+            raise ValueError(f"{symbol}: missing original normalized model-input SHA-256.")
+        reloaded_numeric_hash = _history_frame_sha256(frame)
+        if reloaded_numeric_hash != original_numeric_hash:
+            raise ValueError(
+                f"{symbol}: normalized model-input hash changed after CSV reload. "
+                "Refusing silently different training features; source is immutable."
+            )
         if len(frame) != int(record["normalized_rows"]):
             raise ValueError(f"{symbol}: normalized row count changed.")
         if frame.index[0].date().isoformat() != record["first_session"] or (
@@ -334,6 +352,13 @@ def run_control_snapshot_validation(
         "completed_session": completed_session,
         "source_unchanged": True,
         "snapshot_assets": len(bars),
+        "numeric_input_integrity": {
+            "status": "verified",
+            "csv_float_precision": "round_trip",
+            "checked_assets": len(bars),
+            "source": "manifest.per_asset.normalized_history_sha256",
+            "method": "exact canonical OHLCV hash match versus original in-memory download",
+        },
         "calendar_sessions": audit.calendar_sessions,
         "calibration_window": {
             "train_end": train_dates[-1].date().isoformat(),
@@ -364,7 +389,7 @@ def run_control_snapshot_validation(
     }
 
     # Write reports only after all provenance checks and scientific simulations pass.
-    output = directory / "validation" / "v10.8.40" / validation_job_id
+    output = directory / "validation" / "v10.8.41" / validation_job_id
     output.mkdir(parents=True, exist_ok=False)
     pd.concat(calibration_paths, ignore_index=True).to_csv(
         output / "calibration_curves.csv", index=False, float_format="%.17g",
