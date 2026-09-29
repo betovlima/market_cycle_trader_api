@@ -20,6 +20,9 @@ if str(SRC) not in sys.path:
 
 from market_cycle_trader_api.api.routers.control_shadow import StartControlExecutionRequest
 from market_cycle_trader_api.engine import control_execution_feasibility as execution
+from market_cycle_trader_api.engine import control_execution_adapter as adapter
+from market_cycle_trader_api.tcc_v106_reference import research_challengers as scientific
+from types import FunctionType
 from market_cycle_trader_api.services import control_shadow_execution_jobs as service
 
 SOURCE_VALIDATION = "control-validation-7821002400424ccc"
@@ -133,6 +136,28 @@ class ControlExecutionFeasibilityTests(TestCase):
         )
         self.assertLessEqual(qty * price + fees["total_fee"], 105.000000001)
         self.assertLess(qty, 10)
+
+    def test_isolated_runner_rebinds_only_local_simulator_not_vendored_global(self):
+        original_simulator = scientific._simulate_exact
+
+        def fake_runner(bars, config, fees, slippage, *,
+                        progress_callback, trade_callback,
+                        progress_detail_callback, technical_log_callback):
+            return [_simulate_exact]
+        cloned_fake = FunctionType(
+            fake_runner.__code__,
+            {"_simulate_exact": original_simulator},
+        )
+        with (
+            patch.object(scientific, "_run_lightgbm", cloned_fake),
+            patch.object(scientific, "allocation_execution_enabled", return_value=False),
+        ):
+            selected = adapter.run_feasible_lightgbm(
+                {}, self.config, _fees, lambda p, side, cfg: p,
+            )
+            self.assertIs(selected[0], execution.simulate_feasible_control)
+            self.assertIs(cloned_fake.__globals__["_simulate_exact"], original_simulator)
+            self.assertIs(scientific._simulate_exact, original_simulator)
 
     def test_endpoint_requires_verified_validation_hash_and_confirmation(self):
         model = StartControlExecutionRequest.model_validate({
