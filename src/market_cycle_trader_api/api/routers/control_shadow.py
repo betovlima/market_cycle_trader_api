@@ -11,6 +11,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_tcn_jobs import (
+    TCNConflict, TCNInvalid, TCNNotFound,
+    start_tcn_research, get_tcn_research,
+)
 from ...services.control_shadow_liquidity_jobs import (
     LiquidityConflict,
     LiquidityInvalid,
@@ -419,4 +423,78 @@ def read_liquidity_logs(job_id: str) -> dict[str, Any]:
     try:
         return get_liquidity_research(database(), job_id, logs_only=True)
     except LiquidityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlTCNResearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_FIXED_CAUSAL_TCN_NO_ORDERS"] = Field(
+        description="Fixed TinyTCN with mature labels and identical liquidity-cap accounting. No tuning or real orders."
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+    )
+    source_execution_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-execution-[a-f0-9]{16}$",
+    )
+    source_liquidity_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-liquidity-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/deep-learning/jobs", status_code=202,
+    summary="Exploratory causal TCN, three purged OOS folds, liquidity execution — NO orders",
+    description=(
+        "Trains a fixed pooled CPU TinyTCN on the verified snapshot. "
+        "Selects epochs using pre-test calibration only, keeps 60-session "
+        "label maturity and identical 10% execution constraints. Historical "
+        "Control/Liquidity baselines are read-only references; no Alpaca or orders."
+    ),
+)
+def start_deep_learning_job(payload: StartControlTCNResearchRequest) -> dict[str, Any]:
+    try:
+        return start_tcn_research(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            source_execution_job_id=payload.source_execution_job_id,
+            source_liquidity_job_id=payload.source_liquidity_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TCNNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TCNConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TCNInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/deep-learning/jobs/{job_id}",
+    summary="Read fixed TinyTCN historical model and portfolio diagnostics",
+)
+def read_deep_learning_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_tcn_research(database(), job_id)
+    except TCNNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/deep-learning/jobs/{job_id}/logs",
+    summary="Read fixed TinyTCN progress and logs",
+)
+def read_deep_learning_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_tcn_research(database(), job_id, logs_only=True)
+    except TCNNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
