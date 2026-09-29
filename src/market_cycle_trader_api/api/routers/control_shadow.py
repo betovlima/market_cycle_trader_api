@@ -11,6 +11,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_liquidity_jobs import (
+    LiquidityConflict,
+    LiquidityInvalid,
+    LiquidityNotFound,
+    start_liquidity_research,
+    get_liquidity_research,
+)
 from ...services.control_shadow_sensitivity_jobs import (
     SensitivityConflict,
     SensitivityInvalid,
@@ -336,4 +343,80 @@ def read_sensitivity_logs(job_id: str) -> dict[str, Any]:
     try:
         return get_control_sensitivity(database(), job_id, logs_only=True)
     except SensitivityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlLiquidityResearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_CONTROL_PRIOR_CLOSE_LIQUIDITY_NO_ORDERS"] = Field(
+        description="Compare two predeclared Control policies with identical capacity-constrained research accounting."
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+    )
+    source_execution_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-execution-[a-f0-9]{16}$",
+    )
+    source_sensitivity_job_id: str = Field(
+        min_length=36, max_length=36,
+        pattern=r"^control-sensitivity-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/liquidity/jobs",
+    status_code=202,
+    summary="Paired original Control vs prior-close liquidity-aware Control — research only",
+    description=(
+        "One unchanged LightGBM Control training/calibration; two independent "
+        "10% capacity-constrained OOS accountings. Uses only historical "
+        "volume and completed close for candidate utility adjustment. "
+        "No Alpaca calls, order placement, or Winner promotion."
+    ),
+)
+def start_liquidity_job(payload: StartControlLiquidityResearchRequest) -> dict[str, Any]:
+    try:
+        return start_liquidity_research(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            source_execution_job_id=payload.source_execution_job_id,
+            source_sensitivity_job_id=payload.source_sensitivity_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LiquidityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except LiquidityConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LiquidityInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/liquidity/jobs/{job_id}",
+    summary="Read paired Control liquidity-policy research results (no orders)",
+)
+def read_liquidity_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_liquidity_research(database(), job_id)
+    except LiquidityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/liquidity/jobs/{job_id}/logs",
+    summary="Read prior-close liquidity-policy research progress",
+)
+def read_liquidity_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_liquidity_research(database(), job_id, logs_only=True)
+    except LiquidityNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
