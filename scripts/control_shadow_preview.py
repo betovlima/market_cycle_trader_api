@@ -41,19 +41,29 @@ def run(
     output: Path,
 ) -> dict:
     frozen_root = frozen_root.expanduser().resolve(strict=True)
+    print("Verificando snapshot científico e hashes SHA-256...", flush=True)
     manifest = validate_frozen_tcc_main(frozen_root, assets=ASSETS)
     frames = {}
     exclusions = []
-    for symbol in ASSETS:
+    for index, symbol in enumerate(ASSETS, start=1):
         try:
             frames[symbol] = load_frozen_tcc_main_symbol(frozen_root, symbol, manifest)
         except StructuralResearchAssetExclusion as exc:
             exclusions.append({"symbol": symbol, "reason": str(exc)})
+        if index % 5 == 0 or index == len(ASSETS):
+            print(f"Dados verificados: {index}/{len(ASSETS)}", flush=True)
+
+    def show_progress(phase: str, completed: int, total: int) -> None:
+        if completed % 5 == 0 or completed == total:
+            print(f"LightGBM {phase}: {completed}/{total}", flush=True)
+
+    print("Calculando decisão Control sem ordens...", flush=True)
     preview = build_control_shadow_decision(
         frames,
         completed_session=completed_session,
         current_asset=current_asset,
         holding_sessions=holding_sessions,
+        progress_callback=show_progress,
     )
     preview["source_validation"] = "sha256_verified_frozen_tcc_main_raw_sip_and_corporate_actions"
     preview["input_audit"]["snapshot_sha256"] = FROZEN_TCC_MAIN_SHA256
