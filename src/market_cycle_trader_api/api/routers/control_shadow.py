@@ -11,6 +11,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_validation_jobs import (
+    SnapshotValidationConflict,
+    SnapshotValidationInvalid,
+    SnapshotValidationNotFound,
+    get_snapshot_validation,
+    start_snapshot_validation,
+)
 from ...services.control_shadow_jobs import (
     ControlShadowConflict,
     ControlShadowNotFound,
@@ -94,4 +101,82 @@ def read_shadow_logs(job_id: str) -> dict[str, Any]:
     try:
         return get_control_shadow_logs(database(), job_id)
     except ControlShadowNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["VALIDATE_EXISTING_CONTROL_SNAPSHOT_NO_ORDERS"] = Field(
+        description="Audit a previously completed MCT snapshot and replay Control; no new download and no orders."
+    )
+    source_job_id: str = Field(
+        min_length=31, max_length=31,
+        pattern=r"^control-shadow-[a-f0-9]{16}$",
+        description="The existing Control Shadow job ID, never a file path."
+    )
+    expected_snapshot_sha256: str | None = Field(
+        default=None,
+        min_length=64, max_length=64,
+        pattern=r"^[a-fA-F0-9]{64}$",
+        description=(
+            "Original snapshot_sha256 from the completed Shadow result. "
+            "Required when that source job is absent from the current MongoDB; "
+            "also cross-checked when MongoDB contains the original. "
+            "No disk path is accepted."
+        ),
+    )
+
+
+@router.post(
+    "/validation/jobs",
+    status_code=202,
+    summary="Validate an existing Control snapshot (no download or orders)",
+    description=(
+        "Verify every source SHA-256; reproduce all four calibration margins "
+        "and execute the official expanding walk-forward Control OOS replay. "
+        "If the original MongoDB job is missing, supply the independent "
+        "snapshot SHA-256 recorded in its completed result: the API can verify "
+        "the existing MCT local files directly, without redownloading. "
+        "The API writes CSV/JSON reports beside the original MCT snapshot. "
+        "Progress appears in PyCharm/Uvicorn and in the validation job logs. "
+        "This is research-only and cannot create Alpaca orders or change Winner."
+    ),
+)
+def start_validation_job(payload: StartControlValidationRequest) -> dict[str, Any]:
+    try:
+        return start_snapshot_validation(
+            database(),
+            source_job_id=payload.source_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except SnapshotValidationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SnapshotValidationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SnapshotValidationInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/validation/jobs/{job_id}",
+    summary="Read validation status, margin diagnostics and OOS metrics",
+)
+def read_validation_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_snapshot_validation(database(), job_id)
+    except SnapshotValidationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/validation/jobs/{job_id}/logs",
+    summary="Read validation progress and console logs",
+)
+def read_validation_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_snapshot_validation(database(), job_id, logs_only=True)
+    except SnapshotValidationNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

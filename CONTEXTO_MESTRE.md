@@ -50,6 +50,20 @@
 - Uma thread não sobrevive a reinício; usar um worker sem reload enquanto ensaia. Se um job ativo ficar preso após encerramento abrupto, requer recuperação controlada, não iniciar outro job à força.
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
+## v10.8.40 — correção de origem ausente no Mongo e nova execução
+- Primeiro POST de validação falhou com 404 porque `control-shadow-9602cef2679f4d2a` não foi encontrado na coleção `control_shadow_jobs` do Mongo atualmente conectado. Não é prova de perda do snapshot local. Corrigido POST de validação para aceitar `expected_snapshot_sha256` opcional, obrigatório se registro Mongo original estiver ausente; comprova manifesto e todos os arquivos SHA na pasta dados local, sem redownload. Não aceita Mongo job failed/running como snapshot completo. Exibe `source_registry_mode`; ausência da referência original para score/margem -> null, não falso `reproduced=false`.
+- SHA original independente (log da primeira execução): `319e1658e24227616d2930a17515ddddc3e792cd9aa2fa9736b6922f8f66fee5`.
+- Usuário iniciou novo job **de download** `control-shadow-870fb66e1bdc4fd0`, visto `running`, `market_data_download`, 19/56 e snapshot_directory null. Se concluir no mesmo Mongo, usar ID novo em POST `/api/admin/control-shadow/validation/jobs` após status completed; não precisa hash independente nesse caso. Não fazer terceiro download.
+- A execução do novo job via `POST /api/admin/control-shadow/jobs` é distinta do endpoint de **validação** `POST /api/admin/control-shadow/validation/jobs`; este só analisa snapshot existente. Winner, carteira, ordens e TCC não alterados.
+
+## v10.8.40 — validação do snapshot existente sem download
+- Branch `feature/v10.8.40-control-snapshot-validation` derivada do HEAD v10.8.39 (CI verde). API_VERSION 10.8.40 **somente na branch**; base PR #7 permanece draft. Nenhum merge ou deploy para produção.
+- Usuário executou `control-shadow-9602cef2679f4d2a`: status completed, RAW/SIP até 2026-09-28, 55/56 elegíveis, exclusão DOC->PEAK, decisão hipotética CASH->AVGO, utility 0.35302977890449344, margem 0.0025, calibration score -0.6868088598099447. O score é soma de recompensas ajustadas ao risco, não -68.68% de retorno.
+- Nova rota admin POST `/api/admin/control-shadow/validation/jobs`: literal `VALIDATE_EXISTING_CONTROL_SNAPSHOT_NO_ORDERS` e `source_job_id`; GET status e GET logs nos mesmos paths acrescidos de `/{job_id}` e `/{job_id}/logs`.
+- Valida status/identidade do job original, SHA do manifesto e de todos os arquivos de dados da própria API; não faz novo download nem lê CSVs do TCC. Comparação de quatro margens/curvas e replay cronológico OOS oficial com janelas/purge/simulador, no mesmo snapshot; outputs CSV, JSON e PNG em pasta por validation job. Status Mongo separado em `control_shadow_validation_jobs`; console logs e um job por vez. Nada de ordens, promoção ou alteração do Winner.
+- Prova completa de paridade com Trader e integração operacional ainda pendentes. Ver `docs/changes/v10.8.40-control-snapshot-validation.md`.
+- Em Git Bash usar `PYTHONPATH=src python -m unittest discover -s tests -p "test_control_snapshot_validation.py" -v`; depois /docs no processo local PyCharm (um worker).
+
 ## Próximos passos
 1. Confirmar CI de toda a branch, especialmente o novo shadow preview e CLI.
 2. Isolar o contrato de dados/treinamento/decisão Control v1.0.6 e comparar com o live na mesma janela congelada.
