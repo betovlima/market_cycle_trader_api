@@ -1,0 +1,11 @@
+# Local credentials and generated data: never commit to Git.
+.env
+.env.*
+!.env.example
+/dados/
+/output/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.idea/
