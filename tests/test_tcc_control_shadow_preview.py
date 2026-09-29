@@ -88,7 +88,7 @@ class ControlShadowInferenceTests(TestCase):
         self.assertEqual(len(fitter.call_args_list[1].args[2]), 940)
         self.assertEqual(result["training_end"], dates[753].date().isoformat())
         self.assertEqual(result["calibration_start"], dates[814].date().isoformat())
-        self.assertEqual(result["calibration_end"], dates[939 - 66].date().isoformat())
+        self.assertEqual(result["calibration_end"], dates[939].date().isoformat())
         self.assertEqual(result["final_fit_end"], dates[939].date().isoformat())
         self.assertEqual(growth.call_count, 4)
 
