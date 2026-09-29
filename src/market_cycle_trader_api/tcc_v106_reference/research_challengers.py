@@ -1334,6 +1334,7 @@ def _run_lightgbm(
     trade_callback: Callable[[dict[str, Any]], None] | None,
     progress_detail_callback: Callable[[dict[str, Any]], None] | None,
     technical_log_callback: Callable[[str], None] | None,
+    execution_simulator: Callable[..., RotationRunResult] | None = None,
 ) -> list[RotationRunResult]:
     (
         frames,
@@ -1861,7 +1862,12 @@ def _run_lightgbm(
                 )
                 trade_callback(payload)
 
-        simulator = _simulate_optimized_allocation if allocation_execution_enabled(rep_config) else _simulate_exact
+        if execution_simulator is not None and allocation_execution_enabled(rep_config):
+            raise ValueError("Feasible single-position Control cannot reuse an allocation policy.")
+        simulator = execution_simulator or (
+            _simulate_optimized_allocation if allocation_execution_enabled(rep_config)
+            else _simulate_exact
+        )
 
         def simulation_progress(local_fraction: float, stage: str) -> None:
             fraction = max(0.0, min(1.0, float(local_fraction)))
@@ -2840,6 +2846,7 @@ def run_research_challenger(
     trade_callback: Callable[[dict[str, Any]], None] | None = None,
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
+    execution_simulator: Callable[..., RotationRunResult] | None = None,
 ) -> list[RotationRunResult]:
     if model_family == "lightgbm_utility":
         return _run_lightgbm(
@@ -2851,8 +2858,11 @@ def run_research_challenger(
             trade_callback=trade_callback,
             progress_detail_callback=progress_detail_callback,
             technical_log_callback=technical_log_callback,
+            execution_simulator=execution_simulator,
         )
     if model_family == "iqn":
+        if execution_simulator is not None:
+            raise ValueError("Custom execution simulator is supported only for Control LightGBM.")
         if allocation_execution_enabled(config):
             raise ValueError("Portfolio Allocation / Compound Risk Overlay v3.12.0 supports Ranking Utility models (LightGBM); IQN allocation is not enabled in this release.")
         return _run_iqn(
