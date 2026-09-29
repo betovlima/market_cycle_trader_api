@@ -42,7 +42,7 @@ class ControlShadowCliTests(TestCase):
                 patch.object(cli, "validate_frozen_tcc_main",
                              return_value={"assets": ["AAPL", "DOC"]}) as validate,
                 patch.object(cli, "load_frozen_tcc_main_symbol",
-                             side_effect=[object(), cli.StructuralResearchAssetExclusion("DOC->PEAK")]) as load,
+                             side_effect=[object(), cli.StructuralResearchAssetExclusion({"symbol": "DOC", "action_type": "merger", "acquirer_symbol": "PEAK"})]) as load,
                 patch.object(cli, "build_control_shadow_decision",
                              return_value=mock_preview) as preview,
             ):
@@ -63,7 +63,7 @@ class ControlShadowCliTests(TestCase):
             self.assertEqual(data["order_submission"], "never")
             self.assertEqual(
                 data["input_audit"]["structural_exclusions"],
-                [{"symbol": "DOC", "reason": "DOC->PEAK"}],
+                [{"symbol": "DOC", "reason": "DOC: structural identity change (merger) to PEAK; excluded from the research universe."}],
             )
             self.assertEqual(data["input_audit"]["eligible_assets"], 1)
             self.assertEqual(result["input_audit"]["source_kind"],
