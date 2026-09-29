@@ -231,6 +231,9 @@ def simulate_feasible_control(
                 price, cost = _fill_price(open_, "SELL", sold, cap["realized_daily_volume"], scenario)
                 fees = fee_calculator("SELL", sold, price, config)
                 cash += sold * price - float(fees["total_fee"])
+                if cash < -1e-7:
+                    raise AssertionError("Sell fees would create negative portfolio cash.")
+                cash = max(0.0, cash)
                 qty -= sold
                 executed += sold
                 reason = "PARTIAL_SELL" if qty else "SELL_FILLED"
@@ -342,7 +345,17 @@ def simulate_feasible_control(
     benchmark_curve = predictions["buy_hold_equity"].astype(float)
     days = max(1, (pd.Timestamp(execution_dates[-1]) - pd.Timestamp(execution_dates[0])).days)
     years = max(days / 365.25, 1 / 365.25)
-    daily_returns = equity_curve.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    buy_assets = (
+        trade_df.loc[trade_df["action"] == "BUY", "asset"].tolist()
+        if not trade_df.empty else []
+    )
+    completed_asset_rotations = sum(
+        previous != current
+        for previous, current in zip(buy_assets, buy_assets[1:])
+    )
+    policy_target_changes = int(sum(
+        a != b for a, b in zip(predictions["previous_asset"], predictions["signal_asset"])
+    ))
     cash_exposure = float(predictions["cash_weight"].mean())
     metrics = {
         "initial_capital": capital,
@@ -357,10 +370,8 @@ def simulate_feasible_control(
         "market_exposure": 1.0 - cash_exposure,
         "cash_weight_mean": cash_exposure,
         "cash_days": int((predictions["shares"] == 0).sum()),
-        "capital_rotations": int(sum(
-            a != b and a != "CASH" and b != "CASH"
-            for a, b in zip(predictions["previous_asset"], predictions["signal_asset"])
-        )),
+        "capital_rotations": int(completed_asset_rotations),
+        "policy_target_changes": policy_target_changes,
         "simulated_buys": int((trade_df["action"] == "BUY").sum()) if not trade_df.empty else 0,
         "simulated_sells": int((trade_df["action"] == "SELL").sum()) if not trade_df.empty else 0,
         "execution_scenario": scenario,
