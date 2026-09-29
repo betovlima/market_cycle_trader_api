@@ -145,6 +145,11 @@ def run_control_liquidity_research(
     original_dates = reference.predictions.index
     if len(original_dates) != 1554 or len(detail) != 1554:
         raise ValueError("Expected 1,554 audited chronological decision dates.")
+    decision_keys = pd.DatetimeIndex(
+        pd.to_datetime(runs["liquidity_aware"].predictions["decision_date"], utc=True)
+    )
+    if len(decision_keys) != len(original_dates) or set(decision_keys) != set(detail):
+        raise ValueError("Decision audit dates do not align with prior-close context.")
     fold_comparison = []
     summary = []
     for name in ("control_reference", "liquidity_aware"):
@@ -195,12 +200,16 @@ def run_control_liquidity_research(
     aligned.to_csv(output / "aligned_capital_curves.csv", float_format="%.17g")
     records = []
     for date in original_dates:
-        item = detail[pd.Timestamp(date)]
+        decision_key = pd.Timestamp(
+            runs["liquidity_aware"].predictions.loc[date, "decision_date"]
+        )
+        item = detail[decision_key]
         picked = str(runs["liquidity_aware"].predictions.loc[date, "signal_asset"])
         raw = str(runs["control_reference"].predictions.loc[date, "signal_asset"])
         details = item["candidate_liquidity_detail"]
         records.append({
             "timestamp": date.isoformat(),
+            "decision_timestamp": decision_key.isoformat(),
             "original_policy_target": raw,
             "liquidity_policy_target": picked,
             "raw_best_asset": item["raw_best_asset"],
@@ -232,10 +241,14 @@ def run_control_liquidity_research(
     )
     candidate_rows = []
     for timestamp in original_dates:
-        audit_item = detail[pd.Timestamp(timestamp)]
+        decision_key = pd.Timestamp(
+            runs["liquidity_aware"].predictions.loc[timestamp, "decision_date"]
+        )
+        audit_item = detail[decision_key]
         for symbol, d in audit_item["candidate_liquidity_detail"].items():
             candidate_rows.append({
                 "timestamp": timestamp.isoformat(),
+                "decision_timestamp": decision_key.isoformat(),
                 "asset": symbol,
                 "known_capacity_dollars": d["capacity_dollars"],
                 "capacity_fraction": d["capacity_fraction"],
