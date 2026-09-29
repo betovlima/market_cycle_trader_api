@@ -12,7 +12,7 @@ API_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(API_SRC) not in sys.path:
     sys.path.insert(0, str(API_SRC))
 
-from fastapi.testclient import TestClient
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from pymongo.errors import DuplicateKeyError
 
@@ -30,14 +30,17 @@ class ControlShadowApiTests(TestCase):
         self.assertIn("post", documented[path])
         self.assertIn("/api/admin/control-shadow/jobs/{job_id}", documented)
         self.assertIn("/api/admin/control-shadow/jobs/{job_id}/logs", documented)
-        client = TestClient(app)  # Do not enter lifespan; no real MongoDB.
-        response = client.post(path, json={
-            "confirm": "RUN_FROZEN_SHADOW_NO_ORDERS",
-            "current_asset": "CASH",
-            "holding_sessions": 0,
-        })
-        self.assertEqual(response.status_code, 401)
-        self.assertEqual(client.get(path + "/fake-job").status_code, 401)
+        routes = [
+            route for route in app.routes
+            if isinstance(route, APIRoute)
+            and route.path.startswith("/api/admin/control-shadow/")
+        ]
+        self.assertEqual(len(routes), 3)
+        for route in routes:
+            dependencies = [
+                entry.call.__name__ for entry in route.dependant.dependencies
+            ]
+            self.assertIn("require_admin_session", dependencies)
 
     def test_body_does_not_accept_server_paths_or_unconfirmed_execution(self):
         with self.assertRaises(ValidationError):
