@@ -28,6 +28,7 @@ from ..tcc_v106_reference.capital_rotation import (
 # impact model, or instructions to place an order.
 SCENARIO = {
     "participation_rate": 0.10,
+    "unlimited_capacity": False,
     "prior_volume_lookback": 20,
     "minimum_prior_volume_observations": 5,
     "assumed_full_spread_bps": 15.0,
@@ -71,6 +72,10 @@ def _volume_capacity(frame: pd.DataFrame, date: pd.Timestamp, config: dict[str, 
     expected_cap = math.floor(historical * float(config["participation_rate"]))
     realized_cap = math.floor(realized * float(config["participation_rate"]))
     capacity = max(0, min(expected_cap, realized_cap))
+    if bool(config.get("unlimited_capacity", False)):
+        # The idealized comparator intentionally permits fills above reported
+        # volume (including zero-volume sessions). Never label this executable.
+        capacity = 2**52
     return {
         "prior_median_volume": historical,
         "realized_daily_volume": realized,
@@ -84,10 +89,11 @@ def _volume_capacity(frame: pd.DataFrame, date: pd.Timestamp, config: dict[str, 
 def _fill_price(open_price: float, side: str, shares: int, daily_volume: float,
                 scenario: dict[str, Any]) -> tuple[float, float]:
     base = _nonnegative(open_price)
-    if base == 0 or shares <= 0 or daily_volume <= 0:
+    unlimited = bool(scenario.get("unlimited_capacity", False))
+    if base == 0 or shares <= 0 or (daily_volume <= 0 and not unlimited):
         raise ValueError("Cannot price a trade with no open, size, or daily volume.")
-    participation = shares / daily_volume
-    if participation > float(scenario["participation_rate"]) + 1e-12:
+    participation = shares / daily_volume if daily_volume > 0 else 0.0
+    if not unlimited and participation > float(scenario["participation_rate"]) + 1e-12:
         raise ValueError("Attempted fill above capped realized volume.")
     spread = float(scenario["assumed_full_spread_bps"]) / 2.0
     impact = float(scenario["assumed_impact_coefficient_bps"]) * math.sqrt(participation)
@@ -136,6 +142,7 @@ def simulate_feasible_control(
     model_label: str = "LightGBM Utility",
     method_line: str | None = None,
     simulation_progress_callback: Callable[[float, str], None] | None = None,
+    scenario_override: dict[str, Any] | None = None,
 ) -> RotationRunResult:
     """Model-policy counterfactual, not a fixed tape of original decisions.
 
@@ -151,6 +158,15 @@ def simulate_feasible_control(
     if bool(getattr(config, "rotation_model_repetitions", 1) != 1):
         raise ValueError("Execution feasibility scenario requires a single Control policy repetition.")
     scenario = dict(SCENARIO)
+    if scenario_override is not None:
+        if not isinstance(scenario_override, dict) or set(scenario_override) - set(SCENARIO):
+            raise ValueError("Only declared execution-scenario assumptions are allowed.")
+        scenario.update(scenario_override)
+    if not (0 < float(scenario["participation_rate"]) <= 1):
+        raise ValueError("Participation rate must be in (0, 1].")
+    for field in ("assumed_full_spread_bps", "assumed_impact_coefficient_bps"):
+        if not (math.isfinite(float(scenario[field])) and float(scenario[field]) >= 0):
+            raise ValueError(f"{field} must be finite and nonnegative.")
     started = time.perf_counter()
     capital = float(config.initial_capital)
     if not (math.isfinite(capital) and capital > 0):
@@ -211,7 +227,10 @@ def simulate_feasible_control(
                 "realized_daily_volume": cap["realized_daily_volume"],
                 "prior_median_volume": cap["prior_median_volume"],
                 "maximum_fill_quantity": cap["ex_post_fill_capacity_shares"],
-                "realized_volume_participation": amount / cap["realized_daily_volume"],
+                "realized_volume_participation": (
+                    amount / cap["realized_daily_volume"]
+                    if cap["realized_daily_volume"] > 0 else None
+                ),
                 "cash_after_trade": float(cash),
                 "shares_after_trade": int(qty),
                 "same_session_volume_used_for_signal": False,
@@ -259,7 +278,8 @@ def simulate_feasible_control(
                 approximate_target = int(cash // open_)
                 intended += approximate_target
                 buy_qty, price, cost, fees = _affordable_shares(
-                    cash, maximum, open_, cap["realized_daily_volume"],
+                    cash, min(maximum, approximate_target),
+                    open_, cap["realized_daily_volume"],
                     scenario, fee_calculator, config,
                 )
                 if buy_qty:
@@ -396,6 +416,7 @@ def simulate_feasible_control(
         "no_lookahead_policy_decision": True,
         "daily_volume_is_ex_post_realized_fill_cap_not_pretrade_signal": True,
         "unconstrained_benchmark_not_capacity_checked": True,
+        "unlimited_capacity_is_idealized_not_executable": bool(scenario["unlimited_capacity"]),
     }
     summary = (
         "CONTROL EXECUTION FEASIBILITY — scenario, not broker fill guarantee. "

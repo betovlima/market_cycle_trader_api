@@ -11,6 +11,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_sensitivity_jobs import (
+    SensitivityConflict,
+    SensitivityInvalid,
+    SensitivityNotFound,
+    start_control_sensitivity,
+    get_control_sensitivity,
+)
 from ...services.control_shadow_execution_jobs import (
     ExecutionConflict,
     ExecutionInvalid,
@@ -255,4 +262,78 @@ def read_execution_logs(job_id: str) -> dict[str, Any]:
     try:
         return get_execution_feasibility(database(), job_id, logs_only=True)
     except ExecutionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlSensitivityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["COMPARE_FIXED_CONTROL_EXECUTION_SCENARIOS_NO_ORDERS"] = Field(
+        description="Run five predeclared research scenarios; no tuning, download or trading."
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+        description="Numerically reproduced Control v10.8.41 reference.",
+    )
+    source_execution_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-execution-[a-f0-9]{16}$",
+        description="Matching completed 10% Control v10.8.42 execution reference.",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+        description="Immutable source snapshot SHA-256 confirmation.",
+    )
+
+
+@router.post(
+    "/sensitivity/jobs",
+    status_code=202,
+    summary="Fixed Control execution sensitivity (1%, 5%, 10%, no-cap, costs) — NO orders",
+    description=(
+        "Reuses the same SHA-verified RAW/SIP Control snapshot and single "
+        "chronological LightGBM fit for five PREDECLARED state-aware research "
+        "scenarios. Requires completed matching v10.8.41 and v10.8.42 jobs. "
+        "No download, auto tuning, orders or Winner promotion."
+    ),
+)
+def start_sensitivity_job(payload: StartControlSensitivityRequest) -> dict[str, Any]:
+    try:
+        return start_control_sensitivity(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            source_execution_job_id=payload.source_execution_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except SensitivityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SensitivityConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SensitivityInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/sensitivity/jobs/{job_id}",
+    summary="Fixed Control sensitivity scenario results (no orders)",
+)
+def read_sensitivity_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_control_sensitivity(database(), job_id)
+    except SensitivityNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/sensitivity/jobs/{job_id}/logs",
+    summary="Fixed Control sensitivity progress and diagnostic logs",
+)
+def read_sensitivity_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_control_sensitivity(database(), job_id, logs_only=True)
+    except SensitivityNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
