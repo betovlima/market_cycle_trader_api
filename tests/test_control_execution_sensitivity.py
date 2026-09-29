@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 from types import FunctionType, SimpleNamespace
 from unittest import TestCase
@@ -201,6 +202,96 @@ class ControlSensitivityTests(TestCase):
                     expected_snapshot_sha256=SHA,
                 )
         db[jobs.COLLECTION].insert_one.assert_not_called()
+
+    def test_report_replays_exact_reference_and_keeps_snapshot_immutable(self):
+        original_folds = []
+        for fold, date in enumerate(self.dates[23:26], 1):
+            original_folds.append({
+                "fold_id": fold, "test_start": date.isoformat(),
+                "test_end": date.isoformat(), "sessions": 1,
+            })
+        baseline41 = {
+            "source_snapshot_sha256": SHA, "source_job_id": SNAP,
+            "source_unchanged": True, "snapshot_assets": 55,
+            "calendar_sessions": 2500, "order_submission": "never",
+            "original_shadow": {"reproduced": True},
+            "numeric_input_integrity": {"status": "verified", "checked_assets": 55},
+            "oos": {
+                "strategy_ending_capital": 2000.,
+                "walk_forward_fold_count": 3,
+                "walk_forward_folds": original_folds,
+            },
+        }
+        expected = {key: 0.0 for key in research.METRICS}
+        expected.update({
+            "strategy_ending_capital": 1001.,
+            "session_count": 3,
+            "terminal_holdings_asset": "AAA",
+        })
+        baseline42 = {
+            "source_snapshot_sha256": SHA, "source_job_id": SNAP,
+            "source_validation_job_id": VAL, "source_unchanged": True,
+            "order_submission": "never",
+            "numeric_input_integrity": {"status": "verified", "assets": 55},
+            "source_verified_control": {"strategy_ending_capital": 2000.},
+            "execution_scenario": {
+                "participation_rate": .1,
+                "assumed_full_spread_bps": 15.,
+                "assumed_impact_coefficient_bps": 20.,
+            },
+            "feasible_oos": {
+                **expected, "walk_forward_fold_count": 3,
+            },
+        }
+        prediction = pd.DataFrame({
+            "strategy_equity": [1000., 1000., 1001.],
+            "buy_hold_equity": [1000., 1000., 1000.],
+            "walk_forward_fold": [1, 2, 3],
+            "cash_weight": [0., 0., 0.],
+        }, index=self.dates[23:26])
+        cases = {}
+        for name, override in adapter.SENSITIVITY_SCENARIOS:
+            cases[name] = SimpleNamespace(
+                predictions=prediction.copy(), trades=pd.DataFrame(),
+                metrics={
+                    **expected,
+                    "execution_scenario": {**feasibility.SCENARIO, **override},
+                },
+            )
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / SNAP
+            source.mkdir()
+            manifest = source / "manifest.json"
+            manifest.write_text("source must never be overwritten", encoding="utf-8")
+            with (
+                patch.object(research, "read_verified_control_snapshot",
+                             return_value=(
+                                 {f"S{i:02d}": pd.DataFrame() for i in range(55)},
+                                 {"completed_session": "2026-09-28"}, source,
+                             )),
+                patch.object(research, "prepare_operational_control_panel",
+                             return_value=(
+                                 {}, self.dates,
+                                 SimpleNamespace(calendar_sessions=2500),
+                             )),
+                patch.object(research, "run_sensitivity_lightgbm",
+                             return_value=(cases, cases["cap10_cost"])),
+            ):
+                report = research.run_control_execution_sensitivity(
+                    source_job_id=SNAP, validation_job_id=VAL,
+                    feasibility_job_id=EXEC,
+                    sensitivity_job_id="control-sensitivity-aaaaaaaaaaaaaaaa",
+                    expected_sha256=SHA,
+                    baseline41=baseline41, baseline42=baseline42,
+                )
+            self.assertEqual(manifest.read_text(), "source must never be overwritten")
+            self.assertEqual(report["v1042_scenario_regression"], "verified")
+            self.assertEqual(len(report["scenario_comparison"]), 5)
+            self.assertEqual(len(report["fold_comparison"]), 15)
+            self.assertTrue(report["comparisons_are_not_causal_attributions"])
+            self.assertEqual(report["order_submission"], "never")
+            for filename in report["artifacts"]:
+                self.assertTrue((Path(report["report_directory"]) / filename).exists())
 
     def test_predeclared_comparison_reports_no_causal_attribution(self):
         self.assertEqual(len(research.METRICS), len(set(research.METRICS)))
