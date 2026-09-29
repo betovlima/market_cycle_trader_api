@@ -11,6 +11,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_execution_jobs import (
+    ExecutionConflict,
+    ExecutionInvalid,
+    ExecutionNotFound,
+    start_execution_feasibility,
+    get_execution_feasibility,
+)
 from ...services.control_shadow_validation_jobs import (
     SnapshotValidationConflict,
     SnapshotValidationInvalid,
@@ -179,4 +186,73 @@ def read_validation_logs(job_id: str) -> dict[str, Any]:
     try:
         return get_snapshot_validation(database(), job_id, logs_only=True)
     except SnapshotValidationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["SIMULATE_CONTROL_EXECUTION_FEASIBILITY_NO_ORDERS"] = Field(
+        description="Research-only execution model; does not submit orders or redownload Alpaca."
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+        description="Completed v10.8.41 numerically verified Control validation job ID.",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+        description="Original immutable snapshot SHA-256 as independent confirmation.",
+    )
+
+
+@router.post(
+    "/execution/jobs",
+    status_code=202,
+    summary="OOS Control with volume-constrained modeled partial fills — NO orders",
+    description=(
+        "Research-only rerun of the same chronological LightGBM Control with a "
+        "state-aware, single-position cash portfolio and a fixed conservative "
+        "execution-cost/liquidity scenario. Historical next-session volume caps "
+        "fills ex post but never selects a signal. Requires a completed and "
+        "reproduced v10.8.41 source validation. No Alpaca refresh or orders."
+    ),
+)
+def start_execution_job(payload: StartControlExecutionRequest) -> dict[str, Any]:
+    try:
+        return start_execution_feasibility(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ExecutionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ExecutionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ExecutionInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/execution/jobs/{job_id}",
+    summary="Control feasibility research report and status (no orders)",
+)
+def read_execution_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_execution_feasibility(database(), job_id)
+    except ExecutionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/execution/jobs/{job_id}/logs",
+    summary="Control feasibility research progress and console logs",
+)
+def read_execution_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_execution_feasibility(database(), job_id, logs_only=True)
+    except ExecutionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
