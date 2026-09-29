@@ -139,7 +139,7 @@ def run_control_execution_feasibility(
         "strategy_cagr", "strategy_sharpe", "strategy_maximum_drawdown",
         "risk_adjusted_compound_score", "buy_hold_ending_capital",
         "market_exposure", "cash_weight_mean", "cash_days",
-        "capital_rotations", "simulated_buys", "simulated_sells",
+        "capital_rotations", "policy_target_changes", "simulated_buys", "simulated_sells",
         "blocked_sessions", "partial_sessions", "zero_volume_block_sessions",
         "unfilled_requested_shares", "modeled_price_cost_usd",
         "total_transaction_fees", "terminal_holdings_shares",
