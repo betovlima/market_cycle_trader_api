@@ -20,7 +20,7 @@ from ..tcc_v106_reference.execution import calculate_reference_fees, apply_slipp
 from ..tcc_v106_reference import research_challengers as scientific
 from .control_snapshot_validation import read_verified_control_snapshot
 from .control_deep_learning_tcn import (
-    MODE, FEATURES, TARGET, WINDOW, HIDDEN, DILATIONS, EPOCHS,
+    MODE, FEATURES, TARGET, WINDOW, TRAIN_STRIDE, HIDDEN, DILATIONS, EPOCHS,
     PATIENCE, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY, FIXED_SWITCH_MARGIN,
     run_tcn_challenger,
 )
@@ -230,7 +230,7 @@ def run_control_tcn_research(
         },
         "architecture":{
             "model":"pooled_cpu_temporal_convolutional_network",
-            "window":WINDOW,"features":list(FEATURES),
+            "window":WINDOW,"train_stride":TRAIN_STRIDE,"features":list(FEATURES),
             "target":TARGET,"hidden_channels":HIDDEN,
             "causal_dilations":list(DILATIONS),
             "epochs_max":EPOCHS,"patience":PATIENCE,
