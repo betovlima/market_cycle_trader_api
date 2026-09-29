@@ -106,6 +106,88 @@ class FixedTinyTCNTests(TestCase):
         out=tcn._predict(model,features,[("AAA",55)],scale)
         self.assertTrue(np.isfinite(out[("AAA",55)]))
 
+    def test_full_synthetic_three_fold_tcn_portfolio_wiring_without_retraining(self):
+        dates=pd.bdate_range("2023-01-02",periods=250,tz="UTC")
+        symbols=[f"S{i:02d}" for i in range(55)]
+        frames={}
+        for name in symbols:
+            data=pd.DataFrame({
+                **{key:np.linspace(.01,.02,len(dates))
+                   for key in tcn.FEATURES},
+                "open":np.full(len(dates),10.),
+                "close":np.full(len(dates),10.),
+                "volume":np.full(len(dates),10000.),
+                tcn.TARGET:np.linspace(.05,.09,len(dates)),
+            },index=dates)
+            frames[name]=data
+        folds=[]
+        decision_to_fold={}
+        metadata={}
+        for fid,(start,end) in enumerate(((221,231),(231,241),(241,250)),1):
+            segment=dates[start-1:end]
+            folds.append({
+                "fold_id":fid,
+                "train_end_index":130+fid*10,
+                "calibration_start_index":140+fid*10,
+                "calibration_end_index":150+fid*10,
+                "final_fit_end_index":start-60,
+                "calibration_start":dates[140+fid*10],
+                "test_start":dates[start],
+                "test_end":dates[end-1],
+                "decision_dates":segment,
+            })
+            for d in segment[:-1]:
+                decision_to_fold[d]=fid
+                metadata[d]={"fold_id":fid}
+        config=SimpleNamespace(
+            strategy_mode="COMPOUND_ROTATION_SWING_LIGHTGBM",
+            initial_capital=1000.0,
+            rotation_target_horizons=(5,10,20,40,60),
+            rotation_model_repetitions=1,
+            rotation_downside_penalty=.2,
+            rotation_drawdown_penalty=.35,
+            rotation_cash_threshold=0.,
+            rotation_min_expected_edge=.001,
+            rotation_switch_margin=.0005,
+            rotation_min_holding_days=2,
+        )
+        with (
+            patch.object(tcn,"_fit",
+                         side_effect=lambda *a,**kw:(SimpleNamespace(),1,.01)),
+            patch.object(tcn,"_predict",
+                         side_effect=lambda _model,_x,rows,_scale:
+                         {row:.15 for row in rows}),
+            patch.object(tcn.scientific,"allocation_execution_enabled",
+                         return_value=False),
+            patch.object(tcn,"_utility_policy",
+                         side_effect=lambda models,frames,symbols,config,margin,
+                         **kwargs:(
+                             lambda d,pos,hold: (
+                                 int(np.argmax(kwargs["utility_cache"].get(d))),
+                                 float(np.max(kwargs["utility_cache"].get(d))),
+                             )
+                         )),
+            patch.object(tcn.execution if hasattr(tcn,"execution") else
+                         __import__(
+                             "market_cycle_trader_api.engine.control_execution_feasibility",
+                             fromlist=["_equal_weight_benchmark"]),
+                         "_equal_weight_benchmark",
+                         side_effect=lambda frames,symbols,dates,*args:
+                         pd.Series(1000.,index=dates)),
+        ):
+            outcome,scores,trained,audit=tcn.run_tcn_challenger(
+                frames,dates,symbols,folds,dates[220:250],
+                decision_to_fold,metadata,config,
+                lambda *args:{"total_fee":0.0},
+                lambda p,s,c:p,
+            )
+        self.assertEqual(len(outcome.predictions),29)
+        self.assertEqual(len(scores),29*55)
+        self.assertEqual(len(audit),29)
+        self.assertEqual([int(row["fold_id"]) for row in trained],[1,2,3])
+        self.assertTrue((outcome.predictions["cash"]>=0).all())
+        self.assertEqual(scores["label_mature_at_cutoff"].sum(),0)
+
     def test_predictive_metric_maturity_is_explicit(self):
         observations=pd.DataFrame({
             "predicted_utility":[.2,.1,-.2],
