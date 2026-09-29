@@ -41,21 +41,21 @@ class FixedTinyTCNTests(TestCase):
 
     def test_training_rows_do_not_use_unmatured_future_labels(self):
         rows=tcn._dataset_rows(
-            self.frames,["AAA"],self.dates[:85],
-            maturity_before=self.dates[85],horizon=60,
+            self.frames,["AAA"],self.dates[:110],
+            maturity_before=self.dates[110],horizon=60,
         )
         self.assertTrue(rows)
         self.assertTrue(all(
-            self.frame.index[pos+60]<self.dates[85]
+            self.frame.index[pos+60]<self.dates[110]
             for symbol,pos in rows
         ))
-        self.assertLess(max(pos for _,pos in rows),25)
+        self.assertLess(max(pos for _,pos in rows),50)
         # Mutating labels of rows not mature as of cutoff never changes selection.
         future=self.frame.copy()
-        future.loc[self.dates[30]:,tcn.TARGET]=999.
+        future.loc[self.dates[50]:,tcn.TARGET]=999.
         same=tcn._dataset_rows(
-            {"AAA":future},["AAA"],self.dates[:85],
-            maturity_before=self.dates[85],horizon=60,
+            {"AAA":future},["AAA"],self.dates[:110],
+            maturity_before=self.dates[110],horizon=60,
         )
         self.assertEqual(rows,same)
         for _,pos in same:
