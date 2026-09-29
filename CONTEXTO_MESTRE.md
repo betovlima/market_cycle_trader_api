@@ -33,24 +33,29 @@
 - Implementado até aqui: teste isolado de paridade da regra de decisão Control vs política live, incluindo caso de ausência da barra futura; documentação do contrato de migração.
 - Incremento seguinte no mesmo branch: `engine/operational_control_contract.py` usa painel do Control científico v1.0.6 em modo isolado e sem ordens. Testes verificam igualdade de features em OHLCV idêntico, calendário ancorado vs o atual calendário automático, ausência de barra futura e indisponibilidade de âncora.
 - Incremento seguinte: `engine/operational_control_preview.py` monta decisão shadow de Control com treino/calibração congelados e política live, sem ordens; `scripts/control_shadow_preview.py` consome snapshot CSV SHA-verificado local, registra exclusões estruturais e produz JSON em `output/`. Testes cobrem janelas/ações/falhas e CLI. O snapshot CLI não é série atual Alpaca.
-- Não implementado: equivalência ponta a ponta na fonte Alpaca atual e corporate actions; prova de identidade numérica em sessão a sessão com o backtest v1.0.6; novo binding operacional e integração à cadeia real Paper/Trader; alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado por estes commits.
-- Status: a CI do commit inicial `66e31f6f0be882b5bb3980776d8240c0e29a30ab` passou em Python 3.12. Após erro de importação no Spyder/Python 3.14.2, o teste foi corrigido para inserir `<API>/src` no `sys.path` a partir de `__file__`; aguardar CI do novo commit. Não afirmar paridade operacional completa com base no teste de política.
+- Já implementado na branch: download atual RAW/SIP e Corporate Actions para snapshot local separado e ensaio da última sessão. Ainda não implementado: prova de identidade numérica sessão a sessão com TCC, novo binding operacional e integração à cadeia real Paper/Trader, alteração do catálogo e ativação da Strategy. Nenhum deploy ou ordem autorizado.
+- Status: a CI do commit inicial `66e31f6f0be882b5bb3980776d8240c0e29a30ab` passou em Python 3.12. Após erro de importação no PyCharm/Python 3.14.2, o teste foi corrigido para inserir `<API>/src` no `sys.path` a partir de `__file__`; aguardar CI do novo commit. Não afirmar paridade operacional completa com base no teste de política.
 - O novo preview inclui treino/calibração científicos e CLI de snapshot local; a CI identificou duas falhas apenas nos testes novos (índice esperado do calendário e fixture de exclusão estrutural). Ambas foram corrigidas na branch; confirmar CI do HEAD antes de merge. O CLI imprime progresso e nunca envia ordens.
 - Erro local original: `ModuleNotFoundError: No module named 'market_cycle_trader_api'`, durante importação, antes de qualquer teste. Não indica divergência Control vs live; preferir Python 3.12 para ambiente de referência.
 
-## API Swagger para ensaio sem ordens
-- O antigo CLI agora também está exposto por POST/GET/GET logs em `/api/admin/control-shadow/jobs` (tag Control Shadow — no orders); acesso obrigatório de admin. `POST` inicia thread e devolve job_id; logs aparecem no console do PyCharm/Uvicorn e no GET `/{job_id}/logs`, estado/resultado no GET `/{job_id}`.
-- Feature desligada por padrão: usar `MCT_CONTROL_SHADOW_API_ENABLED=true` e `MCT_CONTROL_SHADOW_FROZEN_ROOT=C:/CAMINHO_DO_TCC/dados/pesquisa` no `.env` local da API; reiniciar o processo (um único worker). POST não aceita caminho de arquivo e exige confirmação `RUN_FROZEN_SHADOW_NO_ORDERS`. O snapshot congelado termina em 2026-09-17. Não confundir com Alpaca atual.
-- MongoDB somente coleção nova `control_shadow_jobs` para logs/resultados, com `active_key` único e sem alterar carteira, Winner, Strategy 28 ou ordens. Executar apenas com admin; não é um endpoint de trading nem backtest.
-- Processo reiniciado interrompe job em thread; nesta primeira entrega não há recuperação automática de jobs interrompidos. Não usar reload ou workers múltiplos em ensaio longo.
-- Ver detalhes em `docs/changes/v10.8.39-control-operational-parity.md`. CI HEAD deve ser confirmada antes de merge.
+## API Swagger para ensaio Control com dados NOVOS do MCT
+- Decisão corrigida pelo usuário: não usar a pasta do TCC para o ensaio do MCT. O MCT baixa sempre novos dados da Alpaca, cria `<raiz_api>/dados/control_shadow/snapshots/<job_id>` automaticamente, mantém raw CSV, Corporate Actions JSON, CSV normalizados e manifesto com SHA-256; `/dados/` consta no `.gitignore`.
+- O endpoint administrativo `POST /api/admin/control-shadow/jobs` exige confirmação `REFRESH_ALPACA_CONTROL_SHADOW_NO_ORDERS`. Alimentação: RAW/SIP 1Day desde 2016-01-01 até a última sessão XNYS segura, corporate actions até a mesma sessão, normalização de splits e exclusão estrutural explícita. Sem fallback de fonte/correção manual.
+- Apenas `MCT_CONTROL_SHADOW_API_ENABLED=true` no `.env` local da API. `MCT_CONTROL_SHADOW_FROZEN_ROOT` **não é utilizado pelo endpoint atualizado**; não é necessário copiar ou clonar o TCC. Os parâmetros HTTP não contêm caminho.
+- MongoDB: somente a coleção isolada `control_shadow_jobs` para status/logs/resultados. Console PyCharm/Uvicorn imprime progresso por ativo e LightGBM. GET `/jobs/{job_id}` traz resultado e diretório, GET `/jobs/{job_id}/logs` mostra logs. Um job por vez.
+- A política Control científica continua referência de código/parametrização, mas os dados são NOVOS; não pressupor mesmo capital histórico. `status=shadow_only`, `order_eligible=false`, `order_submission=never`. Não se conecta ao executor Paper/Trader nem altera Winner, carteira, Strategy #28 ou ordens.
+- O CLI anterior com `--frozen-root` permanece como ferramenta científica auxiliar; não é o fluxo principal de /docs.
+- Produção informada: API v10.8.38 / Front v10.7.16. Branch API v10.8.39 em desenvolvimento, sem merge/deploy.
+- O ensaio requer credenciais Alpaca com SIP histórico; 403/429 sem dados válidos falha com log e sem decisão. A pasta é criada no servidor/processo PyCharm que executa a API.
+- Uma thread não sobrevive a reinício; usar um worker sem reload enquanto ensaia. Se um job ativo ficar preso após encerramento abrupto, requer recuperação controlada, não iniciar outro job à força.
+- Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 ## Próximos passos
 1. Confirmar CI de toda a branch, especialmente o novo shadow preview e CLI.
 2. Isolar o contrato de dados/treinamento/decisão Control v1.0.6 e comparar com o live na mesma janela congelada.
 3. Implantar modo de ensaio sem ordens, com resultado sessão a sessão e auditoria de divergência.
 4. Criar novo perfil operacional somente após paridade aprovada, mantendo Strategy #28 original imutável.
-5. Testar em dados Alpaca atualizados, estado da carteira e integridade de ordens antes de considerar qualquer promoção.
+5. Executar o job /docs com novos dados Alpaca em ambiente local, auditar snapshot/manifests e comparar decisões; depois testar estado da carteira e integridade de ordens antes de considerar qualquer promoção.
 
 ## Comandos Git
 ```powershell
