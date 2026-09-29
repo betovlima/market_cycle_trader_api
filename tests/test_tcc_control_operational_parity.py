@@ -8,6 +8,14 @@ when a real live decision is prepared.
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+import sys
+
+# Keep this standalone regression runnable from Spyder/unittest on Windows,
+# even when the editable API package has not been installed in the interpreter.
+API_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(API_SRC) not in sys.path:
+    sys.path.insert(0, str(API_SRC))
 
 import numpy as np
 import pandas as pd
