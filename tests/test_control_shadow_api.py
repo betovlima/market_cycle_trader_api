@@ -31,7 +31,7 @@ class ControlShadowApiTests(TestCase):
         routes = [
             route for route in app.routes
             if isinstance(route, APIRoute)
-            and route.path.startswith("/api/admin/control-shadow/")
+            and route.path.startswith("/api/admin/control-shadow")
         ]
         self.assertEqual(len(routes), 3)
         for route in routes:
