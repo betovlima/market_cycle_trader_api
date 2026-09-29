@@ -115,6 +115,17 @@ class StartControlValidationRequest(BaseModel):
         pattern=r"^control-shadow-[a-f0-9]{16}$",
         description="The existing Control Shadow job ID, never a file path."
     )
+    expected_snapshot_sha256: str | None = Field(
+        default=None,
+        min_length=64, max_length=64,
+        pattern=r"^[a-fA-F0-9]{64}$",
+        description=(
+            "Original snapshot_sha256 from the completed Shadow result. "
+            "Required when that source job is absent from the current MongoDB; "
+            "also cross-checked when MongoDB contains the original. "
+            "No disk path is accepted."
+        ),
+    )
 
 
 @router.post(
@@ -124,6 +135,9 @@ class StartControlValidationRequest(BaseModel):
     description=(
         "Verify every source SHA-256; reproduce all four calibration margins "
         "and execute the official expanding walk-forward Control OOS replay. "
+        "If the original MongoDB job is missing, supply the independent "
+        "snapshot SHA-256 recorded in its completed result: the API can verify "
+        "the existing MCT local files directly, without redownloading. "
         "The API writes CSV/JSON reports beside the original MCT snapshot. "
         "Progress appears in PyCharm/Uvicorn and in the validation job logs. "
         "This is research-only and cannot create Alpaca orders or change Winner."
@@ -131,7 +145,11 @@ class StartControlValidationRequest(BaseModel):
 )
 def start_validation_job(payload: StartControlValidationRequest) -> dict[str, Any]:
     try:
-        return start_snapshot_validation(database(), source_job_id=payload.source_job_id)
+        return start_snapshot_validation(
+            database(),
+            source_job_id=payload.source_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
     except ControlShadowUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except SnapshotValidationNotFound as exc:
