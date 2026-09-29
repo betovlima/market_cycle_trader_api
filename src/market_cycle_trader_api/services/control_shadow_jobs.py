@@ -1,12 +1,9 @@
-"""Admin-only, read-only Control shadow jobs.
+"""Admin-only current-Alpaca Control shadow jobs with durable console logs.
 
-A job verifies the pinned CSV snapshot, trains the frozen scientific Control
-model and emits a prospective decision to MongoDB and the Uvicorn console.
-It has no paper/live execution imports, order methods or Winner writes.
-
-This first endpoint is deliberately frozen-data only, disabled by default
-and intended for a single-process development API. It does not run against
-current Alpaca data and is not a production Trader integration.
+One request downloads a fresh independent RAW/SIP + corporate-actions snapshot
+under the MCT API's own dados/ directory, then fits TCC Control and computes a
+shadow decision. Trading endpoints, paper plans, Winner and research strategy
+selection are deliberately absent from this module.
 """
 from __future__ import annotations
 
@@ -14,27 +11,24 @@ import logging
 import os
 import threading
 import uuid
-from pathlib import Path
 from typing import Any
 
 from pymongo.errors import DuplicateKeyError
 
-from ..engine.operational_control_preview import build_control_shadow_decision
-from ..engine.research_market_data import StructuralResearchAssetExclusion
-from ..engine.tcc_frozen_reference_source import (
-    FROZEN_TCC_END,
-    FROZEN_TCC_MAIN_SHA256,
-    load_frozen_tcc_main_symbol,
-    validate_frozen_tcc_main,
+from ..engine.control_shadow_market_data import (
+    DATA_DIRECTORY,
+    SOURCE_CONTRACT,
+    download_current_control_snapshot,
 )
+from ..engine.market_data import latest_safe_completed_xnys_session
+from ..engine.operational_control_preview import build_control_shadow_decision
 from ..infrastructure.persistence.mongo_repository import utc_now
 from ..tcc_v106_reference.config import ASSETS
 
 LOGGER = logging.getLogger("uvicorn.error")
 COLLECTION = "control_shadow_jobs"
-ACTIVE_KEY = "frozen-control-shadow"
+ACTIVE_KEY = "fresh-control-shadow"
 ENABLED_ENV = "MCT_CONTROL_SHADOW_API_ENABLED"
-ROOT_ENV = "MCT_CONTROL_SHADOW_FROZEN_ROOT"
 MAX_LOGS = 300
 _ACTIVE_THREADS: dict[str, threading.Thread] = {}
 
@@ -51,22 +45,12 @@ class ControlShadowUnavailable(RuntimeError):
     pass
 
 
-def _server_frozen_root() -> Path:
+def _require_enabled() -> None:
     if str(os.getenv(ENABLED_ENV) or "").strip().lower() != "true":
         raise ControlShadowUnavailable(
-            f"Control shadow API is disabled; set {ENABLED_ENV}=true only in an isolated development API."
+            f"Control shadow API is disabled; set {ENABLED_ENV}=true "
+            "only in your isolated development API."
         )
-    raw = str(os.getenv(ROOT_ENV) or "").strip()
-    if not raw:
-        raise ControlShadowUnavailable(
-            f"Configure {ROOT_ENV} on the API server; a filesystem path is not accepted through HTTP."
-        )
-    root = Path(raw).expanduser().resolve()
-    if not root.is_dir() or not (root / "manifest.json").is_file():
-        raise ControlShadowUnavailable(
-            "Configured Control shadow snapshot directory or manifest is unavailable on this API server."
-        )
-    return root
 
 
 def public_control_shadow_job(document: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +69,8 @@ def public_control_shadow_job(document: dict[str, Any]) -> dict[str, Any]:
         "logs": list(document.get("logs") or []),
         "result": document.get("result"),
         "error": document.get("error"),
-        "source_kind": "verified_frozen_tcc_snapshot",
+        "source_kind": "fresh_alpaca_raw_sip_local_mct_snapshot",
+        "snapshot_directory": document.get("snapshot_directory"),
         "order_eligible": False,
         "order_submission": "never",
     }
@@ -123,7 +108,7 @@ def _run_control_shadow_job(
     db: Any,
     job_id: str,
     *,
-    root: Path,
+    completed_session: str,
     current_asset: str,
     holding_sessions: int,
 ) -> None:
@@ -137,58 +122,93 @@ def _run_control_shadow_job(
                 "updated_at": utc_now(),
             }},
         )
-        _log(db, job_id, "Validating manifest and SHA-256 of frozen RAW/SIP and corporate-actions CSVs.",
-             stage="snapshot_validation", progress=1)
-        manifest = validate_frozen_tcc_main(root, assets=ASSETS)
-        frames: dict[str, Any] = {}
-        exclusions: list[dict[str, str]] = []
-        for index, symbol in enumerate(ASSETS, start=1):
-            try:
-                frames[symbol] = load_frozen_tcc_main_symbol(root, symbol, manifest)
-            except StructuralResearchAssetExclusion as exc:
-                exclusions.append({"symbol": symbol, "reason": str(exc)})
-                _log(db, job_id, f"Structural exclusion: {symbol} — {exc}",
-                     stage="market_data")
-            if index % 5 == 0 or index == len(ASSETS):
-                _log(db, job_id, f"Verified {index}/{len(ASSETS)} frozen assets.",
-                     stage="market_data", progress=5 + int(15 * index / len(ASSETS)))
+        _log(
+            db, job_id,
+            f"Downloading fresh Alpaca RAW/SIP daily history and corporate actions "
+            f"through completed XNYS session {completed_session}. "
+            "The local MCT dados directory will be created automatically.",
+            stage="market_data_download", progress=1,
+        )
+
+        def data_progress(phase: str, completed: int, total: int, symbol: str) -> None:
+            if phase == "excluded":
+                _log(
+                    db, job_id, f"{symbol}: structural identity exclusion; see snapshot manifest.",
+                    level="WARNING", stage="market_data_download",
+                    progress=2 + int(43 * completed / max(1, total)),
+                )
+            elif phase == "download":
+                # The callback runs before and after every symbol to make
+                # a slow provider request visible in the PyCharm console.
+                _log(
+                    db, job_id,
+                    f"RAW/SIP + actions {completed}/{total}: {symbol}",
+                    stage="market_data_download",
+                    progress=2 + int(43 * completed / max(1, total)),
+                )
+
+        snapshot = download_current_control_snapshot(
+            job_id=job_id,
+            completed_session=completed_session,
+            progress_callback=data_progress,
+        )
+        _log(
+            db, job_id,
+            f"Fresh snapshot published: {snapshot.directory}; "
+            f"eligible={len(snapshot.frames)}/{len(ASSETS)}, "
+            f"excluded={len(snapshot.manifest['structural_exclusions'])}, "
+            f"sha256={snapshot.manifest['snapshot_sha256']}.",
+            stage="snapshot_verified", progress=45,
+        )
+        collection.update_one({"_id": job_id}, {
+            "$set": {
+                "snapshot_directory": str(snapshot.directory),
+                "snapshot_sha256": snapshot.manifest["snapshot_sha256"],
+                "updated_at": utc_now(),
+            }
+        })
 
         def training_progress(phase: str, completed: int, total: int) -> None:
-            # The scientific trainer calls this after every asset.
             if completed % 5 == 0 or completed == total:
                 fraction = completed / max(1, total)
                 progress = (
-                    20 + int(fraction * 35) if phase == "calibration"
-                    else 60 + int(fraction * 35)
+                    46 + int(fraction * 24) if phase == "calibration"
+                    else 71 + int(fraction * 24)
                 )
                 _log(
                     db, job_id,
-                    f"LightGBM {phase}: {completed}/{total} assets.",
+                    f"LightGBM Control {phase}: {completed}/{total} assets.",
                     stage=f"lightgbm_{phase}", progress=progress,
                 )
 
-        _log(db, job_id, "Training frozen Control and calibrating switch margin; no orders.",
-             stage="lightgbm_calibration", progress=20)
+        _log(
+            db, job_id, "Training Control and calibrating switch margin; no orders.",
+            stage="lightgbm_calibration", progress=46,
+        )
         result = build_control_shadow_decision(
-            frames,
-            completed_session=FROZEN_TCC_END,
+            snapshot.frames,
+            completed_session=completed_session,
             current_asset=current_asset,
             holding_sessions=holding_sessions,
             progress_callback=training_progress,
         )
-        result["input_audit"]["snapshot_sha256"] = FROZEN_TCC_MAIN_SHA256
-        result["input_audit"]["structural_exclusions"] = exclusions
-        result["input_audit"]["source_kind"] = "frozen_scientific_reference_not_current_alpaca"
-        result["input_audit"]["eligible_assets"] = len(frames)
-        result["source_validation"] = "sha256_verified_frozen_tcc_main_raw_sip_and_corporate_actions"
+        result["input_audit"]["snapshot_sha256"] = snapshot.manifest["snapshot_sha256"]
+        result["input_audit"]["structural_exclusions"] = snapshot.manifest["structural_exclusions"]
+        result["input_audit"]["source_kind"] = "fresh_alpaca_raw_sip_local_mct_snapshot"
+        result["input_audit"]["source_contract"] = SOURCE_CONTRACT
+        result["input_audit"]["eligible_assets"] = len(snapshot.frames)
+        result["input_audit"]["snapshot_directory"] = str(snapshot.directory)
+        result["source_validation"] = "fresh_raw_sip_and_corporate_actions_split_normalized"
         result["order_eligible"] = False
         result["order_submission"] = "never"
 
-        _log(db, job_id, (
+        _log(
+            db, job_id,
             f"Decision: {current_asset} -> {result['target_asset']}; "
             f"margin={result['effective_switch_margin']:.6f}. "
-            "Shadow only; no order created."
-        ), stage="completed", progress=100)
+            "Shadow only; no order created.",
+            stage="completed", progress=100,
+        )
         collection.update_one({"_id": job_id}, {
             "$set": {
                 "status": "completed",
@@ -201,7 +221,9 @@ def _run_control_shadow_job(
             "$unset": {"active_key": ""},
         })
     except Exception as exc:
-        LOGGER.exception("Control Shadow %s | Job failed; no orders were submitted.", job_id)
+        LOGGER.exception(
+            "Control Shadow %s | Job failed; no orders were submitted.", job_id
+        )
         _log(
             db, job_id,
             f"Shadow failed: {type(exc).__name__}: {str(exc)[:700]}",
@@ -227,15 +249,16 @@ def start_control_shadow_job(
     current_asset: str,
     holding_sessions: int,
 ) -> dict[str, Any]:
-    root = _server_frozen_root()
+    _require_enabled()
     current = str(current_asset or "CASH").strip().upper()
     if current != "CASH" and current not in ASSETS:
-        raise ValueError("current_asset must be CASH or an asset of the frozen TCC universe.")
+        raise ValueError("current_asset must be CASH or an asset of the Control universe.")
     if current == "CASH" and holding_sessions:
         raise ValueError("holding_sessions must be 0 when current_asset is CASH.")
     if holding_sessions < 0:
         raise ValueError("holding_sessions must be nonnegative.")
 
+    completed_session = latest_safe_completed_xnys_session().date().isoformat()
     collection = db[COLLECTION]
     collection.create_index("active_key", unique=True, sparse=True)
     now = utc_now()
@@ -246,7 +269,7 @@ def start_control_shadow_job(
         "status": "queued",
         "stage": "queued",
         "progress": 0,
-        "completed_session": FROZEN_TCC_END,
+        "completed_session": completed_session,
         "current_asset": current,
         "holding_sessions": holding_sessions,
         "created_at": now,
@@ -265,7 +288,11 @@ def start_control_shadow_job(
     thread = threading.Thread(
         target=_run_control_shadow_job,
         args=(db, job_id),
-        kwargs={"root": root, "current_asset": current, "holding_sessions": holding_sessions},
+        kwargs={
+            "completed_session": completed_session,
+            "current_asset": current,
+            "holding_sessions": holding_sessions,
+        },
         daemon=True,
         name=f"control-shadow-{job_id}",
     )
@@ -284,7 +311,10 @@ def start_control_shadow_job(
             "$unset": {"active_key": ""},
         })
         raise
-    LOGGER.info("Control Shadow %s | Queued from /docs; frozen-data, no-order execution.", job_id)
+    LOGGER.info(
+        "Control Shadow %s | Queued from /docs: Alpaca RAW/SIP refresh to %s in %s; no orders.",
+        job_id, completed_session, DATA_DIRECTORY,
+    )
     return public_control_shadow_job(document)
 
 
@@ -303,5 +333,6 @@ def get_control_shadow_logs(db: Any, job_id: str) -> dict[str, Any]:
         "stage": job["stage"],
         "progress": job["progress"],
         "logs": job["logs"],
+        "snapshot_directory": job["snapshot_directory"],
         "order_submission": "never",
     }
