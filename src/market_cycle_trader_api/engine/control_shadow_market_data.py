@@ -132,6 +132,13 @@ def download_current_control_snapshot(
                     f"{symbol}: Alpaca RAW/SIP returned no daily bars; "
                     "the Control universe must not be silently reduced."
                 )
+            # Ensure timestamps are offset-aware before causal split processing.
+            # Never infer a local workstation timezone from provider timestamps.
+            raw = raw.copy()
+            raw.index = pd.to_datetime(raw.index, utc=True)
+            raw.index.name = "timestamp"
+            if raw.index.has_duplicates or not raw.index.is_monotonic_increasing:
+                raise ValueError(f"{symbol}: duplicate or unsorted RAW daily sessions.")
             # Never mix RAW with all/dividend-adjusted candles.
             hashes[f"raw_bars/{symbol}.csv"] = _write_bytes(
                 temporary, f"raw_bars/{symbol}.csv", _bars_payload(raw),
