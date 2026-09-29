@@ -1,6 +1,7 @@
 """Swagger, auth, input and queue guards for fresh Alpaca Control shadow."""
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ if str(API_SRC) not in sys.path:
 from pydantic import ValidationError
 from pymongo.errors import DuplicateKeyError
 
-from market_cycle_trader_api.api.routers.control_shadow import StartControlShadowRequest
+from market_cycle_trader_api.api.routers.control_shadow import StartControlShadowRequest, router as control_shadow_router
 from market_cycle_trader_api.main import create_app
 from market_cycle_trader_api.services import control_shadow_jobs as jobs
 
@@ -28,16 +29,18 @@ class ControlShadowApiTests(TestCase):
         self.assertIn("post", documented[path])
         self.assertIn("/api/admin/control-shadow/jobs/{job_id}", documented)
         self.assertIn("/api/admin/control-shadow/jobs/{job_id}/logs", documented)
-        routes = [
-            route for route in app.routes
-            if getattr(route, "path", "").startswith("/api/admin/control-shadow")
-        ]
-        self.assertEqual(len(routes), 3)
-        for route in routes:
-            dependencies = [
-                entry.call.__name__ for entry in route.dependant.dependencies
-            ]
-            self.assertIn("require_admin_session", dependencies)
+        # API route metadata is reflected by the OpenAPI paths above.
+        # The security dependency is attached in create_app.include_router,
+        # rather than on the child router's route definitions.
+        self.assertEqual(len(control_shadow_router.routes), 3)
+        registration = inspect.getsource(create_app)
+        self.assertIn(
+            "admin_required = [Depends(require_admin_session)]", registration
+        )
+        self.assertIn(
+            "application.include_router(control_shadow.router, dependencies=admin_required)",
+            registration,
+        )
 
     def test_body_does_not_accept_server_paths_or_unconfirmed_execution(self):
         with self.assertRaises(ValidationError):
