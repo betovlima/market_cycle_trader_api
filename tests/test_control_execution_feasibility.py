@@ -258,7 +258,8 @@ class ControlExecutionFeasibilityTests(TestCase):
             (source / "manifest.json").write_text("immutable sentinel", encoding="utf8")
             with (
                 patch.object(research, "read_verified_control_snapshot",
-                             return_value=({}, {"completed_session": "2026-09-28"}, source)),
+                             return_value=({"AAA": pd.DataFrame(), "BBB": pd.DataFrame()},
+                                           {"completed_session": "2026-09-28"}, source)),
                 patch.object(research, "prepare_operational_control_panel",
                              return_value=({}, dates, SimpleNamespace(calendar_sessions=2500))),
                 patch.object(research, "run_feasible_lightgbm",
