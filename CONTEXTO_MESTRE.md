@@ -10,7 +10,7 @@
 ## Baseline operacional confirmado pelo usuário
 - API de produção: `10.8.38`.
 - Front de produção: `10.7.16`.
-- A evolução `v10.8.39` está em **branch de desenvolvimento**, não em produção.
+- A evolução `v10.8.39` está em **branch de desenvolvimento**, não em produção. A constante API_VERSION foi atualizada para 10.8.39 somente na branch; produção continua API 10.8.38 e Front 10.7.16.
 - Preservar Winner existente, estado da carteira e ordens. Não promover a Strategy #28 diretamente.
 
 ## Resultado científico selecionado
@@ -37,6 +37,13 @@
 - Status: a CI do commit inicial `66e31f6f0be882b5bb3980776d8240c0e29a30ab` passou em Python 3.12. Após erro de importação no Spyder/Python 3.14.2, o teste foi corrigido para inserir `<API>/src` no `sys.path` a partir de `__file__`; aguardar CI do novo commit. Não afirmar paridade operacional completa com base no teste de política.
 - O novo preview inclui treino/calibração científicos e CLI de snapshot local; a CI identificou duas falhas apenas nos testes novos (índice esperado do calendário e fixture de exclusão estrutural). Ambas foram corrigidas na branch; confirmar CI do HEAD antes de merge. O CLI imprime progresso e nunca envia ordens.
 - Erro local original: `ModuleNotFoundError: No module named 'market_cycle_trader_api'`, durante importação, antes de qualquer teste. Não indica divergência Control vs live; preferir Python 3.12 para ambiente de referência.
+
+## API Swagger para ensaio sem ordens
+- O antigo CLI agora também está exposto por POST/GET/GET logs em `/api/admin/control-shadow/jobs` (tag Control Shadow — no orders); acesso obrigatório de admin. `POST` inicia thread e devolve job_id; logs aparecem no console do PyCharm/Uvicorn e no GET `/{job_id}/logs`, estado/resultado no GET `/{job_id}`.
+- Feature desligada por padrão: usar `MCT_CONTROL_SHADOW_API_ENABLED=true` e `MCT_CONTROL_SHADOW_FROZEN_ROOT=C:/CAMINHO_DO_TCC/dados/pesquisa` no `.env` local da API; reiniciar o processo (um único worker). POST não aceita caminho de arquivo e exige confirmação `RUN_FROZEN_SHADOW_NO_ORDERS`. O snapshot congelado termina em 2026-09-17. Não confundir com Alpaca atual.
+- MongoDB somente coleção nova `control_shadow_jobs` para logs/resultados, com `active_key` único e sem alterar carteira, Winner, Strategy 28 ou ordens. Executar apenas com admin; não é um endpoint de trading nem backtest.
+- Processo reiniciado interrompe job em thread; nesta primeira entrega não há recuperação automática de jobs interrompidos. Não usar reload ou workers múltiplos em ensaio longo.
+- Ver detalhes em `docs/changes/v10.8.39-control-operational-parity.md`. CI HEAD deve ser confirmada antes de merge.
 
 ## Próximos passos
 1. Confirmar CI de toda a branch, especialmente o novo shadow preview e CLI.
