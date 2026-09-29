@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
@@ -109,6 +110,87 @@ class ControlSnapshotValidationTests(TestCase):
         self.assertAlmostEqual(
             total, float(curve["risk_adjusted_reward"].sum()), places=12,
         )
+
+    def test_validation_writes_new_job_reports_without_touching_source(self):
+        dates = pd.bdate_range("2022-01-03", periods=1000, tz="UTC")
+        frames = {"AAPL": pd.DataFrame(index=dates), "NVDA": pd.DataFrame(index=dates)}
+        curve = pd.DataFrame({
+            "date": ["2026-06-03", "2026-06-04"],
+            "equity": [10001.0, 10003.0],
+            "drawdown": [0.0, 0.0],
+            "log_return": [0.0001, 0.0002],
+            "risk_adjusted_reward": [0.0001, 0.0002],
+            "cumulative_calibration_score": [0.0001, 0.0003],
+        })
+        actions = pd.DataFrame({
+            "decision_date": ["2026-06-02", "2026-06-03"],
+            "execution_date": ["2026-06-03", "2026-06-04"],
+            "from_asset": ["CASH", "AAPL"],
+            "target_asset": ["AAPL", "AAPL"],
+            "predicted_utility": [0.1, 0.1],
+            "holding_sessions": [1, 2], "log_return": [0.0001, 0.0002],
+        })
+        oos_dates = pd.date_range("2026-09-24", periods=3, freq="D", tz="UTC")
+        predictions = pd.DataFrame({
+            "strategy_equity": [10000, 10005, 10010],
+            "buy_hold_equity": [10000, 10002, 10007],
+            "selected_asset": ["CASH", "AAPL", "AAPL"],
+            "decision_date": oos_dates,
+            "walk_forward_fold": [1, 1, 1],
+            "trade_action": ["", "BUY", ""],
+        }, index=oos_dates)
+        original_manifest = {
+            "completed_session": "2026-09-26",
+            "snapshot_sha256": "a" * 64,
+        }
+        original = SimpleNamespace(
+            predictions=predictions,
+            trades=pd.DataFrame(),
+            metrics={
+                "strategy_ending_capital": 10010.0,
+                "strategy_return": 0.001,
+                "walk_forward_fold_count": 1,
+                "walk_forward_folds": [],
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / ID
+            source.mkdir()
+            (source / "manifest.json").write_text("source sentinel", encoding="utf-8")
+            with (
+                patch.object(engine, "read_verified_control_snapshot",
+                             return_value=(frames, original_manifest, source)),
+                patch.object(engine, "prepare_operational_control_panel",
+                             return_value=(frames, dates, SimpleNamespace(calendar_sessions=1000))),
+                patch.object(engine, "_lightgbm_fit_models",
+                             return_value={"AAPL": object(), "NVDA": object()}),
+                patch.object(engine, "_utility_policy",
+                             return_value=lambda t, p, h: (0, 0.0)),
+                patch.object(engine, "_simple_policy_growth", return_value=0.0003),
+                patch.object(engine, "_calibration_curve",
+                             return_value=(curve, actions, 0.0003)),
+                patch.object(engine, "run_research_challenger", return_value=[original]) as replay,
+            ):
+                report = engine.run_control_snapshot_validation(
+                    source_job_id=ID,
+                    validation_job_id="control-validation-aaaaaaaaaaaaaaaa",
+                    expected_sha256="a" * 64,
+                    original_calibration_score=0.0003,
+                    original_candidate_margin=0.0,
+                )
+            self.assertEqual((source / "manifest.json").read_text(), "source sentinel")
+            self.assertTrue(report["original_shadow"]["reproduced"])
+            self.assertFalse(report["order_eligible"])
+            self.assertEqual(report["order_submission"], "never")
+            self.assertEqual(len(report["margin_candidates"]), 4)
+            self.assertEqual(report["oos"]["strategy_ending_capital"], 10010.0)
+            self.assertTrue((Path(report["report_directory"]) / "oos_capital.png").is_file())
+            self.assertTrue((Path(report["report_directory"]) / "oos_drawdown.png").is_file())
+            self.assertTrue((Path(report["report_directory"]) / "calibration_curves.csv").is_file())
+            self.assertEqual(replay.call_count, 1)
+            adapter = replay.call_args.args[2]
+            self.assertEqual(pd.Timestamp(adapter.analysis_end_date).date().isoformat(), "2026-09-26")
+            self.assertEqual(pd.Timestamp(adapter.analysis_end_date).hour, 23)
 
     def test_validation_api_schema_requires_exact_existing_job_id(self):
         StartControlValidationRequest.model_validate({
