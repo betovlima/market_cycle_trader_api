@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 from types import FunctionType, SimpleNamespace
 from unittest import TestCase
@@ -195,6 +196,139 @@ class ControlLiquidityAwareTests(TestCase):
         self.assertEqual(policy.POLICY_SPEC["calibrated_on_oos"], False)
         self.assertEqual(research.RESEARCH_STRATEGY_MODE,
                          "MCT_RESEARCH_CONTROL_LIQUIDITY_AWARE_V1")
+
+    def test_real_report_contract_pairs_previous_close_to_next_execution_date(self):
+        full_dates = pd.bdate_range("2020-07-21", periods=1555, tz="UTC")
+        oos_dates = full_dates[1:]
+        fold_ids = [1] * 504 + [2] * 504 + [3] * 546
+        original_folds = []
+        for i, (first, last) in enumerate(((0, 503), (504, 1007), (1008, 1553)), 1):
+            original_folds.append({
+                "fold_id": i, "sessions": last - first + 1,
+                "test_start": oos_dates[first].isoformat(),
+                "test_end": oos_dates[last].isoformat(),
+            })
+        reference_metric = {
+            key: 0.0 for key in research.REPORT_METRICS
+        }
+        reference_metric.update({
+            "initial_capital": 10000.0,
+            "strategy_ending_capital": 10001.0,
+            "session_count": 1554,
+            "terminal_holdings_asset": "S00",
+            "execution_scenario": dict(execution.SCENARIO),
+        })
+        values = np.linspace(10000, 10001, 1554)
+        def curve(target):
+            return pd.DataFrame({
+                "strategy_equity": values,
+                "cash_weight": np.zeros(1554),
+                "walk_forward_fold": fold_ids,
+                "decision_date": full_dates[:-1],
+                "signal_asset": [target] * 1554,
+            }, index=oos_dates)
+        runs = {
+            "control_reference": SimpleNamespace(
+                predictions=curve("S00"), trades=pd.DataFrame(),
+                metrics=reference_metric,
+            ),
+            "liquidity_aware": SimpleNamespace(
+                predictions=curve("S01"), trades=pd.DataFrame(),
+                metrics=dict(reference_metric),
+            ),
+        }
+        candidate = {
+            f"S{i:02d}": {
+                "capacity_dollars": 100.0,
+                "capacity_fraction": .1,
+                "raw_utility": .2,
+                "effective_utility": .02,
+            } for i in range(55)
+        }
+        details = {
+            full_dates[i]: {
+                "equity_at_decision": 10000.0,
+                "cash_at_decision": 9000.0,
+                "held_asset_at_decision": "S00",
+                "incumbent_exit_fraction": .1,
+                "raw_best_asset": "S00",
+                "adjusted_best_asset": "S01",
+                "candidate_liquidity_detail": candidate,
+            } for i in range(1554)
+        }
+        base41 = {
+            "source_snapshot_sha256": SHA, "source_job_id": SNAP,
+            "source_unchanged": True, "order_submission": "never",
+            "original_shadow": {"reproduced": True},
+            "snapshot_assets": 55, "calendar_sessions": 2500,
+            "numeric_input_integrity": {"status": "verified", "checked_assets": 55},
+            "oos": {
+                "walk_forward_fold_count": 3,
+                "walk_forward_folds": original_folds,
+            },
+        }
+        base42 = {
+            "source_snapshot_sha256": SHA, "source_job_id": SNAP,
+            "source_unchanged": True, "order_submission": "never",
+            "source_validation_job_id": VALIDATION,
+            "numeric_input_integrity": {"status": "verified", "assets": 55},
+            "execution_scenario": dict(execution.SCENARIO),
+            "feasible_oos": {
+                **reference_metric, "walk_forward_fold_count": 3,
+            },
+        }
+        base43 = {
+            "source_snapshot_sha256": SHA, "source_job_id": SNAP,
+            "source_unchanged": True, "order_submission": "never",
+            "source_validation_job_id": VALIDATION,
+            "source_execution_job_id": EXECUTION,
+            "v1042_scenario_regression": "verified",
+            "numeric_input_integrity": {"status": "verified", "assets": 55},
+            "scenario_comparison": [{
+                "scenario": name,
+                "strategy_ending_capital": 10001.0,
+            } for name in (
+                "cap10_cost", "no_cap_no_cost", "cap10_no_cost",
+                "cap05_cost", "cap01_cost",
+            )],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / SNAP
+            folder.mkdir()
+            manifest = folder / "manifest.json"
+            manifest.write_text("immutable sentinel", encoding="utf8")
+            with (
+                patch.object(research, "read_verified_control_snapshot",
+                             return_value=(
+                                 {f"S{i:02d}": pd.DataFrame() for i in range(55)},
+                                 {"completed_session": "2026-09-28"}, folder,
+                             )),
+                patch.object(research, "prepare_operational_control_panel",
+                             return_value=(
+                                 {}, full_dates,
+                                 SimpleNamespace(calendar_sessions=2500),
+                             )),
+                patch.object(research, "run_control_liquidity_pair",
+                             return_value=(runs, runs["control_reference"], details)),
+            ):
+                report = research.run_control_liquidity_research(
+                    source_job_id=SNAP, validation_job_id=VALIDATION,
+                    execution_job_id=EXECUTION,
+                    sensitivity_job_id=SENSITIVITY,
+                    research_job_id="control-liquidity-aaaaaaaaaaaaaaaa",
+                    expected_sha256=SHA,
+                    baseline41=base41, baseline42=base42, baseline43=base43,
+                )
+            self.assertEqual(manifest.read_text(), "immutable sentinel")
+            self.assertEqual(report["control_reference_parity"], "verified")
+            self.assertEqual(report["diagnostics"]["candidate_score_rows"], 1554*55)
+            self.assertEqual(report["diagnostics"]["policy_target_disagreement_sessions"], 1554)
+            self.assertFalse(report["order_eligible"])
+            output = Path(report["report_directory"])
+            self.assertTrue(all((output / name).is_file() for name in report["artifacts"]))
+            audit = pd.read_csv(output / "liquidity_decision_audit.csv")
+            self.assertEqual(audit.iloc[0]["timestamp"], oos_dates[0].isoformat())
+            self.assertEqual(audit.iloc[0]["decision_timestamp"], full_dates[0].isoformat())
 
     def test_rejects_mismatched_sources_before_starting_thread(self):
         db = MagicMock()
