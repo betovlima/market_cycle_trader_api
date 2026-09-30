@@ -144,6 +144,7 @@ def simulate_feasible_control(
     simulation_progress_callback: Callable[[float, str], None] | None = None,
     scenario_override: dict[str, Any] | None = None,
     decision_prepare: Callable[[pd.Timestamp, int, int, float, int, float], None] | None = None,
+    initial_state: dict[str, Any] | None = None,
 ) -> RotationRunResult:
     """Model-policy counterfactual, not a fixed tape of original decisions.
 
@@ -169,10 +170,40 @@ def simulate_feasible_control(
         if not (math.isfinite(float(scenario[field])) and float(scenario[field]) >= 0):
             raise ValueError(f"{field} must be finite and nonnegative.")
     started = time.perf_counter()
-    capital = float(config.initial_capital)
-    if not (math.isfinite(capital) and capital > 0):
-        raise ValueError("Initial capital must be strictly positive.")
-    cash, position, qty, holding = capital, 0, 0, 0
+    if initial_state is None:
+        capital = float(config.initial_capital)
+        if not (math.isfinite(capital) and capital > 0):
+            raise ValueError("Initial capital must be strictly positive.")
+        cash, position, qty, holding = capital, 0, 0, 0
+    else:
+        required = {"cash", "position", "shares", "holding_days", "equity"}
+        if not required.issubset(initial_state):
+            raise ValueError("Historical replay initial_state is incomplete.")
+        cash = float(initial_state["cash"])
+        position = int(initial_state["position"])
+        qty = int(initial_state["shares"])
+        holding = int(initial_state["holding_days"])
+        capital = float(initial_state["equity"])
+        if (
+            not math.isfinite(cash) or cash < 0
+            or not math.isfinite(capital) or capital <= 0
+            or not 0 <= position <= len(symbols)
+            or qty < 0 or holding < 0
+            or (position == 0 and qty != 0)
+            or (position > 0 and qty <= 0)
+        ):
+            raise ValueError("Invalid historical replay initial_state.")
+        decision_close_equity = cash
+        if position > 0:
+            first_decision = pd.Timestamp(decision_dates[0])
+            close = _nonnegative(frames[symbols[position-1]].loc[first_decision, "close"])
+            if close <= 0:
+                raise ValueError("Historical replay initial state lacks decision close.")
+            decision_close_equity += qty * close
+        if not math.isclose(
+            decision_close_equity, capital, rel_tol=0, abs_tol=1e-6,
+        ):
+            raise ValueError("Historical replay initial_state equity does not reconcile.")
     total_fees, modeled_price_cost, rejected_qty = 0.0, 0.0, 0.0
     blocked_sessions = partial_sessions = zero_volume_blocks = 0
     trades: list[dict[str, Any]] = []
@@ -183,6 +214,13 @@ def simulate_feasible_control(
     )
     stride = max(1, len(execution_dates) // 20)
     last_price: dict[str, float] = {}
+    if position > 0 and qty > 0:
+        first_decision = pd.Timestamp(decision_dates[0])
+        seeded_close = _nonnegative(
+            frames[symbols[position-1]].loc[first_decision, "close"]
+        )
+        if seeded_close > 0:
+            last_price[symbols[position-1]] = seeded_close
     for i, (decision_date, execution_date) in enumerate(zip(decision_dates[:-1], execution_dates)):
         old_position = position
         if decision_prepare is not None:
