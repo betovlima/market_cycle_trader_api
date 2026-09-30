@@ -505,3 +505,74 @@ def run_meta_veto_pair(
             models, panel, labels, timestamps, settings,
         )
         return _CapitalAwareUtilityCache(cached, panel, labels, account), profile
+
+
+    def policy_wrapper(
+        models, panel, labels, settings, switch_margin, **kwargs,
+    ):
+        base_policy = original_policy(
+            models, panel, labels, settings, switch_margin, **kwargs,
+        )
+        cache = kwargs.get("utility_cache")
+        fold_id = kwargs.get("fold_id")
+        if cache is None or fold_id is None:
+            return base_policy
+        fid = int(fold_id)
+        if fid not in fold_models:
+            return base_policy
+
+        def policy(
+            timestamp: pd.Timestamp,
+            current_position: int,
+            holding_days: int,
+        ) -> tuple[int, float]:
+            base_target, base_score = base_policy(
+                timestamp, current_position, holding_days,
+            )
+            key = pd.Timestamp(timestamp)
+            audit = {
+                "fold_id": fid,
+                "base_target": labels[base_target-1] if base_target else "CASH",
+                "current_asset": labels[current_position-1] if current_position else "CASH",
+                "veto_enabled": bool(account.get("veto_enabled", False)),
+                "fold_threshold": fold_thresholds[fid],
+                "probability_candidate_better": None,
+                "veto_applied": False,
+                "final_target": labels[base_target-1] if base_target else "CASH",
+            }
+            threshold = fold_thresholds[fid]
+            if (
+                not account.get("veto_enabled", False)
+                or threshold is None
+                or current_position <= 0
+                or base_target <= 0
+                or base_target == current_position
+            ):
+                if account.get("veto_enabled", False):
+                    account["veto_audit"][key] = audit
+                return int(base_target), float(base_score)
+
+            effective = np.asarray(cache.get(key), dtype=float)
+            candidate_utility = float(effective[base_target])
+            incumbent_utility = float(effective[current_position])
+            probability = _probability(
+                fold_models[fid],
+                fold_scales[fid],
+                arrays_by_fold[fid],
+                frames,
+                date=key,
+                candidate=labels[base_target-1],
+                incumbent=labels[current_position-1],
+                candidate_utility=candidate_utility,
+                incumbent_utility=incumbent_utility,
+            )
+            audit["probability_candidate_better"] = probability
+            if probability is not None and probability < float(threshold):
+                audit["veto_applied"] = True
+                audit["final_target"] = labels[current_position-1]
+                account["veto_audit"][key] = audit
+                return current_position, incumbent_utility
+            account["veto_audit"][key] = audit
+            return int(base_target), float(base_score)
+
+        return policy
