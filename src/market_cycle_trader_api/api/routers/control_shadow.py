@@ -963,7 +963,7 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 
     confirm: Literal["RESEARCH_CONTROL_REDUCED_META_VETO_NO_ORDERS"] = Field(
         description=(
-            "Run the frozen v10.8.51 reduced-signature fail-safe meta-veto. "
+            "Run the frozen v10.8.53 one-shot reduced-signature fail-safe meta-veto. "
             "Research only; never creates or submits orders."
         )
     )
@@ -980,13 +980,13 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 @router.post(
     "/reduced-meta-veto/jobs",
     status_code=202,
-    summary="Run v10.8.51 reduced-signature Meta-Veto — research only",
+    summary="Run v10.8.53 one-shot reduced-signature Meta-Veto — research only",
     description=(
         "Uses the confirmed v10.8.50 9-feature signature with fixed balanced "
         "Logistic Regression C=0.25. Fold 1 is Control-only; Fold 2 learns "
         "only Fold 1; Fold 3 learns only Folds 1+2. A fold is enabled only "
         "after chronological calibration BA>=0.52 and AUC>=0.52, and a "
-        "rotation is vetoed only when P(ROTATE better)<=0.35. CASH transitions "
+        "rotation is vetoed only when P(ROTATE better)<=0.35. After any veto, " "the next policy call is forced back to Control. Only fully matured prior " "rollout labels are eligible for training. CASH transitions "
         "remain unchanged. No tuning, Alpaca refresh, Winner change or orders."
     ),
 )
@@ -1011,7 +1011,7 @@ def start_reduced_meta_veto_job(
 
 @router.get(
     "/reduced-meta-veto/jobs/{job_id}",
-    summary="Read v10.8.51 reduced-signature Meta-Veto result",
+    summary="Read v10.8.53 one-shot reduced-signature Meta-Veto result",
 )
 def read_reduced_meta_veto_job(job_id: str) -> dict[str, Any]:
     try:
@@ -1022,7 +1022,7 @@ def read_reduced_meta_veto_job(job_id: str) -> dict[str, Any]:
 
 @router.get(
     "/reduced-meta-veto/jobs/{job_id}/logs",
-    summary="Read v10.8.51 reduced-signature Meta-Veto progress and logs",
+    summary="Read v10.8.53 one-shot reduced-signature Meta-Veto progress and logs",
 )
 def read_reduced_meta_veto_logs(job_id: str) -> dict[str, Any]:
     try:
