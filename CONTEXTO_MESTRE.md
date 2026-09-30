@@ -63,6 +63,9 @@
 - Artefatos: `summary.json`, `reduced_model_results.csv`, `reduced_logistic_coefficients.csv`, `coefficient_stability.csv`.
 - Nenhuma policy é criada nesta versão. Mesmo se o sinal for confirmado, o próximo passo seria desenhar separadamente uma política fail-safe e congelar seu protocolo antes de avaliar capital.
 - Próximo passo: confirmar CI completa, executar a v10.8.50 sobre `control-signature-5dedf5eee0f94e8a` e auditar o resultado sem alterar as features/modelos após observar o OOS.
+- Alteração de acesso em 2026-09-30: o `control_shadow.router` deixou de herdar `require_admin_session` no `main.py`. Todos os endpoints de pesquisa sob `/api/admin/control-shadow/*` passam a poder ser acessados sem login. As demais rotas administrativas da API continuam protegidas normalmente.
+- A remoção de login NÃO remove as travas de pesquisa: confirmações literais, `_require_enabled`, validação de cadeia de jobs/SHA, ausência de campos de conta/Winner e contratos `order_eligible=false` / `order_submission="never"` permanecem.
+- Teste `test_control_shadow_api.py` atualizado para exigir registro público do Control Shadow e impedir regressão que reanexe `dependencies=admin_required`.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.49 — Rollout Decision Signature Research (diagnóstico, sem ordem)
