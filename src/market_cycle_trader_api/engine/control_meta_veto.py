@@ -223,3 +223,195 @@ def _arrays(
         ).astype(np.float32)
         for symbol in symbols
     }
+
+
+def _epoch(
+    model: MetaVetoNet,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+) -> tuple[float, list[float], list[int]]:
+    model.train(optimizer is not None)
+    total_loss = 0.0
+    count = 0
+    probabilities: list[float] = []
+    labels: list[int] = []
+    for candidate, incumbent, context, y in loader:
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(optimizer is not None):
+            logits = model(candidate, incumbent, context)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, y)
+            if optimizer is not None:
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+        n = len(y)
+        total_loss += float(loss.detach())*n
+        count += n
+        probabilities.extend(torch.sigmoid(logits.detach()).cpu().tolist())
+        labels.extend(y.to(torch.int64).cpu().tolist())
+    return total_loss/max(1,count), probabilities, labels
+
+
+def _choose_threshold(
+    probabilities: list[float],
+    labels: list[int],
+) -> tuple[float | None, list[dict[str, Any]]]:
+    p = np.asarray(probabilities, dtype=float)
+    y = np.asarray(labels, dtype=int)
+    diagnostics = []
+    qualified = []
+    for threshold in VETO_THRESHOLDS:
+        veto = p < threshold
+        count = int(veto.sum())
+        precision = float(np.mean(y[veto] == 0)) if count else None
+        row = {
+            "threshold": float(threshold),
+            "veto_validation_count": count,
+            "bad_rotation_precision": precision,
+            "qualified": bool(
+                count >= MIN_VETO_VALIDATION_SAMPLES
+                and precision is not None
+                and precision >= MIN_VETO_PRECISION
+            ),
+        }
+        diagnostics.append(row)
+        if row["qualified"]:
+            qualified.append(row)
+    return max(
+        (float(row["threshold"]) for row in qualified),
+        default=None,
+    ), diagnostics
+
+
+def _fit(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    training: list[PairRow],
+    validation: list[PairRow],
+    *,
+    seed: int,
+) -> tuple[MetaVetoNet, MetaScale, dict[str, Any]]:
+    train_scale = _scale(frames, training)
+    train_arrays = _arrays(frames, symbols, train_scale)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        model = MetaVetoNet().to("cpu")
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
+        )
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        train_loader = DataLoader(
+            PairDataset(training, train_arrays, train_scale),
+            batch_size=BATCH_SIZE, shuffle=True, generator=generator,
+            num_workers=0,
+        )
+        valid_loader = DataLoader(
+            PairDataset(validation, train_arrays, train_scale),
+            batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+        )
+        best_loss = float("inf")
+        best_epoch = 1
+        stale = 0
+        best_probs: list[float] = []
+        best_labels: list[int] = []
+        for epoch in range(1, MAX_EPOCHS+1):
+            _epoch(model, train_loader, optimizer)
+            valid_loss, probs, labels = _epoch(model, valid_loader, None)
+            if valid_loss < best_loss - 1e-6:
+                best_loss = valid_loss
+                best_epoch = epoch
+                best_probs = probs
+                best_labels = labels
+                stale = 0
+            else:
+                stale += 1
+                if stale >= PATIENCE:
+                    break
+        threshold, threshold_diagnostics = _choose_threshold(
+            best_probs, best_labels,
+        )
+
+    all_rows = training + validation
+    final_scale = _scale(frames, all_rows)
+    final_arrays = _arrays(frames, symbols, final_scale)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed+1000)
+        final_model = MetaVetoNet().to("cpu")
+        optimizer = torch.optim.AdamW(
+            final_model.parameters(), lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+        )
+        generator = torch.Generator(device="cpu").manual_seed(seed+1000)
+        loader = DataLoader(
+            PairDataset(all_rows, final_arrays, final_scale),
+            batch_size=BATCH_SIZE, shuffle=True, generator=generator,
+            num_workers=0,
+        )
+        for _ in range(best_epoch):
+            _epoch(final_model, loader, optimizer)
+
+    return final_model, final_scale, {
+        "train_pairs": len(training),
+        "validation_pairs": len(validation),
+        "train_dates": len({row.decision_date for row in training}),
+        "validation_dates": len({row.decision_date for row in validation}),
+        "train_accept_rate": float(np.mean([
+            row.label_accept for row in training
+        ])),
+        "validation_accept_rate": float(np.mean([
+            row.label_accept for row in validation
+        ])),
+        "chosen_epochs": best_epoch,
+        "best_validation_bce": best_loss,
+        "threshold_candidates": threshold_diagnostics,
+        "chosen_veto_threshold": threshold,
+        "intervention_enabled": threshold is not None,
+        "minimum_veto_precision_required": MIN_VETO_PRECISION,
+        "minimum_veto_samples_required": MIN_VETO_VALIDATION_SAMPLES,
+    }
+
+
+def _probability(
+    model: MetaVetoNet,
+    scale: MetaScale,
+    arrays: dict[str, np.ndarray],
+    frames: dict[str, pd.DataFrame],
+    *,
+    date: pd.Timestamp,
+    candidate: str,
+    incumbent: str,
+    candidate_utility: float,
+    incumbent_utility: float,
+) -> float | None:
+    cframe = frames[candidate]
+    iframe = frames[incumbent]
+    cidx = cframe.index.get_indexer([date])
+    iidx = iframe.index.get_indexer([date])
+    if (
+        len(cidx) != 1 or len(iidx) != 1
+        or int(cidx[0]) < WINDOW-1 or int(iidx[0]) < WINDOW-1
+    ):
+        return None
+    cloc, iloc = int(cidx[0]), int(iidx[0])
+    candidate_window = arrays[candidate][cloc-WINDOW+1:cloc+1].T
+    incumbent_window = arrays[incumbent][iloc-WINDOW+1:iloc+1].T
+    if not np.isfinite(candidate_window).all() or not np.isfinite(incumbent_window).all():
+        return None
+    raw = np.asarray([
+        candidate_utility,
+        incumbent_utility,
+        candidate_utility-incumbent_utility,
+    ], dtype=np.float64)
+    context = np.clip(
+        (raw-scale.context_mean)/scale.context_std, -8.0, 8.0,
+    ).astype(np.float32)
+    model.eval()
+    with torch.no_grad():
+        logit = model(
+            torch.from_numpy(candidate_window[None].astype(np.float32)),
+            torch.from_numpy(incumbent_window[None].astype(np.float32)),
+            torch.from_numpy(context[None]),
+        )
+        value = float(torch.sigmoid(logit).item())
+    return value if math.isfinite(value) else None
