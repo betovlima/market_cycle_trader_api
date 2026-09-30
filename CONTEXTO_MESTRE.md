@@ -57,7 +57,10 @@
 - Regra fail-safe congelada antes do novo OOS: pelo menos 30 amostras de calibração e balanced accuracy >= 0,55 para habilitar o modelo; somente probabilidade de vantagem <= 0,40 pode vetar. CASH->ativo, ativo->CASH, HOLD, ausência de score ou skill insuficiente executam exatamente o Control.
 - O target deste primeiro incremento é vantagem local de ação por retorno futuro ponderado candidato menos incumbent. Não chamar de DeltaCapital exato de carteira; rollout estado-dependente de capital permanece extensão posterior.
 - Testes em `tests/test_control_counterfactual_advantage.py` cobrem maturidade temporal, ausência de vazamento de features futuras, domínio restrito do veto e fallback Control.
-- Ainda pendente no mesmo branch: acoplar ao replay v10.8.44 com paridade obrigatória, job administrativo /docs, artefatos v10.8.47 e execução local. Nenhuma Strategy operacional, Winner, TCC, carteira ou ordem foi alterada.
+- Integração concluída no branch: o mesmo treinamento LightGBM gera policies/caches usados em dois replays independentes, primeiro v10.8.44 Liquidity-Aware e depois v10.8.47 Meta-Veto. O job aborta se o baseline não reproduzir exatamente o capital persistido da v10.8.44 (tolerância absoluta US$ 1e-6).
+- Endpoint administrativo: `POST /api/admin/control-shadow/counterfactual-advantage/jobs`, confirmação `RESEARCH_CONTROL_COUNTERFACTUAL_ADVANTAGE_NO_ORDERS`, exigindo IDs exatos v10.8.41/42/44/45/46 e mesmo SHA. GET de status/logs no mesmo prefixo. Sem parâmetros HTTP de tuning.
+- Artefatos em `validation/v10.8.47/<job_id>`: summary, curvas/fills baseline e meta-veto, training folds, decisões/probabilidades/vetos, folds de capital, curvas alinhadas e PNG.
+- Próximo passo: confirmar testes/CI do HEAD e executar localmente pelo /docs. Não interpretar capital v10.8.47 antes do job real. Nenhuma Strategy operacional, Winner, TCC, carteira ou ordem foi alterada.
 
 ## v10.8.46 — Deep Pairwise Ranking + Control Utility (pesquisa, sem ordem)
 ### Resultado real v10.8.46 — Deep Ranking falhou e destruiu o Control ao substituir sua ordem
