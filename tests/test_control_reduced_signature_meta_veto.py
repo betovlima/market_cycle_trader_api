@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.51 reduced-signature meta-veto research."""
+"""Safeguards for v10.8.53 one-shot reduced-signature meta-veto research."""
 from __future__ import annotations
 
 import sys
@@ -74,12 +74,18 @@ class ReducedSignatureMetaVetoTests(TestCase):
             with self.assertRaises(ValidationError):
                 StartControlReducedMetaVetoRequest.model_validate({**body,**extra})
 
-    def test_fold_one_is_always_disabled_and_future_fold_rows_are_excluded(self):
+    def test_fold_one_is_disabled_and_only_fully_mature_prior_rows_are_eligible(self):
         rows=[]
+        base=pd.Timestamp("2020-01-01",tz="UTC")
         for i in range(30):
             fold=1 if i<10 else (2 if i<20 else 3)
+            decision=base+pd.Timedelta(days=i)
+            rollout_end=decision+pd.Timedelta(days=2)
+            if i in (18,19):
+                rollout_end=base+pd.Timedelta(days=25)
             row={
-                "decision_date":pd.Timestamp("2020-01-01",tz="UTC")+pd.Timedelta(days=i),
+                "decision_date":decision,
+                "rollout_end_date":rollout_end,
                 "source_fold_id":fold,
                 "rotate_better":i%2,
             }
@@ -87,15 +93,25 @@ class ReducedSignatureMetaVetoTests(TestCase):
             rows.append(row)
         dataset=pd.DataFrame(rows)
         folds=[
-            {"fold_id":1},
-            {"fold_id":2},
-            {"fold_id":3},
+            {"fold_id":1,"test_start":base},
+            {"fold_id":2,"test_start":base+pd.Timedelta(days=10)},
+            {"fold_id":3,"test_start":base+pd.Timedelta(days=20)},
         ]
         models,reports=train_fold_models(dataset,folds)
         self.assertFalse(models[1].enabled)
         self.assertEqual(reports[0]["disable_reason"],"NO_PRIOR_OOS_FOLD")
-        self.assertEqual(reports[1]["eligible_prior_rows"],10)
-        self.assertEqual(reports[2]["eligible_prior_rows"],20)
+        self.assertEqual(reports[1]["eligible_prior_rows"],8)
+        self.assertEqual(reports[2]["eligible_prior_rows"],18)
+
+    def test_one_shot_veto_forces_next_policy_call_back_to_control(self):
+        import inspect
+        from market_cycle_trader_api.engine import control_reduced_signature_meta_veto as engine
+
+        source=inspect.getsource(engine.run_reduced_signature_meta_veto_pair)
+        self.assertIn("force_control_next = [False]",source)
+        self.assertIn("if force_control_next[0]:",source)
+        self.assertIn('reason = "CONTROL_AFTER_ONE_SHOT_VETO"',source)
+        self.assertIn("force_control_next[0] = True",source)
 
     def test_unconfirmed_v1050_is_rejected_before_thread(self):
         db=MagicMock()
