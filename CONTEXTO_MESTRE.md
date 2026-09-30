@@ -60,7 +60,10 @@
 - Fonte de maturidade: `paired_rollout_labels.csv` da v10.8.48, unido ao dataset v10.8.49 por decision_date/incumbent/candidate. Fold2 permanece com 75 labels elegíveis; Fold3 passa de 191 para 184.
 - Modelo, 9 features, C=0.25, split cronológico 70/30, gate BA>=0.52, AUC>=0.52 e veto P(ROTATE melhor)<=0.35 permanecem congelados. Nenhum threshold ou feature foi ajustado após observar o capital ruim.
 - A v10.8.52 é válida para diagnóstico de falha/paridade, mas seu capital Meta-Veto NÃO representa a política-alvo devido à repetição indevida de veto e à maturidade causal incompleta.
-- Próximo passo: implementar/testar v10.8.53, repetir o mesmo endpoint e exigir novamente paridade v10.8.44 antes de interpretar capital.
+- Implementação concluída: `control_reduced_signature_meta_veto.py` exige `rollout_end_date < test_start` e aplica estado one-shot `force_control_next`; `control_reduced_signature_meta_veto_research.py` une os 321 eventos ao `paired_rollout_labels.csv` da v10.8.48 para recuperar maturidade exata e grava artefatos sob `validation/v10.8.53/`.
+- O endpoint permanece `POST /api/admin/control-shadow/reduced-meta-veto/jobs`, sem login e com o mesmo payload. Não foram adicionados parâmetros HTTP.
+- Testes atualizados para exigir maturidade integral, one-shot explícito, Liquidity-Aware habilitado e API v10.8.53.
+- Próximo passo: confirmar CI do HEAD e repetir o mesmo endpoint; paridade v10.8.44 continua obrigatória antes de interpretar capital.
 
 ## v10.8.52 — Correção de paridade Liquidity-Aware no Meta-Veto
 - Branch `fix/v10.8.52-reduced-meta-veto-liquidity-parity`, derivada da v10.8.51 após falha real do job `control-meta-c396c6c3d802488f`.
