@@ -59,7 +59,10 @@
 - Modelos fixos: Logistic Regression balanceada C=1.0; Logistic Regression L2 mais regularizada C=0.25; e nove modelos logísticos univariados (uma feature por vez). Threshold fixo 0.50; sem grid search, feature selection pós-OOS ou tuning.
 - Validação temporal permanece: Fold2 <- Fold1; Fold3 <- Folds1+2.
 - Critério de confirmação pré-declarado e mais rígido: o mesmo modelo multivariado reduzido precisa ter Balanced Accuracy > 0.50 E ROC AUC > 0.50 nos Folds 2 e 3. Modelos univariados são apenas explicativos e não contam isoladamente como confirmação.
+- Implementação concluída: `engine/control_reduced_rollout_signature.py` avalia a assinatura congelada; `engine/control_reduced_rollout_signature_research.py` orquestra fonte/artefatos; `services/control_shadow_reduced_signature_jobs.py` cria job admin isolado; Swagger expõe `POST /api/admin/control-shadow/reduced-signature/jobs` e GET de status/logs.
+- Artefatos: `summary.json`, `reduced_model_results.csv`, `reduced_logistic_coefficients.csv`, `coefficient_stability.csv`.
 - Nenhuma policy é criada nesta versão. Mesmo se o sinal for confirmado, o próximo passo seria desenhar separadamente uma política fail-safe e congelar seu protocolo antes de avaliar capital.
+- Próximo passo: confirmar CI completa, executar a v10.8.50 sobre `control-signature-5dedf5eee0f94e8a` e auditar o resultado sem alterar as features/modelos após observar o OOS.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.49 — Rollout Decision Signature Research (diagnóstico, sem ordem)
