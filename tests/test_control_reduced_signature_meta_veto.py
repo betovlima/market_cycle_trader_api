@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.53 one-shot reduced-signature meta-veto research."""
+"""Safeguards for v10.8.54 capital-weighted meta-veto research."""
 from __future__ import annotations
 
 import sys
@@ -25,6 +25,7 @@ from market_cycle_trader_api.engine.control_reduced_signature_meta_veto import (
     MIN_CALIBRATION_BALANCED_ACCURACY,
     MIN_CALIBRATION_ROC_AUC,
     VETO_PROBABILITY_MAX,
+    _capital_sample_weights,
     train_fold_models,
 )
 from market_cycle_trader_api.services import (
@@ -47,6 +48,16 @@ class ReducedSignatureMetaVetoTests(TestCase):
         self.assertEqual(VETO_PROBABILITY_MAX,0.35)
         self.assertEqual(len(REDUCED_FEATURES),9)
 
+    def test_capital_weights_follow_absolute_delta_and_normalize_mean(self):
+        frame=pd.DataFrame({
+            "delta_capital_fraction":[-0.01,0.02,-0.08,0.0],
+        })
+        weights=_capital_sample_weights(frame)
+        self.assertAlmostEqual(float(weights.mean()),1.0,places=12)
+        self.assertGreater(weights[2],weights[1])
+        self.assertGreater(weights[1],weights[0])
+        self.assertGreater(weights[0],weights[3])
+
     def test_liquidity_overlay_is_explicitly_enabled_in_replay(self):
         import inspect
         from market_cycle_trader_api.engine import control_reduced_signature_meta_veto as engine
@@ -68,6 +79,8 @@ class ReducedSignatureMetaVetoTests(TestCase):
             {"minimum_auc":0.50},
             {"features":["incumbent__return_20"]},
             {"grid_search":True},
+            {"capital_weight_exponent":2.0},
+            {"capital_weight_floor":0.01},
             {"send_order":True},
             {"winner_strategy_id":"x"},
         ):

@@ -49,6 +49,7 @@ VETO_PROBABILITY_MAX = 0.35
 RANDOM_SEED = 20260930
 LIQUIDITY_LOOKBACK = 20
 PARTICIPATION_RATE = 0.10
+CAPITAL_WEIGHT_FLOOR = 1e-6
 
 
 @dataclass(frozen=True)
@@ -84,11 +85,26 @@ def _chronological_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     return ordered.iloc[:cut].copy(), ordered.iloc[cut:].copy()
 
 
+def _capital_sample_weights(frame: pd.DataFrame) -> np.ndarray:
+    raw = pd.to_numeric(
+        frame["delta_capital_fraction"], errors="coerce",
+    ).abs().fillna(0.0).to_numpy(dtype=float)
+    raw = np.maximum(raw, CAPITAL_WEIGHT_FLOOR)
+    mean = float(np.mean(raw))
+    if not math.isfinite(mean) or mean <= 0:
+        raise ValueError("Capital-weighted training requires positive finite weights.")
+    return raw / mean
+
+
 def train_fold_models(
     dataset: pd.DataFrame,
     folds: list[dict[str, Any]],
+    *,
+    capital_weighted: bool = False,
 ) -> tuple[dict[int, FoldModel], list[dict[str, Any]]]:
     required = {"decision_date", "rollout_end_date", "source_fold_id", "rotate_better", *REDUCED_FEATURES}
+    if capital_weighted:
+        required.add("delta_capital_fraction")
     missing = sorted(required - set(dataset.columns))
     if missing:
         raise ValueError(f"v10.8.53 source dataset missing columns: {missing}")
@@ -138,7 +154,18 @@ def train_fold_models(
             continue
 
         model = _make_model()
-        model.fit(training[list(REDUCED_FEATURES)], training["rotate_better"].astype(int))
+        training_weights = (
+            _capital_sample_weights(training) if capital_weighted else None
+        )
+        training_fit = (
+            {"model__sample_weight": training_weights}
+            if training_weights is not None else {}
+        )
+        model.fit(
+            training[list(REDUCED_FEATURES)],
+            training["rotate_better"].astype(int),
+            **training_fit,
+        )
         probability = model.predict_proba(calibration[list(REDUCED_FEATURES)])[:, 1]
         prediction = (probability >= 0.50).astype(int)
         y_cal = calibration["rotate_better"].astype(int)
@@ -156,9 +183,17 @@ def train_fold_models(
         reason = None
         if enabled:
             final_model = _make_model()
+            prior_weights = (
+                _capital_sample_weights(prior) if capital_weighted else None
+            )
+            final_fit = (
+                {"model__sample_weight": prior_weights}
+                if prior_weights is not None else {}
+            )
             final_model.fit(
                 prior[list(REDUCED_FEATURES)],
                 prior["rotate_better"].astype(int),
+                **final_fit,
             )
         else:
             reason = "CALIBRATION_GATE_FAILED"
@@ -176,6 +211,11 @@ def train_fold_models(
             "disable_reason": reason,
             "veto_probability_max": VETO_PROBABILITY_MAX,
             "test_start": test_start.isoformat(),
+            "capital_weighted_training": bool(capital_weighted),
+            "weight_definition": (
+                "abs(delta_capital_fraction)/mean(abs(delta_capital_fraction))"
+                if capital_weighted else "uniform"
+            ),
         })
     return models, reports
 
@@ -253,6 +293,7 @@ def run_reduced_signature_meta_veto_pair(
     slippage: Callable,
     *,
     source_dataset: pd.DataFrame,
+    capital_weighted: bool = False,
     progress_callback: Callable[[float, str, int], None] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     (
@@ -262,7 +303,9 @@ def run_reduced_signature_meta_veto_pair(
     if len(symbols) != 55 or len(folds) != 3:
         raise ValueError("v10.8.53 expects frozen 55-asset / 3-fold Control context.")
 
-    fold_models, training_reports = train_fold_models(source_dataset, folds)
+    fold_models, training_reports = train_fold_models(
+        source_dataset, folds, capital_weighted=capital_weighted,
+    )
 
     original_runner = scientific._run_lightgbm
     original_policy = original_runner.__globals__.get("_utility_policy")
@@ -380,6 +423,7 @@ def run_reduced_signature_meta_veto_pair(
                 "reason": reason,
                 "state_shares": int(account.get("shares") or 0),
                 "state_equity": float(account.get("equity") or 0.0),
+                "capital_weighted_training": bool(capital_weighted),
             })
             return final_target, float(control_score)
 

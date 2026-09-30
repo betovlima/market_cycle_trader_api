@@ -963,7 +963,7 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 
     confirm: Literal["RESEARCH_CONTROL_REDUCED_META_VETO_NO_ORDERS"] = Field(
         description=(
-            "Run the frozen v10.8.53 one-shot reduced-signature fail-safe meta-veto. "
+            "Run the frozen v10.8.54 capital-weighted Meta-Veto comparison. "
             "Research only; never creates or submits orders."
         )
     )
@@ -980,7 +980,7 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 @router.post(
     "/reduced-meta-veto/jobs",
     status_code=202,
-    summary="Run v10.8.53 one-shot reduced-signature Meta-Veto — research only",
+    summary="Run v10.8.54 capital-weighted Meta-Veto comparison — research only",
     description=(
         "Uses the confirmed v10.8.50 9-feature signature with fixed balanced "
         "Logistic Regression C=0.25. Fold 1 is Control-only; Fold 2 learns "
@@ -1011,7 +1011,7 @@ def start_reduced_meta_veto_job(
 
 @router.get(
     "/reduced-meta-veto/jobs/{job_id}",
-    summary="Read v10.8.53 one-shot reduced-signature Meta-Veto result",
+    summary="Read current reduced Meta-Veto research result",
 )
 def read_reduced_meta_veto_job(job_id: str) -> dict[str, Any]:
     try:
@@ -1022,7 +1022,7 @@ def read_reduced_meta_veto_job(job_id: str) -> dict[str, Any]:
 
 @router.get(
     "/reduced-meta-veto/jobs/{job_id}/logs",
-    summary="Read v10.8.53 one-shot reduced-signature Meta-Veto progress and logs",
+    summary="Read current reduced Meta-Veto research progress and logs",
 )
 def read_reduced_meta_veto_logs(job_id: str) -> dict[str, Any]:
     try:

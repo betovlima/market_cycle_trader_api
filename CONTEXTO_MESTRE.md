@@ -59,6 +59,25 @@
 - Métricas de risco (Sharpe, MaxDD, custos, liquidez e estabilidade por fold) permanecem diagnósticos obrigatórios, mas não substituem o objetivo primário de capital final.
 - Não criar novos endpoints por experimento. Reutilizar a rota de pesquisa existente da linha quando possível e manter versões/resultados nos artefatos e documentação.
 
+## v10.8.54 — Capital-Weighted Meta-Veto
+- Branch `feature/v10.8.54-capital-weighted-meta-veto`, derivada da v10.8.53.
+- Objetivo: tentar aumentar o capital final em relação à v10.8.53 sem alterar threshold, features, one-shot, maturidade ou execução. A única hipótese nova é ponderar o treino da Logistic Regression pela magnitude econômica de cada label.
+- Referência obrigatória: a mesma execução deve reproduzir internamente a v10.8.53 unweighted em `US$ 1.891.417,6670329159` e a v10.8.44 em `US$ 1.078.635,4115518222`, ambas com tolerância absoluta 1e-6 antes de interpretar a candidata.
+- Modelo candidato: mesma Logistic Regression balanceada L2, C=0.25, mesmas 9 features.
+- Peso de treino pré-declarado: `w_i = max(abs(delta_capital_fraction_i), 1e-6) / mean(max(abs(delta_capital_fraction), 1e-6))`, calculado apenas sobre o conjunto histórico usado naquele fit. Nenhum clipping, expoente ou parâmetro de peso será ajustado após observar o resultado.
+- Calibração permanece NÃO ponderada para o gate: mínimo 20 eventos, BA>=0.52 e AUC>=0.52. Threshold de veto permanece fixo em P(ROTATE melhor)<=0.35.
+- Fold1 sem modelo; Fold2 usa somente rollouts maduros do Fold1; Fold3 usa somente rollouts maduros Folds1+2; `rollout_end_date < test_start`.
+- One-shot permanece literal: HOLD uma vez e a chamada seguinte é Control obrigatório.
+- O job v10.8.54 executará dois caminhos comparáveis no mesmo snapshot: referência v10.8.53 unweighted e candidata capital-weighted. Só conta como melhoria se o capital final da candidata superar a referência.
+- Implementação concluída: `control_reduced_signature_meta_veto.py` agora aceita `capital_weighted=True|False` com fórmula de peso congelada; `control_capital_weighted_meta_veto_research.py` executa no mesmo job a referência v10.8.53 e a candidata v10.8.54, exigindo paridade v10.8.44 e v10.8.53 antes da comparação; o serviço existente foi reapontado para essa orquestração.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs` com o mesmo payload.
+- Critério de decisão do experimento: candidata só conta como avanço se `candidate_final_capital > 1.891.417,6670329159`; caso contrário, descartar v10.8.54 e manter v10.8.53 como melhor referência comparável.
+- Execução real auditada: job `control-meta-f62da71f186b459c`, snapshot/SHA corretos. Paridade v10.8.44 = `US$ 1.078.635,4115518222`; paridade v10.8.53 = `US$ 1.891.417,6670329159`; ambas diferença 0.
+- Hipótese capital-weighted REJEITADA. Fold2: BA 0,496212 / AUC 0,681818; Fold3: BA 0,442529 / AUC 0,498084. O gate falhou nos dois folds, portanto nenhum modelo candidato foi habilitado, `candidate_veto_count=0`, e a candidata terminou exatamente no Control/Liquidity-Aware `US$ 1.078.635,4115518222` (-42,9721% contra v10.8.53).
+- Interpretação: ponderar diretamente por `abs(delta_capital_fraction)` destruiu a separação de sinal necessária para o gate, especialmente no Fold3. Não ajustar expoente/clipping/peso pós-OOS; descartar esta hipótese.
+- v10.8.53 permanece a melhor referência comparável em `US$ 1.891.417,6670329159`.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
 - Branch `fix/v10.8.53-one-shot-meta-veto-causal-maturity`, derivada da v10.8.52 após auditoria do job `control-meta-da56431b92294ebd`.
 - A v10.8.52 corrigiu corretamente a paridade Liquidity-Aware: baseline reproduziu exatamente `US$ 1.078.635,4115518222` (diferença 0). Porém o Meta-Veto terminou em `US$ 109.239,83562554276`, delta `-89,8724%`, com 734 vetos em 809 decisões modeladas.
