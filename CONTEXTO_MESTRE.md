@@ -51,6 +51,14 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## Regra de objetivo da pesquisa — 2026-09-30
+- Não existe meta fixa de capital (por exemplo US$ 2M, US$ 5M ou US$ 40M).
+- Objetivo primário: maximizar o capital final obtido pelas configurações candidatas, usando como referência a melhor configuração válida disponível no momento.
+- Valores históricos maiores servem como evidência e contexto, não como alvo obrigatório.
+- Uma alteração só conta como avanço quando aumenta o capital final sob protocolo causal/reprodutível comparável; resultados obtidos por tuning pós-OOS, seleção retrospectiva de ativos ou mudança de janela não devem ser tratados como melhoria validada.
+- Métricas de risco (Sharpe, MaxDD, custos, liquidez e estabilidade por fold) permanecem diagnósticos obrigatórios, mas não substituem o objetivo primário de capital final.
+- Não criar novos endpoints por experimento. Reutilizar a rota de pesquisa existente da linha quando possível e manter versões/resultados nos artefatos e documentação.
+
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
 - Branch `fix/v10.8.53-one-shot-meta-veto-causal-maturity`, derivada da v10.8.52 após auditoria do job `control-meta-da56431b92294ebd`.
 - A v10.8.52 corrigiu corretamente a paridade Liquidity-Aware: baseline reproduziu exatamente `US$ 1.078.635,4115518222` (diferença 0). Porém o Meta-Veto terminou em `US$ 109.239,83562554276`, delta `-89,8724%`, com 734 vetos em 809 decisões modeladas.
