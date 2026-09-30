@@ -11,6 +11,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_deep_rank_jobs import (
+    DeepRankConflict, DeepRankInvalid, DeepRankNotFound,
+    start_deep_ranking_research, get_deep_ranking_research,
+)
 from ...services.control_shadow_tcn_jobs import (
     TCNConflict, TCNInvalid, TCNNotFound,
     start_tcn_research, get_tcn_research,
@@ -497,4 +501,94 @@ def read_deep_learning_logs(job_id: str) -> dict[str, Any]:
     try:
         return get_tcn_research(database(), job_id, logs_only=True)
     except TCNNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlDeepRankingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_PAIRWISE_DEEP_RANK_NO_ORDERS"] = Field(
+        description=(
+            "Train a fixed temporal pairwise ranker. Original LightGBM owns "
+            "absolute utility thresholds and the existing liquidity overlay "
+            "and execution accounting remain unchanged."
+        )
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+    )
+    source_execution_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-execution-[a-f0-9]{16}$",
+    )
+    source_liquidity_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-liquidity-[a-f0-9]{16}$",
+    )
+    source_tcn_job_id: str = Field(
+        min_length=28, max_length=28,
+        pattern=r"^control-tcn-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/deep-ranking/jobs",
+    status_code=202,
+    summary="Pairwise Deep Ranking + original Control utility — research only",
+    description=(
+        "Learns within-date candidate ordering on fully matured past labels. "
+        "Deep Learning controls ranking only; original fold-specific LightGBM "
+        "controls absolute utility/CASH/switch thresholds and the v10.8.44 "
+        "liquidity overlay plus v10.8.42 execution model stay fixed. "
+        "No Alpaca refresh, production strategy update or orders."
+    ),
+)
+def start_deep_ranking_job(
+    payload: StartControlDeepRankingRequest,
+) -> dict[str, Any]:
+    try:
+        return start_deep_ranking_research(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            source_execution_job_id=payload.source_execution_job_id,
+            source_liquidity_job_id=payload.source_liquidity_job_id,
+            source_tcn_job_id=payload.source_tcn_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except DeepRankNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DeepRankConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DeepRankInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/deep-ranking/jobs/{job_id}",
+    summary="Read pairwise Deep Ranking historical diagnostics and portfolio",
+)
+def read_deep_ranking_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_deep_ranking_research(database(), job_id)
+    except DeepRankNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/deep-ranking/jobs/{job_id}/logs",
+    summary="Read pairwise Deep Ranking training and replay progress",
+)
+def read_deep_ranking_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_deep_ranking_research(
+            database(), job_id, logs_only=True,
+        )
+    except DeepRankNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
