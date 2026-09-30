@@ -81,6 +81,8 @@
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - Critério do experimento: candidata só conta como avanço se superar `US$ 1.891.417,6670329159`. Se não superar, descartar v10.8.56 e manter v10.8.53.
 - Próximo passo: confirmar CI e executar o endpoint existente; auditar vetos confirmados, vetos cancelados, fallback classifier-only por fold e capital final.
+- Incidente de runtime local em 2026-09-30: o ZIP `dados(20260930-235324).zip` não contém artefatos v10.8.56. A execução mais recente no horário do arquivo foi `control-meta-22a6b2af938f406f` sob `validation/v10.8.54`, com `research_kind=control_capital_weighted_meta_veto`; portanto o processo local que atendeu a requisição ainda estava com runner v10.8.54 carregado. Isso NÃO é resultado v10.8.56.
+- Proteção adicionada ainda na v10.8.56 antes de qualquer execução válida: job público agora expõe `api_version` e `research_runner=consensus-meta-veto-v1056`; o serviço também aborta se `API_VERSION != 10.8.56`. Após trocar branch/pull, reiniciar explicitamente o processo Uvicorn antes de executar a pesquisa.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.55 — Expected Advantage Regression (rejeitada)
