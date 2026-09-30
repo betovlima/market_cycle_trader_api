@@ -60,7 +60,7 @@
 - Integração concluída no branch: o mesmo treinamento LightGBM gera policies/caches usados em dois replays independentes, primeiro v10.8.44 Liquidity-Aware e depois v10.8.47 Meta-Veto. O job aborta se o baseline não reproduzir exatamente o capital persistido da v10.8.44 (tolerância absoluta US$ 1e-6).
 - Endpoint administrativo: `POST /api/admin/control-shadow/counterfactual-advantage/jobs`, confirmação `RESEARCH_CONTROL_COUNTERFACTUAL_ADVANTAGE_NO_ORDERS`, exigindo IDs exatos v10.8.41/42/44/45/46 e mesmo SHA. GET de status/logs no mesmo prefixo. Sem parâmetros HTTP de tuning.
 - Artefatos em `validation/v10.8.47/<job_id>`: summary, curvas/fills baseline e meta-veto, training folds, decisões/probabilidades/vetos, folds de capital, curvas alinhadas e PNG.
-- Próximo passo: confirmar testes/CI do HEAD e executar localmente pelo /docs. Não interpretar capital v10.8.47 antes do job real. Nenhuma Strategy operacional, Winner, TCC, carteira ou ordem foi alterada.
+- CI do HEAD de código `f33b8354cac27aa15642ed206f8fec61acb8b99f` passou completa em Python 3.12 após atualizar os contratos de rotas e API_VERSION para 10.8.47. Próximo passo: executar localmente pelo /docs e analisar os artefatos; não interpretar capital v10.8.47 antes do job real. Nenhuma Strategy operacional, Winner, TCC, carteira ou ordem foi alterada.
 
 ## v10.8.46 — Deep Pairwise Ranking + Control Utility (pesquisa, sem ordem)
 ### Resultado real v10.8.46 — Deep Ranking falhou e destruiu o Control ao substituir sua ordem
