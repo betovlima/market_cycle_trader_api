@@ -61,6 +61,7 @@
 - Implementação concluída na branch: `simulate_feasible_control` aceita `initial_state` opcional e reconciliado; `engine/control_policy_rollout_advantage.py` gera rollouts pareados de 20 sessões; `engine/control_policy_rollout_research.py` exige paridade v10.8.44 e grava artefatos; `services/control_shadow_policy_rollout_jobs.py` cria job isolado; Swagger expõe `POST /api/admin/control-shadow/policy-rollout/jobs` e GET de status/logs.
 - Cadeia real congelada para a execução: v10.8.41 `control-validation-7821002400424ccc`; v10.8.42 `control-execution-c38169f6c6fc4ea0`; v10.8.44 `control-liquidity-dbe4ec6f52c74694`; v10.8.45 `control-tcn-b7d0247118314107`; v10.8.46 `control-rank-c67e91abb3914f26`; v10.8.47 `control-advantage-53fc67bd758f443a`; SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
 - Testes adicionados para estado histórico reconciliado, rejeição fail-closed, Fold 1 obrigatoriamente sem meta-modelo, exclusão de labels do fold corrente e bloqueio de parâmetros HTTP de tuning.
+- Os labels de folds posteriores são sempre gerados sobre a trajetória-base v10.8.44; estados criados pelos próprios vetos v10.8.48 não retroalimentam o treinamento nesta hipótese, evitando dependência recursiva entre folds.
 - Próximo passo: confirmar CI completa do HEAD e executar localmente pelo /docs; somente então analisar `paired_rollout_labels.csv`, skill por fold, vetos e capital v10.8.48.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
