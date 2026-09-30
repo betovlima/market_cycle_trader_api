@@ -30,6 +30,11 @@ from ...services.control_shadow_rollout_signature_jobs import (
     start_rollout_signature_research,
     get_rollout_signature_research,
 )
+from ...services.control_shadow_reduced_signature_jobs import (
+    ReducedSignatureConflict, ReducedSignatureInvalid, ReducedSignatureNotFound,
+    start_reduced_rollout_signature_research,
+    get_reduced_rollout_signature_research,
+)
 from ...services.control_shadow_tcn_jobs import (
     TCNConflict, TCNInvalid, TCNNotFound,
     start_tcn_research, get_tcn_research,
@@ -873,5 +878,78 @@ def read_rollout_signature_logs(job_id: str) -> dict[str, Any]:
             database(), job_id, logs_only=True,
         )
     except SignatureNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+class StartControlReducedSignatureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_CONTROL_REDUCED_ROLLOUT_SIGNATURE_NO_ORDERS"] = Field(
+        description=(
+            "Confirm the frozen 9-feature v10.8.50 diagnostic. This endpoint "
+            "does not create or promote a trading policy."
+        )
+    )
+    source_signature_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-signature-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/reduced-signature/jobs",
+    status_code=202,
+    summary="Confirm the reduced 9-feature rollout signature — diagnostic only",
+    description=(
+        "Consumes the verified signal-positive v10.8.49 dataset and evaluates "
+        "two fixed reduced Logistic Regression models plus nine explanatory "
+        "univariate models. Confirmation requires balanced accuracy > 0.50 "
+        "and ROC AUC > 0.50 on both chronological transfer tests. No tuning, "
+        "policy creation, Alpaca refresh, Winner change or orders."
+    ),
+)
+def start_reduced_signature_job(
+    payload: StartControlReducedSignatureRequest,
+) -> dict[str, Any]:
+    try:
+        return start_reduced_rollout_signature_research(
+            database(),
+            source_signature_job_id=payload.source_signature_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ReducedSignatureNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ReducedSignatureConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ReducedSignatureInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/reduced-signature/jobs/{job_id}",
+    summary="Read v10.8.50 reduced signature confirmation results",
+)
+def read_reduced_signature_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_reduced_rollout_signature_research(database(), job_id)
+    except ReducedSignatureNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/reduced-signature/jobs/{job_id}/logs",
+    summary="Read v10.8.50 reduced signature progress and logs",
+)
+def read_reduced_signature_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_reduced_rollout_signature_research(
+            database(), job_id, logs_only=True,
+        )
+    except ReducedSignatureNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
