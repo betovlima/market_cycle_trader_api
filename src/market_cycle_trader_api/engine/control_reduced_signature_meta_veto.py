@@ -49,6 +49,7 @@ VETO_PROBABILITY_MAX = 0.35
 RANDOM_SEED = 20260930
 LIQUIDITY_LOOKBACK = 20
 PARTICIPATION_RATE = 0.10
+CAPITAL_WEIGHT_FLOOR = 1e-6
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,17 @@ def _chronological_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
     if cut <= 0:
         return ordered.iloc[0:0], ordered.iloc[0:0]
     return ordered.iloc[:cut].copy(), ordered.iloc[cut:].copy()
+
+
+def _capital_sample_weights(frame: pd.DataFrame) -> np.ndarray:
+    raw = pd.to_numeric(
+        frame["delta_capital_fraction"], errors="coerce",
+    ).abs().fillna(0.0).to_numpy(dtype=float)
+    raw = np.maximum(raw, CAPITAL_WEIGHT_FLOOR)
+    mean = float(np.mean(raw))
+    if not math.isfinite(mean) or mean <= 0:
+        raise ValueError("Capital-weighted training requires positive finite weights.")
+    return raw / mean
 
 
 def train_fold_models(
