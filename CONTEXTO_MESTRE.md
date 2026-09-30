@@ -67,6 +67,16 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.55 — Expected Advantage Regression (rejeitada)
+- Job real `control-meta-46ab5ebc5a6c4a6d`; ZIP `dados(20260930-233332).zip`, 548 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Fold2 regressão: 75 labels maduros; calibration sign BA 0,575758; Spearman 0,356719; modelo habilitado.
+- Fold3 regressão: 184 labels maduros; calibration sign BA 0,405492; Spearman -0,199658; gate falhou e modelo foi desabilitado.
+- Candidata aplicou 57 vetos, todos no Fold2. Capital final `US$ 1.038.414,3657602259`, delta `-US$ 853.003,30` / `-45,0986%` contra v10.8.53. Sharpe 1,6594; MaxDD -42,61%.
+- Ao fim do Fold2, antes do Fold3, a candidata já estava materialmente abaixo da referência; o problema não foi apenas a desativação do Fold3.
+- Hipótese de substituir o classificador pelo regressor foi rejeitada sem tuning de alpha/threshold. v10.8.53 permanece a melhor referência válida.
+- Diagnóstico para próxima hipótese: usar o regressor apenas como confirmação secundária dos vetos do classificador, nunca como substituto. No Fold2, dos 30 vetos da v10.8.53, 20 ocorreram em datas/estados nos quais o regressor também indicou vantagem econômica não positiva; o Fold3 deve cair automaticamente para a v10.8.53 porque o regressor não passou no gate.
+
 ## v10.8.55 — Expected Advantage Regression Meta-Veto
 - Branch `feature/v10.8.55-expected-advantage-regression-meta-veto`, derivada diretamente da melhor referência v10.8.53; a v10.8.54 foi rejeitada e não é base desta versão.
 - Objetivo: aumentar capital final modelando diretamente `delta_capital_fraction` do rollout ROTATE-vs-HOLD, em vez de classificar apenas seu sinal.
