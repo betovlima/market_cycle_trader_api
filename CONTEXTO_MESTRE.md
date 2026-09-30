@@ -51,6 +51,16 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.48 — Control Policy Rollout Advantage (pesquisa, sem ordem)
+- Branch `feature/v10.8.48-control-policy-rollout-advantage-research`, derivada da v10.8.47 após auditoria do resultado real.
+- Motivação: v10.8.47 preservou corretamente a v10.8.44 porque nenhum fold atingiu skill mínima, mas o target simplificado `weighted_forward_return(candidate)-weighted_forward_return(incumbent)` não apresentou skill OOS. A arquitetura Meta-Veto é preservada; apenas o target muda.
+- Hipótese congelada antes do novo resultado: aprender `DeltaCapital = capital(ROTATE agora + mesma policy depois) - capital(HOLD uma vez + mesma policy depois)`, usando dois rollouts com o MESMO estado inicial, MESMA policy Control/Liquidity-Aware, MESMAS restrições de execução e horizonte fixo de 20 sessões.
+- Protocolo causal: Fold 1 não usa meta-modelo por não existir OOS anterior intocado. Fold 2 aprende somente com oportunidades da Fold 1. Fold 3 aprende somente com oportunidades das Folds 1–2. Dentro do histórico anterior, treino/calibração são separados cronologicamente. Nenhum label do fold corrente pode treinar ou habilitar o modelo desse mesmo fold.
+- Somente rotações ativo->ativo propostas pelo Control geram label e podem ser vetadas. CASH->ativo, ativo->CASH e HOLD permanecem Control.
+- O gate fail-safe permanece: sem amostras/skill/confiança suficiente, executar exatamente a decisão do Control. Não haverá tuning HTTP nem ajuste após olhar o novo OOS.
+- Próximos passos nesta branch: permitir replay isolado a partir de estado histórico no simulador sem alterar o comportamento padrão; gerar labels por rollouts pareados; integrar ao replay v10.8.44 com paridade obrigatória; criar endpoint /docs, artefatos e testes; executar e auditar o resultado.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.47 — Control Counterfactual Advantage Meta-Veto (pesquisa, sem ordem)
 - Branch `feature/v10.8.47-control-counterfactual-advantage-research`, derivada diretamente da v10.8.46. O Control/Liquidity-Aware permanece a ação padrão; o novo modelo não rankeia os 55 ativos e só pode vetar rotações ativo->ativo.
 - Primeiro incremento implementado em `engine/control_counterfactual_advantage.py`: target pareado candidato-vs-incumbent, horizontes 5/10/20/40/60 com pesos científicos, maturidade integral de 60 sessões, features relativas em janela causal de 40 sessões, TinyTCN binária CPU, calibração cronológica, gate de skill e fallback explícito para Control.
