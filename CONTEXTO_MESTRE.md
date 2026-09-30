@@ -59,6 +59,14 @@
 - Métricas de risco (Sharpe, MaxDD, custos, liquidez e estabilidade por fold) permanecem diagnósticos obrigatórios, mas não substituem o objetivo primário de capital final.
 - Não criar novos endpoints por experimento. Reutilizar a rota de pesquisa existente da linha quando possível e manter versões/resultados nos artefatos e documentação.
 
+## v10.8.54 — Capital-Weighted Meta-Veto (rejeitada)
+- Execução real: job `control-meta-f62da71f186b459c`.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Fold2 candidata: BA 0,496212 / AUC 0,681818 -> gate falhou.
+- Fold3 candidata: BA 0,442529 / AUC 0,498084 -> gate falhou.
+- Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
+- Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
+
 ## v10.8.55 — Expected Advantage Regression Meta-Veto
 - Branch `feature/v10.8.55-expected-advantage-regression-meta-veto`, derivada diretamente da melhor referência v10.8.53; a v10.8.54 foi rejeitada e não é base desta versão.
 - Objetivo: aumentar capital final modelando diretamente `delta_capital_fraction` do rollout ROTATE-vs-HOLD, em vez de classificar apenas seu sinal.
