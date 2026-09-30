@@ -60,7 +60,11 @@
 - Análises fixas antes de olhar resultado: Pearson/Spearman, comparação ROTATE vs HOLD, quantis, estabilidade por fold; modelos simples Logistic Regression, árvore rasa, Random Forest pequeno e LightGBM pequeno com validação temporal.
 - Validação temporal: Fold 2 avaliado com treino somente em Fold 1; Fold 3 avaliado com treino somente em Folds 1+2. Fold 1 é apenas histórico/diagnóstico e nunca é usado como avaliação após treino futuro.
 - Sem tuning em OOS: hiperparâmetros pequenos e fixos; nenhuma busca de grade; nenhuma alteração baseada no resultado da mesma v10.8.49.
-- Próximos passos: implementar dataset/analysis, job admin /docs, artefatos, testes, executar, auditar e registrar conclusão.
+- Implementação concluída na branch: `engine/control_rollout_decision_signature.py` monta dataset causal e análises; `engine/control_rollout_signature_research.py` orquestra fonte/artefatos; `services/control_shadow_rollout_signature_jobs.py` cria job isolado; Swagger expõe `POST /api/admin/control-shadow/rollout-signature/jobs` e GET de status/logs.
+- Variáveis implementadas: estado da carteira quando recuperável na curva-base, 12 features causais do incumbent, 12 do candidate, 12 deltas relativos, preços, volume mediano anterior de 20 sessões, razão de liquidez, capacidade estimada a 10%, capacidade nocional e capacidade/equity.
+- Modelos fixos sem tuning: Logistic Regression, árvore rasa, Random Forest pequeno e LightGBM pequeno. Avaliação temporal pré-declarada: Fold2 <- Fold1; Fold3 <- Folds1+2. Critério preliminar de sinal: balanced accuracy > 0,50 nos dois testes cronológicos para o mesmo modelo.
+- Artefatos: `rollout_decision_dataset.csv`, `feature_correlations.csv`, `feature_class_comparison.csv`, `feature_quantiles.csv`, `fold_feature_stability.csv`, `model_results.csv`, `feature_importance.csv`, `summary.json`.
+- Próximo passo: confirmar CI completa, executar job v10.8.49 pelo /docs e auditar se existe sinal estável. Nenhuma conclusão preditiva foi tomada antes dessa execução.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.48 — Control Policy Rollout Advantage (pesquisa, sem ordem)
