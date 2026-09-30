@@ -50,6 +50,18 @@
 - Uma thread não sobrevive a reinício; usar um worker sem reload enquanto ensaia. Se um job ativo ficar preso após encerramento abrupto, requer recuperação controlada, não iniciar outro job à força.
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
+
+## v10.8.47 — Control Counterfactual Advantage Meta-Veto (pesquisa, sem ordem)
+- Branch `feature/v10.8.47-control-counterfactual-advantage-research`, derivada diretamente da v10.8.46. O Control/Liquidity-Aware permanece a ação padrão; o novo modelo não rankeia os 55 ativos e só pode vetar rotações ativo->ativo.
+- Primeiro incremento implementado em `engine/control_counterfactual_advantage.py`: target pareado candidato-vs-incumbent, horizontes 5/10/20/40/60 com pesos científicos, maturidade integral de 60 sessões, features relativas em janela causal de 40 sessões, TinyTCN binária CPU, calibração cronológica, gate de skill e fallback explícito para Control.
+- Regra fail-safe congelada antes do novo OOS: pelo menos 30 amostras de calibração e balanced accuracy >= 0,55 para habilitar o modelo; somente probabilidade de vantagem <= 0,40 pode vetar. CASH->ativo, ativo->CASH, HOLD, ausência de score ou skill insuficiente executam exatamente o Control.
+- O target deste primeiro incremento é vantagem local de ação por retorno futuro ponderado candidato menos incumbent. Não chamar de DeltaCapital exato de carteira; rollout estado-dependente de capital permanece extensão posterior.
+- Testes em `tests/test_control_counterfactual_advantage.py` cobrem maturidade temporal, ausência de vazamento de features futuras, domínio restrito do veto e fallback Control.
+- Integração concluída no branch: o mesmo treinamento LightGBM gera policies/caches usados em dois replays independentes, primeiro v10.8.44 Liquidity-Aware e depois v10.8.47 Meta-Veto. O job aborta se o baseline não reproduzir exatamente o capital persistido da v10.8.44 (tolerância absoluta US$ 1e-6).
+- Endpoint administrativo: `POST /api/admin/control-shadow/counterfactual-advantage/jobs`, confirmação `RESEARCH_CONTROL_COUNTERFACTUAL_ADVANTAGE_NO_ORDERS`, exigindo IDs exatos v10.8.41/42/44/45/46 e mesmo SHA. GET de status/logs no mesmo prefixo. Sem parâmetros HTTP de tuning.
+- Artefatos em `validation/v10.8.47/<job_id>`: summary, curvas/fills baseline e meta-veto, training folds, decisões/probabilidades/vetos, folds de capital, curvas alinhadas e PNG.
+- CI do HEAD de código `f33b8354cac27aa15642ed206f8fec61acb8b99f` passou completa em Python 3.12 após atualizar os contratos de rotas e API_VERSION para 10.8.47. Próximo passo: executar localmente pelo /docs e analisar os artefatos; não interpretar capital v10.8.47 antes do job real. Nenhuma Strategy operacional, Winner, TCC, carteira ou ordem foi alterada.
+
 ## v10.8.46 — Deep Pairwise Ranking + Control Utility (pesquisa, sem ordem)
 ### Resultado real v10.8.46 — Deep Ranking falhou e destruiu o Control ao substituir sua ordem
 - Job `control-rank-c67e91abb3914f26`, mesmo SHA, 55 ativos, 3 folds, 1.554 OOS; usuário enviou JSON + `dados(6).zip`. ZIP 429 entradas, CRC ok, 167/167 hashes do manifesto conferidos, 9 artefatos presentes, 85.470 scores = 55×1.554. Contabilidade equity=cash+shares×close fecha até ~US$ 3,64e-12; 248 fills, nenhum > capacidade/10% de volume, nenhum em volume zero, CASH sempre >=0. Portanto não é erro de execução.
