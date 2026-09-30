@@ -20,6 +20,11 @@ from ...services.control_shadow_counterfactual_advantage_jobs import (
     start_counterfactual_advantage_research,
     get_counterfactual_advantage_research,
 )
+from ...services.control_shadow_policy_rollout_jobs import (
+    RolloutConflict, RolloutInvalid, RolloutNotFound,
+    start_policy_rollout_advantage_research,
+    get_policy_rollout_advantage_research,
+)
 from ...services.control_shadow_tcn_jobs import (
     TCNConflict, TCNInvalid, TCNNotFound,
     start_tcn_research, get_tcn_research,
@@ -689,5 +694,105 @@ def read_counterfactual_advantage_logs(job_id: str) -> dict[str, Any]:
             database(), job_id, logs_only=True,
         )
     except AdvantageNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+class StartControlPolicyRolloutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_CONTROL_POLICY_ROLLOUT_ADVANTAGE_NO_ORDERS"] = Field(
+        description=(
+            "Run fixed v10.8.48 paired execution-aware rollouts. The Control "
+            "remains the default action and the model may only veto an "
+            "asset-to-asset rotation after pre-OOS calibration skill."
+        )
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+    )
+    source_execution_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-execution-[a-f0-9]{16}$",
+    )
+    source_liquidity_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-liquidity-[a-f0-9]{16}$",
+    )
+    source_tcn_job_id: str = Field(
+        min_length=28, max_length=28,
+        pattern=r"^control-tcn-[a-f0-9]{16}$",
+    )
+    source_ranking_job_id: str = Field(
+        min_length=29, max_length=29,
+        pattern=r"^control-rank-[a-f0-9]{16}$",
+    )
+    source_advantage_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-advantage-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/policy-rollout/jobs",
+    status_code=202,
+    summary="Execution-aware Control policy-rollout advantage — research only",
+    description=(
+        "Builds exact 20-session paired rollouts from the same audited "
+        "historical portfolio state: execute the Control rotation once versus "
+        "HOLD once, then return both branches to the same Liquidity-Aware "
+        "Control policy. Fold 1 cannot use a meta-model; folds 2/3 may use only "
+        "fully matured prior-fold OOS labels. Aborts unless v10.8.44 is "
+        "reproduced exactly. No Alpaca refresh, tuning, Winner promotion or orders."
+    ),
+)
+def start_policy_rollout_job(
+    payload: StartControlPolicyRolloutRequest,
+) -> dict[str, Any]:
+    try:
+        return start_policy_rollout_advantage_research(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            source_execution_job_id=payload.source_execution_job_id,
+            source_liquidity_job_id=payload.source_liquidity_job_id,
+            source_tcn_job_id=payload.source_tcn_job_id,
+            source_ranking_job_id=payload.source_ranking_job_id,
+            source_advantage_job_id=payload.source_advantage_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RolloutNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RolloutConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RolloutInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/policy-rollout/jobs/{job_id}",
+    summary="Read v10.8.48 rollout labels, calibration and portfolio result",
+)
+def read_policy_rollout_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_policy_rollout_advantage_research(database(), job_id)
+    except RolloutNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/policy-rollout/jobs/{job_id}/logs",
+    summary="Read v10.8.48 policy-rollout research progress and logs",
+)
+def read_policy_rollout_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_policy_rollout_advantage_research(
+            database(), job_id, logs_only=True,
+        )
+    except RolloutNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
