@@ -963,7 +963,7 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 
     confirm: Literal["RESEARCH_CONTROL_REDUCED_META_VETO_NO_ORDERS"] = Field(
         description=(
-            "Run the frozen v10.8.53 one-shot reduced-signature fail-safe meta-veto. "
+            "Run the frozen v10.8.55 expected-advantage regression Meta-Veto comparison. "
             "Research only; never creates or submits orders."
         )
     )
@@ -980,14 +980,14 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 @router.post(
     "/reduced-meta-veto/jobs",
     status_code=202,
-    summary="Run v10.8.53 one-shot reduced-signature Meta-Veto — research only",
+    summary="Run current reduced Meta-Veto research — v10.8.55 expected advantage",
     description=(
-        "Uses the confirmed v10.8.50 9-feature signature with fixed balanced "
-        "Logistic Regression C=0.25. Fold 1 is Control-only; Fold 2 learns "
-        "only Fold 1; Fold 3 learns only Folds 1+2. A fold is enabled only "
-        "after chronological calibration BA>=0.52 and AUC>=0.52, and a "
-        "rotation is vetoed only when P(ROTATE better)<=0.35. After any veto, " "the next policy call is forced back to Control. Only fully matured prior " "rollout labels are eligible for training. CASH transitions "
-        "remain unchanged. No tuning, Alpaca refresh, Winner change or orders."
+        "Replays the exact v10.8.53 reference and compares a fixed Ridge "
+        "regression candidate that predicts delta_capital_fraction directly. "
+        "The candidate uses the same 9 features, strict rollout maturity and "
+        "one-shot HOLD semantics. It vetoes only when predicted economic "
+        "advantage is <= 0.0. No HTTP tuning, Alpaca refresh, Winner change "
+        "or orders."
     ),
 )
 def start_reduced_meta_veto_job(
@@ -1011,7 +1011,7 @@ def start_reduced_meta_veto_job(
 
 @router.get(
     "/reduced-meta-veto/jobs/{job_id}",
-    summary="Read v10.8.53 one-shot reduced-signature Meta-Veto result",
+    summary="Read current reduced Meta-Veto research result",
 )
 def read_reduced_meta_veto_job(job_id: str) -> dict[str, Any]:
     try:
@@ -1022,7 +1022,7 @@ def read_reduced_meta_veto_job(job_id: str) -> dict[str, Any]:
 
 @router.get(
     "/reduced-meta-veto/jobs/{job_id}/logs",
-    summary="Read v10.8.53 one-shot reduced-signature Meta-Veto progress and logs",
+    summary="Read current reduced Meta-Veto research progress and logs",
 )
 def read_reduced_meta_veto_logs(job_id: str) -> dict[str, Any]:
     try:
