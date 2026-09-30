@@ -51,6 +51,22 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.51 — Reduced Signature Meta-Veto (pesquisa, sem ordem)
+- Branch `feature/v10.8.51-reduced-signature-meta-veto-research`, derivada da v10.8.50 confirmada.
+- Objetivo: medir impacto de capital de um Meta-Veto fail-safe que usa exclusivamente a assinatura reduzida confirmada na v10.8.50 para decidir se uma rotação ativo->ativo proposta pelo Control deve ser mantida como HOLD por uma decisão.
+- Fonte congelada de treino: dataset causal v10.8.49 `control-signature-5dedf5eee0f94e8a`, confirmação v10.8.50 `control-reduced-b9404f6e1f694e38`, rollout `control-rollout-03253d310ef445b2`, snapshot SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
+- Modelo congelado: Logistic Regression balanceada L2, `C=0.25`, exatamente as 9 features da v10.8.50; nenhuma seleção/tuning posterior.
+- Features: `incumbent__return_20`, `incumbent__return_60`, `incumbent__ema_distance_20`, `incumbent__ema_distance_50`, `incumbent__rsi_14`, `incumbent__channel_position_50`, `incumbent_capacity_equity_ratio`, `state_shares`, `candidate__channel_position_50`.
+- Protocolo causal congelado: Fold1 sempre sem meta-modelo; Fold2 aprende somente com labels do Fold1; Fold3 aprende somente com labels dos Folds1+2. Dentro do histórico elegível, split cronológico 70/30 para treino/calibração; após gate, refit em todo histórico anterior.
+- Gate fail-safe pré-declarado: pelo menos 20 amostras de calibração, Balanced Accuracy >= 0.52 e ROC AUC >= 0.52. Se qualquer requisito falhar, o fold inteiro executa Control puro.
+- Regra de veto pré-declarada: somente rotação ativo->ativo, modelo habilitado e `P(ROTATE melhor) <= 0.35`; então HOLD do incumbent por uma decisão. CASH->ativo, ativo->CASH e HOLD nunca são alterados. Threshold não será ajustado após observar capital.
+- Features durante o replay são calculadas causalmente no estado REAL da trajetória meta naquele decision_date; o dataset de treino permanece sempre o baseline v10.8.49, evitando retroalimentação de labels gerados por vetos.
+- Comparação obrigatória: baseline deve reproduzir exatamente a v10.8.44 Liquidity-Aware `US$ 1.078.635,4115518222` (tolerância absoluta 1e-6). O novo resultado só é interpretável depois dessa paridade.
+- Implementação concluída: `engine/control_reduced_signature_meta_veto.py` treina/gateia o Logistic reduzido por fold e calcula features sobre o estado real da trajetória meta; `engine/control_reduced_signature_meta_veto_research.py` executa baseline+meta e exige paridade v10.8.44; `services/control_shadow_reduced_meta_veto_jobs.py` cria job isolado; Swagger expõe `POST /api/admin/control-shadow/reduced-meta-veto/jobs` e GET de status/logs, sem login.
+- Artefatos previstos: `summary.json`, curvas/fills baseline e meta, `meta_training_folds.csv`, `meta_veto_decisions.csv`, `aligned_capital_curves.csv` e `paired_capital.png`.
+- Próximo passo: confirmar CI do HEAD, executar a v10.8.51 usando `control-reduced-b9404f6e1f694e38` e auditar gate por fold, número de vetos, paridade e impacto de capital sem alterar nenhum parâmetro após observar o resultado.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada. `order_eligible=false`, `order_submission=never`.
+
 ## v10.8.50 — Reduced Rollout Signature Confirmation (diagnóstico, sem ordem)
 - Branch `feature/v10.8.50-reduced-rollout-signature-research`, derivada da v10.8.49 após auditoria do primeiro sinal preditivo preliminar.
 - Objetivo: verificar se o sinal da Logistic Regression v10.8.49 sobrevive com assinatura pequena, explicável e congelada, reduzindo dimensionalidade/colinearidade antes de qualquer Meta-Veto.
