@@ -70,8 +70,10 @@
 - Fold1 sem modelo; Fold2 usa somente rollouts maduros do Fold1; Fold3 somente rollouts maduros dos Folds1+2; `rollout_end_date < test_start`.
 - Semântica one-shot e Liquidity-Aware permanecem idênticas à v10.8.53.
 - Nenhum grid search, tuning de alpha, tuning de threshold, seleção de feature ou peso após observar o resultado.
+- Implementação concluída: `control_expected_advantage_meta_veto.py` treina Ridge por fold e aplica veto no break-even econômico 0; `control_expected_advantage_meta_veto_research.py` reproduz v10.8.44 + v10.8.53 e compara a candidata no mesmo snapshot; o serviço existente `control_shadow_reduced_meta_veto_jobs.py` foi reapontado para essa orquestração.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs` com o mesmo payload.
 - Candidata só conta como avanço se superar o capital final da referência v10.8.53 sob paridade exata.
+- Próximo passo: confirmar CI do HEAD e executar o endpoint existente; auditar gates de regressão, quantidade de vetos e capital final sem ajustar parâmetros após observar o resultado.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
