@@ -82,7 +82,7 @@ class PolicyRolloutAdvantageTests(TestCase):
         rows=[]
         for i in range(75):
             source_fold=1 if i<50 else 2
-            date=dates[20+i]
+            date=dates[45+i]
             rows.append({
                 "decision_date":date,
                 "rollout_end_date":date+pd.Timedelta(days=1),
