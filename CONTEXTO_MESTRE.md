@@ -65,7 +65,16 @@
 - O endpoint permanece `POST /api/admin/control-shadow/reduced-meta-veto/jobs`, sem login e com o mesmo payload. Não foram adicionados parâmetros HTTP.
 - Testes atualizados para exigir maturidade integral, one-shot explícito, Liquidity-Aware habilitado e API v10.8.53.
 - Correção de importação em 2026-09-30: patch anterior inseriu 12 ocorrências de `\\n` literal em `control_reduced_signature_meta_veto.py`, causando `SyntaxError` no startup do Uvicorn/Python 3.14. Todas foram convertidas para quebras de linha reais no commit `5cc5e33860a288170f585df8f0ba935225a60db3`. Nenhuma regra científica foi alterada.
-- Próximo passo: confirmar CI do HEAD e repetir o mesmo endpoint; paridade v10.8.44 continua obrigatória antes de interpretar capital.
+- Execução real v10.8.53 auditada no job `control-meta-f4ed26129d014c6f`, ZIP `output(20260930-221443).zip` com 518 entradas e CRC válido.
+- Paridade v10.8.44 perfeita: esperado/reproduzido `US$ 1.078.635,4115518222`, diferença absoluta 0.
+- Maturidade causal correta: Fold2 = 75 labels elegíveis; Fold3 = 184. Gate Fold2: BA 0,537879 / AUC 0,651515; Gate Fold3: BA 0,590677 / AUC 0,583653; ambos habilitados.
+- Semântica one-shot validada: 63 vetos totais, 63 decisões seguintes marcadas `CONTROL_AFTER_ONE_SHOT_VETO`, nenhum veto consecutivo (streak máximo = 1), nenhum veto em transição CASH e todo veto manteve o incumbent. Foram 30 vetos no Fold2 e 33 no Fold3, 63/233 = 27,04% das decisões efetivamente modeladas.
+- Resultado de capital: baseline `US$ 1.078.635,41`; Meta-Veto `US$ 1.891.417,67`; delta `+US$ 812.782,26` / `+75,3528%`. CAGR subiu de 113,15% para 133,41%; Sharpe de 1,6686 para 1,8120. MaxDD piorou de -42,61% para -45,76%.
+- A vantagem surgiu em ambos os períodos com modelo ativo: ao fim do Fold2 a trajetória Meta estava 61,54% acima da baseline; no Fold3 o multiplicador relativo ainda aumentou cerca de 8,55% sobre a vantagem carregada.
+- Rotations caíram de 320 para 292, mas custos/fees absolutos aumentaram com o capital maior (`modeled_price_cost` ~US$220,1k vs US$138,3k; fees ~US$2,91k vs US$1,93k).
+- Conclusão científica: a v10.8.53 é o primeiro replay desta linha com paridade, one-shot literal e maturidade causal do target de 20 sessões corretamente implementadas. O resultado retrospectivo é forte, porém NÃO constitui novo OOS independente porque as mesmas janelas históricas participaram da descoberta da assinatura v10.8.49/v10.8.50. Congelar a policy v10.8.53 e exigir validação futura/independente antes de qualquer promoção operacional.
+- CI dos commits de correção de sintaxe/importação passou; não criar novo endpoint para versões seguintes desta linha. Reutilizar `/api/admin/control-shadow/reduced-meta-veto/jobs`.
+
 
 ## v10.8.52 — Correção de paridade Liquidity-Aware no Meta-Veto
 - Branch `fix/v10.8.52-reduced-meta-veto-liquidity-parity`, derivada da v10.8.51 após falha real do job `control-meta-c396c6c3d802488f`.
