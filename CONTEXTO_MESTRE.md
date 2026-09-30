@@ -69,7 +69,9 @@
 - Fold1 sem modelo; Fold2 usa somente rollouts maduros do Fold1; Fold3 usa somente rollouts maduros Folds1+2; `rollout_end_date < test_start`.
 - One-shot permanece literal: HOLD uma vez e a chamada seguinte é Control obrigatório.
 - O job v10.8.54 executará dois caminhos comparáveis no mesmo snapshot: referência v10.8.53 unweighted e candidata capital-weighted. Só conta como melhoria se o capital final da candidata superar a referência.
+- Implementação concluída: `control_reduced_signature_meta_veto.py` agora aceita `capital_weighted=True|False` com fórmula de peso congelada; `control_capital_weighted_meta_veto_research.py` executa no mesmo job a referência v10.8.53 e a candidata v10.8.54, exigindo paridade v10.8.44 e v10.8.53 antes da comparação; o serviço existente foi reapontado para essa orquestração.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs` com o mesmo payload.
+- Critério de decisão do experimento: candidata só conta como avanço se `candidate_final_capital > 1.891.417,6670329159`; caso contrário, descartar v10.8.54 e manter v10.8.53 como melhor referência comparável.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
