@@ -62,6 +62,9 @@
 - Regra de veto pré-declarada: somente rotação ativo->ativo, modelo habilitado e `P(ROTATE melhor) <= 0.35`; então HOLD do incumbent por uma decisão. CASH->ativo, ativo->CASH e HOLD nunca são alterados. Threshold não será ajustado após observar capital.
 - Features durante o replay são calculadas causalmente no estado REAL da trajetória meta naquele decision_date; o dataset de treino permanece sempre o baseline v10.8.49, evitando retroalimentação de labels gerados por vetos.
 - Comparação obrigatória: baseline deve reproduzir exatamente a v10.8.44 Liquidity-Aware `US$ 1.078.635,4115518222` (tolerância absoluta 1e-6). O novo resultado só é interpretável depois dessa paridade.
+- Implementação concluída: `engine/control_reduced_signature_meta_veto.py` treina/gateia o Logistic reduzido por fold e calcula features sobre o estado real da trajetória meta; `engine/control_reduced_signature_meta_veto_research.py` executa baseline+meta e exige paridade v10.8.44; `services/control_shadow_reduced_meta_veto_jobs.py` cria job isolado; Swagger expõe `POST /api/admin/control-shadow/reduced-meta-veto/jobs` e GET de status/logs, sem login.
+- Artefatos previstos: `summary.json`, curvas/fills baseline e meta, `meta_training_folds.csv`, `meta_veto_decisions.csv`, `aligned_capital_curves.csv` e `paired_capital.png`.
+- Próximo passo: confirmar CI do HEAD, executar a v10.8.51 usando `control-reduced-b9404f6e1f694e38` e auditar gate por fold, número de vetos, paridade e impacto de capital sem alterar nenhum parâmetro após observar o resultado.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada. `order_eligible=false`, `order_submission=never`.
 
 ## v10.8.50 — Reduced Rollout Signature Confirmation (diagnóstico, sem ordem)
