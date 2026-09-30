@@ -20,6 +20,7 @@ from market_cycle_trader_api.api.routers.control_shadow import (
 )
 from market_cycle_trader_api.engine import control_execution_feasibility as execution
 from market_cycle_trader_api.engine import control_policy_rollout_advantage as rollout
+from market_cycle_trader_api.engine.control_counterfactual_advantage import FEATURES
 from market_cycle_trader_api.services import control_shadow_policy_rollout_jobs as jobs
 
 VAL="control-validation-7821002400424ccc"
@@ -70,10 +71,7 @@ class PolicyRolloutAdvantageTests(TestCase):
         for n,symbol in enumerate(("AAA","BBB")):
             frame=pd.DataFrame(index=dates)
             frame["close"]=np.linspace(10+n,20+n,len(dates))
-            for j,name in enumerate(rollout._pair_sample.__globals__["PairSample"].__module__ and __import__(
-                "market_cycle_trader_api.engine.control_counterfactual_advantage",
-                fromlist=["FEATURES"]
-            ).FEATURES):
+            for j,name in enumerate(FEATURES):
                 frame[name]=np.linspace(.01+j*.001,.2+j*.001,len(dates))+n*.001
             frames[symbol]=frame
         folds=[
