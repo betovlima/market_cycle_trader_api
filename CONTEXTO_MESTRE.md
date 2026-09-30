@@ -51,6 +51,39 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## Regra de objetivo da pesquisa — 2026-09-30
+- Não existe meta fixa de capital (por exemplo US$ 2M, US$ 5M ou US$ 40M).
+- Objetivo primário: maximizar o capital final obtido pelas configurações candidatas, usando como referência a melhor configuração válida disponível no momento.
+- Valores históricos maiores servem como evidência e contexto, não como alvo obrigatório.
+- Uma alteração só conta como avanço quando aumenta o capital final sob protocolo causal/reprodutível comparável; resultados obtidos por tuning pós-OOS, seleção retrospectiva de ativos ou mudança de janela não devem ser tratados como melhoria validada.
+- Métricas de risco (Sharpe, MaxDD, custos, liquidez e estabilidade por fold) permanecem diagnósticos obrigatórios, mas não substituem o objetivo primário de capital final.
+- Não criar novos endpoints por experimento. Reutilizar a rota de pesquisa existente da linha quando possível e manter versões/resultados nos artefatos e documentação.
+
+## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
+- Branch `fix/v10.8.53-one-shot-meta-veto-causal-maturity`, derivada da v10.8.52 após auditoria do job `control-meta-da56431b92294ebd`.
+- A v10.8.52 corrigiu corretamente a paridade Liquidity-Aware: baseline reproduziu exatamente `US$ 1.078.635,4115518222` (diferença 0). Porém o Meta-Veto terminou em `US$ 109.239,83562554276`, delta `-89,8724%`, com 734 vetos em 809 decisões modeladas.
+- Causa principal confirmada: o target original v10.8.48 é `HOLD uma vez, depois voltar ao Control`, mas a v10.8.51/52 permitia novo veto imediatamente na decisão seguinte. Isso gerou lock-in recursivo; no Fold 2 houve sequência de 333 vetos consecutivos e outras sequências longas.
+- Correção sem tuning: após aplicar um veto, a decisão seguinte é obrigatoriamente entregue ao Control sem possibilidade de novo veto. O cooldown é consumido em exatamente uma chamada de policy. Isso implementa literalmente o branch de treino `HOLD once, then Control`.
+- Segunda correção causal: Fold3 da v10.8.51 usou 191 labels anteriores, mas somente 184 tinham `rollout_end_date < test_start`. Sete rollouts do fim do Fold2 maturavam já dentro do Fold3. A v10.8.53 exige maturidade integral do rollout antes do início do fold de teste, igual ao protocolo v10.8.48.
+- Implicação retroativa: a avaliação Fold3 das v10.8.49/v10.8.50 também deve ser tratada como exploratória, pois a seleção/treino por `source_fold_id` não excluía explicitamente esses 7 labels ainda não maduros. A v10.8.50 deixa de ser considerada confirmação causal independente; ela permanece como evidência exploratória que motivou a hipótese reduzida. A v10.8.53 é a primeira execução desta linha que restaura a regra de maturidade do target de 20 sessões no treino do Meta-Veto.
+- Fonte de maturidade: `paired_rollout_labels.csv` da v10.8.48, unido ao dataset v10.8.49 por decision_date/incumbent/candidate. Fold2 permanece com 75 labels elegíveis; Fold3 passa de 191 para 184.
+- Modelo, 9 features, C=0.25, split cronológico 70/30, gate BA>=0.52, AUC>=0.52 e veto P(ROTATE melhor)<=0.35 permanecem congelados. Nenhum threshold ou feature foi ajustado após observar o capital ruim.
+- A v10.8.52 é válida para diagnóstico de falha/paridade, mas seu capital Meta-Veto NÃO representa a política-alvo devido à repetição indevida de veto e à maturidade causal incompleta.
+- Implementação concluída: `control_reduced_signature_meta_veto.py` exige `rollout_end_date < test_start` e aplica estado one-shot `force_control_next`; `control_reduced_signature_meta_veto_research.py` une os 321 eventos ao `paired_rollout_labels.csv` da v10.8.48 para recuperar maturidade exata e grava artefatos sob `validation/v10.8.53/`.
+- O endpoint permanece `POST /api/admin/control-shadow/reduced-meta-veto/jobs`, sem login e com o mesmo payload. Não foram adicionados parâmetros HTTP.
+- Testes atualizados para exigir maturidade integral, one-shot explícito, Liquidity-Aware habilitado e API v10.8.53.
+- Correção de importação em 2026-09-30: patch anterior inseriu 12 ocorrências de `\\n` literal em `control_reduced_signature_meta_veto.py`, causando `SyntaxError` no startup do Uvicorn/Python 3.14. Todas foram convertidas para quebras de linha reais no commit `5cc5e33860a288170f585df8f0ba935225a60db3`. Nenhuma regra científica foi alterada.
+- Execução real v10.8.53 auditada no job `control-meta-f4ed26129d014c6f`, ZIP `output(20260930-221443).zip` com 518 entradas e CRC válido.
+- Paridade v10.8.44 perfeita: esperado/reproduzido `US$ 1.078.635,4115518222`, diferença absoluta 0.
+- Maturidade causal correta: Fold2 = 75 labels elegíveis; Fold3 = 184. Gate Fold2: BA 0,537879 / AUC 0,651515; Gate Fold3: BA 0,590677 / AUC 0,583653; ambos habilitados.
+- Semântica one-shot validada: 63 vetos totais, 63 decisões seguintes marcadas `CONTROL_AFTER_ONE_SHOT_VETO`, nenhum veto consecutivo (streak máximo = 1), nenhum veto em transição CASH e todo veto manteve o incumbent. Foram 30 vetos no Fold2 e 33 no Fold3, 63/233 = 27,04% das decisões efetivamente modeladas.
+- Resultado de capital: baseline `US$ 1.078.635,41`; Meta-Veto `US$ 1.891.417,67`; delta `+US$ 812.782,26` / `+75,3528%`. CAGR subiu de 113,15% para 133,41%; Sharpe de 1,6686 para 1,8120. MaxDD piorou de -42,61% para -45,76%.
+- A vantagem surgiu em ambos os períodos com modelo ativo: ao fim do Fold2 a trajetória Meta estava 61,54% acima da baseline; no Fold3 o multiplicador relativo ainda aumentou cerca de 8,55% sobre a vantagem carregada.
+- Rotations caíram de 320 para 292, mas custos/fees absolutos aumentaram com o capital maior (`modeled_price_cost` ~US$220,1k vs US$138,3k; fees ~US$2,91k vs US$1,93k).
+- Conclusão científica: a v10.8.53 é o primeiro replay desta linha com paridade, one-shot literal e maturidade causal do target de 20 sessões corretamente implementadas. O resultado retrospectivo é forte, porém NÃO constitui novo OOS independente porque as mesmas janelas históricas participaram da descoberta da assinatura v10.8.49/v10.8.50. Congelar a policy v10.8.53 e exigir validação futura/independente antes de qualquer promoção operacional.
+- CI dos commits de correção de sintaxe/importação passou; não criar novo endpoint para versões seguintes desta linha. Reutilizar `/api/admin/control-shadow/reduced-meta-veto/jobs`.
+
+
 ## v10.8.52 — Correção de paridade Liquidity-Aware no Meta-Veto
 - Branch `fix/v10.8.52-reduced-meta-veto-liquidity-parity`, derivada da v10.8.51 após falha real do job `control-meta-c396c6c3d802488f`.
 - Erro observado: paridade esperada v10.8.44 `US$ 1.078.635,4115518222`, mas replay reproduziu `US$ 528.709,776437140652`, exatamente o benchmark v10.8.42 execution-constrained.

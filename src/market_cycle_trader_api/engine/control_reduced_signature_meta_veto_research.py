@@ -1,4 +1,4 @@
-"""SHA-pinned v10.8.51 reduced-signature meta-veto capital research."""
+"""SHA-pinned v10.8.53 one-shot reduced-signature meta-veto capital research."""
 from __future__ import annotations
 
 import json
@@ -43,7 +43,7 @@ def run_reduced_signature_meta_veto_research(
     snapshot_root: Path | None = None,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"control-meta-[a-f0-9]{16}", meta_job_id):
-        raise ValueError("Expected server-generated v10.8.51 meta-veto job ID.")
+        raise ValueError("Expected server-generated v10.8.53 meta-veto job ID.")
 
     if (
         rollout_result.get("research_kind")
@@ -76,7 +76,7 @@ def run_reduced_signature_meta_veto_research(
             for item in (rollout_result, signature_result, reduced_result)
         )
     ):
-        raise ValueError("v10.8.51 requires exact verified v10.8.48/49/50 chain.")
+        raise ValueError("v10.8.53 requires exact verified v10.8.48/49/50 chain.")
 
     bars, manifest, directory = read_verified_control_snapshot(
         source_job_id,
@@ -89,7 +89,30 @@ def run_reduced_signature_meta_veto_research(
         raise FileNotFoundError("v10.8.49 rollout decision dataset is missing.")
     dataset = pd.read_csv(dataset_path)
     if len(dataset) != 321:
-        raise ValueError("v10.8.51 requires exact 321-event source dataset.")
+        raise ValueError("v10.8.53 requires exact 321-event source dataset.")
+
+    rollout_dir = Path(str(rollout_result.get("report_directory") or ""))
+    labels_path = rollout_dir / "paired_rollout_labels.csv"
+    if not labels_path.is_file():
+        raise FileNotFoundError("v10.8.48 paired rollout labels are missing.")
+    labels = pd.read_csv(
+        labels_path,
+        usecols=[
+            "decision_date", "incumbent_asset", "control_target_asset",
+            "rollout_end_date",
+        ],
+    )
+    labels["decision_date"] = pd.to_datetime(labels["decision_date"], utc=True)
+    labels["rollout_end_date"] = pd.to_datetime(labels["rollout_end_date"], utc=True)
+    dataset["decision_date"] = pd.to_datetime(dataset["decision_date"], utc=True)
+    dataset = dataset.merge(
+        labels.rename(columns={"control_target_asset": "candidate_asset"}),
+        on=["decision_date", "incumbent_asset", "candidate_asset"],
+        how="left",
+        validate="one_to_one",
+    )
+    if dataset["rollout_end_date"].isna().any() or len(dataset) != 321:
+        raise ValueError("v10.8.53 could not attach exact rollout maturity dates.")
 
     cutoff = str(manifest["completed_session"])
     inclusive = (
@@ -105,7 +128,7 @@ def run_reduced_signature_meta_veto_research(
         bars, completed_session=cutoff, config=config,
     )
     if calendar_audit.available_assets != 55:
-        raise ValueError("v10.8.51 requires the frozen 55-asset panel.")
+        raise ValueError("v10.8.53 requires the frozen 55-asset panel.")
 
     if progress:
         progress("training prior-fold reduced logistic gates", 5, 100)
@@ -125,7 +148,7 @@ def run_reduced_signature_meta_veto_research(
     baseline = paths["liquidity_baseline"]
     meta = paths["meta_veto"]
     if len(baseline.predictions) != 1554 or len(meta.predictions) != 1554:
-        raise ValueError("v10.8.51 replay must contain exactly 1,554 OOS sessions.")
+        raise ValueError("v10.8.53 replay must contain exactly 1,554 OOS sessions.")
 
     reproduced = float(baseline.metrics["strategy_ending_capital"])
     source_v1044 = float(
@@ -138,7 +161,7 @@ def run_reduced_signature_meta_veto_research(
         or not math.isclose(reproduced, EXPECTED_V1044_CAPITAL, rel_tol=0, abs_tol=1e-6)
     ):
         raise ValueError(
-            "v10.8.44 parity failed before v10.8.51 capital comparison: "
+            "v10.8.44 parity failed before v10.8.53 capital comparison: "
             f"expected {EXPECTED_V1044_CAPITAL:.12f}, source {source_v1044:.12f}, "
             f"reproduced {reproduced:.12f}."
         )
@@ -146,7 +169,7 @@ def run_reduced_signature_meta_veto_research(
         (baseline.predictions["cash"] < -1e-8).any()
         or (meta.predictions["cash"] < -1e-8).any()
     ):
-        raise ValueError("v10.8.51 generated negative CASH.")
+        raise ValueError("v10.8.53 generated negative CASH.")
 
     original_folds = (
         (rollout_result.get("liquidity_baseline") or {}).get("walk_forward_folds")
@@ -176,9 +199,9 @@ def run_reduced_signature_meta_veto_research(
         decision_frame["probability_rotate_better"].notna()
     ] if not decision_frame.empty else decision_frame
 
-    output = directory / "validation" / "v10.8.51" / meta_job_id
+    output = directory / "validation" / "v10.8.53" / meta_job_id
     if output.exists():
-        raise FileExistsError("Never overwrite v10.8.51 research artifacts.")
+        raise FileExistsError("Never overwrite v10.8.53 research artifacts.")
     output.mkdir(parents=True)
 
     for name, run in (
@@ -224,7 +247,7 @@ def run_reduced_signature_meta_veto_research(
     ax.plot(
         aligned.index,
         aligned["reduced_signature_meta_veto"],
-        label="v10.8.51 Reduced Signature Meta-Veto",
+        label="v10.8.53 One-shot Reduced Signature Meta-Veto",
     )
     ax.set_yscale("log")
     ax.set_title("Reduced Signature Meta-Veto · research only")
@@ -239,7 +262,7 @@ def run_reduced_signature_meta_veto_research(
     meta_capital = float(meta.metrics["strategy_ending_capital"])
     report = {
         "schema_version": 1,
-        "research_kind": "control_reduced_signature_meta_veto",
+        "research_kind": "control_reduced_signature_meta_veto_one_shot",
         "strategy_mode": MODE,
         "meta_job_id": meta_job_id,
         "source_reduced_job_id": reduced_job_id,
@@ -273,6 +296,8 @@ def run_reduced_signature_meta_veto_research(
             "cash_transitions_modified": False,
             "dynamic_features_use_actual_meta_state": True,
             "training_labels_always_from_baseline_v1049": True,
+            "training_requires_rollout_end_before_test_start": True,
+            "one_shot_veto_semantics": "HOLD once, next policy call forced Control",
             "oos_tuning": False,
         },
         "training_folds": training_folds,

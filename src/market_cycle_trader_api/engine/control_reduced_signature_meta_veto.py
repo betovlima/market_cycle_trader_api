@@ -1,4 +1,4 @@
-"""v10.8.51 reduced-signature fail-safe meta-veto research.
+"""v10.8.53 reduced-signature one-shot fail-safe meta-veto research.
 
 The v10.8.44 Liquidity-Aware Control remains the default policy. A fixed
 Logistic Regression (C=0.25) trained only on prior-fold v10.8.49 rollout
@@ -14,7 +14,9 @@ Protocol frozen before capital evaluation:
 - enable only with >=20 calibration samples, BA>=0.52 and AUC>=0.52;
 - veto only when P(ROTATE better)<=0.35;
 - CASH transitions are never modified;
-- dynamic features use the actual meta-trajectory state at decision time.
+- dynamic features use the actual meta-trajectory state at decision time;
+- labels must be fully matured before the test-fold start;
+- after a veto, the next policy decision is Control-only (one-shot semantics).
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ from .control_execution_feasibility import simulate_feasible_control
 from .control_liquidity_policy import _CapitalAwareUtilityCache
 from .control_reduced_rollout_signature import REDUCED_FEATURES
 
-MODE = "MCT_RESEARCH_REDUCED_SIGNATURE_META_VETO_V1"
+MODE = "MCT_RESEARCH_REDUCED_SIGNATURE_META_VETO_ONE_SHOT_V2"
 MODEL_C = 0.25
 TRAIN_FRACTION = 0.70
 MIN_CALIBRATION_SAMPLES = 20
@@ -86,19 +88,28 @@ def train_fold_models(
     dataset: pd.DataFrame,
     folds: list[dict[str, Any]],
 ) -> tuple[dict[int, FoldModel], list[dict[str, Any]]]:
-    required = {"decision_date", "source_fold_id", "rotate_better", *REDUCED_FEATURES}
+    required = {"decision_date", "rollout_end_date", "source_fold_id", "rotate_better", *REDUCED_FEATURES}
     missing = sorted(required - set(dataset.columns))
     if missing:
-        raise ValueError(f"v10.8.51 source dataset missing columns: {missing}")
+        raise ValueError(f"v10.8.53 source dataset missing columns: {missing}")
     source = dataset.copy()
     source["decision_date"] = pd.to_datetime(source["decision_date"], utc=True)
+    source["rollout_end_date"] = pd.to_datetime(source["rollout_end_date"], utc=True)
     source = source.sort_values("decision_date").reset_index(drop=True)
 
     models: dict[int, FoldModel] = {}
     reports: list[dict[str, Any]] = []
     for fold in folds:
         fid = int(fold["fold_id"])
-        prior = source.loc[source["source_fold_id"].astype(int) < fid].copy()
+        test_start = pd.Timestamp(fold["test_start"])
+        if test_start.tzinfo is None:
+            test_start = test_start.tz_localize("UTC")
+        else:
+            test_start = test_start.tz_convert("UTC")
+        prior = source.loc[
+            (source["source_fold_id"].astype(int) < fid)
+            & (source["rollout_end_date"] < test_start)
+        ].copy()
         if fid == 1:
             models[fid] = FoldModel(False, None, "NO_PRIOR_OOS_FOLD")
             reports.append({
@@ -108,6 +119,7 @@ def train_fold_models(
                 "calibration_rows": 0,
                 "model_enabled": False,
                 "disable_reason": "NO_PRIOR_OOS_FOLD",
+                "test_start": test_start.isoformat(),
             })
             continue
 
@@ -121,6 +133,7 @@ def train_fold_models(
                 "calibration_rows": int(len(calibration)),
                 "model_enabled": False,
                 "disable_reason": "INSUFFICIENT_PRIOR_ROWS",
+                "test_start": test_start.isoformat(),
             })
             continue
 
@@ -162,6 +175,7 @@ def train_fold_models(
             "model_enabled": enabled,
             "disable_reason": reason,
             "veto_probability_max": VETO_PROBABILITY_MAX,
+            "test_start": test_start.isoformat(),
         })
     return models, reports
 
@@ -228,7 +242,7 @@ def build_dynamic_feature_row(
         ),
     }
     if tuple(values) != tuple(REDUCED_FEATURES):
-        raise RuntimeError("v10.8.51 dynamic feature order drifted from v10.8.50.")
+        raise RuntimeError("v10.8.53 dynamic feature order drifted from v10.8.50.")
     return pd.DataFrame([values], columns=list(REDUCED_FEATURES))
 
 
@@ -246,7 +260,7 @@ def run_reduced_signature_meta_veto_pair(
         _decision_to_fold, decision_metadata,
     ) = scientific._build_execution_context(bars, config)
     if len(symbols) != 55 or len(folds) != 3:
-        raise ValueError("v10.8.51 expects frozen 55-asset / 3-fold Control context.")
+        raise ValueError("v10.8.53 expects frozen 55-asset / 3-fold Control context.")
 
     fold_models, training_reports = train_fold_models(source_dataset, folds)
 
@@ -287,7 +301,7 @@ def run_reduced_signature_meta_veto_pair(
 
     def simulator_wrapper(*args, **kwargs):
         if captured:
-            raise ValueError("v10.8.51 expected exactly one scheduled OOS simulator call.")
+            raise ValueError("v10.8.53 expected exactly one scheduled OOS simulator call.")
         backend, scheduled, panel, labels, dates, settings, fees, slip = args[:8]
         metadata = kwargs.get("decision_metadata") or decision_metadata
 
@@ -296,6 +310,8 @@ def run_reduced_signature_meta_veto_pair(
             **{**kwargs, "decision_prepare": prepare_account},
         )
         captured["liquidity_baseline"] = baseline
+
+        force_control_next = [False]
 
         def meta_policy(
             timestamp: pd.Timestamp,
@@ -314,7 +330,10 @@ def run_reduced_signature_meta_veto_pair(
             veto = False
             reason = "CONTROL_DEFAULT"
 
-            if (
+            if force_control_next[0]:
+                force_control_next[0] = False
+                reason = "CONTROL_AFTER_ONE_SHOT_VETO"
+            elif (
                 fold_model.enabled
                 and current_position > 0
                 and control_target > 0
@@ -335,6 +354,7 @@ def run_reduced_signature_meta_veto_pair(
                 )
                 if probability <= VETO_PROBABILITY_MAX:
                     veto = True
+                    force_control_next[0] = True
                     reason = "VETO_LOW_ROTATE_PROBABILITY"
                 else:
                     reason = "MODEL_PASS"
@@ -396,10 +416,10 @@ def run_reduced_signature_meta_veto_pair(
         or result[0] is not captured.get("liquidity_baseline")
         or set(captured) != {"liquidity_baseline", "meta_veto"}
     ):
-        raise ValueError("v10.8.51 replay did not produce baseline and meta paths.")
+        raise ValueError("v10.8.53 replay did not produce baseline and meta paths.")
     if (
         original_runner.__globals__.get("_utility_policy") is not original_policy
         or original_runner.__globals__.get("_simulate_exact") is not original_simulator
     ):
-        raise RuntimeError("Frozen TCC module was mutated by v10.8.51.")
+        raise RuntimeError("Frozen TCC module was mutated by v10.8.53.")
     return captured, training_reports, audit
