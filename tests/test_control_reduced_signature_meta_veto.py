@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.53 one-shot reduced-signature meta-veto research."""
+"""Safeguards for v10.8.55 expected-advantage regression Meta-Veto."""
 from __future__ import annotations
 
 import sys
@@ -30,6 +30,11 @@ from market_cycle_trader_api.engine.control_reduced_signature_meta_veto import (
 from market_cycle_trader_api.services import (
     control_shadow_reduced_meta_veto_jobs as jobs,
 )
+from market_cycle_trader_api.engine.control_expected_advantage_meta_veto import (
+    RIDGE_ALPHA,
+    MIN_CALIBRATION_SIGN_BALANCED_ACCURACY,
+    MIN_CALIBRATION_SPEARMAN,
+)
 
 REDUCED="control-reduced-b9404f6e1f694e38"
 SIGNATURE="control-signature-5dedf5eee0f94e8a"
@@ -46,6 +51,19 @@ class ReducedSignatureMetaVetoTests(TestCase):
         self.assertEqual(MIN_CALIBRATION_ROC_AUC,0.52)
         self.assertEqual(VETO_PROBABILITY_MAX,0.35)
         self.assertEqual(len(REDUCED_FEATURES),9)
+
+    def test_expected_advantage_contract_is_fixed(self):
+        self.assertEqual(RIDGE_ALPHA,1.0)
+        self.assertEqual(MIN_CALIBRATION_SIGN_BALANCED_ACCURACY,0.52)
+        self.assertEqual(MIN_CALIBRATION_SPEARMAN,0.0)
+
+    def test_expected_advantage_uses_zero_as_economic_break_even(self):
+        import inspect
+        from market_cycle_trader_api.engine import control_expected_advantage_meta_veto as engine
+
+        source=inspect.getsource(engine.run_expected_advantage_meta_veto_pair)
+        self.assertIn("if predicted_delta <= 0.0:",source)
+        self.assertIn("VETO_NONPOSITIVE_EXPECTED_ADVANTAGE",source)
 
     def test_liquidity_overlay_is_explicitly_enabled_in_replay(self):
         import inspect
@@ -68,6 +86,8 @@ class ReducedSignatureMetaVetoTests(TestCase):
             {"minimum_auc":0.50},
             {"features":["incumbent__return_20"]},
             {"grid_search":True},
+            {"ridge_alpha":0.1},
+            {"regression_threshold":-0.01},
             {"send_order":True},
             {"winner_strategy_id":"x"},
         ):
