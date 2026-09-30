@@ -51,6 +51,17 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
+- Branch `fix/v10.8.53-one-shot-meta-veto-causal-maturity`, derivada da v10.8.52 após auditoria do job `control-meta-da56431b92294ebd`.
+- A v10.8.52 corrigiu corretamente a paridade Liquidity-Aware: baseline reproduziu exatamente `US$ 1.078.635,4115518222` (diferença 0). Porém o Meta-Veto terminou em `US$ 109.239,83562554276`, delta `-89,8724%`, com 734 vetos em 809 decisões modeladas.
+- Causa principal confirmada: o target original v10.8.48 é `HOLD uma vez, depois voltar ao Control`, mas a v10.8.51/52 permitia novo veto imediatamente na decisão seguinte. Isso gerou lock-in recursivo; no Fold 2 houve sequência de 333 vetos consecutivos e outras sequências longas.
+- Correção sem tuning: após aplicar um veto, a decisão seguinte é obrigatoriamente entregue ao Control sem possibilidade de novo veto. O cooldown é consumido em exatamente uma chamada de policy. Isso implementa literalmente o branch de treino `HOLD once, then Control`.
+- Segunda correção causal: Fold3 da v10.8.51 usou 191 labels anteriores, mas somente 184 tinham `rollout_end_date < test_start`. Sete rollouts do fim do Fold2 maturavam já dentro do Fold3. A v10.8.53 exige maturidade integral do rollout antes do início do fold de teste, igual ao protocolo v10.8.48.
+- Fonte de maturidade: `paired_rollout_labels.csv` da v10.8.48, unido ao dataset v10.8.49 por decision_date/incumbent/candidate. Fold2 permanece com 75 labels elegíveis; Fold3 passa de 191 para 184.
+- Modelo, 9 features, C=0.25, split cronológico 70/30, gate BA>=0.52, AUC>=0.52 e veto P(ROTATE melhor)<=0.35 permanecem congelados. Nenhum threshold ou feature foi ajustado após observar o capital ruim.
+- A v10.8.52 é válida para diagnóstico de falha/paridade, mas seu capital Meta-Veto NÃO representa a política-alvo devido à repetição indevida de veto e à maturidade causal incompleta.
+- Próximo passo: implementar/testar v10.8.53, repetir o mesmo endpoint e exigir novamente paridade v10.8.44 antes de interpretar capital.
+
 ## v10.8.52 — Correção de paridade Liquidity-Aware no Meta-Veto
 - Branch `fix/v10.8.52-reduced-meta-veto-liquidity-parity`, derivada da v10.8.51 após falha real do job `control-meta-c396c6c3d802488f`.
 - Erro observado: paridade esperada v10.8.44 `US$ 1.078.635,4115518222`, mas replay reproduziu `US$ 528.709,776437140652`, exatamente o benchmark v10.8.42 execution-constrained.
