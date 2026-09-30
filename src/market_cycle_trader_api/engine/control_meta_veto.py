@@ -576,3 +576,86 @@ def run_meta_veto_pair(
             return int(base_target), float(base_score)
 
         return policy
+
+
+    captured: dict[str, Any] = {}
+
+    def simulator_wrapper(*args, **kwargs):
+        if captured:
+            raise ValueError("Meta-veto pair requires exactly one OOS campaign.")
+        base_progress = kwargs.get("simulation_progress_callback")
+
+        def prepare(date, position, holding, cash, shares, equity):
+            account.update({
+                "decision_timestamp": pd.Timestamp(date),
+                "position": int(position),
+                "holding_days": int(holding),
+                "cash": float(cash),
+                "shares": int(shares),
+                "equity": float(equity),
+            })
+
+        account["veto_enabled"] = False
+        account["audit"] = {}
+        account["veto_audit"] = {}
+        captured["base_liquidity"] = simulate_feasible_control(
+            *args,
+            **{
+                **kwargs,
+                "decision_prepare": prepare,
+                "simulation_progress_callback": (
+                    (lambda f, s: base_progress(.5*f, f"base_liquidity: {s}"))
+                    if base_progress else None
+                ),
+            },
+        )
+
+        account["veto_enabled"] = True
+        account["audit"] = {}
+        account["veto_audit"] = {}
+        captured["meta_veto"] = simulate_feasible_control(
+            *args,
+            **{
+                **kwargs,
+                "decision_prepare": prepare,
+                "simulation_progress_callback": (
+                    (lambda f, s: base_progress(.5+.5*f, f"meta_veto: {s}"))
+                    if base_progress else None
+                ),
+            },
+        )
+        captured["veto_audit"] = dict(account["veto_audit"])
+        return captured["meta_veto"]
+
+    isolated_globals = dict(original_runner.__globals__)
+    isolated_globals["_precompute_model_utilities"] = liquidity_utilities
+    isolated_globals["_utility_policy"] = policy_wrapper
+    isolated_globals["_simulate_exact"] = simulator_wrapper
+    isolated = FunctionType(
+        original_runner.__code__,
+        isolated_globals,
+        original_runner.__name__,
+        original_runner.__defaults__,
+        original_runner.__closure__,
+    )
+    isolated.__kwdefaults__ = dict(original_runner.__kwdefaults__ or {})
+    result = isolated(
+        bars, config, fee_calculator, slippage,
+        progress_callback=progress_callback,
+        trade_callback=None,
+        progress_detail_callback=None,
+        technical_log_callback=None,
+    )
+    if (
+        len(result) != 1
+        or result[0] is not captured.get("meta_veto")
+        or set(captured) != {"base_liquidity", "meta_veto", "veto_audit"}
+    ):
+        raise ValueError("Meta-veto paired replay contract failed.")
+    if (
+        original_runner.__globals__.get("_precompute_model_utilities") is not original_predict
+        or original_runner.__globals__.get("_utility_policy") is not original_policy
+        or original_runner.__globals__.get("_simulate_exact") is not original_simulator
+    ):
+        raise RuntimeError("Meta-veto experiment mutated frozen module bindings.")
+    return captured, fold_reports, captured["veto_audit"]
