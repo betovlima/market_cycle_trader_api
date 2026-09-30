@@ -51,6 +51,28 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.50 — Reduced Rollout Signature Confirmation (diagnóstico, sem ordem)
+- Branch `feature/v10.8.50-reduced-rollout-signature-research`, derivada da v10.8.49 após auditoria do primeiro sinal preditivo preliminar.
+- Objetivo: verificar se o sinal da Logistic Regression v10.8.49 sobrevive com assinatura pequena, explicável e congelada, reduzindo dimensionalidade/colinearidade antes de qualquer Meta-Veto.
+- Fonte congelada: v10.8.49 `control-signature-5dedf5eee0f94e8a`, baseada no rollout v10.8.48 `control-rollout-03253d310ef445b2`, snapshot SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
+- Features congeladas antes do resultado: `incumbent__return_20`, `incumbent__return_60`, `incumbent__ema_distance_20`, `incumbent__ema_distance_50`, `incumbent__rsi_14`, `incumbent__channel_position_50`, `incumbent_capacity_equity_ratio`, `state_shares`, `candidate__channel_position_50`.
+- Modelos fixos: Logistic Regression balanceada C=1.0; Logistic Regression L2 mais regularizada C=0.25; e nove modelos logísticos univariados (uma feature por vez). Threshold fixo 0.50; sem grid search, feature selection pós-OOS ou tuning.
+- Validação temporal permanece: Fold2 <- Fold1; Fold3 <- Folds1+2.
+- Critério de confirmação pré-declarado e mais rígido: o mesmo modelo multivariado reduzido precisa ter Balanced Accuracy > 0.50 E ROC AUC > 0.50 nos Folds 2 e 3. Modelos univariados são apenas explicativos e não contam isoladamente como confirmação.
+- Implementação concluída: `engine/control_reduced_rollout_signature.py` avalia a assinatura congelada; `engine/control_reduced_rollout_signature_research.py` orquestra fonte/artefatos; `services/control_shadow_reduced_signature_jobs.py` cria job admin isolado; Swagger expõe `POST /api/admin/control-shadow/reduced-signature/jobs` e GET de status/logs.
+- Artefatos: `summary.json`, `reduced_model_results.csv`, `reduced_logistic_coefficients.csv`, `coefficient_stability.csv`.
+- Nenhuma policy é criada nesta versão. Mesmo se o sinal for confirmado, o próximo passo seria desenhar separadamente uma política fail-safe e congelar seu protocolo antes de avaliar capital.
+- Execução/auditoria v10.8.50 concluída em 2026-09-30: job `control-reduced-b9404f6e1f694e38`, fonte `control-signature-5dedf5eee0f94e8a`, rollout `control-rollout-03253d310ef445b2`, snapshot `control-shadow-870fb66e1bdc4fd0`, SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`. ZIP `dados(10).zip` com 496 entradas e CRC válido.
+- A assinatura reduzida foi CONFIRMADA segundo o critério pré-declarado. Logistic C=1.0: Fold2 balanced accuracy 0,557984 / AUC 0,606601; Fold3 balanced accuracy 0,555383 / AUC 0,590594. Logistic C=0.25: Fold2 balanced accuracy 0,594558 / AUC 0,609277; Fold3 balanced accuracy 0,542731 / AUC 0,586775. Ambos excederam 0,50 em BA e AUC nos dois testes temporais.
+- O modelo C=0.25 foi mais equilibrado no Fold2 (accuracy 0,594828, precision 0,589286, recall 0,578947, predicted_positive_rate 0,482759, Brier 0,242402). No Fold3, C=1.0 teve BA levemente maior (0,555383 vs 0,542731), mas ambos mantiveram AUC ~0,59.
+- Todos os 9 modelos univariados também ficaram acima de 0,50 em BA e AUC nos dois folds, embora por protocolo NÃO sejam elegíveis isoladamente para confirmar a hipótese. Os sinais univariados foram consistentes entre folds: `state_shares` negativo; as demais oito features positivas.
+- Estabilidade multivariada: em C=0.25, 7/9 coeficientes preservaram sinal entre Fold2 e Fold3: `state_shares` negativo; `incumbent_capacity_equity_ratio`, `incumbent__return_60`, `incumbent__return_20`, `candidate__channel_position_50`, `incumbent__ema_distance_50`, `incumbent__rsi_14` positivos. `incumbent__ema_distance_20` e `incumbent__channel_position_50` inverteram sinal no modelo multivariado, sugerindo colinearidade/instabilidade condicional apesar do sinal univariado positivo.
+- Conclusão v10.8.50: a hipótese de que existe uma assinatura preditiva pequena e explicável no estado da decisão está suportada preliminarmente por dois testes cronológicos independentes dentro do mesmo histórico OOS. Isso ainda NÃO autoriza produção; o próximo passo deve ser desenhar e pré-declarar separadamente um Meta-Veto fail-safe que use a assinatura confirmada e então medir impacto de capital, sem tuning sobre este OOS.
+- Alteração de acesso em 2026-09-30: o `control_shadow.router` deixou de herdar `require_admin_session` no `main.py`. Todos os endpoints de pesquisa sob `/api/admin/control-shadow/*` passam a poder ser acessados sem login. As demais rotas administrativas da API continuam protegidas normalmente.
+- A remoção de login NÃO remove as travas de pesquisa: confirmações literais, `_require_enabled`, validação de cadeia de jobs/SHA, ausência de campos de conta/Winner e contratos `order_eligible=false` / `order_submission="never"` permanecem.
+- Teste `test_control_shadow_api.py` atualizado para exigir registro público do Control Shadow e impedir regressão que reanexe `dependencies=admin_required`.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.49 — Rollout Decision Signature Research (diagnóstico, sem ordem)
 - Branch `feature/v10.8.49-rollout-decision-signature-research`, derivada da v10.8.48.
 - Objetivo: explicar os 321 eventos contrafactuais da v10.8.48 e descobrir se variáveis conhecidas no instante da decisão conseguem separar `ROTATE melhor` de `HOLD melhor`.

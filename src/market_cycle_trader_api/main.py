@@ -128,7 +128,10 @@ def create_app() -> FastAPI:
     application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
     application.include_router(admin_rotations.router, dependencies=admin_required)
     application.include_router(admin_trader.router, dependencies=admin_required)
-    application.include_router(control_shadow.router, dependencies=admin_required)
+    # Research-only Control Shadow endpoints intentionally do not require an
+    # authenticated session. Their own fixed confirmations, source-chain/SHA
+    # validation, feature flags and no-order contracts remain enforced.
+    application.include_router(control_shadow.router)
     application.include_router(parameter_bootstrap.router, dependencies=admin_required)
     application.include_router(strategy_configuration.router, dependencies=admin_required)
     application.include_router(strategy_lab.router, dependencies=research_access)
