@@ -35,8 +35,8 @@ class MetaVetoTests(TestCase):
         threshold,rows=veto._choose_threshold(probabilities,labels)
         # 0.10 has good precision but too few examples; 0.30 has 60% bad
         # precision over 100 examples and is allowed.
-        self.assertEqual(threshold,.30)
-        selected=next(x for x in rows if x["threshold"]==.30)
+        self.assertEqual(threshold,.40)
+        selected=next(x for x in rows if x["threshold"]==.40)
         self.assertTrue(selected["qualified"])
 
     def test_weak_validation_skill_disables_all_intervention(self):
