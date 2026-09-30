@@ -51,6 +51,15 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.52 — Correção de paridade Liquidity-Aware no Meta-Veto
+- Branch `fix/v10.8.52-reduced-meta-veto-liquidity-parity`, derivada da v10.8.51 após falha real do job `control-meta-c396c6c3d802488f`.
+- Erro observado: paridade esperada v10.8.44 `US$ 1.078.635,4115518222`, mas replay reproduziu `US$ 528.709,776437140652`, exatamente o benchmark v10.8.42 execution-constrained.
+- Causa raiz confirmada: `_CapitalAwareUtilityCache.get()` só aplica o overlay quando `account["enabled"]` é verdadeiro. A v10.8.51 inicializou `account = {}`, então o wrapper existia mas retornava as utilities originais, reproduzindo v10.8.42.
+- Correção mínima: inicializar o contexto em `run_reduced_signature_meta_veto_pair` como `{"enabled": True, "audit": {}}`, igual ao contrato funcional necessário para o Liquidity-Aware. Nenhuma feature, C, gate, threshold, fold protocol ou regra de veto foi alterada.
+- API incrementada para `10.8.52`. Teste dedicado adicionado para impedir regressão da ativação explícita do overlay.
+- O job v10.8.51 que falhou NÃO produziu resultado científico válido e não deve ser usado em comparação de capital.
+- Próximo passo: confirmar CI da v10.8.52 e repetir o mesmo endpoint/payload do Meta-Veto. A nova execução deve primeiro reproduzir exatamente `US$ 1.078.635,4115518222`; qualquer divergência continua abortando o experimento.
+
 ## v10.8.51 — Reduced Signature Meta-Veto (pesquisa, sem ordem)
 - Branch `feature/v10.8.51-reduced-signature-meta-veto-research`, derivada da v10.8.50 confirmada.
 - Objetivo: medir impacto de capital de um Meta-Veto fail-safe que usa exclusivamente a assinatura reduzida confirmada na v10.8.50 para decidir se uma rotação ativo->ativo proposta pelo Control deve ser mantida como HOLD por uma decisão.
