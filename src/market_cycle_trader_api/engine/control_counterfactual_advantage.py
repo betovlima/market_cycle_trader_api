@@ -153,6 +153,97 @@ def build_pair_samples(
     return samples
 
 
+
+def build_cross_sectional_pair_samples(
+    frames: dict[str, pd.DataFrame],
+    symbols: list[str],
+    dates: pd.DatetimeIndex,
+    *,
+    maturity_before: pd.Timestamp,
+    date_stride: int = TRAIN_STRIDE,
+    pair_stride: int = 7,
+) -> list[PairSample]:
+    """Deterministic broad pair training set, independent of future winners.
+
+    For each accepted historical date, symbols are paired by fixed offsets in
+    lexical order. Pair membership never uses the future label or OOS result.
+    This trains a general candidate-vs-incumbent comparator that is applied
+    only to Control-proposed rotations at inference.
+    """
+    ordered = sorted(str(s).upper() for s in symbols)
+    cutoff = pd.Timestamp(maturity_before)
+    samples: list[PairSample] = []
+    accepted_dates = list(pd.DatetimeIndex(dates))
+    for date_ordinal, date in enumerate(accepted_dates):
+        if date_ordinal % max(1, int(date_stride)):
+            continue
+        date = pd.Timestamp(date)
+        for left in range(0, len(ordered), max(1, int(pair_stride))):
+            incumbent = ordered[left]
+            for offset in (1, 5, 13):
+                candidate = ordered[(left + offset) % len(ordered)]
+                if candidate == incumbent:
+                    continue
+                iloc = _loc(frames[incumbent], date)
+                cloc = _loc(frames[candidate], date)
+                if min(iloc, cloc) < WINDOW - 1:
+                    continue
+                if (
+                    iloc + MAX_HORIZON >= len(frames[incumbent])
+                    or cloc + MAX_HORIZON >= len(frames[candidate])
+                ):
+                    continue
+                mature = max(
+                    pd.Timestamp(frames[incumbent].index[iloc + MAX_HORIZON]),
+                    pd.Timestamp(frames[candidate].index[cloc + MAX_HORIZON]),
+                )
+                if mature >= cutoff:
+                    continue
+                advantage = (
+                    _weighted_forward_return(frames[candidate], cloc)
+                    - _weighted_forward_return(frames[incumbent], iloc)
+                )
+                if math.isfinite(advantage):
+                    samples.append(PairSample(
+                        decision_date=date,
+                        incumbent=incumbent,
+                        candidate=candidate,
+                        incumbent_loc=iloc,
+                        candidate_loc=cloc,
+                        advantage=float(advantage),
+                    ))
+    return samples
+
+
+def refit_meta_veto(
+    frames: dict[str, pd.DataFrame],
+    samples: list[PairSample],
+    *,
+    seed: int,
+    epochs: int,
+) -> tuple[TinyTCN, PairScale]:
+    """Refit on all pre-test matured samples for calibration-selected epochs."""
+    if not samples or epochs < 1:
+        raise ValueError("Meta-veto final fit requires samples and positive epochs.")
+    scale = fit_scale(frames, samples)
+    x, y = _tensor(frames, samples, scale)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        model = TinyTCN().cpu()
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
+        )
+        criterion = nn.BCEWithLogitsLoss()
+        for _ in range(int(epochs)):
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(x), y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+    model.eval()
+    return model, scale
+
 def fit_scale(
     frames: dict[str, pd.DataFrame], samples: list[PairSample],
 ) -> PairScale:
