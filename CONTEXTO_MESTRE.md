@@ -59,6 +59,21 @@
 - Métricas de risco (Sharpe, MaxDD, custos, liquidez e estabilidade por fold) permanecem diagnósticos obrigatórios, mas não substituem o objetivo primário de capital final.
 - Não criar novos endpoints por experimento. Reutilizar a rota de pesquisa existente da linha quando possível e manter versões/resultados nos artefatos e documentação.
 
+## v10.8.55 — Expected Advantage Regression Meta-Veto
+- Branch `feature/v10.8.55-expected-advantage-regression-meta-veto`, derivada diretamente da melhor referência v10.8.53; a v10.8.54 foi rejeitada e não é base desta versão.
+- Objetivo: aumentar capital final modelando diretamente `delta_capital_fraction` do rollout ROTATE-vs-HOLD, em vez de classificar apenas seu sinal.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
+- Modelo candidato congelado antes da execução: Ridge Regression com `alpha=1.0`, `SimpleImputer(median)` + `StandardScaler`; mesmas 9 features da v10.8.53.
+- Target: `delta_capital_fraction = (capital_ROTATE - capital_HOLD) / initial_equity` já congelado na v10.8.49/v10.8.48.
+- Gate de calibração pré-declarado: mínimo 20 eventos, Balanced Accuracy do sinal previsto >=0.52 e Spearman(predição, delta real) > 0.0. Calibração permanece cronológica 70/30, sem peso.
+- Regra de veto natural, sem threshold calibrável: se o modelo do fold estiver habilitado e `predicted_delta_capital_fraction <= 0.0`, HOLD one-shot; caso contrário, Control.
+- Fold1 sem modelo; Fold2 usa somente rollouts maduros do Fold1; Fold3 somente rollouts maduros dos Folds1+2; `rollout_end_date < test_start`.
+- Semântica one-shot e Liquidity-Aware permanecem idênticas à v10.8.53.
+- Nenhum grid search, tuning de alpha, tuning de threshold, seleção de feature ou peso após observar o resultado.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs` com o mesmo payload.
+- Candidata só conta como avanço se superar o capital final da referência v10.8.53 sob paridade exata.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
 - Branch `fix/v10.8.53-one-shot-meta-veto-causal-maturity`, derivada da v10.8.52 após auditoria do job `control-meta-da56431b92294ebd`.
 - A v10.8.52 corrigiu corretamente a paridade Liquidity-Aware: baseline reproduziu exatamente `US$ 1.078.635,4115518222` (diferença 0). Porém o Meta-Veto terminou em `US$ 109.239,83562554276`, delta `-89,8724%`, com 734 vetos em 809 decisões modeladas.
