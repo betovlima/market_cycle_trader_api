@@ -256,7 +256,7 @@ def run_reduced_signature_meta_veto_pair(
     if original_policy is not frozen_utility_policy or original_simulator is not scientific._simulate_exact:
         raise RuntimeError("Frozen Control runner bindings changed unexpectedly.")
 
-    account: dict[str, Any] = {}
+    account: dict[str, Any] = {"enabled": True, "audit": {}}
     captured: dict[str, Any] = {}
     audit: list[dict[str, Any]] = []
 
