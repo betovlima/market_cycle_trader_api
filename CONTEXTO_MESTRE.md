@@ -51,6 +51,13 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 ## v10.8.45 — Deep Learning TinyTCN causal (pesquisa, sem ordem)
+### Regra de referência permanente — Control científico vs execução
+- **Control científico congelado (v10.8.41 / TCC Control reproduzido): US$ 5.887.904,38** a partir de US$ 10.000, CAGR ~180,46%, Sharpe ~1,956, MaxDD ~−36,65%. Este continua sendo o **Control principal de desempenho/modelagem** e não deve ser esquecido ou substituído por resultados de viabilidade de execução.
+- **Control com restrições de execução (v10.8.42): US$ 528.709,78**. Este é um cenário de exequibilidade histórica com limite de volume, custos assumidos, ações inteiras e trajetória estado-dependente; serve para medir quanto do Control científico sobrevive às hipóteses de execução.
+- **Liquidity-Aware v10.8.44: US$ 1.078.635,41** sob a mesma contabilidade restrita da v10.8.42. É melhor que o Control *executável* nessa simulação, mas **não supera o Control científico de US$ 5,89M**.
+- Toda nova pesquisa (Deep Learning, ranking, contrafactual etc.) deve reportar lado a lado, quando aplicável: (1) Control científico ~US$ 5,89M; (2) Control executável ~US$ 528,7k; (3) Liquidity-Aware ~US$ 1,078M. Nunca chamar US$ 528,7k de "resultado do Control" sem qualificar que é o cenário restrito de execução.
+
+
 ### Resultado real v10.8.45 — TinyTCN falhou como ranker nesta hipótese
 - Usuário enviou `output(20260930-092311).zip`: 442 entradas, CRC válido e 167/167 SHA do manifesto original conferidos. Job `control-tcn-b7d0247118314107`; mesmos 55 ativos, 3 folds e 1.554 OOS, sem Alpaca/ordem. TCN terminou com **US$ 68.345,26**, CAGR 36,45%, Sharpe 0,791, MaxDD **−81,12%**, vs Control executável US$ 528.709,78 e v10.8.44 Liquidity-Aware US$ 1.078.635,41. Fold 1 US$ 33.964,69; fold 2 cai a US$ 22.248,55 (−34,50% no fold); fold 3 fecha US$ 68.345,26. Pico global US$ 60.901,95 em 17/01/2024 e fundo US$ 11.496,95 em 28/02/2025.
 - Não foi nova armadilha de liquidez: CASH médio 0,596%; apenas 6 sessões >50% CASH; 811 fills todos <= capacidade e <=10% volume realizado; 0 fills em volume zero; 0 CASH negativo; resíduo de balanço equity−(cash+ações×close) < US$ 1,5e−11. Portanto falha principal está em **previsão/ranking**, não execução.
