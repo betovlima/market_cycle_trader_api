@@ -77,7 +77,10 @@
 - Fold1 sem modelo; Fold2/Fold3 somente labels maduros com `rollout_end_date < test_start`. One-shot e Liquidity-Aware idênticos à v10.8.53.
 - Não há threshold novo, tuning de C/alpha, seleção de features ou ajuste pós-OOS.
 - Esta hipótese é exploratória e pós-descoberta: o consenso foi escolhido após observar que a regressão v10.8.55 falhou como substituta. Só deve ser tratada como melhoria retrospectiva se aumentar capital; validação futura independente continua necessária.
+- Implementação concluída: `control_consensus_meta_veto.py` combina o classificador v10.8.53 com o regressor v10.8.55 sem permitir novos vetos; `control_consensus_meta_veto_research.py` reproduz v10.8.44 + v10.8.53 e compara a candidata no mesmo snapshot; o serviço existente foi reapontado para essa orquestração.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Critério do experimento: candidata só conta como avanço se superar `US$ 1.891.417,6670329159`. Se não superar, descartar v10.8.56 e manter v10.8.53.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar vetos confirmados, vetos cancelados, fallback classifier-only por fold e capital final.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.55 — Expected Advantage Regression (rejeitada)
