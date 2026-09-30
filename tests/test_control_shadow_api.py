@@ -68,7 +68,11 @@ class ControlShadowApiTests(TestCase):
         self.assertIn("post", documented["/api/admin/control-shadow/reduced-signature/jobs"])
         self.assertIn("/api/admin/control-shadow/reduced-signature/jobs/{job_id}", documented)
         self.assertIn("/api/admin/control-shadow/reduced-signature/jobs/{job_id}/logs", documented)
-        self.assertEqual(len(control_shadow_router.routes), 33)
+        self.assertIn("/api/admin/control-shadow/reduced-meta-veto/jobs", documented)
+        self.assertIn("post", documented["/api/admin/control-shadow/reduced-meta-veto/jobs"])
+        self.assertIn("/api/admin/control-shadow/reduced-meta-veto/jobs/{job_id}", documented)
+        self.assertIn("/api/admin/control-shadow/reduced-meta-veto/jobs/{job_id}/logs", documented)
+        self.assertEqual(len(control_shadow_router.routes), 36)
         registration = inspect.getsource(create_app)
         self.assertIn(
             "admin_required = [Depends(require_admin_session)]", registration
