@@ -60,10 +60,14 @@ class ControlShadowApiTests(TestCase):
         self.assertIn("post", documented["/api/admin/control-shadow/policy-rollout/jobs"])
         self.assertIn("/api/admin/control-shadow/policy-rollout/jobs/{job_id}", documented)
         self.assertIn("/api/admin/control-shadow/policy-rollout/jobs/{job_id}/logs", documented)
+        self.assertIn("/api/admin/control-shadow/rollout-signature/jobs", documented)
+        self.assertIn("post", documented["/api/admin/control-shadow/rollout-signature/jobs"])
+        self.assertIn("/api/admin/control-shadow/rollout-signature/jobs/{job_id}", documented)
+        self.assertIn("/api/admin/control-shadow/rollout-signature/jobs/{job_id}/logs", documented)
         # API route metadata is reflected by the OpenAPI paths above.
         # The security dependency is attached in create_app.include_router,
         # rather than on the child router's route definitions.
-        self.assertEqual(len(control_shadow_router.routes), 27)
+        self.assertEqual(len(control_shadow_router.routes), 30)
         registration = inspect.getsource(create_app)
         self.assertIn(
             "admin_required = [Depends(require_admin_session)]", registration

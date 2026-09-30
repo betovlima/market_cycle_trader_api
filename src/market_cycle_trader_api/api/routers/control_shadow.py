@@ -25,6 +25,11 @@ from ...services.control_shadow_policy_rollout_jobs import (
     start_policy_rollout_advantage_research,
     get_policy_rollout_advantage_research,
 )
+from ...services.control_shadow_rollout_signature_jobs import (
+    SignatureConflict, SignatureInvalid, SignatureNotFound,
+    start_rollout_signature_research,
+    get_rollout_signature_research,
+)
 from ...services.control_shadow_tcn_jobs import (
     TCNConflict, TCNInvalid, TCNNotFound,
     start_tcn_research, get_tcn_research,
@@ -794,5 +799,79 @@ def read_policy_rollout_logs(job_id: str) -> dict[str, Any]:
             database(), job_id, logs_only=True,
         )
     except RolloutNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+class StartControlRolloutSignatureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_CONTROL_ROLLOUT_DECISION_SIGNATURE_NO_ORDERS"] = Field(
+        description=(
+            "Analyze the fixed v10.8.48 paired rollout events using causal "
+            "decision-time features and small fixed models. This endpoint "
+            "creates no trading policy."
+        )
+    )
+    source_rollout_job_id: str = Field(
+        min_length=32, max_length=32,
+        pattern=r"^control-rollout-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/rollout-signature/jobs",
+    status_code=202,
+    summary="Diagnose predictive signature of v10.8.48 rollout decisions",
+    description=(
+        "Builds a 321-event causal decision dataset from the verified v10.8.48 "
+        "paired rollouts, computes feature diagnostics, and evaluates fixed "
+        "Logistic Regression, shallow Decision Tree, small Random Forest and "
+        "small LightGBM with chronological fold transfer. No policy creation, "
+        "hyperparameter search, Alpaca refresh, Winner change or orders."
+    ),
+)
+def start_rollout_signature_job(
+    payload: StartControlRolloutSignatureRequest,
+) -> dict[str, Any]:
+    try:
+        return start_rollout_signature_research(
+            database(),
+            source_rollout_job_id=payload.source_rollout_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except SignatureNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SignatureConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SignatureInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/rollout-signature/jobs/{job_id}",
+    summary="Read v10.8.49 diagnostic results",
+)
+def read_rollout_signature_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_rollout_signature_research(database(), job_id)
+    except SignatureNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/rollout-signature/jobs/{job_id}/logs",
+    summary="Read v10.8.49 diagnostic progress and logs",
+)
+def read_rollout_signature_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_rollout_signature_research(
+            database(), job_id, logs_only=True,
+        )
+    except SignatureNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

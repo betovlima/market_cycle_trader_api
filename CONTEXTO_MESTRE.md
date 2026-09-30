@@ -51,6 +51,28 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.49 — Rollout Decision Signature Research (diagnóstico, sem ordem)
+- Branch `feature/v10.8.49-rollout-decision-signature-research`, derivada da v10.8.48.
+- Objetivo: explicar os 321 eventos contrafactuais da v10.8.48 e descobrir se variáveis conhecidas no instante da decisão conseguem separar `ROTATE melhor` de `HOLD melhor`.
+- Esta versão NÃO cria nova policy. É exclusivamente diagnóstica e não pode alterar Control, Liquidity-Aware, Winner, Strategy, Trader ou ordens.
+- Fonte congelada: job v10.8.48 `control-rollout-03253d310ef445b2`, snapshot `control-shadow-870fb66e1bdc4fd0`, SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
+- Dataset alvo: 321 linhas de `paired_rollout_labels.csv`, enriquecidas apenas com variáveis disponíveis em `decision_date`: estado da carteira, features causais incumbent/candidate, diferenças relativas, liquidez/capacidade estimada e, quando disponível sem recomputar futuro, diagnostics/utility do Control.
+- Análises fixas antes de olhar resultado: Pearson/Spearman, comparação ROTATE vs HOLD, quantis, estabilidade por fold; modelos simples Logistic Regression, árvore rasa, Random Forest pequeno e LightGBM pequeno com validação temporal.
+- Validação temporal: Fold 2 avaliado com treino somente em Fold 1; Fold 3 avaliado com treino somente em Folds 1+2. Fold 1 é apenas histórico/diagnóstico e nunca é usado como avaliação após treino futuro.
+- Sem tuning em OOS: hiperparâmetros pequenos e fixos; nenhuma busca de grade; nenhuma alteração baseada no resultado da mesma v10.8.49.
+- Implementação concluída na branch: `engine/control_rollout_decision_signature.py` monta dataset causal e análises; `engine/control_rollout_signature_research.py` orquestra fonte/artefatos; `services/control_shadow_rollout_signature_jobs.py` cria job isolado; Swagger expõe `POST /api/admin/control-shadow/rollout-signature/jobs` e GET de status/logs.
+- Variáveis implementadas: estado da carteira quando recuperável na curva-base, 12 features causais do incumbent, 12 do candidate, 12 deltas relativos, preços, volume mediano anterior de 20 sessões, razão de liquidez, capacidade estimada a 10%, capacidade nocional e capacidade/equity.
+- Modelos fixos sem tuning: Logistic Regression, árvore rasa, Random Forest pequeno e LightGBM pequeno. Avaliação temporal pré-declarada: Fold2 <- Fold1; Fold3 <- Folds1+2. Critério preliminar de sinal: balanced accuracy > 0,50 nos dois testes cronológicos para o mesmo modelo.
+- Artefatos: `rollout_decision_dataset.csv`, `feature_correlations.csv`, `feature_class_comparison.csv`, `feature_quantiles.csv`, `fold_feature_stability.csv`, `model_results.csv`, `feature_importance.csv`, `summary.json`.
+- Execução/auditoria real v10.8.49 concluída sobre job `control-signature-5dedf5eee0f94e8a`, fonte `control-rollout-03253d310ef445b2`, SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`. ZIP analisado com 490 entradas e CRC válido; 321 eventos, 157 ROTATE melhor e 164 HOLD melhor.
+- Pela primeira vez um modelo simples cumpriu o critério predeclarado de sinal preliminar nos dois testes temporais: Logistic Regression balanced accuracy Fold2 = 0,516949 e Fold3 = 0,547267. AUC: Fold2 = 0,495837; Fold3 = 0,578658. Portanto `predictive_signal_detected=true` segundo a regra definida antes do resultado.
+- O sinal é fraco e NÃO autoriza policy: no Fold2 a Logistic Regression teve recall 1,0 e precision 0,50, indicando comportamento quase sempre ROTATE; Brier = 0,483135. Fold3 foi melhor, com balanced accuracy 0,547267 e AUC 0,578658, mas ainda modesto.
+- Outros modelos não mantiveram >0,50 nos dois folds: Decision Tree (0,500000 / 0,424445), Random Forest (0,538507 / 0,496419), LightGBM pequeno (0,506096 / 0,472547).
+- Features descritivas com sinal Spearman consistente nos 3 folds incluem principalmente estado/força do incumbent: `state_shares` (negativo), `incumbent__return_20`, `incumbent__return_60`, `incumbent__ema_distance_20`, `incumbent__ema_distance_50`, `incumbent__rsi_14`, `incumbent__channel_position_50`, `incumbent_close`, `incumbent_capacity_notional`, `incumbent_capacity_equity_ratio`, além de `candidate__channel_position_50`.
+- Nos 321 eventos, `incumbent__return_20` teve Spearman ~0,168 com DeltaCapital; `incumbent__ema_distance_50` ~0,153; `incumbent__return_60` ~0,134. ROTATE-better apresentou incumbent com momentum/posição técnica mais forte em média. Esse padrão é descritivo e precisa de confirmação causal/preditiva adicional.
+- Conclusão v10.8.49: existe um primeiro sinal temporalmente transferível, mas insuficiente para criar Meta-Veto. Próxima pesquisa deve focar uma representação explicável do estado do incumbent e reduzir dimensionalidade/colinearidade, mantendo validação Fold2<-Fold1 e Fold3<-Folds1+2; não fazer tuning sobre este mesmo OOS nem promover Strategy/Winner.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.48 — Control Policy Rollout Advantage (pesquisa, sem ordem)
 - Branch `feature/v10.8.48-control-policy-rollout-advantage-research`, derivada da v10.8.47 após auditoria do resultado real.
 - Motivação: v10.8.47 preservou corretamente a v10.8.44 porque nenhum fold atingiu skill mínima, mas o target simplificado `weighted_forward_return(candidate)-weighted_forward_return(incumbent)` não apresentou skill OOS. A arquitetura Meta-Veto é preservada; apenas o target muda.
