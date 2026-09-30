@@ -72,6 +72,10 @@
 - Implementação concluída: `control_reduced_signature_meta_veto.py` agora aceita `capital_weighted=True|False` com fórmula de peso congelada; `control_capital_weighted_meta_veto_research.py` executa no mesmo job a referência v10.8.53 e a candidata v10.8.54, exigindo paridade v10.8.44 e v10.8.53 antes da comparação; o serviço existente foi reapontado para essa orquestração.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs` com o mesmo payload.
 - Critério de decisão do experimento: candidata só conta como avanço se `candidate_final_capital > 1.891.417,6670329159`; caso contrário, descartar v10.8.54 e manter v10.8.53 como melhor referência comparável.
+- Execução real auditada: job `control-meta-f62da71f186b459c`, snapshot/SHA corretos. Paridade v10.8.44 = `US$ 1.078.635,4115518222`; paridade v10.8.53 = `US$ 1.891.417,6670329159`; ambas diferença 0.
+- Hipótese capital-weighted REJEITADA. Fold2: BA 0,496212 / AUC 0,681818; Fold3: BA 0,442529 / AUC 0,498084. O gate falhou nos dois folds, portanto nenhum modelo candidato foi habilitado, `candidate_veto_count=0`, e a candidata terminou exatamente no Control/Liquidity-Aware `US$ 1.078.635,4115518222` (-42,9721% contra v10.8.53).
+- Interpretação: ponderar diretamente por `abs(delta_capital_fraction)` destruiu a separação de sinal necessária para o gate, especialmente no Fold3. Não ajustar expoente/clipping/peso pós-OOS; descartar esta hipótese.
+- v10.8.53 permanece a melhor referência comparável em `US$ 1.891.417,6670329159`.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
