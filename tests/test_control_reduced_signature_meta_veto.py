@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.55 expected-advantage regression Meta-Veto."""
+"""Safeguards for v10.8.56 consensus Meta-Veto."""
 from __future__ import annotations
 
 import sys
@@ -35,6 +35,7 @@ from market_cycle_trader_api.engine.control_expected_advantage_meta_veto import 
     MIN_CALIBRATION_SIGN_BALANCED_ACCURACY,
     MIN_CALIBRATION_SPEARMAN,
 )
+from market_cycle_trader_api.engine import control_consensus_meta_veto as consensus_engine
 
 REDUCED="control-reduced-b9404f6e1f694e38"
 SIGNATURE="control-signature-5dedf5eee0f94e8a"
@@ -64,6 +65,16 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(engine.run_expected_advantage_meta_veto_pair)
         self.assertIn("if predicted_delta <= 0.0:",source)
         self.assertIn("VETO_NONPOSITIVE_EXPECTED_ADVANTAGE",source)
+
+    def test_consensus_cannot_create_new_veto(self):
+        import inspect
+
+        source=inspect.getsource(consensus_engine.run_consensus_meta_veto_pair)
+        self.assertIn("classifier_veto_candidate",source)
+        self.assertIn("elif regressor.enabled:",source)
+        self.assertIn("REGRESSION_CANCELLED_CLASSIFIER_VETO",source)
+        self.assertIn("CLASSIFIER_VETO_REGRESSOR_UNAVAILABLE",source)
+        self.assertNotIn("VETO_NONPOSITIVE_EXPECTED_ADVANTAGE",source)
 
     def test_liquidity_overlay_is_explicitly_enabled_in_replay(self):
         import inspect
