@@ -47,6 +47,13 @@ class ReducedSignatureMetaVetoTests(TestCase):
         self.assertEqual(VETO_PROBABILITY_MAX,0.35)
         self.assertEqual(len(REDUCED_FEATURES),9)
 
+    def test_liquidity_overlay_is_explicitly_enabled_in_replay(self):
+        import inspect
+        from market_cycle_trader_api.engine import control_reduced_signature_meta_veto as engine
+
+        source=inspect.getsource(engine.run_reduced_signature_meta_veto_pair)
+        self.assertIn('{"enabled": True, "audit": {}}',source)
+
     def test_endpoint_rejects_tuning_or_order_fields(self):
         body={
             "confirm":"RESEARCH_CONTROL_REDUCED_META_VETO_NO_ORDERS",
