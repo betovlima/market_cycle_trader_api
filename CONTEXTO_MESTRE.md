@@ -63,7 +63,13 @@
 - Testes adicionados para estado histórico reconciliado, rejeição fail-closed, Fold 1 obrigatoriamente sem meta-modelo, exclusão de labels do fold corrente e bloqueio de parâmetros HTTP de tuning.
 - Os labels de folds posteriores são sempre gerados sobre a trajetória-base v10.8.44; estados criados pelos próprios vetos v10.8.48 não retroalimentam o treinamento nesta hipótese, evitando dependência recursiva entre folds.
 - Execução real v10.8.48 concluída com sucesso em 2026-09-30: job `control-rollout-03253d310ef445b2`. O log chegou até fold 3/3, replay OOS 1554 sessões, geração de rollouts pareados sobre 326 oportunidades e status final `completed`, sem tocar no caminho de ordens.
-- Auditoria numérica ainda pendente: é necessário analisar o diretório `validation/v10.8.48/control-rollout-03253d310ef445b2`, principalmente `summary.json`, `paired_rollout_labels.csv`, `rollout_training_folds.csv`, `rollout_meta_veto_decisions.csv` e curvas/folds de capital. Não concluir skill, número de vetos ou capital final antes dessa auditoria.
+- Auditoria v10.8.48 concluída sobre o ZIP real `dados(8).zip`: 456 entradas, CRC válido e 167/167 hashes do snapshot conferidos contra o manifesto; SHA permanece `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
+- Paridade v10.8.44 perfeita: esperado e reproduzido `US$ 1.078.635,4115518222`, diferença absoluta 0.
+- Foram gerados 321 labels de rollout pareado com horizonte fixo de 20 sessões; 157 (48,91%) favoreceram ROTATE e 164 favoreceram HOLD. Distribuição por fold-base: fold1 75 labels, 54,67% positivos; fold2 116, 49,14%; fold3 130, 45,38%.
+- Skill do meta-modelo: Fold 1 desabilitado por protocolo; Fold 2 balanced accuracy de calibração 44,44% (30 amostras); Fold 3 46,23% (56 amostras). Nenhum fold atingiu o gate de 55%, logo `enabled_fold_count=0` e `veto_count=0`.
+- Capital v10.8.48 = `US$ 1.078.635,4115518222`, exatamente igual à v10.8.44, por fallback integral ao Control. A arquitetura fail-safe voltou a funcionar corretamente.
+- O target DeltaCapital por rollout é economicamente expressivo, com diferenças extremas de aproximadamente -33,25% a +30,93% da equity inicial em 20 sessões, porém a TinyTCN atual não conseguiu prever o sinal dessas diferenças de forma útil. A hipótese de que apenas substituir o label local por rollout de capital resolveria o problema preditivo está rejeitada nesta implementação.
+- Próximo passo de pesquisa não deve ser tuning da mesma TinyTCN/threshold/horizonte sobre este OOS. Preservar o Control/Liquidity-Aware e investigar representação/variáveis específicas do estado de decisão ou modelos mais simples/interpretáveis sobre os 321 eventos antes de qualquer nova rede.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## v10.8.47 — Control Counterfactual Advantage Meta-Veto (pesquisa, sem ordem)
