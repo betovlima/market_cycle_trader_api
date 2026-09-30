@@ -415,3 +415,93 @@ def _probability(
         )
         value = float(torch.sigmoid(logit).item())
     return value if math.isfinite(value) else None
+
+
+def run_meta_veto_pair(
+    bars: dict[str, pd.DataFrame],
+    config: Any,
+    fee_calculator: Callable,
+    slippage: Callable,
+    *,
+    progress_callback: Callable[[float, str, int], None] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[pd.Timestamp, dict[str, Any]]]:
+    """Fit meta-veto on pre-OOS calibration and replay paired OOS paths."""
+    (
+        frames, common_dates, symbols, folds, _all_decision_dates,
+        _decision_to_fold, _decision_metadata,
+    ) = scientific._build_execution_context(bars, config)
+    if len(symbols) != 55 or len(folds) != 3:
+        raise ValueError("Meta-veto requires original 55 assets and 3 folds.")
+
+    fold_models: dict[int, MetaVetoNet] = {}
+    fold_scales: dict[int, MetaScale] = {}
+    fold_thresholds: dict[int, float | None] = {}
+    fold_reports: list[dict[str, Any]] = []
+
+    for fold in folds:
+        fid = int(fold["fold_id"])
+        train_dates = common_dates[:int(fold["train_end_index"])]
+        calibration_dates = common_dates[
+            int(fold["calibration_start_index"]):int(fold["calibration_end_index"])
+        ]
+        if progress_callback:
+            progress_callback(
+                2.0 + 5.0*(fid-1),
+                f"Meta-veto fold {fid}: fitting pre-OOS proposal model",
+                0,
+            )
+        calibration_models = scientific._lightgbm_fit_models(
+            frames, symbols, train_dates, config,
+            phase=f"meta_veto_fold_{fid}_proposal_source",
+        )
+        calibration_cache, _ = _precompute_model_utilities(
+            calibration_models, frames, symbols, calibration_dates, config,
+        )
+        rows = _build_pair_rows(
+            frames, symbols, calibration_dates, calibration_cache,
+            test_start=pd.Timestamp(fold["test_start"]),
+        )
+        training, validation = _split_pairs(rows)
+        model, scale, report = _fit(
+            frames, symbols, training, validation,
+            seed=RANDOM_SEED+fid,
+        )
+        fold_models[fid] = model
+        fold_scales[fid] = scale
+        fold_thresholds[fid] = report["chosen_veto_threshold"]
+        fold_reports.append({
+            "fold_id": fid,
+            "test_start": pd.Timestamp(fold["test_start"]).isoformat(),
+            "test_end": pd.Timestamp(fold["test_end"]).isoformat(),
+            "proposal_pair_source": "top calibration LightGBM candidate versus lower-ranked possible incumbents",
+            "meta_label": "candidate forward_risk_adjusted_utility > incumbent forward_risk_adjusted_utility",
+            **report,
+        })
+
+    original_runner = scientific._run_lightgbm
+    original_predict = scientific._precompute_model_utilities
+    original_policy = original_runner.__globals__.get("_utility_policy")
+    original_simulator = original_runner.__globals__.get("_simulate_exact")
+    if (
+        original_policy is not frozen_utility_policy
+        or original_simulator is not scientific._simulate_exact
+        or original_runner.__globals__.get("_precompute_model_utilities") is not original_predict
+    ):
+        raise RuntimeError("Frozen Control bindings differ from expected source.")
+
+    account: dict[str, Any] = {
+        "enabled": True,
+        "veto_enabled": False,
+        "audit": {},
+        "veto_audit": {},
+    }
+    arrays_by_fold = {
+        fid: _arrays(frames, symbols, fold_scales[fid])
+        for fid in fold_scales
+    }
+
+    def liquidity_utilities(models, panel, labels, timestamps, settings):
+        cached, profile = original_predict(
+            models, panel, labels, timestamps, settings,
+        )
+        return _CapitalAwareUtilityCache(cached, panel, labels, account), profile
