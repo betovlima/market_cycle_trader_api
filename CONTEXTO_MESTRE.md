@@ -51,6 +51,18 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.49 — Rollout Decision Signature Research (diagnóstico, sem ordem)
+- Branch `feature/v10.8.49-rollout-decision-signature-research`, derivada da v10.8.48.
+- Objetivo: explicar os 321 eventos contrafactuais da v10.8.48 e descobrir se variáveis conhecidas no instante da decisão conseguem separar `ROTATE melhor` de `HOLD melhor`.
+- Esta versão NÃO cria nova policy. É exclusivamente diagnóstica e não pode alterar Control, Liquidity-Aware, Winner, Strategy, Trader ou ordens.
+- Fonte congelada: job v10.8.48 `control-rollout-03253d310ef445b2`, snapshot `control-shadow-870fb66e1bdc4fd0`, SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
+- Dataset alvo: 321 linhas de `paired_rollout_labels.csv`, enriquecidas apenas com variáveis disponíveis em `decision_date`: estado da carteira, features causais incumbent/candidate, diferenças relativas, liquidez/capacidade estimada e, quando disponível sem recomputar futuro, diagnostics/utility do Control.
+- Análises fixas antes de olhar resultado: Pearson/Spearman, comparação ROTATE vs HOLD, quantis, estabilidade por fold; modelos simples Logistic Regression, árvore rasa, Random Forest pequeno e LightGBM pequeno com validação temporal.
+- Validação temporal: Fold 2 avaliado com treino somente em Fold 1; Fold 3 avaliado com treino somente em Folds 1+2. Fold 1 é apenas histórico/diagnóstico e nunca é usado como avaliação após treino futuro.
+- Sem tuning em OOS: hiperparâmetros pequenos e fixos; nenhuma busca de grade; nenhuma alteração baseada no resultado da mesma v10.8.49.
+- Próximos passos: implementar dataset/analysis, job admin /docs, artefatos, testes, executar, auditar e registrar conclusão.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.48 — Control Policy Rollout Advantage (pesquisa, sem ordem)
 - Branch `feature/v10.8.48-control-policy-rollout-advantage-research`, derivada da v10.8.47 após auditoria do resultado real.
 - Motivação: v10.8.47 preservou corretamente a v10.8.44 porque nenhum fold atingiu skill mínima, mas o target simplificado `weighted_forward_return(candidate)-weighted_forward_return(incumbent)` não apresentou skill OOS. A arquitetura Meta-Veto é preservada; apenas o target muda.
