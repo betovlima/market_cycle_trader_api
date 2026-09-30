@@ -64,6 +64,7 @@
 - Implementação concluída: `control_reduced_signature_meta_veto.py` exige `rollout_end_date < test_start` e aplica estado one-shot `force_control_next`; `control_reduced_signature_meta_veto_research.py` une os 321 eventos ao `paired_rollout_labels.csv` da v10.8.48 para recuperar maturidade exata e grava artefatos sob `validation/v10.8.53/`.
 - O endpoint permanece `POST /api/admin/control-shadow/reduced-meta-veto/jobs`, sem login e com o mesmo payload. Não foram adicionados parâmetros HTTP.
 - Testes atualizados para exigir maturidade integral, one-shot explícito, Liquidity-Aware habilitado e API v10.8.53.
+- Correção de importação em 2026-09-30: patch anterior inseriu 12 ocorrências de `\\n` literal em `control_reduced_signature_meta_veto.py`, causando `SyntaxError` no startup do Uvicorn/Python 3.14. Todas foram convertidas para quebras de linha reais no commit `5cc5e33860a288170f585df8f0ba935225a60db3`. Nenhuma regra científica foi alterada.
 - Próximo passo: confirmar CI do HEAD e repetir o mesmo endpoint; paridade v10.8.44 continua obrigatória antes de interpretar capital.
 
 ## v10.8.52 — Correção de paridade Liquidity-Aware no Meta-Veto
