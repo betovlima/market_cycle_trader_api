@@ -13,6 +13,7 @@ from ..engine.control_consensus_meta_veto_research import (
     run_consensus_meta_veto_research,
 )
 from ..infrastructure.persistence.mongo_repository import utc_now
+from ..core.config import API_VERSION
 from .control_shadow_jobs import _require_enabled
 from .control_shadow_reduced_signature_jobs import COLLECTION as REDUCED_COLLECTION
 from .control_shadow_rollout_signature_jobs import COLLECTION as SIGNATURE_COLLECTION
@@ -21,6 +22,8 @@ from .control_shadow_policy_rollout_jobs import COLLECTION as ROLLOUT_COLLECTION
 LOGGER = logging.getLogger("uvicorn.error")
 COLLECTION = "control_shadow_reduced_signature_meta_veto_jobs"
 ACTIVE_KEY = "control-reduced-signature-meta-veto-v1056"
+EXPECTED_API_VERSION = "10.8.56"
+RESEARCH_RUNNER = "consensus-meta-veto-v1056"
 _THREADS: dict[str, threading.Thread] = {}
 
 
@@ -51,6 +54,8 @@ def _public(record: dict[str, Any], *, logs_only: bool = False) -> dict[str, Any
         "source_download": "never",
         "order_eligible": False,
         "order_submission": "never",
+        "api_version": record.get("api_version"),
+        "research_runner": record.get("research_runner"),
     }
     if not logs_only:
         payload.update({
@@ -103,7 +108,7 @@ def _run_job(
         )
         _log(
             db, job_id,
-            "Running v10.8.56 consensus Meta-Veto comparison; no orders.",
+            f"Running {RESEARCH_RUNNER} on API {API_VERSION}; no orders.",
             stage="verify_and_replay", progress=1,
         )
 
@@ -165,6 +170,11 @@ def start_reduced_signature_meta_veto_research(
     expected_snapshot_sha256: str,
 ) -> dict[str, Any]:
     _require_enabled()
+    if API_VERSION != EXPECTED_API_VERSION:
+        raise MetaVetoInvalid(
+            f"Stale/mixed runtime: expected API {EXPECTED_API_VERSION}, "
+            f"loaded {API_VERSION}. Restart the API before running research."
+        )
     if (
         not re.fullmatch(r"control-reduced-[a-f0-9]{16}", source_reduced_job_id)
         or not re.fullmatch(r"[a-f0-9]{64}", expected_snapshot_sha256)
@@ -236,6 +246,8 @@ def start_reduced_signature_meta_veto_research(
         "source_signature_job_id": signature_id,
         "source_reduced_job_id": source_reduced_job_id,
         "snapshot_sha256": expected_snapshot_sha256,
+        "api_version": API_VERSION,
+        "research_runner": RESEARCH_RUNNER,
         "created_at": now,
         "updated_at": now,
         "started_at": None,
