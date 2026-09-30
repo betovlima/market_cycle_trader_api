@@ -51,6 +51,17 @@
 - Testes novos cobrem download simulado, metadados, hashes, exclusão estrutural, falha de provedor, segurança de endpoint e ausência de rota de ordens. Ver `docs/changes/v10.8.39-control-operational-parity.md`.
 
 
+## v10.8.50 — Reduced Rollout Signature Confirmation (diagnóstico, sem ordem)
+- Branch `feature/v10.8.50-reduced-rollout-signature-research`, derivada da v10.8.49 após auditoria do primeiro sinal preditivo preliminar.
+- Objetivo: verificar se o sinal da Logistic Regression v10.8.49 sobrevive com assinatura pequena, explicável e congelada, reduzindo dimensionalidade/colinearidade antes de qualquer Meta-Veto.
+- Fonte congelada: v10.8.49 `control-signature-5dedf5eee0f94e8a`, baseada no rollout v10.8.48 `control-rollout-03253d310ef445b2`, snapshot SHA `6d9e7d69865277487a6b193adedcc1d91e428ab451921d538aa4938fe108e8f3`.
+- Features congeladas antes do resultado: `incumbent__return_20`, `incumbent__return_60`, `incumbent__ema_distance_20`, `incumbent__ema_distance_50`, `incumbent__rsi_14`, `incumbent__channel_position_50`, `incumbent_capacity_equity_ratio`, `state_shares`, `candidate__channel_position_50`.
+- Modelos fixos: Logistic Regression balanceada C=1.0; Logistic Regression L2 mais regularizada C=0.25; e nove modelos logísticos univariados (uma feature por vez). Threshold fixo 0.50; sem grid search, feature selection pós-OOS ou tuning.
+- Validação temporal permanece: Fold2 <- Fold1; Fold3 <- Folds1+2.
+- Critério de confirmação pré-declarado e mais rígido: o mesmo modelo multivariado reduzido precisa ter Balanced Accuracy > 0.50 E ROC AUC > 0.50 nos Folds 2 e 3. Modelos univariados são apenas explicativos e não contam isoladamente como confirmação.
+- Nenhuma policy é criada nesta versão. Mesmo se o sinal for confirmado, o próximo passo seria desenhar separadamente uma política fail-safe e congelar seu protocolo antes de avaliar capital.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.49 — Rollout Decision Signature Research (diagnóstico, sem ordem)
 - Branch `feature/v10.8.49-rollout-decision-signature-research`, derivada da v10.8.48.
 - Objetivo: explicar os 321 eventos contrafactuais da v10.8.48 e descobrir se variáveis conhecidas no instante da decisão conseguem separar `ROTATE melhor` de `HOLD melhor`.
