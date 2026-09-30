@@ -1,4 +1,4 @@
-"""Public research-only v10.8.51 reduced-signature meta-veto jobs."""
+"""Public research-only v10.8.53 one-shot reduced-signature meta-veto jobs."""
 from __future__ import annotations
 
 import logging
@@ -20,7 +20,7 @@ from .control_shadow_policy_rollout_jobs import COLLECTION as ROLLOUT_COLLECTION
 
 LOGGER = logging.getLogger("uvicorn.error")
 COLLECTION = "control_shadow_reduced_signature_meta_veto_jobs"
-ACTIVE_KEY = "control-reduced-signature-meta-veto-v1051"
+ACTIVE_KEY = "control-reduced-signature-meta-veto-v1053"
 _THREADS: dict[str, threading.Thread] = {}
 
 
@@ -103,7 +103,7 @@ def _run_job(
         )
         _log(
             db, job_id,
-            "Running v10.8.51 fail-safe reduced-signature meta-veto; no orders.",
+            "Running v10.8.53 one-shot reduced-signature meta-veto; no orders.",
             stage="verify_and_replay", progress=1,
         )
 
@@ -129,7 +129,7 @@ def _run_job(
         now = utc_now()
         _log(
             db, job_id,
-            "v10.8.51 meta-veto research completed; no order path touched.",
+            "v10.8.53 one-shot meta-veto research completed; no order path touched.",
             stage="completed", progress=100,
         )
         db[COLLECTION].update_one(
@@ -247,7 +247,7 @@ def start_reduced_signature_meta_veto_research(
     try:
         collection.insert_one(record)
     except DuplicateKeyError as exc:
-        raise MetaVetoConflict("Another v10.8.51 meta-veto job is active.") from exc
+        raise MetaVetoConflict("Another v10.8.53 meta-veto job is active.") from exc
 
     thread = threading.Thread(
         target=_run_job,
@@ -287,5 +287,5 @@ def get_reduced_signature_meta_veto_research(
 ) -> dict[str, Any]:
     record = db[COLLECTION].find_one({"_id": job_id})
     if record is None:
-        raise MetaVetoNotFound("v10.8.51 meta-veto job not found.")
+        raise MetaVetoNotFound("v10.8.53 meta-veto job not found.")
     return _public(record, logs_only=logs_only)
