@@ -14,7 +14,10 @@ Protocol frozen before capital evaluation:
 - enable only with >=20 calibration samples, BA>=0.52 and AUC>=0.52;
 - veto only when P(ROTATE better)<=0.35;
 - CASH transitions are never modified;
-- dynamic features use the actual meta-trajectory state at decision time;\n- labels must be fully matured before the test-fold start;\n- after a veto, the next policy decision is Control-only (one-shot semantics).\n"""
+- dynamic features use the actual meta-trajectory state at decision time;
+- labels must be fully matured before the test-fold start;
+- after a veto, the next policy decision is Control-only (one-shot semantics).
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -90,7 +93,10 @@ def train_fold_models(
     if missing:
         raise ValueError(f"v10.8.53 source dataset missing columns: {missing}")
     source = dataset.copy()
-    source["decision_date"] = pd.to_datetime(source["decision_date"], utc=True)\n    source["rollout_end_date"] = pd.to_datetime(source["rollout_end_date"], utc=True)\n    source = source.sort_values("decision_date").reset_index(drop=True)\n
+    source["decision_date"] = pd.to_datetime(source["decision_date"], utc=True)
+    source["rollout_end_date"] = pd.to_datetime(source["rollout_end_date"], utc=True)
+    source = source.sort_values("decision_date").reset_index(drop=True)
+
     models: dict[int, FoldModel] = {}
     reports: list[dict[str, Any]] = []
     for fold in folds:
@@ -112,7 +118,9 @@ def train_fold_models(
                 "training_rows": 0,
                 "calibration_rows": 0,
                 "model_enabled": False,
-                "disable_reason": "NO_PRIOR_OOS_FOLD",\n                "test_start": test_start.isoformat(),\n            })
+                "disable_reason": "NO_PRIOR_OOS_FOLD",
+                "test_start": test_start.isoformat(),
+            })
             continue
 
         training, calibration = _chronological_split(prior)
@@ -124,7 +132,9 @@ def train_fold_models(
                 "training_rows": int(len(training)),
                 "calibration_rows": int(len(calibration)),
                 "model_enabled": False,
-                "disable_reason": "INSUFFICIENT_PRIOR_ROWS",\n                "test_start": test_start.isoformat(),\n            })
+                "disable_reason": "INSUFFICIENT_PRIOR_ROWS",
+                "test_start": test_start.isoformat(),
+            })
             continue
 
         model = _make_model()
@@ -164,7 +174,9 @@ def train_fold_models(
             "calibration_roc_auc": auc if math.isfinite(auc) else None,
             "model_enabled": enabled,
             "disable_reason": reason,
-            "veto_probability_max": VETO_PROBABILITY_MAX,\n            "test_start": test_start.isoformat(),\n        })
+            "veto_probability_max": VETO_PROBABILITY_MAX,
+            "test_start": test_start.isoformat(),
+        })
     return models, reports
 
 
