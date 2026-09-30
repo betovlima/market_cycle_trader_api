@@ -67,6 +67,19 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## v10.8.56 — Consensus Meta-Veto
+- Branch `feature/v10.8.56-consensus-meta-veto`, derivada da v10.8.55 apenas para reutilizar o regressor já congelado; a melhor referência continua sendo v10.8.53.
+- Objetivo: aumentar o capital final reduzindo falsos positivos de veto da v10.8.53 sem permitir que o regressor substitua o classificador.
+- Referência obrigatória no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
+- Classificador primário: exatamente v10.8.53 (Logistic Regression balanceada L2 C=0.25, mesmas 9 features, gate BA>=0.52 e AUC>=0.52, veto candidato quando P(ROTATE melhor)<=0.35).
+- Confirmação secundária: exatamente o regressor v10.8.55 (Ridge alpha=1.0, mesmas 9 features, gate sign BA>=0.52 e Spearman>0).
+- Regra congelada: se o classificador NÃO pedir veto, executar Control. Se pedir veto e o regressor estiver habilitado no fold, só vetar quando `predicted_delta_capital_fraction<=0`. Se o regressor estiver desabilitado, preservar exatamente o veto da v10.8.53 (fallback classifier-only).
+- Fold1 sem modelo; Fold2/Fold3 somente labels maduros com `rollout_end_date < test_start`. One-shot e Liquidity-Aware idênticos à v10.8.53.
+- Não há threshold novo, tuning de C/alpha, seleção de features ou ajuste pós-OOS.
+- Esta hipótese é exploratória e pós-descoberta: o consenso foi escolhido após observar que a regressão v10.8.55 falhou como substituta. Só deve ser tratada como melhoria retrospectiva se aumentar capital; validação futura independente continua necessária.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.55 — Expected Advantage Regression (rejeitada)
 - Job real `control-meta-46ab5ebc5a6c4a6d`; ZIP `dados(20260930-233332).zip`, 548 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
