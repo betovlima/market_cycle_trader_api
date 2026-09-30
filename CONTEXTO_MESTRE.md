@@ -59,6 +59,41 @@
 - Métricas de risco (Sharpe, MaxDD, custos, liquidez e estabilidade por fold) permanecem diagnósticos obrigatórios, mas não substituem o objetivo primário de capital final.
 - Não criar novos endpoints por experimento. Reutilizar a rota de pesquisa existente da linha quando possível e manter versões/resultados nos artefatos e documentação.
 
+## v10.8.54 — Capital-Weighted Meta-Veto (rejeitada)
+- Execução real: job `control-meta-f62da71f186b459c`.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Fold2 candidata: BA 0,496212 / AUC 0,681818 -> gate falhou.
+- Fold3 candidata: BA 0,442529 / AUC 0,498084 -> gate falhou.
+- Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
+- Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
+
+## Resultado v10.8.55 — Expected Advantage Regression (rejeitada)
+- Job real `control-meta-46ab5ebc5a6c4a6d`; ZIP `dados(20260930-233332).zip`, 548 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Fold2 regressão: 75 labels maduros; calibration sign BA 0,575758; Spearman 0,356719; modelo habilitado.
+- Fold3 regressão: 184 labels maduros; calibration sign BA 0,405492; Spearman -0,199658; gate falhou e modelo foi desabilitado.
+- Candidata aplicou 57 vetos, todos no Fold2. Capital final `US$ 1.038.414,3657602259`, delta `-US$ 853.003,30` / `-45,0986%` contra v10.8.53. Sharpe 1,6594; MaxDD -42,61%.
+- Ao fim do Fold2, antes do Fold3, a candidata já estava materialmente abaixo da referência; o problema não foi apenas a desativação do Fold3.
+- Hipótese de substituir o classificador pelo regressor foi rejeitada sem tuning de alpha/threshold. v10.8.53 permanece a melhor referência válida.
+- Diagnóstico para próxima hipótese: usar o regressor apenas como confirmação secundária dos vetos do classificador, nunca como substituto. No Fold2, dos 30 vetos da v10.8.53, 20 ocorreram em datas/estados nos quais o regressor também indicou vantagem econômica não positiva; o Fold3 deve cair automaticamente para a v10.8.53 porque o regressor não passou no gate.
+
+## v10.8.55 — Expected Advantage Regression Meta-Veto
+- Branch `feature/v10.8.55-expected-advantage-regression-meta-veto`, derivada diretamente da melhor referência v10.8.53; a v10.8.54 foi rejeitada e não é base desta versão.
+- Objetivo: aumentar capital final modelando diretamente `delta_capital_fraction` do rollout ROTATE-vs-HOLD, em vez de classificar apenas seu sinal.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
+- Modelo candidato congelado antes da execução: Ridge Regression com `alpha=1.0`, `SimpleImputer(median)` + `StandardScaler`; mesmas 9 features da v10.8.53.
+- Target: `delta_capital_fraction = (capital_ROTATE - capital_HOLD) / initial_equity` já congelado na v10.8.49/v10.8.48.
+- Gate de calibração pré-declarado: mínimo 20 eventos, Balanced Accuracy do sinal previsto >=0.52 e Spearman(predição, delta real) > 0.0. Calibração permanece cronológica 70/30, sem peso.
+- Regra de veto natural, sem threshold calibrável: se o modelo do fold estiver habilitado e `predicted_delta_capital_fraction <= 0.0`, HOLD one-shot; caso contrário, Control.
+- Fold1 sem modelo; Fold2 usa somente rollouts maduros do Fold1; Fold3 somente rollouts maduros dos Folds1+2; `rollout_end_date < test_start`.
+- Semântica one-shot e Liquidity-Aware permanecem idênticas à v10.8.53.
+- Nenhum grid search, tuning de alpha, tuning de threshold, seleção de feature ou peso após observar o resultado.
+- Implementação concluída: `control_expected_advantage_meta_veto.py` treina Ridge por fold e aplica veto no break-even econômico 0; `control_expected_advantage_meta_veto_research.py` reproduz v10.8.44 + v10.8.53 e compara a candidata no mesmo snapshot; o serviço existente `control_shadow_reduced_meta_veto_jobs.py` foi reapontado para essa orquestração.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs` com o mesmo payload.
+- Candidata só conta como avanço se superar o capital final da referência v10.8.53 sob paridade exata.
+- Próximo passo: confirmar CI do HEAD e executar o endpoint existente; auditar gates de regressão, quantidade de vetos e capital final sem ajustar parâmetros após observar o resultado.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## v10.8.53 — One-shot Meta-Veto + maturidade causal estrita
 - Branch `fix/v10.8.53-one-shot-meta-veto-causal-maturity`, derivada da v10.8.52 após auditoria do job `control-meta-da56431b92294ebd`.
 - A v10.8.52 corrigiu corretamente a paridade Liquidity-Aware: baseline reproduziu exatamente `US$ 1.078.635,4115518222` (diferença 0). Porém o Meta-Veto terminou em `US$ 109.239,83562554276`, delta `-89,8724%`, com 734 vetos em 809 decisões modeladas.
