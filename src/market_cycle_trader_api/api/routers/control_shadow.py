@@ -11,6 +11,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.runtime import database
+from ...services.control_shadow_meta_veto_jobs import (
+    MetaVetoConflict, MetaVetoInvalid, MetaVetoNotFound,
+    start_meta_veto_research, get_meta_veto_research,
+)
 from ...services.control_shadow_deep_rank_jobs import (
     DeepRankConflict, DeepRankInvalid, DeepRankNotFound,
     start_deep_ranking_research, get_deep_ranking_research,
@@ -591,4 +595,95 @@ def read_deep_ranking_logs(job_id: str) -> dict[str, Any]:
             database(), job_id, logs_only=True,
         )
     except DeepRankNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class StartControlMetaVetoRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["RESEARCH_CONTROL_META_VETO_NO_ORDERS"] = Field(
+        description=(
+            "Deep Learning may only veto a Control-proposed asset rotation. "
+            "If pre-OOS validation does not earn intervention rights the fold "
+            "falls back exactly to v10.8.44."
+        )
+    )
+    source_validation_job_id: str = Field(
+        min_length=35, max_length=35,
+        pattern=r"^control-validation-[a-f0-9]{16}$",
+    )
+    source_execution_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-execution-[a-f0-9]{16}$",
+    )
+    source_liquidity_job_id: str = Field(
+        min_length=34, max_length=34,
+        pattern=r"^control-liquidity-[a-f0-9]{16}$",
+    )
+    source_tcn_job_id: str = Field(
+        min_length=28, max_length=28,
+        pattern=r"^control-tcn-[a-f0-9]{16}$",
+    )
+    source_ranking_job_id: str = Field(
+        min_length=29, max_length=29,
+        pattern=r"^control-rank-[a-f0-9]{16}$",
+    )
+    expected_snapshot_sha256: str = Field(
+        min_length=64, max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+
+
+@router.post(
+    "/meta-veto/jobs",
+    status_code=202,
+    summary="Control-first neural meta-veto — paired base vs veto, no orders",
+    description=(
+        "Keeps the v10.8.44 Liquidity-Aware Control as the complete base "
+        "decision policy. Deep Learning can only veto asset-to-asset rotations "
+        "and only in folds where pre-OOS validation earns intervention rights. "
+        "Runs an exact paired base replay and aborts unless it reproduces the "
+        "known v10.8.44 capital. No Alpaca refresh or orders."
+    ),
+)
+def start_meta_veto_job(payload: StartControlMetaVetoRequest) -> dict[str, Any]:
+    try:
+        return start_meta_veto_research(
+            database(),
+            source_validation_job_id=payload.source_validation_job_id,
+            source_execution_job_id=payload.source_execution_job_id,
+            source_liquidity_job_id=payload.source_liquidity_job_id,
+            source_tcn_job_id=payload.source_tcn_job_id,
+            source_ranking_job_id=payload.source_ranking_job_id,
+            expected_snapshot_sha256=payload.expected_snapshot_sha256,
+        )
+    except ControlShadowUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except MetaVetoNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MetaVetoConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MetaVetoInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/meta-veto/jobs/{job_id}",
+    summary="Read Control-first meta-veto paired research result",
+)
+def read_meta_veto_job(job_id: str) -> dict[str, Any]:
+    try:
+        return get_meta_veto_research(database(), job_id)
+    except MetaVetoNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get(
+    "/meta-veto/jobs/{job_id}/logs",
+    summary="Read Control-first meta-veto training/replay logs",
+)
+def read_meta_veto_logs(job_id: str) -> dict[str, Any]:
+    try:
+        return get_meta_veto_research(database(), job_id, logs_only=True)
+    except MetaVetoNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
