@@ -67,6 +67,34 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.56 — Consensus Meta-Veto (rejeitada)
+- Job real `control-meta-63f2e1bb18014c91`; ZIP `dados(20261001-000909).zip`, 578 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Candidata terminou em `US$ 1.857.794,740041506`, delta `-US$ 33.622,93` / `-1,7777%` contra v10.8.53. Sharpe 1,80585 vs 1,81203; MaxDD praticamente igual (-45,7567% vs -45,7576%).
+- A candidata manteve 63 vetos totais, mas no Fold2 cancelou 3 vetos originais da v10.8.53 e a mudança de trajetória gerou vetos diferentes depois. Fold3 caiu para classifier-only porque a Ridge falhou no gate.
+- Os 3 vetos cancelados foram auditados contra `paired_rollout_labels.csv` e TODOS eram vetos corretos: 2023-09-19 LKFT->RACE delta -1,7357%; 2023-09-29 LKFT->CORT delta -2,5952%; 2024-02-20 CCK->CORT delta -5,9430%. Portanto o regressor removeu ações economicamente úteis.
+- Ao final do Fold2 a candidata já estava ~5,82% abaixo da v10.8.53; o fallback no Fold3 reduziu parte da diferença, mas não recuperou o capital final.
+- Hipótese de consenso classificador+Ridge rejeitada. v10.8.53 permanece a melhor referência válida em `US$ 1.891.417,6670329159`.
+- Diagnóstico adicional da v10.8.53: entre 48 vetos que puderam ser alinhados exatamente ao rollout-base, 33 (68,75%) eram HOLD-better e 15 eram falsos positivos. Entre 180 decisões modeladas alinháveis, havia 56 oportunidades HOLD-better não vetadas. Há espaço de melhoria, mas não via Ridge de magnitude.
+
+## v10.8.56 — Consensus Meta-Veto
+- Branch `feature/v10.8.56-consensus-meta-veto`, derivada da v10.8.55 apenas para reutilizar o regressor já congelado; a melhor referência continua sendo v10.8.53.
+- Objetivo: aumentar o capital final reduzindo falsos positivos de veto da v10.8.53 sem permitir que o regressor substitua o classificador.
+- Referência obrigatória no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
+- Classificador primário: exatamente v10.8.53 (Logistic Regression balanceada L2 C=0.25, mesmas 9 features, gate BA>=0.52 e AUC>=0.52, veto candidato quando P(ROTATE melhor)<=0.35).
+- Confirmação secundária: exatamente o regressor v10.8.55 (Ridge alpha=1.0, mesmas 9 features, gate sign BA>=0.52 e Spearman>0).
+- Regra congelada: se o classificador NÃO pedir veto, executar Control. Se pedir veto e o regressor estiver habilitado no fold, só vetar quando `predicted_delta_capital_fraction<=0`. Se o regressor estiver desabilitado, preservar exatamente o veto da v10.8.53 (fallback classifier-only).
+- Fold1 sem modelo; Fold2/Fold3 somente labels maduros com `rollout_end_date < test_start`. One-shot e Liquidity-Aware idênticos à v10.8.53.
+- Não há threshold novo, tuning de C/alpha, seleção de features ou ajuste pós-OOS.
+- Esta hipótese é exploratória e pós-descoberta: o consenso foi escolhido após observar que a regressão v10.8.55 falhou como substituta. Só deve ser tratada como melhoria retrospectiva se aumentar capital; validação futura independente continua necessária.
+- Implementação concluída: `control_consensus_meta_veto.py` combina o classificador v10.8.53 com o regressor v10.8.55 sem permitir novos vetos; `control_consensus_meta_veto_research.py` reproduz v10.8.44 + v10.8.53 e compara a candidata no mesmo snapshot; o serviço existente foi reapontado para essa orquestração.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Critério do experimento: candidata só conta como avanço se superar `US$ 1.891.417,6670329159`. Se não superar, descartar v10.8.56 e manter v10.8.53.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar vetos confirmados, vetos cancelados, fallback classifier-only por fold e capital final.
+- Incidente de runtime local em 2026-09-30: o ZIP `dados(20260930-235324).zip` não contém artefatos v10.8.56. A execução mais recente no horário do arquivo foi `control-meta-22a6b2af938f406f` sob `validation/v10.8.54`, com `research_kind=control_capital_weighted_meta_veto`; portanto o processo local que atendeu a requisição ainda estava com runner v10.8.54 carregado. Isso NÃO é resultado v10.8.56.
+- Proteção adicionada ainda na v10.8.56 antes de qualquer execução válida: job público agora expõe `api_version` e `research_runner=consensus-meta-veto-v1056`; o serviço também aborta se `API_VERSION != 10.8.56`. Após trocar branch/pull, reiniciar explicitamente o processo Uvicorn antes de executar a pesquisa.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.55 — Expected Advantage Regression (rejeitada)
 - Job real `control-meta-46ab5ebc5a6c4a6d`; ZIP `dados(20260930-233332).zip`, 548 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.

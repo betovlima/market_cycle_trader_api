@@ -963,7 +963,7 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 
     confirm: Literal["RESEARCH_CONTROL_REDUCED_META_VETO_NO_ORDERS"] = Field(
         description=(
-            "Run the frozen v10.8.55 expected-advantage regression Meta-Veto comparison. "
+            "Run the frozen v10.8.56 consensus Meta-Veto comparison. "
             "Research only; never creates or submits orders."
         )
     )
@@ -980,14 +980,15 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 @router.post(
     "/reduced-meta-veto/jobs",
     status_code=202,
-    summary="Run current reduced Meta-Veto research — v10.8.55 expected advantage",
+    summary="Run current reduced Meta-Veto research — v10.8.56 consensus",
     description=(
-        "Replays the exact v10.8.53 reference and compares a fixed Ridge "
-        "regression candidate that predicts delta_capital_fraction directly. "
-        "The candidate uses the same 9 features, strict rollout maturity and "
-        "one-shot HOLD semantics. It vetoes only when predicted economic "
-        "advantage is <= 0.0. No HTTP tuning, Alpaca refresh, Winner change "
-        "or orders."
+        "Replays the exact v10.8.53 reference and compares a consensus "
+        "candidate. The v10.8.53 Logistic classifier remains primary; the "
+        "frozen Ridge expected-advantage regressor can only confirm/cancel a "
+        "classifier veto when its fold gate passed. If the regressor is "
+        "disabled, the candidate falls back to the exact v10.8.53 veto. "
+        "The consensus cannot create new vetoes. No HTTP tuning, Alpaca "
+        "refresh, Winner change or orders."
     ),
 )
 def start_reduced_meta_veto_job(
