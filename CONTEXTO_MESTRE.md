@@ -82,6 +82,9 @@
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - A candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57 como melhor referência.
 - Próximo passo: confirmar CI e executar o endpoint existente; auditar número de vetos adicionais no Fold3, precisão nos rollouts alinháveis e capital final.
+- Incidente de persistência no job `control-meta-1bcc6907678b4426`: o replay chegou ao fim, mas falhou ao gravar `v1057_reference_temporal_ensemble_capital_curve.csv`. O path completo no Windows tinha 264 caracteres, ultrapassando o limite clássico de 260. Não houve falha científica ou de replay.
+- Correção sem mudança de estratégia: nomes dos artefatos da v10.8.58 foram encurtados (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`). O maior path equivalente cai para ~233 caracteres no ambiente reportado. Teste de regressão adicionado para impedir a reintrodução do nome longo.
+- O job `control-meta-1bcc6907678b4426` é inválido apenas como entrega de artefatos incompleta; rerodar a mesma rota após atualizar/reiniciar a API. Não alterar threshold, modelos, gates ou agregação por causa deste erro.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.57 — Temporal Ensemble Meta-Veto (nova melhor referência retrospectiva)
