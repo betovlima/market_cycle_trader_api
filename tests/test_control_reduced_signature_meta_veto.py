@@ -136,8 +136,8 @@ class ReducedSignatureMetaVetoTests(TestCase):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.57"',source)
-        self.assertIn('RESEARCH_RUNNER = "temporal-ensemble-meta-veto-v1057"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.58"',source)
+        self.assertIn('RESEARCH_RUNNER = "worst-regime-temporal-veto-v1058"',source)
         self.assertIn('"api_version": record.get("api_version")',source)
         self.assertIn('"research_runner": record.get("research_runner")',source)
 
