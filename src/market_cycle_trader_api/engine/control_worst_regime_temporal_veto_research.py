@@ -273,29 +273,29 @@ def run_worst_regime_temporal_veto_research(
         raise FileExistsError("Never overwrite v10.8.58 research artifacts.")
     output.mkdir(parents=True)
 
-    _write_run(output, "liquidity_baseline", reference_baseline)
-    _write_run(output, "v1057_reference_temporal_ensemble", reference_meta)
-    _write_run(output, "worst_regime_temporal_veto", candidate_meta)
+    _write_run(output, "base", reference_baseline)
+    _write_run(output, "ref57", reference_meta)
+    _write_run(output, "cand58", candidate_meta)
 
     pd.DataFrame(reference_training).to_json(
-        output / "v1057_reference_training_folds.json",
+        output / "ref57_train.json",
         orient="records",
         indent=2,
         date_format="iso",
     )
     pd.DataFrame(candidate_training).to_json(
-        output / "worst_regime_training_folds.json",
+        output / "cand58_train.json",
         orient="records",
         indent=2,
         date_format="iso",
     )
     ref_decisions.to_csv(
-        output / "v1057_reference_decisions.csv",
+        output / "ref57_decisions.csv",
         index=False,
         float_format="%.17g",
     )
     candidate_decision_frame.to_csv(
-        output / "worst_regime_decisions.csv",
+        output / "cand58_decisions.csv",
         index=False,
         float_format="%.17g",
     )
@@ -311,7 +311,7 @@ def run_worst_regime_temporal_veto_research(
             "worst_regime"
         ),
     ], axis=1)
-    aligned.to_csv(output / "aligned_capital_curves.csv", float_format="%.17g")
+    aligned.to_csv(output / "curves.csv", float_format="%.17g")
 
     import matplotlib
     matplotlib.use("Agg")
@@ -340,7 +340,7 @@ def run_worst_regime_temporal_veto_research(
     ax.legend()
     fig.autofmt_xdate()
     fig.tight_layout()
-    fig.savefig(output / "worst_regime_comparison.png", dpi=140)
+    fig.savefig(output / "comparison.png", dpi=140)
     plt.close(fig)
 
     reference_veto_count = int(
@@ -410,18 +410,18 @@ def run_worst_regime_temporal_veto_research(
         "report_directory": str(output),
         "artifacts": [
             "summary.json",
-            "liquidity_baseline_capital_curve.csv",
-            "liquidity_baseline_fills.csv",
-            "v1057_reference_temporal_ensemble_capital_curve.csv",
-            "v1057_reference_temporal_ensemble_fills.csv",
-            "worst_regime_temporal_veto_capital_curve.csv",
-            "worst_regime_temporal_veto_fills.csv",
-            "v1057_reference_training_folds.json",
-            "worst_regime_training_folds.json",
-            "v1057_reference_decisions.csv",
-            "worst_regime_decisions.csv",
-            "aligned_capital_curves.csv",
-            "worst_regime_comparison.png",
+            "base_capital_curve.csv",
+            "base_fills.csv",
+            "ref57_capital_curve.csv",
+            "ref57_fills.csv",
+            "cand58_capital_curve.csv",
+            "cand58_fills.csv",
+            "ref57_train.json",
+            "cand58_train.json",
+            "ref57_decisions.csv",
+            "cand58_decisions.csv",
+            "curves.csv",
+            "comparison.png",
         ],
         "order_eligible": False,
         "order_submission": "never",
