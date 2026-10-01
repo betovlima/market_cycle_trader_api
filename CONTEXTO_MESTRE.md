@@ -67,6 +67,36 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.60 — Unanimous Temporal Veto (rejeitada)
+- Job real `control-meta-e836ea093f0940b9`; ZIP `dados(20261001-162250).zip`, 641 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Candidata terminou em `US$ 2.033.103,1065520192`, delta `-US$ 372.120,54` / `-15,4713%` contra v10.8.57.
+- CAGR 136,1557% vs 142,6615%; Sharpe 1,83102 vs 1,86988; MaxDD melhorou para -42,6133% vs -45,6664%, mas o objetivo primário de capital final piorou.
+- Vetos totais: 58 vs 76 na v10.8.57; Fold2 permaneceu exatamente 30, Fold3 caiu de 46 para 28.
+- Vetos alinháveis ao rollout-base: candidata 30 HOLD-better / 16 ROTATE-better em 46 eventos (65,22% de precisão; delta médio -1,5941%), contra v10.8.57 35/15 em 50 eventos (70,0%; delta médio -2,0086%).
+- Em 12 estados/propostas diretamente comparáveis, a unanimidade removeu vetos da v10.8.57. Seis puderam ser ligados exatamente ao rollout-base: cinco eram vetos corretos removidos (NFLX->AVGO -15,8789%; AMD->DNN -0,2706%; MKSI->TSLA -5,7386%; GKOS->AMZN -1,4904%; CRM->NVDA -0,3001%) e apenas um era falso positivo removido (NFLX->CLMT +4,3586%).
+- Primeira divergência: 2024-07-30 NFLX->AVGO. v10.8.57 mean P=0,337412 e veta; v10.8.60 max P=0,421277 e libera ROTATE. O rollout-base mostra `delta_capital_fraction=-15,8789%`, portanto o veto removido era fortemente correto.
+- Conclusão: exigir unanimidade reduz falsos positivos, mas perde vetos economicamente muito relevantes. Hipótese rejeitada sem ajuste posterior. v10.8.57 permanece a melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Não ajustar threshold de unanimidade ou criar exceções usando este mesmo OOS.
+
+## v10.8.60 — Unanimous Temporal Veto
+- Branch `feature/v10.8.60-unanimous-temporal-veto`, derivada da linha v10.8.59; melhor referência continua v10.8.57.
+- Objetivo: tentar aumentar capital final reduzindo falsos positivos da v10.8.57 sem alterar componentes, features, C, gates, maturidade, one-shot ou execução.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Componentes: exatamente os Logit temporais da v10.8.57, um por source_fold maduro, balanced L2 C=0.25, 9 features, gate BA>=0.52/AUC>=0.52.
+- Única mudança experimental: agregar com `max(P_component)`. Como o veto continua `P<=0.35`, isto equivale a exigir que TODOS os componentes habilitados estejam <=0.35 para vetar.
+- Fold2 tem um único componente e deve ser exatamente idêntico à v10.8.57. Qualquer diferença de equity antes do Fold3 aborta.
+- Nenhum threshold, peso, C, feature, gate ou hiperparâmetro novo.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem idênticos.
+- Hipótese exploratória/post-discovery: após min() e skill-weighted piorarem a seletividade, testar unanimidade como política conservadora. Melhora retrospectiva ainda exige validação futura independente.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` suporta agregação `max`; `control_unanimous_temporal_veto_research.py` reproduz v10.8.57 com mean e compara a candidata `max(P_component)` no mesmo snapshot, exigindo paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=unanimous-temporal-veto-v1060`, com runtime guard `API_VERSION=10.8.60`.
+- Artefatos permanecem curtos para evitar limite de path do Windows.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar vetos removidos no Fold3, precisão nos rollouts alinháveis e capital final.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.59 — Skill-Weighted Temporal Ensemble (rejeitada)
 - Job real `control-meta-36b5b2753c0348b0`; ZIP `dados(20261001-143554).zip`, 626 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
