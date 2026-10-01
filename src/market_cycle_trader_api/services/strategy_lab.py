@@ -16,6 +16,8 @@ from pydantic import ValidationError
 from pymongo import ReturnDocument
 
 from ..core.config import API_VERSION, PACKAGE_DIR
+from ..core.config import TCC_CONTROL_OPERATIONAL_MODE
+from ..engine.tcc_control_operational_runtime import tcc_control_contract_issues
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
@@ -608,6 +610,40 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         else document.get("winner_model_snapshot")
     )
     model_family = str((snapshot or {}).get("family") or "").strip().lower() or None
+
+    configuration = (
+        document.get("configuration")
+        if isinstance(document.get("configuration"), dict)
+        else {}
+    )
+    if str(configuration.get("strategy_mode") or "") == TCC_CONTROL_OPERATIONAL_MODE:
+        issues = tcc_control_contract_issues(configuration)
+        if model_family != "lightgbm_utility":
+            return {
+                "eligible": False,
+                "code": "tcc_control_requires_lightgbm",
+                "reason": "TCC Control v1.0.6 operational runtime requires LightGBM Utility.",
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
+        if issues:
+            return {
+                "eligible": False,
+                "code": "tcc_control_contract_mismatch",
+                "reason": (
+                    "TCC Control v1.0.6 configuration differs from its protected "
+                    "operational contract: " + "; ".join(issues[:5])
+                ),
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
+        return {
+            "eligible": True,
+            "code": "tcc_control_v106_live_runtime_ready",
+            "reason": None,
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
 
     if model_family == "iqn":
         return {
