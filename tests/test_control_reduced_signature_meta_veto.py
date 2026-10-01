@@ -158,6 +158,16 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(engine.run_reduced_signature_meta_veto_pair)
         self.assertIn('{"enabled": True, "audit": {}}',source)
 
+    def test_v1061_exports_completed_report_zip_to_output(self):
+        import inspect
+
+        source=inspect.getsource(jobs._export_report_zip)
+        self.assertIn('SOURCE_ROOT.parent / "output"',source)
+        self.assertIn("control_meta_v10.8.61_",source)
+        self.assertIn("zipfile.ZIP_DEFLATED",source)
+        runner=inspect.getsource(jobs._run_job)
+        self.assertIn('report["export_zip"] = export_zip',runner)
+
     def test_service_exposes_runner_and_runtime_guard(self):
         import inspect
 
