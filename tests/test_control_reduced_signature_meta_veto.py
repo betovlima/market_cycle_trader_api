@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.59 skill-weighted temporal Meta-Veto."""
+"""Safeguards for v10.8.60 unanimous temporal Meta-Veto."""
 from __future__ import annotations
 
 import sys
@@ -71,9 +71,17 @@ class ReducedSignatureMetaVetoTests(TestCase):
         import inspect
 
         source=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
-        self.assertIn('aggregation not in {"mean", "min", "skill_weighted"}',source)
+        self.assertIn('aggregation not in {"mean", "min", "max", "skill_weighted"}',source)
         self.assertIn("np.min(component_probabilities)",source)
         self.assertIn("WORST_REGIME_VETO",source)
+
+    def test_temporal_ensemble_supports_unanimous_max_aggregation(self):
+        import inspect
+
+        source=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
+        self.assertIn('aggregation == "max"',source)
+        self.assertIn("np.max(component_probabilities)",source)
+        self.assertIn("UNANIMOUS_TEMPORAL_VETO",source)
 
     def test_temporal_ensemble_skill_weight_is_fixed_from_calibration(self):
         import inspect
@@ -118,12 +126,12 @@ class ReducedSignatureMetaVetoTests(TestCase):
             "v1057_reference_temporal_ensemble_capital_curve.csv",source
         )
 
-    def test_v1059_service_exposes_runner_identity(self):
+    def test_v1060_service_exposes_runner_identity(self):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.59"',source)
-        self.assertIn('RESEARCH_RUNNER = "skill-weighted-temporal-veto-v1059"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.60"',source)
+        self.assertIn('RESEARCH_RUNNER = "unanimous-temporal-veto-v1060"',source)
 
     def test_consensus_cannot_create_new_veto(self):
         import inspect
@@ -146,8 +154,8 @@ class ReducedSignatureMetaVetoTests(TestCase):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.59"',source)
-        self.assertIn('RESEARCH_RUNNER = "skill-weighted-temporal-veto-v1059"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.60"',source)
+        self.assertIn('RESEARCH_RUNNER = "unanimous-temporal-veto-v1060"',source)
         self.assertIn('"api_version": record.get("api_version")',source)
         self.assertIn('"research_runner": record.get("research_runner")',source)
 
