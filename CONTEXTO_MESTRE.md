@@ -77,8 +77,12 @@
 - Nenhum threshold, peso, C, feature, gate ou hiperparâmetro novo.
 - One-shot, Liquidity-Aware, custos, execução e snapshot permanecem idênticos.
 - Hipótese exploratória/post-discovery: após min() e skill-weighted piorarem a seletividade, testar unanimidade como política conservadora. Melhora retrospectiva ainda exige validação futura independente.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` suporta agregação `max`; `control_unanimous_temporal_veto_research.py` reproduz v10.8.57 com mean e compara a candidata `max(P_component)` no mesmo snapshot, exigindo paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=unanimous-temporal-veto-v1060`, com runtime guard `API_VERSION=10.8.60`.
+- Artefatos permanecem curtos para evitar limite de path do Windows.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar vetos removidos no Fold3, precisão nos rollouts alinháveis e capital final.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.59 — Skill-Weighted Temporal Ensemble (rejeitada)
