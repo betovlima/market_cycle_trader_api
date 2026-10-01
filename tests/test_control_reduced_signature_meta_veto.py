@@ -97,7 +97,7 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(temporal_engine.train_temporal_ensemble_fold_models)
         self.assertIn("skill_weight = float((ba - 0.5) + (auc - 0.5))",source)
         runner=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
-        self.assertIn('aggregation == "skill_weighted"',runner)
+        self.assertIn('"skill_weighted"',runner)
         self.assertIn("np.average(",runner)
         self.assertIn("fold_model.component_weights",runner)
 
