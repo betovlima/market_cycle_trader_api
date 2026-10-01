@@ -35,6 +35,64 @@ TCC_CONTROL_EXPERIMENT_VERSION = "1.0.6"
 TCC_CONTROL_REQUESTED_ASSETS = tuple(ASSETS)
 
 
+def tcc_control_strategy_updates() -> dict[str, Any]:
+    """BacktestRequest fields that define the protected operational profile."""
+    return {
+        "assets": list(TCC_CONTROL_REQUESTED_ASSETS),
+        "strategy_mode": TCC_CONTROL_OPERATIONAL_MODE,
+        "start_date": "2016-01-01",
+        "end_date": None,
+        "timeframe": "1Day",
+        "market_data_provider": "alpaca",
+        "alpaca_historical_feed": "sip",
+        "alpaca_live_feed": "iex",
+        "alpaca_adjustment": "raw",
+        "market_data_history_backfill_enabled": False,
+        "market_data_history_backfill_provider": "alpaca",
+        "market_data_history_start_tolerance_days": 10,
+        "market_data_require_complete_history": True,
+        "rotation_horizon_days": 40,
+        "rotation_target_horizons": [5, 10, 20, 40, 60],
+        "rotation_target_horizon_weights": [0.10, 0.15, 0.20, 0.30, 0.25],
+        "rotation_movement_capture_weight": 0.35,
+        "rotation_trend_persistence_weight": 0.20,
+        "rotation_minimum_training_rows": 700,
+        "rotation_walk_forward_enabled": True,
+        "rotation_walk_forward_calibration_days": 126,
+        "rotation_walk_forward_test_days": 504,
+        "rotation_walk_forward_min_test_days": 126,
+        "rotation_purge_days": 60,
+        "rotation_downside_penalty": 0.20,
+        "rotation_drawdown_penalty": 0.35,
+        "rotation_min_holding_days": 2,
+        "rotation_min_expected_edge": 0.001,
+        "rotation_cash_threshold": 0.0,
+        "rotation_switch_margin": 0.0005,
+        "rotation_switch_margin_candidates": [0.0, 0.0025, 0.005, 0.01],
+        "rotation_accelerator": "cpu",
+        "rotation_allow_cpu_fallback": False,
+        "rotation_xgb_repetitions": 1,
+        "rotation_seed_step": 1000,
+        "initial_capital": 10_000.0,
+        "whole_shares": False,
+        "slippage_bps": 0.0,
+        "commission_rate": 0.0,
+        "sec_fee_rate": 0.0000206,
+        "taf_fee_per_share": 0.000195,
+        "taf_fee_cap": 9.79,
+        "cat_fee_per_share": 0.000003,
+        "deterministic_execution": False,
+        "numeric_thread_limit": 1,
+        "random_state": 42,
+    }
+
+
+def tcc_control_model_values() -> dict[str, Any]:
+    values = tcc_control_expected_lightgbm_settings()
+    values.pop("early_stopping_enabled", None)
+    return values
+
+
 def tcc_control_expected_lightgbm_settings() -> dict[str, Any]:
     config = build_control_config(TCC_CONFIG)
     settings = dict(config.research_model_settings or {})
