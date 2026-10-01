@@ -67,6 +67,37 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.59 — Skill-Weighted Temporal Ensemble (rejeitada)
+- Job real `control-meta-36b5b2753c0348b0`; ZIP `dados(20261001-143554).zip`, 626 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Pesos causais calculados conforme protocolo: source Fold1 `w=0,1893939394` (normalizado 46,0590%); source Fold2 `w=0,2218045113` (normalizado 53,9410%).
+- Candidata terminou em `US$ 1.826.974,8329424586`, delta `-US$ 578.248,82` / `-24,0414%` contra v10.8.57.
+- CAGR 132,1089% vs 142,6615%; Sharpe 1,82577 vs 1,86988; MaxDD idêntico em -45,6664%.
+- Vetos totais: 67 vs 76 na v10.8.57. Vetos alinháveis ao rollout-base: candidata 34 HOLD-better / 16 ROTATE-better em 50 eventos (68,0% de precisão; delta médio -1,9621%), contra v10.8.57 35/15 em 50 eventos (70,0%; delta médio -2,0086%).
+- Em estados/propostas diretamente comparáveis, a ponderação cancelou três vetos da v10.8.57: 2025-05-05 MKSI->TSLA; 2026-05-14 GKOS->AMZN; 2026-09-10 ADI->AMZN. O caso GKOS->AMZN existe no rollout-base e era veto correto: `delta_capital_fraction=-1,49037%`; a v10.8.59 elevou P de 0,310236 (mean) para 0,407430 (skill-weighted) e liberou a rotação.
+- Na composição de vetos alinháveis, a candidata perdeu o veto correto GKOS->AMZN (-1,4904%) e adicionou posteriormente um veto CEF->NVDA cujo rollout mostra ROTATE melhor (+0,8323%). Isso explica a piora de seletividade observada.
+- Conclusão: skill de calibração BA/AUC não deve ser convertida diretamente em peso econômico do ensemble. Hipótese rejeitada sem tuning posterior. v10.8.57 permanece melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Não ajustar a fórmula de peso usando este mesmo OOS.
+
+## v10.8.59 — Skill-Weighted Temporal Ensemble Meta-Veto
+- Branch `feature/v10.8.59-skill-weighted-temporal-ensemble`, derivada da linha v10.8.58, mas a melhor referência continua sendo v10.8.57.
+- Objetivo: tentar aumentar capital final preservando os componentes temporais da v10.8.57 e substituindo apenas o peso 50/50 por pesos causais derivados da qualidade de calibração de cada componente.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Cada componente permanece exatamente balanced L2 Logistic Regression C=0.25, mesmas 9 features, gate BA>=0.52 e AUC>=0.52, mesma maturidade `rollout_end_date < test_start`.
+- Peso pré-declarado e sem hiperparâmetro: `w = (BA_calibration - 0.5) + (AUC_calibration - 0.5)`. Como componentes só entram após BA/AUC>=0.52, todos os pesos habilitados são positivos.
+- Probabilidade candidata: `sum(w_i * P_i) / sum(w_i)`. Threshold de veto permanece exatamente 0.35.
+- Fold2 possui um único componente e deve ser exatamente idêntico à v10.8.57. Qualquer diferença de equity antes do Fold3 aborta o job.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem idênticos.
+- Não há tuning de peso, expoente, threshold, C, feature ou gate. A fórmula de peso foi congelada antes da execução.
+- Hipótese exploratória/post-discovery; melhora retrospectiva não equivale a validação futura independente.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` passou a armazenar o skill weight causal de cada componente e suporta agregação interna `skill_weighted`; `control_skill_weighted_temporal_ensemble_research.py` reproduz v10.8.57 com mean e compara a candidata no mesmo snapshot, exigindo paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=skill-weighted-temporal-veto-v1059`, com runtime guard `API_VERSION=10.8.59`.
+- Artefatos permanecem curtos para evitar o limite de path do Windows.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar pesos dos componentes, vetos alterados no Fold3 e capital final.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.58 — Worst-Regime Temporal Veto (rejeitada)
 - Job real `control-meta-fc55cbf05e5540d9`; ZIP `dados(20261001-133742).zip`, 611 entradas, CRC válido.
 - Correção de path validada: artefatos curtos foram gravados com sucesso (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`).
