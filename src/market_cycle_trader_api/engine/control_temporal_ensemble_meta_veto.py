@@ -44,6 +44,7 @@ class TemporalEnsembleFoldModel:
     enabled: bool
     models: tuple[Any, ...]
     source_fold_ids: tuple[int, ...]
+    component_weights: tuple[float, ...]
     disable_reason: str | None
 
 
@@ -82,11 +83,12 @@ def train_temporal_ensemble_fold_models(
 
         enabled_models: list[Any] = []
         enabled_sources: list[int] = []
+        enabled_weights: list[float] = []
         component_reports: list[dict[str, Any]] = []
 
         if fid == 1:
             models[fid] = TemporalEnsembleFoldModel(
-                False, tuple(), tuple(), "NO_PRIOR_OOS_FOLD",
+                False, tuple(), tuple(), tuple(), "NO_PRIOR_OOS_FOLD",
             )
             reports.append({
                 "fold_id": fid,
@@ -159,8 +161,15 @@ def train_temporal_ensemble_fold_models(
                     component[list(REDUCED_FEATURES)],
                     component["rotate_better"].astype(int),
                 )
+                skill_weight = float((ba - 0.5) + (auc - 0.5))
+                if not math.isfinite(skill_weight) or skill_weight <= 0.0:
+                    raise ValueError(
+                        "Enabled temporal component must have positive skill weight."
+                    )
                 enabled_models.append(final_model)
                 enabled_sources.append(source_fid)
+                enabled_weights.append(skill_weight)
+                component_report["skill_weight"] = skill_weight
                 component_report["final_training_rows"] = int(len(component))
             else:
                 component_report["final_training_rows"] = 0
@@ -173,6 +182,7 @@ def train_temporal_ensemble_fold_models(
             fold_enabled,
             tuple(enabled_models),
             tuple(enabled_sources),
+            tuple(enabled_weights),
             reason,
         )
         reports.append({
@@ -212,17 +222,19 @@ def run_temporal_ensemble_meta_veto_pair(
     if len(symbols) != 55 or len(folds) != 3:
         raise ValueError("v10.8.57 expects frozen 55-asset / 3-fold Control context.")
 
-    if aggregation not in {"mean", "min"}:
-        raise ValueError("Temporal ensemble aggregation must be mean or min.")
+    if aggregation not in {"mean", "min", "skill_weighted"}:
+        raise ValueError(
+            "Temporal ensemble aggregation must be mean, min or skill_weighted."
+        )
     fold_models, training_reports = train_temporal_ensemble_fold_models(
         source_dataset, folds,
     )
     for report in training_reports:
-        report["aggregation"] = (
-            "arithmetic_mean_probability"
-            if aggregation == "mean"
-            else "minimum_component_probability"
-        )
+        report["aggregation"] = {
+            "mean": "arithmetic_mean_probability",
+            "min": "minimum_component_probability",
+            "skill_weighted": "calibration_skill_weighted_probability",
+        }[aggregation]
 
     original_runner = scientific._run_lightgbm
     original_policy = original_runner.__globals__.get("_utility_policy")
@@ -296,7 +308,7 @@ def run_temporal_ensemble_meta_veto_pair(
             fold_model = fold_models.get(
                 fid,
                 TemporalEnsembleFoldModel(
-                    False, tuple(), tuple(), "UNKNOWN_FOLD",
+                    False, tuple(), tuple(), tuple(), "UNKNOWN_FOLD",
                 ),
             )
             incumbent = (
@@ -336,25 +348,40 @@ def run_temporal_ensemble_meta_veto_pair(
                     float(model.predict_proba(feature_row)[:, 1][0])
                     for model in fold_model.models
                 ]
-                probability = float(
-                    np.mean(component_probabilities)
-                    if aggregation == "mean"
-                    else np.min(component_probabilities)
-                )
+                if aggregation == "mean":
+                    probability = float(np.mean(component_probabilities))
+                elif aggregation == "min":
+                    probability = float(np.min(component_probabilities))
+                else:
+                    if (
+                        len(fold_model.component_weights)
+                        != len(component_probabilities)
+                        or not fold_model.component_weights
+                    ):
+                        raise ValueError(
+                            "Skill-weighted temporal ensemble requires one "
+                            "positive calibration weight per component."
+                        )
+                    probability = float(np.average(
+                        np.asarray(component_probabilities, dtype=float),
+                        weights=np.asarray(
+                            fold_model.component_weights, dtype=float,
+                        ),
+                    ))
                 if probability <= VETO_PROBABILITY_MAX:
                     veto = True
                     force_control_next[0] = True
-                    reason = (
-                        "TEMPORAL_ENSEMBLE_VETO"
-                        if aggregation == "mean"
-                        else "WORST_REGIME_VETO"
-                    )
+                    reason = {
+                        "mean": "TEMPORAL_ENSEMBLE_VETO",
+                        "min": "WORST_REGIME_VETO",
+                        "skill_weighted": "SKILL_WEIGHTED_TEMPORAL_VETO",
+                    }[aggregation]
                 else:
-                    reason = (
-                        "TEMPORAL_ENSEMBLE_PASS"
-                        if aggregation == "mean"
-                        else "WORST_REGIME_PASS"
-                    )
+                    reason = {
+                        "mean": "TEMPORAL_ENSEMBLE_PASS",
+                        "min": "WORST_REGIME_PASS",
+                        "skill_weighted": "SKILL_WEIGHTED_TEMPORAL_PASS",
+                    }[aggregation]
             elif not fold_model.enabled:
                 reason = fold_model.disable_reason or "MODEL_DISABLED"
             elif current_position == 0 or control_target == 0:
@@ -379,6 +406,9 @@ def run_temporal_ensemble_meta_veto_pair(
                     str(value) for value in fold_model.source_fold_ids
                 ),
                 "enabled_component_count": len(fold_model.models),
+                "component_weights": "|".join(
+                    f"{value:.17g}" for value in fold_model.component_weights
+                ),
                 "aggregation": aggregation,
                 "veto_applied": veto,
                 "reason": reason,
