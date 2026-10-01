@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.60 unanimous temporal Meta-Veto."""
+"""Safeguards for v10.8.61 logit-mean temporal Meta-Veto."""
 from __future__ import annotations
 
 import sys
@@ -71,9 +71,17 @@ class ReducedSignatureMetaVetoTests(TestCase):
         import inspect
 
         source=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
-        self.assertIn('aggregation not in {"mean", "min", "max", "skill_weighted"}',source)
+        self.assertIn('aggregation not in {"mean", "min", "max", "skill_weighted", "logit_mean"}',source)
         self.assertIn("np.min(component_probabilities)",source)
         self.assertIn("WORST_REGIME_VETO",source)
+
+    def test_temporal_ensemble_supports_logit_mean_aggregation(self):
+        import inspect
+
+        source=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
+        self.assertIn('aggregation == "logit_mean"',source)
+        self.assertIn("mean_logit",source)
+        self.assertIn("LOGIT_MEAN_TEMPORAL_VETO",source)
 
     def test_temporal_ensemble_supports_unanimous_max_aggregation(self):
         import inspect
@@ -89,7 +97,7 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(temporal_engine.train_temporal_ensemble_fold_models)
         self.assertIn("skill_weight = float((ba - 0.5) + (auc - 0.5))",source)
         runner=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
-        self.assertIn('aggregation == "skill_weighted"',runner)
+        self.assertIn('"skill_weighted"',runner)
         self.assertIn("np.average(",runner)
         self.assertIn("fold_model.component_weights",runner)
 
@@ -126,12 +134,12 @@ class ReducedSignatureMetaVetoTests(TestCase):
             "v1057_reference_temporal_ensemble_capital_curve.csv",source
         )
 
-    def test_v1060_service_exposes_runner_identity(self):
+    def test_v1061_service_exposes_runner_identity(self):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.60"',source)
-        self.assertIn('RESEARCH_RUNNER = "unanimous-temporal-veto-v1060"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.61"',source)
+        self.assertIn('RESEARCH_RUNNER = "logit-mean-temporal-veto-v1061"',source)
 
     def test_consensus_cannot_create_new_veto(self):
         import inspect
@@ -150,12 +158,22 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(engine.run_reduced_signature_meta_veto_pair)
         self.assertIn('{"enabled": True, "audit": {}}',source)
 
+    def test_v1061_exports_completed_report_zip_to_output(self):
+        import inspect
+
+        source=inspect.getsource(jobs._export_report_zip)
+        self.assertIn('SOURCE_ROOT.parent / "output"',source)
+        self.assertIn("control_meta_v10.8.61_",source)
+        self.assertIn("zipfile.ZIP_DEFLATED",source)
+        runner=inspect.getsource(jobs._run_job)
+        self.assertIn('report["export_zip"] = export_zip',runner)
+
     def test_service_exposes_runner_and_runtime_guard(self):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.60"',source)
-        self.assertIn('RESEARCH_RUNNER = "unanimous-temporal-veto-v1060"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.61"',source)
+        self.assertIn('RESEARCH_RUNNER = "logit-mean-temporal-veto-v1061"',source)
         self.assertIn('"api_version": record.get("api_version")',source)
         self.assertIn('"research_runner": record.get("research_runner")',source)
 

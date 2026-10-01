@@ -67,6 +67,40 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.61 — Logit-Mean Temporal Ensemble (rejeitada)
+- Job real `control-meta-1a6d5ed41c214e01`; export automático `output/control_meta_v10.8.61_control-meta-1a6d5ed41c214e01.zip` validado dentro do ZIP `output(20261001-214436).zip`.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Candidata Logit-Mean terminou em `US$ 1.733.124,7680815505`, delta `-US$ 672.098,88` / `-27,9433%` contra v10.8.57.
+- CAGR 130,1382% vs 142,6615%; Sharpe 1,80353 vs 1,86988; MaxDD idêntico em -45,6664%. Rotações 289 vs 286. Vetos 71 vs 76.
+- Fold2 permaneceu exatamente igual: 30 vetos. Fold3 caiu de 46 para 41 vetos.
+- Em toda a trajetória diretamente comparável antes de efeitos de estado, houve exatamente UMA divergência de veto: 2025-06-23 CORT->AAPL. v10.8.57 mean P=0,355848 e rotaciona; v10.8.61 logit-mean P=0,344794 e veta. A pré-auditoria do rollout-base indicava `delta_capital_fraction=-3,4325%`, portanto o novo veto era localmente correto.
+- O efeito imediato confirmou isso: em 2025-06-24 a candidata chegou a ficar ~3,6155% acima da v10.8.57; em 2025-07-01 ainda estava ~3,1806% acima.
+- Porém a mudança inicial alterou a trajetória de incumbentes. A candidata só ficou abaixo da referência em 2025-12-10 (-4,7819%) e sofreu forte divergência em dezembro; em 2025-12-22 estava -29,1148%. Exemplos de estados diferentes: referência ADEA com veto para NVDA em 2025-12-10, enquanto candidata já estava em NVDA; em 2025-12-16 referência seguia ADEA, candidata estava CLMT e vetou AVGO; em 2025-12-22 referência vetava ADEA->AVGO enquanto candidata já estava em AVGO.
+- Conclusão: uma melhoria local de rollout não garante melhoria de capital de política quando a decisão muda a trajetória futura. A hipótese Logit-Mean é rejeitada.
+- v10.8.57 permanece a melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Após v10.8.58 (min), v10.8.59 (skill-weighted), v10.8.60 (max/unanimous) e v10.8.61 (logit-mean) terem sido selecionadas/analisadas sequencialmente no mesmo OOS e todas falharem contra v10.8.57, CONGELAR a v10.8.57. Não criar nova agregação/threshold usando este mesmo histórico. Próxima evidência deve vir de janela temporal realmente futura/independente ou novo protocolo previamente congelado em dados não usados na descoberta.
+
+## v10.8.61 — Logit-Mean Temporal Ensemble
+- Branch `feature/v10.8.61-logit-mean-temporal-ensemble`, derivada da linha v10.8.60; melhor referência continua v10.8.57.
+- Objetivo: tentar aumentar capital final preservando os mesmos componentes temporais da v10.8.57 e mudando apenas o espaço matemático de agregação.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Componentes permanecem exatamente balanced L2 Logistic Regression C=0.25, mesmas 9 features, gates BA>=0.52/AUC>=0.52, mesma maturidade causal.
+- Única mudança experimental: `P = sigmoid(mean(logit(P_component)))`. Isto equivale a combinar as odds geometricamente, sem peso treinado ou hiperparâmetro adicional.
+- Threshold permanece 0.35. Fold2 possui um componente e deve ser exatamente idêntico à v10.8.57; qualquer divergência pré-Fold3 aborta.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem inalterados.
+- Pré-auditoria causal no replay v10.8.57: entre 133 decisões Fold3 com dois componentes, a regra logit-mean altera diretamente apenas uma decisão antes de efeitos de trajetória: 2025-06-23 CORT->AAPL, mean P=0,355848 vs logit-mean P=0,344794. O rollout-base mostra delta_capital_fraction=-3,4325%, portanto HOLD era melhor. Esta observação motiva a hipótese, mas torna a v10.8.61 explicitamente exploratória/post-discovery.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` suporta `logit_mean` com clipping apenas por precisão numérica de ponto flutuante; `control_logit_mean_temporal_ensemble_research.py` reproduz v10.8.57 com mean e compara a candidata logit-mean no mesmo snapshot, exigindo paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=logit-mean-temporal-veto-v1061`, com runtime guard `API_VERSION=10.8.61`.
+- Artefatos permanecem curtos para Windows.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar a primeira divergência CORT->AAPL, vetos alterados por efeitos de trajetória e capital final.
+- Incidente em 2026-10-01 com ZIP `output(20261001-170414).zip`: o arquivo não contém nenhum artefato `validation/v10.8.61`; a execução mais recente é `validation/v10.8.60/control-meta-75712a3ac7c74aab`, `research_kind=control_unanimous_temporal_veto`, reproduzindo exatamente o resultado rejeitado v10.8.60. Portanto o runtime local usado nessa execução ainda estava em v10.8.60; não interpretar o ZIP como resultado v10.8.61.
+- GitHub da branch v10.8.61 estava correto (`API_VERSION=10.8.61`, `research_runner=logit-mean-temporal-veto-v1061`), mas a CI revelou um teste legado da v10.8.59 que exigia a string literal `aggregation == "skill_weighted"`. O teste foi corrigido para validar a presença do contrato skill-weighted sem depender da forma do branch interno. Nenhuma mudança científica/runtime da v10.8.61.
+- O ZIP `output(20261001-174029).zip` enviado depois continha novamente somente `output/tcc_v106_*` (24 entradas), sem `validation/v10.8.61`. Diagnóstico corrigido: a coleta estava apontando para a pasta genérica `output/`, enquanto a v10.8.61 persiste em `<raiz_api>/dados/control_shadow/snapshots/control-shadow-870fb66e1bdc4fd0/validation/v10.8.61/<control-meta-job>/`. A API agora registra o `report_directory` exato no log de conclusão para evitar nova ambiguidade.
+- Novo ZIP `output(20261001-180558).zip` repetiu exatamente o mesmo padrão: 24 entradas `output/tcc_v106_*`, sem artefatos Meta-Veto. Para eliminar a fricção, a v10.8.61 agora gera automaticamente, após o relatório canônico, um ZIP de exportação em `<raiz_api>/output/control_meta_v10.8.61_<job_id>.zip`, contendo todos os arquivos do `report_directory`. Falha nessa cópia de conveniência gera apenas WARNING e não invalida o resultado científico canônico.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.60 — Unanimous Temporal Veto (rejeitada)
 - Job real `control-meta-e836ea093f0940b9`; ZIP `dados(20261001-162250).zip`, 641 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
