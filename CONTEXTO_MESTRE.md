@@ -67,6 +67,38 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.57 — Temporal Ensemble Meta-Veto (nova melhor referência retrospectiva)
+- Job real `control-meta-c0a2875df3404aa0`; ZIP `output(20261001-103811).zip`, 593 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Trava pré-Fold3 passou com diferença máxima de equity exatamente 0. Toda a diferença de capital veio exclusivamente do ensemble temporal no Fold3.
+- Fold3 habilitou 2 componentes: source Fold1 (75 labels; BA 0,537879 / AUC 0,651515) e source Fold2 (109 labels maduros; BA 0,593985 / AUC 0,627820). Probabilidade final = média aritmética simples.
+- Capital final candidato `US$ 2.405.223,6491167042`, delta `+US$ 513.805,98` / `+27,1651%` contra v10.8.53.
+- CAGR 142,6615% vs 133,4135%; Sharpe 1,86988 vs 1,81203; MaxDD -45,6664% vs -45,7576% (ligeiramente melhor). Rotações 286 vs 292.
+- Vetos totais: 76 vs 63 na v10.8.53; Fold2 permaneceu exatamente 30 vetos em ambas, Fold3 passou de 33 para 46.
+- Entre vetos alinháveis exatamente ao rollout-base: v10.8.57 teve 35 HOLD-better / 15 ROTATE-better em 50 eventos (70,0% de precisão), contra 33/15 em 48 eventos (68,75%) da v10.8.53. DeltaCapital_fraction médio dos vetos alinháveis melhorou de -1,7049% para -2,0086%.
+- Primeira divergência de policy no Fold3: 2024-07-30 NFLX->AVGO. v10.8.53 P=0,382223 (passa); ensemble P=0,337412 (componentes Fold1=0,253547 e Fold2=0,421277) e veta. O rollout-base mostra delta -15,8789%, portanto HOLD era fortemente melhor.
+- Entre 7 divergências de veto em estados/propostas diretamente comparáveis antes de efeitos de trajetória, 3 puderam ser ligados exatamente ao rollout-base: duas novas decisões de veto estavam corretas (NFLX->AVGO -15,8789%; GKOS->AMZN -1,4904%) e uma estava errada (NFLX->CLMT +4,3586%).
+- Conclusão: v10.8.57 supera materialmente a melhor referência comparável e passa a ser a melhor configuração retrospectiva desta linha em `US$ 2.405.223,65`. Como a hipótese é pós-descoberta no mesmo histórico, isso NÃO é validação independente futura; preservar como nova referência de pesquisa e validar futuramente antes de promoção operacional.
+- Não ajustar pesos dos componentes ou threshold 0,35 usando este OOS.
+
+## v10.8.57 — Temporal Ensemble Meta-Veto
+- Branch `feature/v10.8.57-temporal-ensemble-meta-veto`, derivada da linha v10.8.56; melhor referência continua v10.8.53.
+- Objetivo: aumentar capital final atacando possível drift temporal sem alterar features, C, threshold, one-shot ou execução.
+- Hipótese congelada: em vez de treinar um único Logistic em todos os folds anteriores, manter um Logistic independente por fold histórico maduro e usar a média aritmética das probabilidades dos componentes habilitados.
+- Modelo de cada componente: exatamente Logistic Regression balanceada L2, C=0.25, mesmas 9 features da v10.8.53.
+- Gate de cada componente: split cronológico 70/30 dentro do próprio source_fold, mínimo 20 eventos de calibração, BA>=0.52 e AUC>=0.52. Componente que falhar não entra no ensemble.
+- Fold2: apenas componente Fold1, portanto estruturalmente equivalente à v10.8.53. Fold3: componentes independentes Fold1 e Fold2, usando apenas labels com `rollout_end_date < test_start`; probabilidade final = média simples dos componentes habilitados.
+- Regra de veto permanece `mean P(ROTATE melhor) <= 0.35`; nenhuma nova calibração de threshold.
+- One-shot, Liquidity-Aware, custos e snapshot idênticos à v10.8.53.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
+- A hipótese é exploratória/post-discovery; qualquer melhora retrospectiva ainda exige validação futura independente.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` treina/gateia um Logistic separado por source_fold e calcula a média simples das probabilidades habilitadas; `control_temporal_ensemble_meta_veto_research.py` reproduz v10.8.44 + v10.8.53 e exige paridade exata da candidata com v10.8.53 em toda a trajetória anterior ao Fold3.
+- Serviço existente reapontado para `research_runner=temporal-ensemble-meta-veto-v1057`, com runtime guard `API_VERSION=10.8.57`.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Critério do experimento: candidata só conta como avanço se superar `US$ 1.891.417,6670329159`; caso contrário, descartar v10.8.57 e manter v10.8.53.
+- Próximo passo: confirmar CI do HEAD e executar o endpoint existente; auditar componentes habilitados por source_fold, paridade pré-Fold3, vetos do Fold3 e capital final.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.56 — Consensus Meta-Veto (rejeitada)
 - Job real `control-meta-63f2e1bb18014c91`; ZIP `dados(20261001-000909).zip`, 578 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
