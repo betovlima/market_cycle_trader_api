@@ -78,7 +78,11 @@
 - One-shot, Liquidity-Aware, custos e snapshot idênticos à v10.8.53.
 - Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
 - A hipótese é exploratória/post-discovery; qualquer melhora retrospectiva ainda exige validação futura independente.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` treina/gateia um Logistic separado por source_fold e calcula a média simples das probabilidades habilitadas; `control_temporal_ensemble_meta_veto_research.py` reproduz v10.8.44 + v10.8.53 e exige paridade exata da candidata com v10.8.53 em toda a trajetória anterior ao Fold3.
+- Serviço existente reapontado para `research_runner=temporal-ensemble-meta-veto-v1057`, com runtime guard `API_VERSION=10.8.57`.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Critério do experimento: candidata só conta como avanço se superar `US$ 1.891.417,6670329159`; caso contrário, descartar v10.8.57 e manter v10.8.53.
+- Próximo passo: confirmar CI do HEAD e executar o endpoint existente; auditar componentes habilitados por source_fold, paridade pré-Fold3, vetos do Fold3 e capital final.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.56 — Consensus Meta-Veto (rejeitada)
