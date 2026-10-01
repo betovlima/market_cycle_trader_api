@@ -67,6 +67,20 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## v10.8.57 — Temporal Ensemble Meta-Veto
+- Branch `feature/v10.8.57-temporal-ensemble-meta-veto`, derivada da linha v10.8.56; melhor referência continua v10.8.53.
+- Objetivo: aumentar capital final atacando possível drift temporal sem alterar features, C, threshold, one-shot ou execução.
+- Hipótese congelada: em vez de treinar um único Logistic em todos os folds anteriores, manter um Logistic independente por fold histórico maduro e usar a média aritmética das probabilidades dos componentes habilitados.
+- Modelo de cada componente: exatamente Logistic Regression balanceada L2, C=0.25, mesmas 9 features da v10.8.53.
+- Gate de cada componente: split cronológico 70/30 dentro do próprio source_fold, mínimo 20 eventos de calibração, BA>=0.52 e AUC>=0.52. Componente que falhar não entra no ensemble.
+- Fold2: apenas componente Fold1, portanto estruturalmente equivalente à v10.8.53. Fold3: componentes independentes Fold1 e Fold2, usando apenas labels com `rollout_end_date < test_start`; probabilidade final = média simples dos componentes habilitados.
+- Regra de veto permanece `mean P(ROTATE melhor) <= 0.35`; nenhuma nova calibração de threshold.
+- One-shot, Liquidity-Aware, custos e snapshot idênticos à v10.8.53.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.53 `US$ 1.891.417,6670329159`, tolerância absoluta 1e-6.
+- A hipótese é exploratória/post-discovery; qualquer melhora retrospectiva ainda exige validação futura independente.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.56 — Consensus Meta-Veto (rejeitada)
 - Job real `control-meta-63f2e1bb18014c91`; ZIP `dados(20261001-000909).zip`, 578 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
