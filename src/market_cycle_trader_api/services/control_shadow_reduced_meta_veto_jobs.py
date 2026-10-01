@@ -132,9 +132,13 @@ def _run_job(
             progress=progress,
         )
         now = utc_now()
+        report_directory = str(report.get("report_directory") or "")
         _log(
             db, job_id,
-            "v10.8.61 logit-mean comparison completed; no order path touched.",
+            (
+                "v10.8.61 logit-mean comparison completed; "
+                f"report_directory={report_directory}; no order path touched."
+            ),
             stage="completed", progress=100,
         )
         db[COLLECTION].update_one(
