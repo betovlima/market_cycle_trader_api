@@ -67,6 +67,19 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.61 — Logit-Mean Temporal Ensemble (rejeitada)
+- Job real `control-meta-1a6d5ed41c214e01`; export automático `output/control_meta_v10.8.61_control-meta-1a6d5ed41c214e01.zip` validado dentro do ZIP `output(20261001-214436).zip`.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Candidata Logit-Mean terminou em `US$ 1.733.124,7680815505`, delta `-US$ 672.098,88` / `-27,9433%` contra v10.8.57.
+- CAGR 130,1382% vs 142,6615%; Sharpe 1,80353 vs 1,86988; MaxDD idêntico em -45,6664%. Rotações 289 vs 286. Vetos 71 vs 76.
+- Fold2 permaneceu exatamente igual: 30 vetos. Fold3 caiu de 46 para 41 vetos.
+- Em toda a trajetória diretamente comparável antes de efeitos de estado, houve exatamente UMA divergência de veto: 2025-06-23 CORT->AAPL. v10.8.57 mean P=0,355848 e rotaciona; v10.8.61 logit-mean P=0,344794 e veta. A pré-auditoria do rollout-base indicava `delta_capital_fraction=-3,4325%`, portanto o novo veto era localmente correto.
+- O efeito imediato confirmou isso: em 2025-06-24 a candidata chegou a ficar ~3,6155% acima da v10.8.57; em 2025-07-01 ainda estava ~3,1806% acima.
+- Porém a mudança inicial alterou a trajetória de incumbentes. A candidata só ficou abaixo da referência em 2025-12-10 (-4,7819%) e sofreu forte divergência em dezembro; em 2025-12-22 estava -29,1148%. Exemplos de estados diferentes: referência ADEA com veto para NVDA em 2025-12-10, enquanto candidata já estava em NVDA; em 2025-12-16 referência seguia ADEA, candidata estava CLMT e vetou AVGO; em 2025-12-22 referência vetava ADEA->AVGO enquanto candidata já estava em AVGO.
+- Conclusão: uma melhoria local de rollout não garante melhoria de capital de política quando a decisão muda a trajetória futura. A hipótese Logit-Mean é rejeitada.
+- v10.8.57 permanece a melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Após v10.8.58 (min), v10.8.59 (skill-weighted), v10.8.60 (max/unanimous) e v10.8.61 (logit-mean) terem sido selecionadas/analisadas sequencialmente no mesmo OOS e todas falharem contra v10.8.57, CONGELAR a v10.8.57. Não criar nova agregação/threshold usando este mesmo histórico. Próxima evidência deve vir de janela temporal realmente futura/independente ou novo protocolo previamente congelado em dados não usados na descoberta.
+
 ## v10.8.61 — Logit-Mean Temporal Ensemble
 - Branch `feature/v10.8.61-logit-mean-temporal-ensemble`, derivada da linha v10.8.60; melhor referência continua v10.8.57.
 - Objetivo: tentar aumentar capital final preservando os mesmos componentes temporais da v10.8.57 e mudando apenas o espaço matemático de agregação.
