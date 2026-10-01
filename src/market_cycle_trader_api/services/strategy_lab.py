@@ -20,6 +20,8 @@ from ..core.config import TCC_CONTROL_OPERATIONAL_MODE
 from ..engine.tcc_control_operational_runtime import (
     tcc_control_contract_issues,
     tcc_control_model_snapshot_issues,
+    tcc_control_model_values,
+    tcc_control_strategy_updates,
 )
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
@@ -1812,6 +1814,26 @@ def update_strategy(
         and abs(float(configuration.allocation_max_asset_weight) - 0.35) <= 1e-12
     ):
         normalized_configuration = configuration.model_copy(update={"allocation_max_asset_weight": 1.0})
+    tcc_model_snapshot = None
+    if str(configuration.strategy_mode) == TCC_CONTROL_OPERATIONAL_MODE:
+        normalized_configuration = configuration.model_copy(
+            update=tcc_control_strategy_updates()
+        )
+        next_model_revision = max(
+            1, int(current.get("research_model_revision") or 1) + 1
+        )
+        tcc_settings = execution_settings_from_values(
+            "lightgbm_utility",
+            tcc_control_model_values(),
+            settings_revision=next_model_revision,
+            profile_id="tcc-v1.0.6-control",
+        )
+        tcc_model_snapshot = model_execution_snapshot(
+            "lightgbm_utility",
+            tcc_settings,
+        )
+        tcc_model_snapshot["source"] = "tcc_v106_operational_contract"
+
     payload = normalized_configuration.model_dump(mode="json")
     now = utc_now()
     updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
@@ -1835,9 +1857,26 @@ def update_strategy(
                 "candidate_revision": None,
                 "candidate_backtest_id": None,
                 "candidate_model_snapshot": None,
+                **(
+                    {
+                        "research_model_snapshot": bson_value(tcc_model_snapshot),
+                        "backtest_engine_binding": None,
+                        "reference_engine_id": None,
+                        "reference_source_repository": None,
+                        "reference_source_tag": None,
+                        "reference_source_commit": None,
+                        "strategy_kind": "standard",
+                        "tuning_target": "model_strategy",
+                    }
+                    if tcc_model_snapshot is not None
+                    else {}
+                ),
                 **_derived_policy_edit_updates(current, reason="strategy_configuration_changed", now=now),
             },
-            "$inc": {"revision": 1},
+            "$inc": {
+                "revision": 1,
+                **({"research_model_revision": 1} if tcc_model_snapshot is not None else {}),
+            },
         },
         return_document=ReturnDocument.AFTER,
     )
