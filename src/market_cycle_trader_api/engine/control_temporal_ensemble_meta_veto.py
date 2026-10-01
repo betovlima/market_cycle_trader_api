@@ -222,9 +222,9 @@ def run_temporal_ensemble_meta_veto_pair(
     if len(symbols) != 55 or len(folds) != 3:
         raise ValueError("v10.8.57 expects frozen 55-asset / 3-fold Control context.")
 
-    if aggregation not in {"mean", "min", "skill_weighted"}:
+    if aggregation not in {"mean", "min", "max", "skill_weighted"}:
         raise ValueError(
-            "Temporal ensemble aggregation must be mean, min or skill_weighted."
+            "Temporal ensemble aggregation must be mean, min, max or skill_weighted."
         )
     fold_models, training_reports = train_temporal_ensemble_fold_models(
         source_dataset, folds,
@@ -233,6 +233,7 @@ def run_temporal_ensemble_meta_veto_pair(
         report["aggregation"] = {
             "mean": "arithmetic_mean_probability",
             "min": "minimum_component_probability",
+            "max": "maximum_component_probability",
             "skill_weighted": "calibration_skill_weighted_probability",
         }[aggregation]
 
@@ -352,6 +353,8 @@ def run_temporal_ensemble_meta_veto_pair(
                     probability = float(np.mean(component_probabilities))
                 elif aggregation == "min":
                     probability = float(np.min(component_probabilities))
+                elif aggregation == "max":
+                    probability = float(np.max(component_probabilities))
                 else:
                     if (
                         len(fold_model.component_weights)
@@ -374,12 +377,14 @@ def run_temporal_ensemble_meta_veto_pair(
                     reason = {
                         "mean": "TEMPORAL_ENSEMBLE_VETO",
                         "min": "WORST_REGIME_VETO",
+                        "max": "UNANIMOUS_TEMPORAL_VETO",
                         "skill_weighted": "SKILL_WEIGHTED_TEMPORAL_VETO",
                     }[aggregation]
                 else:
                     reason = {
                         "mean": "TEMPORAL_ENSEMBLE_PASS",
                         "min": "WORST_REGIME_PASS",
+                        "max": "UNANIMOUS_TEMPORAL_PASS",
                         "skill_weighted": "SKILL_WEIGHTED_TEMPORAL_PASS",
                     }[aggregation]
             elif not fold_model.enabled:
