@@ -76,8 +76,12 @@
 - Threshold permanece 0.35. Fold2 possui um componente e deve ser exatamente idêntico à v10.8.57; qualquer divergência pré-Fold3 aborta.
 - One-shot, Liquidity-Aware, custos, execução e snapshot permanecem inalterados.
 - Pré-auditoria causal no replay v10.8.57: entre 133 decisões Fold3 com dois componentes, a regra logit-mean altera diretamente apenas uma decisão antes de efeitos de trajetória: 2025-06-23 CORT->AAPL, mean P=0,355848 vs logit-mean P=0,344794. O rollout-base mostra delta_capital_fraction=-3,4325%, portanto HOLD era melhor. Esta observação motiva a hipótese, mas torna a v10.8.61 explicitamente exploratória/post-discovery.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` suporta `logit_mean` com clipping apenas por precisão numérica de ponto flutuante; `control_logit_mean_temporal_ensemble_research.py` reproduz v10.8.57 com mean e compara a candidata logit-mean no mesmo snapshot, exigindo paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=logit-mean-temporal-veto-v1061`, com runtime guard `API_VERSION=10.8.61`.
+- Artefatos permanecem curtos para Windows.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar a primeira divergência CORT->AAPL, vetos alterados por efeitos de trajetória e capital final.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.60 — Unanimous Temporal Veto (rejeitada)
