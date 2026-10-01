@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.56 consensus Meta-Veto."""
+"""Safeguards for v10.8.57 temporal-ensemble Meta-Veto."""
 from __future__ import annotations
 
 import sys
@@ -36,6 +36,7 @@ from market_cycle_trader_api.engine.control_expected_advantage_meta_veto import 
     MIN_CALIBRATION_SPEARMAN,
 )
 from market_cycle_trader_api.engine import control_consensus_meta_veto as consensus_engine
+from market_cycle_trader_api.engine import control_temporal_ensemble_meta_veto as temporal_engine
 
 REDUCED="control-reduced-b9404f6e1f694e38"
 SIGNATURE="control-signature-5dedf5eee0f94e8a"
@@ -65,6 +66,21 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(engine.run_expected_advantage_meta_veto_pair)
         self.assertIn("if predicted_delta <= 0.0:",source)
         self.assertIn("VETO_NONPOSITIVE_EXPECTED_ADVANTAGE",source)
+
+    def test_temporal_ensemble_contract_preserves_threshold_and_mean(self):
+        import inspect
+
+        source=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
+        self.assertIn("np.mean(component_probabilities)",source)
+        self.assertIn("probability <= VETO_PROBABILITY_MAX",source)
+        self.assertIn("TEMPORAL_ENSEMBLE_VETO",source)
+
+    def test_v1057_service_exposes_runner_identity(self):
+        import inspect
+
+        source=inspect.getsource(jobs)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.57"',source)
+        self.assertIn('RESEARCH_RUNNER = "temporal-ensemble-meta-veto-v1057"',source)
 
     def test_consensus_cannot_create_new_veto(self):
         import inspect
