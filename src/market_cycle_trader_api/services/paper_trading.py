@@ -17,7 +17,10 @@ from ..core.config import (
 )
 from ..engine.control_shadow_market_data import download_current_control_snapshot
 from ..engine.live_model_signal import build_live_model_decision
-from ..engine.tcc_control_operational_runtime import assert_tcc_control_operational_contract
+from ..engine.tcc_control_operational_runtime import (
+    assert_tcc_control_model_snapshot,
+    assert_tcc_control_operational_contract,
+)
 from ..engine.market_data import (
     latest_safe_completed_xnys_session,
     load_market_bars,
@@ -177,6 +180,7 @@ def _validated_context(
     if str(strategy.strategy_mode) == TCC_CONTROL_OPERATIONAL_MODE:
         try:
             assert_tcc_control_operational_contract(strategy)
+            assert_tcc_control_model_snapshot(winner_model)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
     if strategy.market_data_provider != "alpaca":
