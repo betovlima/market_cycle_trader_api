@@ -84,6 +84,7 @@
 - Próximo passo: confirmar CI e executar o endpoint existente; auditar número de vetos adicionais no Fold3, precisão nos rollouts alinháveis e capital final.
 - Incidente de persistência no job `control-meta-1bcc6907678b4426`: o replay chegou ao fim, mas falhou ao gravar `v1057_reference_temporal_ensemble_capital_curve.csv`. O path completo no Windows tinha 264 caracteres, ultrapassando o limite clássico de 260. Não houve falha científica ou de replay.
 - Correção sem mudança de estratégia: nomes dos artefatos da v10.8.58 foram encurtados (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`). O maior path equivalente cai para ~233 caracteres no ambiente reportado. Teste de regressão adicionado para impedir a reintrodução do nome longo.
+- CI anterior da v10.8.58 também revelou um teste legado que ainda esperava `API_VERSION=10.8.57` / `temporal-ensemble-meta-veto-v1057`; expectativa corrigida para `10.8.58` / `worst-regime-temporal-veto-v1058`. Isso não altera runtime nem protocolo científico.
 - O job `control-meta-1bcc6907678b4426` é inválido apenas como entrega de artefatos incompleta; rerodar a mesma rota após atualizar/reiniciar a API. Não alterar threshold, modelos, gates ou agregação por causa deste erro.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
