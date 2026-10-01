@@ -1,4 +1,4 @@
-"""Public research-only v10.8.56 consensus Meta-Veto jobs."""
+"""Public research-only v10.8.57 temporal-ensemble Meta-Veto jobs."""
 from __future__ import annotations
 
 import logging
@@ -9,8 +9,8 @@ from typing import Any
 
 from pymongo.errors import DuplicateKeyError
 
-from ..engine.control_consensus_meta_veto_research import (
-    run_consensus_meta_veto_research,
+from ..engine.control_temporal_ensemble_meta_veto_research import (
+    run_temporal_ensemble_meta_veto_research,
 )
 from ..infrastructure.persistence.mongo_repository import utc_now
 from ..core.config import API_VERSION
@@ -21,9 +21,9 @@ from .control_shadow_policy_rollout_jobs import COLLECTION as ROLLOUT_COLLECTION
 
 LOGGER = logging.getLogger("uvicorn.error")
 COLLECTION = "control_shadow_reduced_signature_meta_veto_jobs"
-ACTIVE_KEY = "control-reduced-signature-meta-veto-v1056"
-EXPECTED_API_VERSION = "10.8.56"
-RESEARCH_RUNNER = "consensus-meta-veto-v1056"
+ACTIVE_KEY = "control-reduced-signature-meta-veto-v1057"
+EXPECTED_API_VERSION = "10.8.57"
+RESEARCH_RUNNER = "temporal-ensemble-meta-veto-v1057"
 _THREADS: dict[str, threading.Thread] = {}
 
 
@@ -119,7 +119,7 @@ def _run_job(
                 progress=max(1, min(100, int(done))),
             )
 
-        report = run_consensus_meta_veto_research(
+        report = run_temporal_ensemble_meta_veto_research(
             source_job_id=source_id,
             rollout_job_id=rollout_id,
             signature_job_id=signature_id,
@@ -134,7 +134,7 @@ def _run_job(
         now = utc_now()
         _log(
             db, job_id,
-            "v10.8.56 consensus comparison completed; no order path touched.",
+            "v10.8.57 temporal-ensemble comparison completed; no order path touched.",
             stage="completed", progress=100,
         )
         db[COLLECTION].update_one(
@@ -259,7 +259,7 @@ def start_reduced_signature_meta_veto_research(
     try:
         collection.insert_one(record)
     except DuplicateKeyError as exc:
-        raise MetaVetoConflict("Another v10.8.56 meta-veto job is active.") from exc
+        raise MetaVetoConflict("Another v10.8.57 meta-veto job is active.") from exc
 
     thread = threading.Thread(
         target=_run_job,
@@ -299,5 +299,5 @@ def get_reduced_signature_meta_veto_research(
 ) -> dict[str, Any]:
     record = db[COLLECTION].find_one({"_id": job_id})
     if record is None:
-        raise MetaVetoNotFound("v10.8.56 meta-veto job not found.")
+        raise MetaVetoNotFound("v10.8.57 meta-veto job not found.")
     return _public(record, logs_only=logs_only)
