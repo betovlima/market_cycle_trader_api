@@ -107,6 +107,18 @@ def tcc_control_contract_issues(config: Any) -> list[str]:
         if not matches:
             issues.append(f"{name}: expected={expected!r}, actual={actual!r}")
 
+    model_family = _value(config, "research_model_family")
+    if model_family is not None and str(model_family) != "lightgbm_utility":
+        issues.append(
+            f"research_model_family: expected='lightgbm_utility', actual={model_family!r}"
+        )
+    protocol = _value(config, "research_market_data_protocol")
+    if protocol is not None and str(protocol) != "raw_total_causal_v1":
+        issues.append(
+            "research_market_data_protocol: expected='raw_total_causal_v1', "
+            f"actual={protocol!r}"
+        )
+
     assets = tuple(str(item).upper() for item in (_value(config, "assets", []) or []))
     if assets != TCC_CONTROL_REQUESTED_ASSETS:
         issues.append(
