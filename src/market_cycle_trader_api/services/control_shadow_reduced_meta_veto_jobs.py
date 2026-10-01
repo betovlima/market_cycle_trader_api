@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import re
 import threading
 import uuid
+import zipfile
 from typing import Any
 
 from pymongo.errors import DuplicateKeyError
@@ -13,7 +15,7 @@ from ..engine.control_logit_mean_temporal_ensemble_research import (
     run_logit_mean_temporal_veto_research,
 )
 from ..infrastructure.persistence.mongo_repository import utc_now
-from ..core.config import API_VERSION
+from ..core.config import API_VERSION, SOURCE_ROOT
 from .control_shadow_jobs import _require_enabled
 from .control_shadow_reduced_signature_jobs import COLLECTION as REDUCED_COLLECTION
 from .control_shadow_rollout_signature_jobs import COLLECTION as SIGNATURE_COLLECTION
@@ -87,6 +89,30 @@ def _log(db: Any, job_id: str, message: str, *, level="INFO",
     )
 
 
+def _export_report_zip(job_id: str, report_directory: str) -> str:
+    source = Path(report_directory)
+    if not source.is_dir():
+        raise FileNotFoundError(
+            f"Canonical report directory does not exist: {source}"
+        )
+    output_dir = SOURCE_ROOT.parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / f"control_meta_v10.8.61_{job_id}.zip"
+    if target.exists():
+        raise FileExistsError(f"Refusing to overwrite export ZIP: {target}")
+    with zipfile.ZipFile(
+        target, "w", compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for file_path in sorted(source.rglob("*")):
+            if file_path.is_file():
+                archive.write(
+                    file_path,
+                    arcname=Path("v10.8.61") / job_id
+                    / file_path.relative_to(source),
+                )
+    return str(target)
+
+
 def _run_job(
     db: Any,
     job_id: str,
@@ -133,11 +159,23 @@ def _run_job(
         )
         now = utc_now()
         report_directory = str(report.get("report_directory") or "")
+        export_zip = None
+        try:
+            export_zip = _export_report_zip(job_id, report_directory)
+            report["export_zip"] = export_zip
+        except Exception as export_exc:
+            _log(
+                db, job_id,
+                f"Export ZIP warning: {type(export_exc).__name__}: "
+                f"{str(export_exc)[:240]}",
+                level="WARNING",
+            )
         _log(
             db, job_id,
             (
                 "v10.8.61 logit-mean comparison completed; "
-                f"report_directory={report_directory}; no order path touched."
+                f"report_directory={report_directory}; "
+                f"export_zip={export_zip}; no order path touched."
             ),
             stage="completed", progress=100,
         )
