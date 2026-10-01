@@ -67,6 +67,20 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## v10.8.58 — Worst-Regime Temporal Veto
+- Branch `feature/v10.8.58-worst-regime-temporal-veto`, derivada da nova melhor referência v10.8.57.
+- Objetivo: tentar aumentar o capital final recuperando parte dos HOLD-better ainda não detectados, mantendo exatamente os componentes temporais da v10.8.57.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222`, v10.8.53 `US$ 1.891.417,6670329159` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Única mudança experimental: no Fold3, em vez de média aritmética das probabilidades dos componentes temporais habilitados, usar `min(P_component)`. Interpretação: como o Meta-Veto é um fail-safe one-shot, se qualquer regime histórico habilitado considerar a rotação suficientemente insegura, a decisão pode ser vetada.
+- Modelo de cada componente permanece exatamente Logistic Regression balanceada L2 C=0.25, mesmas 9 features, mesmo gate BA>=0.52/AUC>=0.52 por source_fold, mesma maturidade `rollout_end_date < test_start`.
+- Threshold permanece 0.35. Nenhum peso, threshold, C, feature ou gate novo.
+- Fold2 continua estruturalmente idêntico à v10.8.53/v10.8.57 porque existe um único componente. A candidata deve ter equity exatamente igual à v10.8.57 antes do Fold3.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem inalterados.
+- Hipótese explicitamente exploratória/post-discovery. O motivo estrutural é o diagnóstico de recall: a v10.8.53/v10.8.57 ainda deixam casos HOLD-better não vetados; a regra worst-regime testa uma política de proteção sem tuning contínuo.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- A candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57 como melhor referência.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.57 — Temporal Ensemble Meta-Veto (nova melhor referência retrospectiva)
 - Job real `control-meta-c0a2875df3404aa0`; ZIP `output(20261001-103811).zip`, 593 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
