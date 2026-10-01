@@ -35,6 +35,65 @@ TCC_CONTROL_EXPERIMENT_VERSION = "1.0.6"
 TCC_CONTROL_REQUESTED_ASSETS = tuple(ASSETS)
 
 
+def tcc_control_expected_lightgbm_settings() -> dict[str, Any]:
+    config = build_control_config(TCC_CONFIG)
+    settings = dict(config.research_model_settings or {})
+    return dict(settings.get("lightgbm") or {})
+
+
+def tcc_control_model_snapshot_issues(snapshot: Any) -> list[str]:
+    raw = snapshot if isinstance(snapshot, dict) else {}
+    issues: list[str] = []
+    family = str(raw.get("family") or "")
+    if family != "lightgbm_utility":
+        issues.append(
+            f"family: expected='lightgbm_utility', actual={family!r}"
+        )
+        return issues
+    settings_snapshot = (
+        raw.get("settings_snapshot")
+        if isinstance(raw.get("settings_snapshot"), dict)
+        else {}
+    )
+    actual = (
+        settings_snapshot.get("lightgbm")
+        if isinstance(settings_snapshot.get("lightgbm"), dict)
+        else {}
+    )
+    expected = tcc_control_expected_lightgbm_settings()
+    for key, expected_value in expected.items():
+        if key == "early_stopping_enabled":
+            actual_value = actual.get(key, False)
+        else:
+            actual_value = actual.get(key)
+        if isinstance(expected_value, float):
+            try:
+                matches = math.isclose(
+                    float(actual_value),
+                    float(expected_value),
+                    rel_tol=0,
+                    abs_tol=1e-12,
+                )
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = actual_value == expected_value
+        if not matches:
+            issues.append(
+                f"lightgbm.{key}: expected={expected_value!r}, actual={actual_value!r}"
+            )
+    return issues
+
+
+def assert_tcc_control_model_snapshot(snapshot: Any) -> None:
+    issues = tcc_control_model_snapshot_issues(snapshot)
+    if issues:
+        raise ValueError(
+            "TCC Control v1.0.6 model snapshot mismatch: "
+            + "; ".join(issues)
+        )
+
+
 def _value(config: Any, name: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(name, default)
