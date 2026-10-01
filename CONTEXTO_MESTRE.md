@@ -82,6 +82,8 @@
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
 - Próximo passo: confirmar CI e executar o endpoint existente; auditar a primeira divergência CORT->AAPL, vetos alterados por efeitos de trajetória e capital final.
+- Incidente em 2026-10-01 com ZIP `output(20261001-170414).zip`: o arquivo não contém nenhum artefato `validation/v10.8.61`; a execução mais recente é `validation/v10.8.60/control-meta-75712a3ac7c74aab`, `research_kind=control_unanimous_temporal_veto`, reproduzindo exatamente o resultado rejeitado v10.8.60. Portanto o runtime local usado nessa execução ainda estava em v10.8.60; não interpretar o ZIP como resultado v10.8.61.
+- GitHub da branch v10.8.61 estava correto (`API_VERSION=10.8.61`, `research_runner=logit-mean-temporal-veto-v1061`), mas a CI revelou um teste legado da v10.8.59 que exigia a string literal `aggregation == "skill_weighted"`. O teste foi corrigido para validar a presença do contrato skill-weighted sem depender da forma do branch interno. Nenhuma mudança científica/runtime da v10.8.61.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.60 — Unanimous Temporal Veto (rejeitada)
