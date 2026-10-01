@@ -186,7 +186,7 @@ def run_unanimous_temporal_veto_research(
             calculate_reference_fees,
             apply_slippage,
             source_dataset=dataset,
-            aggregation="unanimous",
+            aggregation="max",
             progress_callback=scaled(50, 45),
         )
     )
@@ -331,10 +331,10 @@ def run_unanimous_temporal_veto_research(
     ax.plot(
         aligned.index,
         aligned["unanimous"],
-        label="v10.8.60 Skill-Weighted",
+        label="v10.8.60 Unanimous",
     )
     ax.set_yscale("log")
-    ax.set_title("Skill-Weighted Temporal Veto · research only")
+    ax.set_title("Unanimous Temporal Veto · research only")
     ax.set_ylabel("USD, log scale")
     ax.grid(alpha=.2)
     ax.legend()
@@ -387,7 +387,7 @@ def run_unanimous_temporal_veto_research(
             "component_model": "balanced L2 Logistic Regression C=0.25",
             "feature_count": 9,
             "component_gate": "BA>=0.52 and AUC>=0.52",
-            "aggregation": "calibration_unanimous_probability",
+            "aggregation": "maximum_component_probability",
             "unanimity_rule": "max(P_component) <= 0.35",
             "veto_probability_max": 0.35,
             "training_requires_rollout_end_before_test_start": True,
