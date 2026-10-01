@@ -331,10 +331,10 @@ def run_logit_mean_temporal_veto_research(
     ax.plot(
         aligned.index,
         aligned["logit_mean"],
-        label="v10.8.61 Unanimous",
+        label="v10.8.61 Logit-Mean",
     )
     ax.set_yscale("log")
-    ax.set_title("Unanimous Temporal Veto · research only")
+    ax.set_title("Logit-Mean Temporal Ensemble · research only")
     ax.set_ylabel("USD, log scale")
     ax.grid(alpha=.2)
     ax.legend()
