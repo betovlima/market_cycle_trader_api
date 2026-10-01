@@ -67,6 +67,18 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.59 — Skill-Weighted Temporal Ensemble (rejeitada)
+- Job real `control-meta-36b5b2753c0348b0`; ZIP `dados(20261001-143554).zip`, 626 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Pesos causais calculados conforme protocolo: source Fold1 `w=0,1893939394` (normalizado 46,0590%); source Fold2 `w=0,2218045113` (normalizado 53,9410%).
+- Candidata terminou em `US$ 1.826.974,8329424586`, delta `-US$ 578.248,82` / `-24,0414%` contra v10.8.57.
+- CAGR 132,1089% vs 142,6615%; Sharpe 1,82577 vs 1,86988; MaxDD idêntico em -45,6664%.
+- Vetos totais: 67 vs 76 na v10.8.57. Vetos alinháveis ao rollout-base: candidata 34 HOLD-better / 16 ROTATE-better em 50 eventos (68,0% de precisão; delta médio -1,9621%), contra v10.8.57 35/15 em 50 eventos (70,0%; delta médio -2,0086%).
+- Em estados/propostas diretamente comparáveis, a ponderação cancelou três vetos da v10.8.57: 2025-05-05 MKSI->TSLA; 2026-05-14 GKOS->AMZN; 2026-09-10 ADI->AMZN. O caso GKOS->AMZN existe no rollout-base e era veto correto: `delta_capital_fraction=-1,49037%`; a v10.8.59 elevou P de 0,310236 (mean) para 0,407430 (skill-weighted) e liberou a rotação.
+- Na composição de vetos alinháveis, a candidata perdeu o veto correto GKOS->AMZN (-1,4904%) e adicionou posteriormente um veto CEF->NVDA cujo rollout mostra ROTATE melhor (+0,8323%). Isso explica a piora de seletividade observada.
+- Conclusão: skill de calibração BA/AUC não deve ser convertida diretamente em peso econômico do ensemble. Hipótese rejeitada sem tuning posterior. v10.8.57 permanece melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Não ajustar a fórmula de peso usando este mesmo OOS.
+
 ## v10.8.59 — Skill-Weighted Temporal Ensemble Meta-Veto
 - Branch `feature/v10.8.59-skill-weighted-temporal-ensemble`, derivada da linha v10.8.58, mas a melhor referência continua sendo v10.8.57.
 - Objetivo: tentar aumentar capital final preservando os componentes temporais da v10.8.57 e substituindo apenas o peso 50/50 por pesos causais derivados da qualidade de calibração de cada componente.
