@@ -67,6 +67,20 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## v10.8.60 — Unanimous Temporal Veto
+- Branch `feature/v10.8.60-unanimous-temporal-veto`, derivada da linha v10.8.59; melhor referência continua v10.8.57.
+- Objetivo: tentar aumentar capital final reduzindo falsos positivos da v10.8.57 sem alterar componentes, features, C, gates, maturidade, one-shot ou execução.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Componentes: exatamente os Logit temporais da v10.8.57, um por source_fold maduro, balanced L2 C=0.25, 9 features, gate BA>=0.52/AUC>=0.52.
+- Única mudança experimental: agregar com `max(P_component)`. Como o veto continua `P<=0.35`, isto equivale a exigir que TODOS os componentes habilitados estejam <=0.35 para vetar.
+- Fold2 tem um único componente e deve ser exatamente idêntico à v10.8.57. Qualquer diferença de equity antes do Fold3 aborta.
+- Nenhum threshold, peso, C, feature, gate ou hiperparâmetro novo.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem idênticos.
+- Hipótese exploratória/post-discovery: após min() e skill-weighted piorarem a seletividade, testar unanimidade como política conservadora. Melhora retrospectiva ainda exige validação futura independente.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.59 — Skill-Weighted Temporal Ensemble (rejeitada)
 - Job real `control-meta-36b5b2753c0348b0`; ZIP `dados(20261001-143554).zip`, 626 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
