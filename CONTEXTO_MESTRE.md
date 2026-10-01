@@ -78,8 +78,12 @@
 - One-shot, Liquidity-Aware, custos, execução e snapshot permanecem idênticos.
 - Não há tuning de peso, expoente, threshold, C, feature ou gate. A fórmula de peso foi congelada antes da execução.
 - Hipótese exploratória/post-discovery; melhora retrospectiva não equivale a validação futura independente.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` passou a armazenar o skill weight causal de cada componente e suporta agregação interna `skill_weighted`; `control_skill_weighted_temporal_ensemble_research.py` reproduz v10.8.57 com mean e compara a candidata no mesmo snapshot, exigindo paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=skill-weighted-temporal-veto-v1059`, com runtime guard `API_VERSION=10.8.59`.
+- Artefatos permanecem curtos para evitar o limite de path do Windows.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar pesos dos componentes, vetos alterados no Fold3 e capital final.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.58 — Worst-Regime Temporal Veto (rejeitada)
