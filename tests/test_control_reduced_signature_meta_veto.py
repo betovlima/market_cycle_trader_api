@@ -99,12 +99,12 @@ class ReducedSignatureMetaVetoTests(TestCase):
         source=inspect.getsource(engine.run_reduced_signature_meta_veto_pair)
         self.assertIn('{"enabled": True, "audit": {}}',source)
 
-    def test_v1056_service_exposes_runner_and_runtime_guard(self):
+    def test_service_exposes_runner_and_runtime_guard(self):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.56"',source)
-        self.assertIn('RESEARCH_RUNNER = "consensus-meta-veto-v1056"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.57"',source)
+        self.assertIn('RESEARCH_RUNNER = "temporal-ensemble-meta-veto-v1057"',source)
         self.assertIn('"api_version": record.get("api_version")',source)
         self.assertIn('"research_runner": record.get("research_runner")',source)
 
