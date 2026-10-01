@@ -67,6 +67,16 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.56 — Consensus Meta-Veto (rejeitada)
+- Job real `control-meta-63f2e1bb18014c91`; ZIP `dados(20261001-000909).zip`, 578 entradas, CRC válido.
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.
+- Candidata terminou em `US$ 1.857.794,740041506`, delta `-US$ 33.622,93` / `-1,7777%` contra v10.8.53. Sharpe 1,80585 vs 1,81203; MaxDD praticamente igual (-45,7567% vs -45,7576%).
+- A candidata manteve 63 vetos totais, mas no Fold2 cancelou 3 vetos originais da v10.8.53 e a mudança de trajetória gerou vetos diferentes depois. Fold3 caiu para classifier-only porque a Ridge falhou no gate.
+- Os 3 vetos cancelados foram auditados contra `paired_rollout_labels.csv` e TODOS eram vetos corretos: 2023-09-19 LKFT->RACE delta -1,7357%; 2023-09-29 LKFT->CORT delta -2,5952%; 2024-02-20 CCK->CORT delta -5,9430%. Portanto o regressor removeu ações economicamente úteis.
+- Ao final do Fold2 a candidata já estava ~5,82% abaixo da v10.8.53; o fallback no Fold3 reduziu parte da diferença, mas não recuperou o capital final.
+- Hipótese de consenso classificador+Ridge rejeitada. v10.8.53 permanece a melhor referência válida em `US$ 1.891.417,6670329159`.
+- Diagnóstico adicional da v10.8.53: entre 48 vetos que puderam ser alinhados exatamente ao rollout-base, 33 (68,75%) eram HOLD-better e 15 eram falsos positivos. Entre 180 decisões modeladas alinháveis, havia 56 oportunidades HOLD-better não vetadas. Há espaço de melhoria, mas não via Ridge de magnitude.
+
 ## v10.8.56 — Consensus Meta-Veto
 - Branch `feature/v10.8.56-consensus-meta-veto`, derivada da v10.8.55 apenas para reutilizar o regressor já congelado; a melhor referência continua sendo v10.8.53.
 - Objetivo: aumentar o capital final reduzindo falsos positivos de veto da v10.8.53 sem permitir que o regressor substitua o classificador.
