@@ -67,6 +67,19 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## v10.8.61 — Logit-Mean Temporal Ensemble
+- Branch `feature/v10.8.61-logit-mean-temporal-ensemble`, derivada da linha v10.8.60; melhor referência continua v10.8.57.
+- Objetivo: tentar aumentar capital final preservando os mesmos componentes temporais da v10.8.57 e mudando apenas o espaço matemático de agregação.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Componentes permanecem exatamente balanced L2 Logistic Regression C=0.25, mesmas 9 features, gates BA>=0.52/AUC>=0.52, mesma maturidade causal.
+- Única mudança experimental: `P = sigmoid(mean(logit(P_component)))`. Isto equivale a combinar as odds geometricamente, sem peso treinado ou hiperparâmetro adicional.
+- Threshold permanece 0.35. Fold2 possui um componente e deve ser exatamente idêntico à v10.8.57; qualquer divergência pré-Fold3 aborta.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem inalterados.
+- Pré-auditoria causal no replay v10.8.57: entre 133 decisões Fold3 com dois componentes, a regra logit-mean altera diretamente apenas uma decisão antes de efeitos de trajetória: 2025-06-23 CORT->AAPL, mean P=0,355848 vs logit-mean P=0,344794. O rollout-base mostra delta_capital_fraction=-3,4325%, portanto HOLD era melhor. Esta observação motiva a hipótese, mas torna a v10.8.61 explicitamente exploratória/post-discovery.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.60 — Unanimous Temporal Veto (rejeitada)
 - Job real `control-meta-e836ea093f0940b9`; ZIP `dados(20261001-162250).zip`, 641 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
