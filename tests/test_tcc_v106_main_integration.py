@@ -16,7 +16,7 @@ from market_cycle_trader_api.services.strategy_lab import (
 
 class MainReferenceIntegrationTests(unittest.TestCase):
     def test_distinct_integrated_api_version(self) -> None:
-        self.assertEqual(API_VERSION, "10.8.57")
+        self.assertEqual(API_VERSION, "10.8.58")
 
     def test_main_heartbeat_and_tcc_data_path_coexist(self) -> None:
         source = inspect.getsource(compound_rotation_backtest.run_job)

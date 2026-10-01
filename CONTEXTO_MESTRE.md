@@ -67,6 +67,40 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.58 — Worst-Regime Temporal Veto (rejeitada)
+- Job real `control-meta-fc55cbf05e5540d9`; ZIP `dados(20261001-133742).zip`, 611 entradas, CRC válido.
+- Correção de path validada: artefatos curtos foram gravados com sucesso (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`).
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Candidata `min(P_component)` terminou em `US$ 1.769.558,7211170627`, delta `-US$ 635.664,93` / `-26,4285%` contra v10.8.57.
+- CAGR 130,9137% vs 142,6615%; Sharpe 1,80466 vs 1,86988; MaxDD praticamente igual (-45,6670% vs -45,6664%).
+- Vetos: 84 vs 76 na v10.8.57; Fold2 permaneceu exatamente 30, Fold3 aumentou de 46 para 54.
+- Vetos alinháveis ao rollout-base: candidata 41 HOLD-better / 19 ROTATE-better em 60 eventos (68,33% de precisão; delta médio -1,9429%), contra v10.8.57 35/15 em 50 eventos (70,0%; delta médio -2,0086%). Portanto o aumento de recall veio com pior precisão econômica.
+- Primeira divergência no Fold3: 2024-07-24 NFLX->AVGO. v10.8.57 mean P=0,368438 e executa ROTATE; v10.8.58 min P=0,285018 e veta. Rollout-base: `delta_capital_fraction=+1,2583%`, portanto ROTATE era melhor e o novo veto foi falso positivo.
+- Entre 13 novos vetos diretamente comparáveis antes de efeitos de trajetória, 9 puderam ser ligados ao rollout-base; 5 eram HOLD-better e 4 ROTATE-better. A agressividade worst-regime não melhora a seletividade.
+- Hipótese rejeitada sem ajuste de threshold/agregação. v10.8.57 permanece a melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Não tentar calibrar um percentil entre mean e min olhando este mesmo OOS.
+
+## v10.8.58 — Worst-Regime Temporal Veto
+- Branch `feature/v10.8.58-worst-regime-temporal-veto`, derivada da nova melhor referência v10.8.57.
+- Objetivo: tentar aumentar o capital final recuperando parte dos HOLD-better ainda não detectados, mantendo exatamente os componentes temporais da v10.8.57.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222`, v10.8.53 `US$ 1.891.417,6670329159` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Única mudança experimental: no Fold3, em vez de média aritmética das probabilidades dos componentes temporais habilitados, usar `min(P_component)`. Interpretação: como o Meta-Veto é um fail-safe one-shot, se qualquer regime histórico habilitado considerar a rotação suficientemente insegura, a decisão pode ser vetada.
+- Modelo de cada componente permanece exatamente Logistic Regression balanceada L2 C=0.25, mesmas 9 features, mesmo gate BA>=0.52/AUC>=0.52 por source_fold, mesma maturidade `rollout_end_date < test_start`.
+- Threshold permanece 0.35. Nenhum peso, threshold, C, feature ou gate novo.
+- Fold2 continua estruturalmente idêntico à v10.8.53/v10.8.57 porque existe um único componente. A candidata deve ter equity exatamente igual à v10.8.57 antes do Fold3.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem inalterados.
+- Hipótese explicitamente exploratória/post-discovery. O motivo estrutural é o diagnóstico de recall: a v10.8.53/v10.8.57 ainda deixam casos HOLD-better não vetados; a regra worst-regime testa uma política de proteção sem tuning contínuo.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` agora suporta apenas duas agregações internas congeladas (`mean` para reproduzir v10.8.57 e `min` para a candidata); `control_worst_regime_temporal_veto_research.py` executa referência v10.8.57 e candidata v10.8.58 no mesmo snapshot, exige paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=worst-regime-temporal-veto-v1058`, com runtime guard `API_VERSION=10.8.58`.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- A candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57 como melhor referência.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar número de vetos adicionais no Fold3, precisão nos rollouts alinháveis e capital final.
+- Incidente de persistência no job `control-meta-1bcc6907678b4426`: o replay chegou ao fim, mas falhou ao gravar `v1057_reference_temporal_ensemble_capital_curve.csv`. O path completo no Windows tinha 264 caracteres, ultrapassando o limite clássico de 260. Não houve falha científica ou de replay.
+- Correção sem mudança de estratégia: nomes dos artefatos da v10.8.58 foram encurtados (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`). O maior path equivalente cai para ~233 caracteres no ambiente reportado. Teste de regressão adicionado para impedir a reintrodução do nome longo.
+- CI anterior da v10.8.58 também revelou um teste legado que ainda esperava `API_VERSION=10.8.57` / `temporal-ensemble-meta-veto-v1057`; expectativa corrigida para `10.8.58` / `worst-regime-temporal-veto-v1058`. Isso não altera runtime nem protocolo científico.
+- O job `control-meta-1bcc6907678b4426` é inválido apenas como entrega de artefatos incompleta; rerodar a mesma rota após atualizar/reiniciar a API. Não alterar threshold, modelos, gates ou agregação por causa deste erro.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.57 — Temporal Ensemble Meta-Veto (nova melhor referência retrospectiva)
 - Job real `control-meta-c0a2875df3404aa0`; ZIP `output(20261001-103811).zip`, 593 entradas, CRC válido.
 - Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.53 perfeita em `US$ 1.891.417,6670329159`.

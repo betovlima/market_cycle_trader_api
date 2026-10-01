@@ -197,6 +197,7 @@ def run_temporal_ensemble_meta_veto_pair(
     slippage: Callable,
     *,
     source_dataset: pd.DataFrame,
+    aggregation: str = "mean",
     progress_callback: Callable[[float, str, int], None] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     (
@@ -211,9 +212,17 @@ def run_temporal_ensemble_meta_veto_pair(
     if len(symbols) != 55 or len(folds) != 3:
         raise ValueError("v10.8.57 expects frozen 55-asset / 3-fold Control context.")
 
+    if aggregation not in {"mean", "min"}:
+        raise ValueError("Temporal ensemble aggregation must be mean or min.")
     fold_models, training_reports = train_temporal_ensemble_fold_models(
         source_dataset, folds,
     )
+    for report in training_reports:
+        report["aggregation"] = (
+            "arithmetic_mean_probability"
+            if aggregation == "mean"
+            else "minimum_component_probability"
+        )
 
     original_runner = scientific._run_lightgbm
     original_policy = original_runner.__globals__.get("_utility_policy")
@@ -327,13 +336,25 @@ def run_temporal_ensemble_meta_veto_pair(
                     float(model.predict_proba(feature_row)[:, 1][0])
                     for model in fold_model.models
                 ]
-                probability = float(np.mean(component_probabilities))
+                probability = float(
+                    np.mean(component_probabilities)
+                    if aggregation == "mean"
+                    else np.min(component_probabilities)
+                )
                 if probability <= VETO_PROBABILITY_MAX:
                     veto = True
                     force_control_next[0] = True
-                    reason = "TEMPORAL_ENSEMBLE_VETO"
+                    reason = (
+                        "TEMPORAL_ENSEMBLE_VETO"
+                        if aggregation == "mean"
+                        else "WORST_REGIME_VETO"
+                    )
                 else:
-                    reason = "TEMPORAL_ENSEMBLE_PASS"
+                    reason = (
+                        "TEMPORAL_ENSEMBLE_PASS"
+                        if aggregation == "mean"
+                        else "WORST_REGIME_PASS"
+                    )
             elif not fold_model.enabled:
                 reason = fold_model.disable_reason or "MODEL_DISABLED"
             elif current_position == 0 or control_target == 0:
@@ -358,6 +379,7 @@ def run_temporal_ensemble_meta_veto_pair(
                     str(value) for value in fold_model.source_fold_ids
                 ),
                 "enabled_component_count": len(fold_model.models),
+                "aggregation": aggregation,
                 "veto_applied": veto,
                 "reason": reason,
                 "state_shares": int(account.get("shares") or 0),

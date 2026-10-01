@@ -1,4 +1,4 @@
-"""Safeguards for v10.8.57 temporal-ensemble Meta-Veto."""
+"""Safeguards for v10.8.58 worst-regime temporal Meta-Veto."""
 from __future__ import annotations
 
 import sys
@@ -67,6 +67,14 @@ class ReducedSignatureMetaVetoTests(TestCase):
         self.assertIn("if predicted_delta <= 0.0:",source)
         self.assertIn("VETO_NONPOSITIVE_EXPECTED_ADVANTAGE",source)
 
+    def test_temporal_ensemble_supports_fixed_worst_regime_aggregation(self):
+        import inspect
+
+        source=inspect.getsource(temporal_engine.run_temporal_ensemble_meta_veto_pair)
+        self.assertIn('aggregation not in {"mean", "min"}',source)
+        self.assertIn("np.min(component_probabilities)",source)
+        self.assertIn("WORST_REGIME_VETO",source)
+
     def test_temporal_ensemble_contract_preserves_threshold_and_mean(self):
         import inspect
 
@@ -75,12 +83,37 @@ class ReducedSignatureMetaVetoTests(TestCase):
         self.assertIn("probability <= VETO_PROBABILITY_MAX",source)
         self.assertIn("TEMPORAL_ENSEMBLE_VETO",source)
 
-    def test_v1057_service_exposes_runner_identity(self):
+    def test_v1058_artifact_names_are_windows_path_safe(self):
+        import inspect
+        from market_cycle_trader_api.engine import (
+            control_worst_regime_temporal_veto_research as research,
+        )
+
+        source=inspect.getsource(research.run_worst_regime_temporal_veto_research)
+        expected=[
+            "base_capital_curve.csv",
+            "ref57_capital_curve.csv",
+            "cand58_capital_curve.csv",
+            "ref57_train.json",
+            "cand58_train.json",
+            "ref57_decisions.csv",
+            "cand58_decisions.csv",
+            "curves.csv",
+            "comparison.png",
+        ]
+        for name in expected:
+            self.assertIn(name,source)
+            self.assertLessEqual(len(name),24)
+        self.assertNotIn(
+            "v1057_reference_temporal_ensemble_capital_curve.csv",source
+        )
+
+    def test_v1058_service_exposes_runner_identity(self):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.57"',source)
-        self.assertIn('RESEARCH_RUNNER = "temporal-ensemble-meta-veto-v1057"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.58"',source)
+        self.assertIn('RESEARCH_RUNNER = "worst-regime-temporal-veto-v1058"',source)
 
     def test_consensus_cannot_create_new_veto(self):
         import inspect
@@ -103,8 +136,8 @@ class ReducedSignatureMetaVetoTests(TestCase):
         import inspect
 
         source=inspect.getsource(jobs)
-        self.assertIn('EXPECTED_API_VERSION = "10.8.57"',source)
-        self.assertIn('RESEARCH_RUNNER = "temporal-ensemble-meta-veto-v1057"',source)
+        self.assertIn('EXPECTED_API_VERSION = "10.8.58"',source)
+        self.assertIn('RESEARCH_RUNNER = "worst-regime-temporal-veto-v1058"',source)
         self.assertIn('"api_version": record.get("api_version")',source)
         self.assertIn('"research_runner": record.get("research_runner")',source)
 
