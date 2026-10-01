@@ -963,7 +963,7 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 
     confirm: Literal["RESEARCH_CONTROL_REDUCED_META_VETO_NO_ORDERS"] = Field(
         description=(
-            "Run the frozen v10.8.59 skill-weighted temporal Meta-Veto comparison. "
+            "Run the frozen v10.8.60 unanimous temporal Meta-Veto comparison. "
             "Research only; never creates or submits orders."
         )
     )
@@ -980,14 +980,14 @@ class StartControlReducedMetaVetoRequest(BaseModel):
 @router.post(
     "/reduced-meta-veto/jobs",
     status_code=202,
-    summary="Run current reduced Meta-Veto research — v10.8.59 skill weighted",
+    summary="Run current reduced Meta-Veto research — v10.8.60 unanimous",
     description=(
         "Replays the exact v10.8.57 mean-ensemble reference and compares "
-        "a skill-weighted candidate using the same temporal components. Each "
-        "component weight is fixed from its own prior calibration skill: "
-        "(BA-0.5)+(AUC-0.5). Threshold remains 0.35, Fold2 stays identical "
-        "with one component, and there is no HTTP tuning, Alpaca refresh, "
-        "Winner change or orders."
+        "an unanimous candidate using the same temporal components. The "
+        "candidate uses max(P_component), so every enabled regime must be "
+        "at or below the unchanged 0.35 threshold before a one-shot veto. "
+        "Fold2 stays identical with one component. No HTTP tuning, Alpaca "
+        "refresh, Winner change or orders."
     ),
 )
 def start_reduced_meta_veto_job(
