@@ -77,8 +77,11 @@
 - Fold2 continua estruturalmente idêntico à v10.8.53/v10.8.57 porque existe um único componente. A candidata deve ter equity exatamente igual à v10.8.57 antes do Fold3.
 - One-shot, Liquidity-Aware, custos, execução e snapshot permanecem inalterados.
 - Hipótese explicitamente exploratória/post-discovery. O motivo estrutural é o diagnóstico de recall: a v10.8.53/v10.8.57 ainda deixam casos HOLD-better não vetados; a regra worst-regime testa uma política de proteção sem tuning contínuo.
+- Implementação concluída: `control_temporal_ensemble_meta_veto.py` agora suporta apenas duas agregações internas congeladas (`mean` para reproduzir v10.8.57 e `min` para a candidata); `control_worst_regime_temporal_veto_research.py` executa referência v10.8.57 e candidata v10.8.58 no mesmo snapshot, exige paridade v10.8.44, paridade exata v10.8.57 e igualdade total pré-Fold3.
+- Serviço existente reapontado para `research_runner=worst-regime-temporal-veto-v1058`, com runtime guard `API_VERSION=10.8.58`.
 - Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
 - A candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57 como melhor referência.
+- Próximo passo: confirmar CI e executar o endpoint existente; auditar número de vetos adicionais no Fold3, precisão nos rollouts alinháveis e capital final.
 - Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
 
 ## Resultado v10.8.57 — Temporal Ensemble Meta-Veto (nova melhor referência retrospectiva)
