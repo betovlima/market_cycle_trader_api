@@ -67,6 +67,21 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## v10.8.59 — Skill-Weighted Temporal Ensemble Meta-Veto
+- Branch `feature/v10.8.59-skill-weighted-temporal-ensemble`, derivada da linha v10.8.58, mas a melhor referência continua sendo v10.8.57.
+- Objetivo: tentar aumentar capital final preservando os componentes temporais da v10.8.57 e substituindo apenas o peso 50/50 por pesos causais derivados da qualidade de calibração de cada componente.
+- Referências obrigatórias no mesmo job: v10.8.44 `US$ 1.078.635,4115518222` e v10.8.57 `US$ 2.405.223,6491167042`, tolerância absoluta 1e-6.
+- Cada componente permanece exatamente balanced L2 Logistic Regression C=0.25, mesmas 9 features, gate BA>=0.52 e AUC>=0.52, mesma maturidade `rollout_end_date < test_start`.
+- Peso pré-declarado e sem hiperparâmetro: `w = (BA_calibration - 0.5) + (AUC_calibration - 0.5)`. Como componentes só entram após BA/AUC>=0.52, todos os pesos habilitados são positivos.
+- Probabilidade candidata: `sum(w_i * P_i) / sum(w_i)`. Threshold de veto permanece exatamente 0.35.
+- Fold2 possui um único componente e deve ser exatamente idêntico à v10.8.57. Qualquer diferença de equity antes do Fold3 aborta o job.
+- One-shot, Liquidity-Aware, custos, execução e snapshot permanecem idênticos.
+- Não há tuning de peso, expoente, threshold, C, feature ou gate. A fórmula de peso foi congelada antes da execução.
+- Hipótese exploratória/post-discovery; melhora retrospectiva não equivale a validação futura independente.
+- Nenhum endpoint novo. Reutilizar `POST /api/admin/control-shadow/reduced-meta-veto/jobs`.
+- Candidata só conta como avanço retrospectivo se superar `US$ 2.405.223,6491167042`; caso contrário, manter v10.8.57.
+- Nenhuma Strategy operacional, Winner, TCC, carteira real ou ordem é alterada.
+
 ## Resultado v10.8.58 — Worst-Regime Temporal Veto (rejeitada)
 - Job real `control-meta-fc55cbf05e5540d9`; ZIP `dados(20261001-133742).zip`, 611 entradas, CRC válido.
 - Correção de path validada: artefatos curtos foram gravados com sucesso (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`).
