@@ -83,6 +83,31 @@ class ReducedSignatureMetaVetoTests(TestCase):
         self.assertIn("probability <= VETO_PROBABILITY_MAX",source)
         self.assertIn("TEMPORAL_ENSEMBLE_VETO",source)
 
+    def test_v1058_artifact_names_are_windows_path_safe(self):
+        import inspect
+        from market_cycle_trader_api.engine import (
+            control_worst_regime_temporal_veto_research as research,
+        )
+
+        source=inspect.getsource(research.run_worst_regime_temporal_veto_research)
+        expected=[
+            "base_capital_curve.csv",
+            "ref57_capital_curve.csv",
+            "cand58_capital_curve.csv",
+            "ref57_train.json",
+            "cand58_train.json",
+            "ref57_decisions.csv",
+            "cand58_decisions.csv",
+            "curves.csv",
+            "comparison.png",
+        ]
+        for name in expected:
+            self.assertIn(name,source)
+            self.assertLessEqual(len(name),24)
+        self.assertNotIn(
+            "v1057_reference_temporal_ensemble_capital_curve.csv",source
+        )
+
     def test_v1058_service_exposes_runner_identity(self):
         import inspect
 
