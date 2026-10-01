@@ -222,9 +222,9 @@ def run_temporal_ensemble_meta_veto_pair(
     if len(symbols) != 55 or len(folds) != 3:
         raise ValueError("v10.8.57 expects frozen 55-asset / 3-fold Control context.")
 
-    if aggregation not in {"mean", "min", "max", "skill_weighted"}:
+    if aggregation not in {"mean", "min", "max", "skill_weighted", "logit_mean"}:
         raise ValueError(
-            "Temporal ensemble aggregation must be mean, min, max or skill_weighted."
+            "Temporal ensemble aggregation must be mean, min, max, skill_weighted or logit_mean."
         )
     fold_models, training_reports = train_temporal_ensemble_fold_models(
         source_dataset, folds,
@@ -235,6 +235,7 @@ def run_temporal_ensemble_meta_veto_pair(
             "min": "minimum_component_probability",
             "max": "maximum_component_probability",
             "skill_weighted": "calibration_skill_weighted_probability",
+            "logit_mean": "mean_component_log_odds_probability",
         }[aggregation]
 
     original_runner = scientific._run_lightgbm
@@ -355,6 +356,14 @@ def run_temporal_ensemble_meta_veto_pair(
                     probability = float(np.min(component_probabilities))
                 elif aggregation == "max":
                     probability = float(np.max(component_probabilities))
+                elif aggregation == "logit_mean":
+                    probs = np.clip(
+                        np.asarray(component_probabilities, dtype=float),
+                        np.finfo(float).eps,
+                        1.0 - np.finfo(float).eps,
+                    )
+                    mean_logit = float(np.mean(np.log(probs / (1.0 - probs))))
+                    probability = float(1.0 / (1.0 + np.exp(-mean_logit)))
                 else:
                     if (
                         len(fold_model.component_weights)
@@ -379,6 +388,7 @@ def run_temporal_ensemble_meta_veto_pair(
                         "min": "WORST_REGIME_VETO",
                         "max": "UNANIMOUS_TEMPORAL_VETO",
                         "skill_weighted": "SKILL_WEIGHTED_TEMPORAL_VETO",
+                        "logit_mean": "LOGIT_MEAN_TEMPORAL_VETO",
                     }[aggregation]
                 else:
                     reason = {
@@ -386,6 +396,7 @@ def run_temporal_ensemble_meta_veto_pair(
                         "min": "WORST_REGIME_PASS",
                         "max": "UNANIMOUS_TEMPORAL_PASS",
                         "skill_weighted": "SKILL_WEIGHTED_TEMPORAL_PASS",
+                        "logit_mean": "LOGIT_MEAN_TEMPORAL_PASS",
                     }[aggregation]
             elif not fold_model.enabled:
                 reason = fold_model.disable_reason or "MODEL_DISABLED"
