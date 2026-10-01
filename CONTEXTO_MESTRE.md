@@ -67,6 +67,19 @@
 - Nenhum fold candidato foi habilitado, `candidate_veto_count=0`; capital final candidato = `US$ 1.078.635,4115518222`, delta `-42,9721%` contra v10.8.53.
 - Hipótese rejeitada sem tuning posterior. v10.8.53 continua sendo a melhor referência válida em `US$ 1.891.417,6670329159`.
 
+## Resultado v10.8.58 — Worst-Regime Temporal Veto (rejeitada)
+- Job real `control-meta-fc55cbf05e5540d9`; ZIP `dados(20261001-133742).zip`, 611 entradas, CRC válido.
+- Correção de path validada: artefatos curtos foram gravados com sucesso (`base_*`, `ref57_*`, `cand58_*`, `curves.csv`, `comparison.png`).
+- Paridade v10.8.44 perfeita em `US$ 1.078.635,4115518222`; paridade v10.8.57 perfeita em `US$ 2.405.223,6491167042`; diferença pré-Fold3 exatamente 0.
+- Candidata `min(P_component)` terminou em `US$ 1.769.558,7211170627`, delta `-US$ 635.664,93` / `-26,4285%` contra v10.8.57.
+- CAGR 130,9137% vs 142,6615%; Sharpe 1,80466 vs 1,86988; MaxDD praticamente igual (-45,6670% vs -45,6664%).
+- Vetos: 84 vs 76 na v10.8.57; Fold2 permaneceu exatamente 30, Fold3 aumentou de 46 para 54.
+- Vetos alinháveis ao rollout-base: candidata 41 HOLD-better / 19 ROTATE-better em 60 eventos (68,33% de precisão; delta médio -1,9429%), contra v10.8.57 35/15 em 50 eventos (70,0%; delta médio -2,0086%). Portanto o aumento de recall veio com pior precisão econômica.
+- Primeira divergência no Fold3: 2024-07-24 NFLX->AVGO. v10.8.57 mean P=0,368438 e executa ROTATE; v10.8.58 min P=0,285018 e veta. Rollout-base: `delta_capital_fraction=+1,2583%`, portanto ROTATE era melhor e o novo veto foi falso positivo.
+- Entre 13 novos vetos diretamente comparáveis antes de efeitos de trajetória, 9 puderam ser ligados ao rollout-base; 5 eram HOLD-better e 4 ROTATE-better. A agressividade worst-regime não melhora a seletividade.
+- Hipótese rejeitada sem ajuste de threshold/agregação. v10.8.57 permanece a melhor referência retrospectiva em `US$ 2.405.223,6491167042`.
+- Não tentar calibrar um percentil entre mean e min olhando este mesmo OOS.
+
 ## v10.8.58 — Worst-Regime Temporal Veto
 - Branch `feature/v10.8.58-worst-regime-temporal-veto`, derivada da nova melhor referência v10.8.57.
 - Objetivo: tentar aumentar o capital final recuperando parte dos HOLD-better ainda não detectados, mantendo exatamente os componentes temporais da v10.8.57.
