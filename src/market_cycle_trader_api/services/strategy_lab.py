@@ -17,7 +17,10 @@ from pymongo import ReturnDocument
 
 from ..core.config import API_VERSION, PACKAGE_DIR
 from ..core.config import TCC_CONTROL_OPERATIONAL_MODE
-from ..engine.tcc_control_operational_runtime import tcc_control_contract_issues
+from ..engine.tcc_control_operational_runtime import (
+    tcc_control_contract_issues,
+    tcc_control_model_snapshot_issues,
+)
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
@@ -618,11 +621,15 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     )
     if str(configuration.get("strategy_mode") or "") == TCC_CONTROL_OPERATIONAL_MODE:
         issues = tcc_control_contract_issues(configuration)
-        if model_family != "lightgbm_utility":
+        model_issues = tcc_control_model_snapshot_issues(snapshot)
+        if model_family != "lightgbm_utility" or model_issues:
             return {
                 "eligible": False,
-                "code": "tcc_control_requires_lightgbm",
-                "reason": "TCC Control v1.0.6 operational runtime requires LightGBM Utility.",
+                "code": "tcc_control_model_contract_mismatch",
+                "reason": (
+                    "TCC Control v1.0.6 requires its protected LightGBM "
+                    "snapshot: " + "; ".join(model_issues[:5])
+                ),
                 "strategy_kind": strategy_kind,
                 "model_family": model_family,
             }
