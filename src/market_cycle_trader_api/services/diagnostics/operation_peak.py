@@ -438,7 +438,7 @@ def peak_distance_boxplot_figures(
         figure, axis = plt.subplots(
             figsize=(12, max(6.0, 0.42 * len(assets) + 1.5))
         )
-        axis.boxplot(data, vert=False, labels=assets, showfliers=False)
+        axis.boxplot(data, vert=False, tick_labels=assets, showfliers=False)
         axis.axvline(0.0, linewidth=1.0)
         axis.set_xlabel("Distância da saída ao topo (%) — 0% = saída no topo")
         axis.set_title(
