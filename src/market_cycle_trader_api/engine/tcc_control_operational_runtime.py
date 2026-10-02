@@ -321,7 +321,8 @@ def run_tcc_control_operational_backtest(
         # MCT-only operational diagnostics are attached after the scientific
         # simulation has completed, using the exact OHLC frames supplied to
         # that run. This must not affect decisions, equity, fees or metrics.
-        trades = result.trades if isinstance(result.trades, pd.DataFrame) else pd.DataFrame(result.trades or [])
+        raw_trades = getattr(result, "trades", None)
+        trades = raw_trades if isinstance(raw_trades, pd.DataFrame) else pd.DataFrame(raw_trades or [])
         if not trades.empty:
             enriched = enrich_trade_diagnostics(
                 trades.to_dict(orient="records"),
