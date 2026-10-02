@@ -159,3 +159,14 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -p "test_tcc_control_operational_parity.py" -v
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
+
+
+## v10.8.64 — TCC Control peak-exit persistence
+
+- Branch: `fix/v10.8.64-tcc-peak-exit-diagnostics`.
+- Cause: v10.8.63 added Peak Exit diagnostics to the generic MCT rotation module, but Strategy #12 runs through the protected vendored TCC v1.0.6 engine, so its persisted SELL rows did not receive `peak_exit_diagnostics_schema_version=1`.
+- Symptom: Front v10.7.17/v10.7.18 rendered the Peak section but showed the availability message and no charts.
+- Fix: post-process the completed TCC Control trades in the MCT operational wrapper with the exact OHLC frames used by the run, before MongoDB persistence.
+- Scientific boundary: no change to the vendored TCC source, model, policy, trades, equity, capital or metrics. Only MCT diagnostic fields are appended after simulation.
+- Compatibility: Front v10.7.18; API v10.8.64.
+- Historical runs are not reconstructed from later mutable market data. Run a new backtest to populate the diagnostics.
