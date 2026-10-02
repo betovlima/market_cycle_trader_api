@@ -103,6 +103,136 @@ def _position_excursions(
     }
 
 
+def _peak_exit_diagnostics(
+    frames: dict[str, pd.DataFrame],
+    symbol: str,
+    entry_at: Any,
+    exit_at: Any,
+    entry_price: Any,
+    exit_price: Any,
+    action: str,
+) -> dict[str, Any]:
+    """Measure how much of the intraposition peak was captured at exit.
+
+    Normal SELL orders execute at the exit-session open, so their held-period
+    peak ends on the previous session. FINAL_SELL is bookkeeping at the final
+    close, so the final session remains part of the held period.
+
+    Post-exit windows start on the exit session for SELL and on the following
+    session for FINAL_SELL. A horizon is reported only when the full number of
+    sessions is available, avoiding partial-window bias near the backtest end.
+    """
+
+    empty: dict[str, Any] = {
+        "peak_exit_diagnostics_schema_version": 1,
+        "peak_price_while_held": None,
+        "peak_timestamp_while_held": None,
+        "exit_distance_from_peak_pct": None,
+        "peak_capture_pct": None,
+        "max_runup_pct": None,
+        "days_from_peak_to_exit": None,
+        "post_exit_peak_5d_pct": None,
+        "post_exit_peak_10d_pct": None,
+        "post_exit_peak_20d_pct": None,
+    }
+    frame = _frame_at(frames, symbol)
+    start = _timestamp(entry_at)
+    end = _timestamp(exit_at)
+    base = _number(entry_price)
+    execution = _number(exit_price)
+    normalized_action = str(action or "").upper()
+    if (
+        frame is None
+        or start is None
+        or end is None
+        or base in {None, 0.0}
+        or end < start
+        or normalized_action not in {"SELL", "FINAL_SELL"}
+    ):
+        return empty
+
+    if execution is None:
+        execution_column = "close" if normalized_action == "FINAL_SELL" else "open"
+        try:
+            execution = _number(frame.loc[end, execution_column])
+        except (KeyError, TypeError):
+            execution = None
+
+    include_exit_session = normalized_action == "FINAL_SELL"
+    holding_mask = (frame.index >= start) & (
+        (frame.index <= end) if include_exit_session else (frame.index < end)
+    )
+    holding = frame.loc[holding_mask]
+    high_column = holding.get("high")
+    highs = (
+        pd.to_numeric(high_column, errors="coerce").dropna()
+        if high_column is not None
+        else pd.Series(dtype=float)
+    )
+
+    peak_price = float(base)
+    peak_at = start
+    if not highs.empty:
+        candidate_at = highs.idxmax()
+        candidate_price = _number(highs.loc[candidate_at])
+        if candidate_price is not None and candidate_price >= peak_price:
+            peak_price = float(candidate_price)
+            peak_at = _timestamp(candidate_at) or peak_at
+
+    peak_gain = max(0.0, peak_price / float(base) - 1.0)
+    exit_gain = (
+        float(execution) / float(base) - 1.0
+        if execution is not None
+        else None
+    )
+    exit_distance = (
+        max(0.0, (peak_price - float(execution)) / peak_price) * 100.0
+        if execution is not None and peak_price > 0
+        else None
+    )
+    peak_capture = (
+        min(1.0, max(0.0, float(exit_gain)) / peak_gain) * 100.0
+        if exit_gain is not None and peak_gain > 0
+        else None
+    )
+
+    sessions_from_peak = int(
+        ((frame.index > peak_at) & (frame.index <= end)).sum()
+    )
+
+    post_start_mask = (
+        frame.index > end
+        if normalized_action == "FINAL_SELL"
+        else frame.index >= end
+    )
+    post = frame.loc[post_start_mask]
+
+    def post_peak(horizon: int) -> float | None:
+        if execution in {None, 0.0} or len(post) < horizon:
+            return None
+        window = post.head(horizon)
+        window_high_column = window.get("high")
+        if window_high_column is None:
+            return None
+        window_highs = pd.to_numeric(window_high_column, errors="coerce").dropna()
+        if window_highs.empty:
+            return None
+        return max(0.0, float(window_highs.max()) / float(execution) - 1.0) * 100.0
+
+    return {
+        "peak_exit_diagnostics_schema_version": 1,
+        "peak_price_while_held": peak_price,
+        "peak_timestamp_while_held": peak_at.isoformat(),
+        "exit_distance_from_peak_pct": exit_distance,
+        "peak_capture_pct": peak_capture,
+        "max_runup_pct": peak_gain * 100.0,
+        "days_from_peak_to_exit": sessions_from_peak,
+        "post_exit_peak_5d_pct": post_peak(5),
+        "post_exit_peak_10d_pct": post_peak(10),
+        "post_exit_peak_20d_pct": post_peak(20),
+    }
+
+
 def _next_exit(
     rows: list[dict[str, Any]],
     buy_index: int,
@@ -142,6 +272,17 @@ def enrich_trade_diagnostics(
             row.get("entry_price"),
         )
         row.update(excursions)
+        row.update(
+            _peak_exit_diagnostics(
+                frames,
+                str(row.get("asset") or ""),
+                row.get("entry_timestamp"),
+                row.get("timestamp"),
+                row.get("entry_price"),
+                row.get("execution_price"),
+                str(row.get("action") or ""),
+            )
+        )
         realized_return = _number(row.get("position_return"))
         mfe = _number(excursions.get("maximum_favorable_excursion"))
         row["profit_capture_ratio"] = (
@@ -201,6 +342,16 @@ def enrich_trade_diagnostics(
                 "maximum_favorable_excursion": _number(exit_row.get("maximum_favorable_excursion")),
                 "maximum_adverse_excursion": _number(exit_row.get("maximum_adverse_excursion")),
                 "profit_capture_ratio": _number(exit_row.get("profit_capture_ratio")),
+                "peak_exit_diagnostics_schema_version": exit_row.get("peak_exit_diagnostics_schema_version"),
+                "peak_price_while_held": _number(exit_row.get("peak_price_while_held")),
+                "peak_timestamp_while_held": exit_row.get("peak_timestamp_while_held"),
+                "exit_distance_from_peak_pct": _number(exit_row.get("exit_distance_from_peak_pct")),
+                "peak_capture_pct": _number(exit_row.get("peak_capture_pct")),
+                "max_runup_pct": _number(exit_row.get("max_runup_pct")),
+                "days_from_peak_to_exit": _number(exit_row.get("days_from_peak_to_exit")),
+                "post_exit_peak_5d_pct": _number(exit_row.get("post_exit_peak_5d_pct")),
+                "post_exit_peak_10d_pct": _number(exit_row.get("post_exit_peak_10d_pct")),
+                "post_exit_peak_20d_pct": _number(exit_row.get("post_exit_peak_20d_pct")),
                 "subsequent_holding_days": _number(exit_row.get("holding_bars")),
             }
         )
