@@ -29,6 +29,7 @@ from .operational_control_preview import (
     TCC_CONTROL_SOURCE_COMMIT,
     build_control_shadow_decision,
 )
+from .rotation_diagnostics import enrich_trade_diagnostics
 
 TCC_CONTROL_EXPECTED_CHECKPOINT_CAPITAL = 10_094_316.30
 TCC_CONTROL_EXPERIMENT_VERSION = "1.0.6"
@@ -315,6 +316,27 @@ def run_tcc_control_operational_backtest(
         result.metrics["operational_contract"] = "tcc_v1.0.6_control"
         result.metrics["tcc_source_commit"] = TCC_CONTROL_SOURCE_COMMIT
         result.metrics["tcc_experiment_version"] = TCC_CONTROL_EXPERIMENT_VERSION
+
+        # The vendored TCC v1.0.6 engine remains scientifically frozen.
+        # MCT-only operational diagnostics are attached after the scientific
+        # simulation has completed, using the exact OHLC frames supplied to
+        # that run. This must not affect decisions, equity, fees or metrics.
+        trades = result.trades if isinstance(result.trades, pd.DataFrame) else pd.DataFrame(result.trades or [])
+        if not trades.empty:
+            enriched = enrich_trade_diagnostics(
+                trades.to_dict(orient="records"),
+                bars_by_symbol,
+                eligible_assets,
+            )
+            result.trades = pd.DataFrame(enriched)
+            if "timestamp" in result.trades.columns:
+                result.trades["timestamp"] = pd.to_datetime(
+                    result.trades["timestamp"],
+                    utc=True,
+                )
+                result.trades = result.trades.sort_values(
+                    ["timestamp", "action", "asset"],
+                ).reset_index(drop=True)
     return results
 
 
