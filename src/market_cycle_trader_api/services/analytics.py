@@ -385,6 +385,19 @@ def _trade_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
             "position_return": 1,
             "realized_pnl": 1,
             "total_fee": 1,
+            "entry_timestamp": 1,
+            "entry_price": 1,
+            "execution_price": 1,
+            "peak_exit_diagnostics_schema_version": 1,
+            "peak_price_while_held": 1,
+            "peak_timestamp_while_held": 1,
+            "exit_distance_from_peak_pct": 1,
+            "peak_capture_pct": 1,
+            "max_runup_pct": 1,
+            "days_from_peak_to_exit": 1,
+            "post_exit_peak_5d_pct": 1,
+            "post_exit_peak_10d_pct": 1,
+            "post_exit_peak_20d_pct": 1,
         },
     )
     return sorted(
@@ -439,6 +452,100 @@ def _asset_attribution(sells: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             else None
         )
     return result
+
+
+def _peak_exit_analysis(sells: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    diagnostic_rows = [
+        dict(row)
+        for row in sells
+        if int(row.get("peak_exit_diagnostics_schema_version") or 0) >= 1
+    ]
+
+    def values(rows: Iterable[dict[str, Any]], key: str) -> list[float]:
+        return [
+            value
+            for row in rows
+            if (value := _as_float(row.get(key))) is not None
+        ]
+
+    def average(rows: Iterable[dict[str, Any]], key: str) -> float | None:
+        numeric = values(rows, key)
+        return float(fmean(numeric)) if numeric else None
+
+    def midpoint(rows: Iterable[dict[str, Any]], key: str) -> float | None:
+        numeric = values(rows, key)
+        return float(median(numeric)) if numeric else None
+
+    trades = [
+        {
+            "sequence": int(row.get("sequence") or 0),
+            "asset": str(row.get("asset") or "UNKNOWN"),
+            "action": str(row.get("action") or ""),
+            "entry_timestamp": iso_value(row.get("entry_timestamp")),
+            "exit_timestamp": iso_value(row.get("timestamp")),
+            "entry_price": _as_float(row.get("entry_price")),
+            "execution_price": _as_float(row.get("execution_price")),
+            "position_return": _as_float(row.get("position_return")),
+            "holding_bars": _as_float(row.get("holding_bars")),
+            "peak_price_while_held": _as_float(row.get("peak_price_while_held")),
+            "peak_timestamp_while_held": iso_value(row.get("peak_timestamp_while_held")),
+            "exit_distance_from_peak_pct": _as_float(row.get("exit_distance_from_peak_pct")),
+            "peak_capture_pct": _as_float(row.get("peak_capture_pct")),
+            "max_runup_pct": _as_float(row.get("max_runup_pct")),
+            "days_from_peak_to_exit": _as_float(row.get("days_from_peak_to_exit")),
+            "post_exit_peak_5d_pct": _as_float(row.get("post_exit_peak_5d_pct")),
+            "post_exit_peak_10d_pct": _as_float(row.get("post_exit_peak_10d_pct")),
+            "post_exit_peak_20d_pct": _as_float(row.get("post_exit_peak_20d_pct")),
+        }
+        for row in diagnostic_rows
+    ]
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in trades:
+        groups[str(row.get("asset") or "UNKNOWN")].append(row)
+
+    by_asset: list[dict[str, Any]] = []
+    for asset, rows in groups.items():
+        by_asset.append(
+            {
+                "asset": asset,
+                "closed_positions": len(rows),
+                "median_exit_distance_from_peak_pct": midpoint(rows, "exit_distance_from_peak_pct"),
+                "average_exit_distance_from_peak_pct": average(rows, "exit_distance_from_peak_pct"),
+                "median_peak_capture_pct": midpoint(rows, "peak_capture_pct"),
+                "average_peak_capture_pct": average(rows, "peak_capture_pct"),
+                "median_max_runup_pct": midpoint(rows, "max_runup_pct"),
+                "median_days_from_peak_to_exit": midpoint(rows, "days_from_peak_to_exit"),
+                "median_post_exit_peak_5d_pct": midpoint(rows, "post_exit_peak_5d_pct"),
+                "median_post_exit_peak_10d_pct": midpoint(rows, "post_exit_peak_10d_pct"),
+                "median_post_exit_peak_20d_pct": midpoint(rows, "post_exit_peak_20d_pct"),
+                "post_exit_5d_observations": len(values(rows, "post_exit_peak_5d_pct")),
+                "post_exit_10d_observations": len(values(rows, "post_exit_peak_10d_pct")),
+                "post_exit_20d_observations": len(values(rows, "post_exit_peak_20d_pct")),
+            }
+        )
+    by_asset.sort(
+        key=lambda row: (-int(row.get("closed_positions") or 0), str(row.get("asset") or ""))
+    )
+
+    return {
+        "schema_version": 1,
+        "summary": {
+            "closed_positions": len(trades),
+            "assets": len(groups),
+            "median_exit_distance_from_peak_pct": midpoint(trades, "exit_distance_from_peak_pct"),
+            "average_exit_distance_from_peak_pct": average(trades, "exit_distance_from_peak_pct"),
+            "median_peak_capture_pct": midpoint(trades, "peak_capture_pct"),
+            "average_peak_capture_pct": average(trades, "peak_capture_pct"),
+            "median_max_runup_pct": midpoint(trades, "max_runup_pct"),
+            "median_days_from_peak_to_exit": midpoint(trades, "days_from_peak_to_exit"),
+            "median_post_exit_peak_5d_pct": midpoint(trades, "post_exit_peak_5d_pct"),
+            "median_post_exit_peak_10d_pct": midpoint(trades, "post_exit_peak_10d_pct"),
+            "median_post_exit_peak_20d_pct": midpoint(trades, "post_exit_peak_20d_pct"),
+        },
+        "by_asset": by_asset,
+        "trades": trades,
+    }
 
 
 def _transition_matrix(rotations: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -680,6 +787,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
             "transition_matrix": [],
             "holding_buckets": [],
             "trade_dependency": _trade_dependency([]),
+            "peak_exit_analysis": _peak_exit_analysis([]),
             "rotations": [],
         }
 
@@ -703,6 +811,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
         "transition_matrix": _transition_matrix(rotations),
         "holding_buckets": _holding_buckets(sells),
         "trade_dependency": _trade_dependency(sells),
+        "peak_exit_analysis": _peak_exit_analysis(sells),
         "rotations": rotations,
     }
     _assert_strategy_neutral(payload)
