@@ -1,6 +1,6 @@
 # CONTEXTO_MESTRE — Market Cycle Trader
 
-Última atualização: 2026-10-01. Documento de continuidade; não substitui a verificação de versões realmente implantadas nem os registros por versão em `docs/changes/`.
+Última atualização: 2026-10-02. Documento de continuidade; não substitui a verificação de versões realmente implantadas nem os registros por versão em `docs/changes/`.
 
 ## Separação de responsabilidades
 - **TCC** (`betovlima/tcc_mba_usp_data_science_analytics`): pesquisa, comparação Control/Soft, otimização, validação cronológica e congelamento de evidências.
@@ -117,6 +117,22 @@ Conclusão: os ~US$ 2,4M não são uma reprodução pior do mesmo Control de ~US
 - Snapshot atual v10.8.62: 148.610 RAW rows elegíveis, market-data signature `8d61930b791e8bfe350b88c4284717ed228389b689f821b40ff4276a59aa7650`, 550 linhas adicionais no universo elegível.
 - O Fold1 desta execução escolheu candidate/effective switch margin `0.01/0.01`; a auditoria TCC congelada já havia mostrado que diferenças muito pequenas de features podem mudar árvores/predições e a escolha do margin. Portanto o próximo trabalho é **paridade numérica do snapshot TCC**, não alteração de política/parâmetros.
 - Não perseguir os US$ 10,09M via tuning. Para reproduzir o checkpoint, usar exatamente o snapshot TCC e localizar a primeira divergência numérica/decisória; para operação real, manter dados Alpaca atuais com o comportamento TCC já recuperado.
+
+
+## v10.8.63 — Distância ao topo e qualidade da saída
+
+- Branch: `feature/v10.8.63-peak-exit-diagnostics`, derivada diretamente da v10.8.62 operacional.
+- Objetivo: diagnosticar quanto cada saída ficou abaixo do melhor preço observável enquanto a posição estava realmente aberta, sem alterar política, modelo, parâmetros, Winner ou ordens.
+- O cálculo fica em `engine/rotation_diagnostics.py` e usa o mesmo frame OHLC do backtest. Os valores ficam persistidos no trade para que uma revisão histórica posterior da Alpaca não mude o diagnóstico de uma execução antiga.
+- `SELL` normal: o topo encerra na sessão anterior porque a venda executa na abertura. O `High` intradiário da sessão da venda entra apenas no pós-saída.
+- `FINAL_SELL`: a sessão final entra no topo porque a liquidação é no fechamento.
+- Métricas congeladas: `peak_price_while_held`, `peak_timestamp_while_held`, `exit_distance_from_peak_pct`, `peak_capture_pct`, `max_runup_pct`, `days_from_peak_to_exit` e máximas pós-saída de 5/10/20 sessões.
+- Horizontes pós-saída incompletos ficam `null`; não extrapolar nem usar janela parcial.
+- `services/analytics.py` expõe `peak_exit_analysis` com resumo, agregação por ativo e observações por trade para os gráficos. Backtests antigos sem schema v1 retornam análise vazia; não são recalculados sobre histórico mutável.
+- Compatibilidade: MFE/MAE e `profit_capture_ratio` anteriores permanecem intactos.
+- Teste novo: `tests/test_peak_exit_diagnostics.py`. Registro completo: `docs/changes/v10.8.63-peak-exit-diagnostics.md`.
+- Front planejado em branch própria v10.7.17 para mostrar visão geral por ativo e detalhe selecionável sem colocar todos os ativos no mesmo gráfico.
+
 
 ### Próxima validação antes de promoção
 1. Executar backtest do novo modo em input TCC cuja identidade de checkpoint possa ser comprovada; comparar com `US$ 10.094.316,30` sem ajustar parâmetros.
