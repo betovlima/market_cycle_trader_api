@@ -30,6 +30,11 @@ from ..infrastructure.persistence.mongo_repository import (
     replace_run_result,
 )
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
+from ..services.diagnostics.operation_peak import (
+    enrich_operation_peak_trades,
+    operation_peak_rows,
+    operation_peak_summary,
+)
 from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
 from .tcc_control_operational_runtime import (
@@ -600,8 +605,32 @@ def run_job(
     comparisons: list[dict[str, Any]] = []
     total_results = max(1, len(results))
     for result_position, result in enumerate(results, start=1):
+        # Hindsight-only diagnostics. This runs after the strategy has completed,
+        # so peak/future prices can never affect model fitting or policy decisions.
+        result.trades = enrich_operation_peak_trades(
+            result.trades,
+            bars_by_symbol,
+        )
+        peak_rows = operation_peak_rows(result.trades)
+        peak_summary = operation_peak_summary(peak_rows)
+        result.metrics.update(
+            {
+                "operation_peak_analysis_schema_version": 1,
+                "operation_peak_analysis_rows": int(len(peak_rows)),
+                "operation_peak_analysis_asset_count": int(len(peak_summary)),
+            }
+        )
         result.metrics.update(reproducibility)
         result.summary += "\n\nREPRODUCIBILITY\n"
+        result.summary += "\nOPERATION PEAK DIAGNOSTICS\n"
+        result.summary += (
+            "Completed operations analyzed: "
+            f"{len(peak_rows)} across {len(peak_summary)} assets\n"
+        )
+        result.summary += (
+            "Semantics: hindsight-only; normal exits stop the held peak at "
+            "the exit open, while post-exit windows start from that session.\n"
+        )
         result.summary += (
             "Configuration SHA-256: "
             f"{reproducibility['strategy_configuration_sha256']}\n"

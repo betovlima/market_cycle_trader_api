@@ -34,6 +34,9 @@ class ExperimentManifestTests(unittest.TestCase):
                     "market_data_history_changed_assets": ["AAPL"],
                     "market_data_history_changed_asset_count": 1,
                     "market_data_history_comparison_unavailable_assets": [],
+                    "operation_peak_analysis_schema_version": 1,
+                    "operation_peak_analysis_rows": 331,
+                    "operation_peak_analysis_asset_count": 27,
                 }
             }
         ]
@@ -65,6 +68,9 @@ class ExperimentManifestTests(unittest.TestCase):
             manifest["market_data_history_comparison_unavailable_assets"],
             [],
         )
+        self.assertEqual(manifest["operation_peak_analysis_schema_version"], 1)
+        self.assertEqual(manifest["operation_peak_analysis_rows"], 331)
+        self.assertEqual(manifest["operation_peak_analysis_asset_count"], 27)
 
 
 if __name__ == "__main__":
