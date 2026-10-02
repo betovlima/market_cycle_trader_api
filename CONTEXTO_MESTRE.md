@@ -107,6 +107,17 @@ Conclusão: os ~US$ 2,4M não são uma reprodução pior do mesmo Control de ~US
 - `tests/test_tcc_control_operational_parity.py` continua garantindo paridade da regra científica vs política live nos estados sintéticos e documentando a exceção legítima da barra futura.
 - CI do commit `420cf8ef695ba23b9e0be9ea7b83a19c13e404bd` passou antes da documentação final. Revalidar CI do HEAD após docs/CONTEXTO.
 
+### Primeiro backtest real da v10.8.62
+- Job `20261002T000018-d07e7c64`, status completed, Strategy #12 rev3.
+- Contrato confirmado: `COMPOUND_ROTATION_SWING_TCC_CONTROL_V106`, LightGBM, `operational_contract=tcc_v1.0.6_control`, source commit `c0d71772092f0c26c9f28f0211b9933e9c396b95`, CPU, seed42, RAW/SIP, causal split normalization, DOC excluído, 55 elegíveis, 17 splits.
+- Resultado: capital `US$ 5.882.637,94`; CAGR 180,16%; Sharpe 1,95472; MaxDD -36,6504%; 331 rotações; exposição 100%; buy-and-hold `US$ 39.279,28`.
+- A diferença contra a referência científica MCT v10.8.41 (`US$ 5.887.904,38`) é apenas `-US$ 5.266,44` / `-0,08945%`. Isso confirma que a v10.8.62 reproduz a linha Control científica do MCT praticamente no mesmo patamar.
+- Na mesma última sessão do checkpoint TCC, 2026-09-16, a curva v10.8.62 estava em `US$ 5.551.262,80`, aproximadamente -45,01% contra o checkpoint TCC `US$ 10.094.316,30`. Os dez pregões adicionais até 2026-09-30 elevaram o capital ~5,97%, portanto a extensão temporal não explica a diferença histórica.
+- Snapshot TCC congelado: 148.060 RAW rows elegíveis, 2.692 por ativo solicitado, snapshot SHA `4e2fd225cc0ea05da56dad8f0628ca989ad332812a5fa3a7dc796b2b8a6d5128`.
+- Snapshot atual v10.8.62: 148.610 RAW rows elegíveis, market-data signature `8d61930b791e8bfe350b88c4284717ed228389b689f821b40ff4276a59aa7650`, 550 linhas adicionais no universo elegível.
+- O Fold1 desta execução escolheu candidate/effective switch margin `0.01/0.01`; a auditoria TCC congelada já havia mostrado que diferenças muito pequenas de features podem mudar árvores/predições e a escolha do margin. Portanto o próximo trabalho é **paridade numérica do snapshot TCC**, não alteração de política/parâmetros.
+- Não perseguir os US$ 10,09M via tuning. Para reproduzir o checkpoint, usar exatamente o snapshot TCC e localizar a primeira divergência numérica/decisória; para operação real, manter dados Alpaca atuais com o comportamento TCC já recuperado.
+
 ### Próxima validação antes de promoção
 1. Executar backtest do novo modo em input TCC cuja identidade de checkpoint possa ser comprovada; comparar com `US$ 10.094.316,30` sem ajustar parâmetros.
 2. Executar o mesmo modo sobre o snapshot MCT atual e comparar com o Control científico equivalente (ordem de grandeza histórica v10.8.41 ~US$ 5,888M), não com a linha Liquidity/Meta.
