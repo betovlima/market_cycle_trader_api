@@ -99,6 +99,15 @@ def build_experiment_manifest(
         "position_risk_diagnostics_rows": metrics.get("position_risk_diagnostics_rows"),
         "market_regime_diagnostics_schema_version": metrics.get("market_regime_diagnostics_schema_version"),
         "market_regime_diagnostics_rows": metrics.get("market_regime_diagnostics_rows"),
+        "operation_peak_analysis_schema_version": metrics.get(
+            "operation_peak_analysis_schema_version"
+        ),
+        "operation_peak_analysis_rows": metrics.get(
+            "operation_peak_analysis_rows"
+        ),
+        "operation_peak_analysis_asset_count": metrics.get(
+            "operation_peak_analysis_asset_count"
+        ),
         "walk_forward_fold_count": metrics.get("walk_forward_fold_count"),
         "walk_forward_folds": metrics.get("walk_forward_folds") or [],
         "configuration": request,
