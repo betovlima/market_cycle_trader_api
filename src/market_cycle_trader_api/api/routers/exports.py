@@ -12,6 +12,15 @@ from fastapi.responses import Response
 
 from ...core.runtime import database
 from ...infrastructure.persistence.mongo_repository import COMPARISONS_COLLECTION, PREDICTIONS_COLLECTION, RUNS_COLLECTION, TRADES_COLLECTION
+from ...services.diagnostics.operation_peak import (
+    distance_vs_post_exit_scatter_figure,
+    figure_png_bytes,
+    metric_bar_figures,
+    operation_peak_metadata,
+    operation_peak_rows,
+    operation_peak_summary,
+    peak_distance_boxplot_figures,
+)
 from ...services.diagnostics.performance import build_performance_diagnostics
 from ...services.experiment_manifest import build_experiment_manifest
 from ...services.jobs import require_job
@@ -575,6 +584,98 @@ def export_zip(job_id: str) -> Response:
                 archive.writestr(
                     f"{folder}/{symbol}_{backend}_diagnostics_error.txt",
                     diagnostics_error,
+                )
+
+            operation_peak_error: str | None = None
+            try:
+                peak_rows = operation_peak_rows(trades)
+                if peak_rows:
+                    peak_summary = operation_peak_summary(peak_rows)
+                    peak_folder = f"{folder}/operation_peak_analysis"
+                    archive.writestr(
+                        f"{peak_folder}/operation_peak_analysis.csv",
+                        csv_bytes(peak_rows),
+                    )
+                    archive.writestr(
+                        f"{peak_folder}/operation_peak_analysis_by_asset.csv",
+                        csv_bytes(peak_summary),
+                    )
+                    archive.writestr(
+                        f"{peak_folder}/operation_peak_analysis_metadata.json",
+                        json.dumps(
+                            iso_value(operation_peak_metadata()),
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                    )
+
+                    for page, figure in enumerate(
+                        peak_distance_boxplot_figures(peak_rows),
+                        start=1,
+                    ):
+                        archive.writestr(
+                            (
+                                f"{peak_folder}/"
+                                f"peak_distance_boxplot_by_asset_p{page:02d}.png"
+                            ),
+                            figure_png_bytes(figure),
+                        )
+
+                    for page, figure in enumerate(
+                        metric_bar_figures(
+                            peak_summary,
+                            metric="median_peak_capture_pct",
+                            title="Captura mediana do topo por ativo",
+                            xlabel="Peak capture mediano (%)",
+                            ascending=True,
+                        ),
+                        start=1,
+                    ):
+                        archive.writestr(
+                            (
+                                f"{peak_folder}/"
+                                f"peak_capture_by_asset_p{page:02d}.png"
+                            ),
+                            figure_png_bytes(figure),
+                        )
+
+                    for page, figure in enumerate(
+                        metric_bar_figures(
+                            peak_summary,
+                            metric="median_post_exit_peak_10d_pct",
+                            title="Alta máxima após a saída por ativo",
+                            xlabel="Alta máxima mediana nos 10 pregões após a saída (%)",
+                            ascending=True,
+                        ),
+                        start=1,
+                    ):
+                        archive.writestr(
+                            (
+                                f"{peak_folder}/"
+                                f"post_exit_peak_10d_by_asset_p{page:02d}.png"
+                            ),
+                            figure_png_bytes(figure),
+                        )
+
+                    scatter = distance_vs_post_exit_scatter_figure(
+                        peak_summary,
+                        top_n=25,
+                    )
+                    if scatter is not None:
+                        archive.writestr(
+                            (
+                                f"{peak_folder}/"
+                                "peak_distance_vs_post_exit_10d_top25.png"
+                            ),
+                            figure_png_bytes(scatter),
+                        )
+            except Exception as exc:
+                operation_peak_error = f"{type(exc).__name__}: {exc}"
+
+            if operation_peak_error:
+                archive.writestr(
+                    f"{folder}/operation_peak_analysis_error.txt",
+                    operation_peak_error,
                 )
 
             if str(metrics.get("strategy_mode", "")) == "COMPOUND_ROTATION_DAY_TRADE_OPEN_CLOSE":
