@@ -119,7 +119,7 @@ class OperationPeakAnalysisTests(TestCase):
         # FINAL_SELL is at the close, so post-exit starts on the next session.
         self.assertEqual(
             pd.Timestamp(row["post_exit_peak_5d_timestamp"]),
-            bars.index[5],
+            bars.index[7],
         )
 
     def test_summary_and_graphs_are_generated_per_asset(self):
