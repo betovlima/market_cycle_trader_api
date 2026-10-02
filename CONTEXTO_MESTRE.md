@@ -1,6 +1,6 @@
 # CONTEXTO_MESTRE — Market Cycle Trader
 
-Última atualização: 2026-10-01. Documento de continuidade; não substitui a verificação de versões realmente implantadas nem os registros por versão em `docs/changes/`.
+Última atualização: 2026-10-02. Documento de continuidade; não substitui a verificação de versões realmente implantadas nem os registros por versão em `docs/changes/`.
 
 ## Separação de responsabilidades
 - **TCC** (`betovlima/tcc_mba_usp_data_science_analytics`): pesquisa, comparação Control/Soft, otimização, validação cronológica e congelamento de evidências.
@@ -143,3 +143,53 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -p "test_tcc_control_operational_parity.py" -v
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
+
+
+## v10.8.63 — Operation Peak Analysis
+
+### Objetivo
+- Pedido do usuário em 2026-10-02: medir, por operação e por ativo, o quanto a saída se aproximou do topo realmente observado durante a posição e quanto o ativo ainda avançou depois da saída.
+- Branch: `feature/v10.8.63-operation-peak-analysis`, derivada de `feature/v10.8.62-tcc-control-operational-runtime`.
+- API de desenvolvimento: `10.8.63`; produção permanece API `10.8.38` / Front `10.7.16`.
+- Alteração exclusivamente diagnóstica/hindsight. Não muda TCC Control, LightGBM, parâmetros, folds, switch margin, capital, Paper/Trader ou ordens.
+
+### Semântica protegida
+- A análise roda depois que o backtest e todas as decisões terminaram; os preços de topo e pós-saída nunca entram no modelo/política.
+- SELL normal executa na abertura: topo while-held usa máximas da entrada até a sessão anterior + preço de execução na abertura de saída. Não usa a máxima intradiária posterior da própria sessão de saída.
+- Para SELL normal, a janela pós-saída 5/10/20 começa na própria sessão da venda, porque o restante do pregão já ocorreu sem posição.
+- FINAL_SELL ocorre no fechamento: inclui a máxima da sessão final no topo da posição e começa a janela pós-saída somente na próxima sessão.
+- Nenhum arquivo vendorizado de `tcc_v106_reference` foi alterado.
+
+### Métricas
+Por operação concluída:
+- `peak_price_while_held`, `peak_timestamp_while_held`;
+- `exit_distance_from_peak_pct`, `exit_peak_proximity_pct`;
+- `peak_capture_pct`, `max_runup_pct`, `max_drawdown_from_entry_pct`;
+- `sessions_from_peak_to_exit` e dias corridos;
+- `post_exit_peak_5d_pct`, `post_exit_peak_10d_pct`, `post_exit_peak_20d_pct`.
+
+Resumo por ativo:
+- número de operações;
+- média/mediana/P25/P75 da distância do topo;
+- média/mediana de peak capture;
+- mediana de run-up/drawdown;
+- mediana da alta pós-saída 5/10/20;
+- taxas de saída dentro de 1%, 2%, 5% e 10% do topo.
+
+### Artefatos do ZIP
+Em `PORTFOLIO_<backend>/operation_peak_analysis/`:
+- `operation_peak_analysis.csv`;
+- `operation_peak_analysis_by_asset.csv`;
+- `operation_peak_analysis_metadata.json`;
+- `peak_distance_boxplot_by_asset_pXX.png`;
+- `peak_capture_by_asset_pXX.png`;
+- `post_exit_peak_10d_by_asset_pXX.png`;
+- `peak_distance_vs_post_exit_10d_top25.png`.
+Os gráficos por ativo são paginados para evitar excesso de informação.
+
+### Auditoria e testes
+- `experiment_manifest.json` passa a registrar schema, quantidade de operações analisadas e quantidade de ativos.
+- `tests/test_operation_peak_analysis.py` cobre a separação temporal SELL/FINAL_SELL, métricas e geração de gráficos.
+- `tests/test_experiment_manifest.py` cobre os novos campos do manifesto.
+- Necessário executar novo backtest na v10.8.63: jobs antigos não possuem os campos de peak analysis persistidos.
+- Usar os resultados inicialmente como diagnóstico. Não ajustar parâmetros contra o mesmo OOS apenas para aproximar saídas de top sem nova validação cronológica.
