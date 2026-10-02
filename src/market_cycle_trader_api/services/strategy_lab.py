@@ -16,6 +16,13 @@ from pydantic import ValidationError
 from pymongo import ReturnDocument
 
 from ..core.config import API_VERSION, PACKAGE_DIR
+from ..core.config import TCC_CONTROL_OPERATIONAL_MODE
+from ..engine.tcc_control_operational_runtime import (
+    tcc_control_contract_issues,
+    tcc_control_model_snapshot_issues,
+    tcc_control_model_values,
+    tcc_control_strategy_updates,
+)
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
@@ -608,6 +615,44 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         else document.get("winner_model_snapshot")
     )
     model_family = str((snapshot or {}).get("family") or "").strip().lower() or None
+
+    configuration = (
+        document.get("configuration")
+        if isinstance(document.get("configuration"), dict)
+        else {}
+    )
+    if str(configuration.get("strategy_mode") or "") == TCC_CONTROL_OPERATIONAL_MODE:
+        issues = tcc_control_contract_issues(configuration)
+        model_issues = tcc_control_model_snapshot_issues(snapshot)
+        if model_family != "lightgbm_utility" or model_issues:
+            return {
+                "eligible": False,
+                "code": "tcc_control_model_contract_mismatch",
+                "reason": (
+                    "TCC Control v1.0.6 requires its protected LightGBM "
+                    "snapshot: " + "; ".join(model_issues[:5])
+                ),
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
+        if issues:
+            return {
+                "eligible": False,
+                "code": "tcc_control_contract_mismatch",
+                "reason": (
+                    "TCC Control v1.0.6 configuration differs from its protected "
+                    "operational contract: " + "; ".join(issues[:5])
+                ),
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+            }
+        return {
+            "eligible": True,
+            "code": "tcc_control_v106_live_runtime_ready",
+            "reason": None,
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+        }
 
     if model_family == "iqn":
         return {
@@ -1769,6 +1814,26 @@ def update_strategy(
         and abs(float(configuration.allocation_max_asset_weight) - 0.35) <= 1e-12
     ):
         normalized_configuration = configuration.model_copy(update={"allocation_max_asset_weight": 1.0})
+    tcc_model_snapshot = None
+    if str(configuration.strategy_mode) == TCC_CONTROL_OPERATIONAL_MODE:
+        normalized_configuration = configuration.model_copy(
+            update=tcc_control_strategy_updates()
+        )
+        next_model_revision = max(
+            1, int(current.get("research_model_revision") or 1) + 1
+        )
+        tcc_settings = execution_settings_from_values(
+            "lightgbm_utility",
+            tcc_control_model_values(),
+            settings_revision=next_model_revision,
+            profile_id="tcc-v1.0.6-control",
+        )
+        tcc_model_snapshot = model_execution_snapshot(
+            "lightgbm_utility",
+            tcc_settings,
+        )
+        tcc_model_snapshot["source"] = "tcc_v106_operational_contract"
+
     payload = normalized_configuration.model_dump(mode="json")
     now = utc_now()
     updated = db[STRATEGY_PROFILES_COLLECTION].find_one_and_update(
@@ -1792,9 +1857,26 @@ def update_strategy(
                 "candidate_revision": None,
                 "candidate_backtest_id": None,
                 "candidate_model_snapshot": None,
+                **(
+                    {
+                        "research_model_snapshot": bson_value(tcc_model_snapshot),
+                        "backtest_engine_binding": None,
+                        "reference_engine_id": None,
+                        "reference_source_repository": None,
+                        "reference_source_tag": None,
+                        "reference_source_commit": None,
+                        "strategy_kind": "standard",
+                        "tuning_target": "model_strategy",
+                    }
+                    if tcc_model_snapshot is not None
+                    else {}
+                ),
                 **_derived_policy_edit_updates(current, reason="strategy_configuration_changed", now=now),
             },
-            "$inc": {"revision": 1},
+            "$inc": {
+                "revision": 1,
+                **({"research_model_revision": 1} if tcc_model_snapshot is not None else {}),
+            },
         },
         return_document=ReturnDocument.AFTER,
     )

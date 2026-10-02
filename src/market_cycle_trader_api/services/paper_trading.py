@@ -10,8 +10,17 @@ import pandas as pd
 from pydantic import ValidationError
 from pymongo import ReturnDocument
 
-from ..core.config import RESEARCH_ONLY_SWING_STRATEGY_MODES, SWING_STRATEGY_MODES
+from ..core.config import (
+    RESEARCH_ONLY_SWING_STRATEGY_MODES,
+    SWING_STRATEGY_MODES,
+    TCC_CONTROL_OPERATIONAL_MODE,
+)
+from ..engine.control_shadow_market_data import download_current_control_snapshot
 from ..engine.live_model_signal import build_live_model_decision
+from ..engine.tcc_control_operational_runtime import (
+    assert_tcc_control_model_snapshot,
+    assert_tcc_control_operational_contract,
+)
 from ..engine.market_data import (
     latest_safe_completed_xnys_session,
     load_market_bars,
@@ -168,6 +177,12 @@ def _validated_context(
         raise RuntimeError(
             f"Trader Winner model {winner_model['family']!r} does not have a protected live engine."
         )
+    if str(strategy.strategy_mode) == TCC_CONTROL_OPERATIONAL_MODE:
+        try:
+            assert_tcc_control_operational_contract(strategy)
+            assert_tcc_control_model_snapshot(winner_model)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
     if strategy.market_data_provider != "alpaca":
         raise RuntimeError("Paper trading requires market_data_provider='alpaca'.")
     if strategy.end_date is not None:
@@ -545,7 +560,40 @@ def prepare_next_paper_plan(
     if allow_open_market and not market_is_open:
         raise RuntimeError("Manual current-session recovery requires the regular market to be open.")
 
-    live_market = refresh_trader_live_market_data(db, source=refresh_source, force=True)
+    tcc_control_runtime = (
+        str(strategy.strategy_mode) == TCC_CONTROL_OPERATIONAL_MODE
+    )
+    tcc_control_snapshot = None
+    if tcc_control_runtime:
+        completed_session = latest_safe_completed_xnys_session().date().isoformat()
+        snapshot_id = (
+            "control-shadow-live-"
+            + completed_session.replace("-", "")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+        tcc_control_snapshot = download_current_control_snapshot(
+            job_id=snapshot_id,
+            completed_session=completed_session,
+            per_asset_pause_seconds=0.0,
+        )
+        update_trader_live_market_cutoff(
+            db,
+            cutoff=completed_session,
+            source="tcc_control_v106_raw_sip_snapshot",
+        )
+        live_market = {
+            "live_market_cutoff": completed_session,
+            "target_session": completed_session,
+            "refreshed": True,
+            "source": "tcc_control_v106_raw_sip_snapshot",
+            "snapshot_directory": str(tcc_control_snapshot.directory),
+            "snapshot_sha256": tcc_control_snapshot.manifest["snapshot_sha256"],
+        }
+    else:
+        live_market = refresh_trader_live_market_data(
+            db, source=refresh_source, force=True
+        )
 
     _assert_no_conflicting_orders(client, assets=strategy.assets)
     _reconcile_state_with_account(
@@ -555,12 +603,24 @@ def prepare_next_paper_plan(
     )
 
     bars_by_symbol: dict[str, pd.DataFrame] = {}
-    for symbol in strategy.assets:
-        bars = validate_and_clean_bars(load_market_bars(symbol, strategy), strategy)
-        bars = _trim_incomplete_daily_session(bars, clock=clock)
-        if bars.empty:
-            raise RuntimeError(f"No completed daily bars are available for {symbol}.")
-        bars_by_symbol[symbol] = bars
+    if tcc_control_runtime:
+        if tcc_control_snapshot is None:
+            raise RuntimeError("TCC Control operational snapshot was not created.")
+        bars_by_symbol = {
+            symbol: frame.copy()
+            for symbol, frame in tcc_control_snapshot.frames.items()
+        }
+    else:
+        for symbol in strategy.assets:
+            bars = validate_and_clean_bars(
+                load_market_bars(symbol, strategy), strategy
+            )
+            bars = _trim_incomplete_daily_session(bars, clock=clock)
+            if bars.empty:
+                raise RuntimeError(
+                    f"No completed daily bars are available for {symbol}."
+                )
+            bars_by_symbol[symbol] = bars
 
     decision = build_live_model_decision(
         bars_by_symbol,
@@ -689,7 +749,22 @@ def prepare_next_paper_plan(
         "paper_account_id": account["id"],
         "live_market_cutoff": live_market.get("live_market_cutoff"),
         "manual_current_session_recovery": bool(allow_open_market),
-        "plan_source": refresh_source,
+        "plan_source": (
+            "tcc_control_v106_operational"
+            if tcc_control_runtime
+            else refresh_source
+        ),
+        "tcc_control_operational": bool(tcc_control_runtime),
+        "tcc_control_snapshot_directory": (
+            str(tcc_control_snapshot.directory)
+            if tcc_control_snapshot is not None
+            else None
+        ),
+        "tcc_control_snapshot_sha256": (
+            str(tcc_control_snapshot.manifest.get("snapshot_sha256") or "")
+            if tcc_control_snapshot is not None
+            else None
+        ),
         "stateful_intervention": bool((stateful_decision or {}).get("stateful_intervention")),
         "stateful_control_target_asset": (stateful_decision or {}).get("control_target_asset"),
         "stateful_defer_cooldown_before": bool((stateful_decision or {}).get("stateful_cooldown_before")),
