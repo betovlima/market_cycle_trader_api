@@ -103,14 +103,27 @@ def install_tcc_u67_operational_strategy(
     actor = (actor_email or "").strip().lower() or None
     existing = _existing_profile(db)
     if existing is not None:
+        now = utc_now()
+        db[STRATEGY_PROFILES_COLLECTION].update_one(
+            {"_id": existing["_id"]},
+            {
+                "$set": {
+                    "operational_stage": "protected_live_runtime",
+                    "live_trader_eligible": True,
+                    "live_runtime_version": "10.8.86",
+                    "updated_at": now,
+                    "updated_by": actor,
+                }
+            },
+        )
         control = get_strategy_control(db)
         selected = select_research_strategy_only(
             db,
             str(existing["_id"]),
             expected_control_revision=int(control["revision"]),
             note=(
-                "Select TCC main U67 v1.21.0 operational backtest "
-                "for Research only"
+                "Select TCC main U67 v1.21.0 operational Strategy "
+                "with protected live runtime"
             ),
             actor_email=actor,
         )
@@ -178,8 +191,9 @@ def install_tcc_u67_operational_strategy(
                 "reference_control_variant": "CONTROL",
                 "reference_checkpoint_capital": EXPECTED_ENDING_CAPITAL,
                 "reference_checkpoint_is_optimization_target": False,
-                "operational_stage": "backtest_only",
-                "live_trader_eligible": False,
+                "operational_stage": "protected_live_runtime",
+                "live_trader_eligible": True,
+                "live_runtime_version": "10.8.86",
                 "shadow_validated": False,
                 "source_git_commit_message": (
                     "TCC main U67 v1.21.0 Control migration "
@@ -211,7 +225,7 @@ def install_tcc_u67_operational_strategy(
         expected_control_revision=int(control["revision"]),
         note=(
             "Create and select TCC main U67 v1.21.0 "
-            "for Research/Backtest only"
+            "with protected live runtime"
         ),
         actor_email=actor,
     )
