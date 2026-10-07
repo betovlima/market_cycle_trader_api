@@ -4,7 +4,9 @@ from typing import Any
 
 import pandas as pd
 
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE
 from .live_lightgbm_signal import build_live_lightgbm_decision
+from .tcc_u67_operational_runtime import build_live_tcc_u67_decision
 
 
 def build_live_model_decision(
@@ -17,6 +19,17 @@ def build_live_model_decision(
 ) -> Any:
     if model_family == "xgboost_utility":
         raise ValueError("XGBoost Utility was retired in API v8.0.0. The live Trader uses LightGBM Utility.")
+    if (
+        model_family == "lightgbm_utility"
+        and str(getattr(config, "strategy_mode", ""))
+        == TCC_U67_CONTROL_OPERATIONAL_MODE
+    ):
+        return build_live_tcc_u67_decision(
+            bars_by_symbol,
+            config,
+            current_asset=current_asset,
+            holding_sessions=holding_sessions,
+        )
     if model_family == "lightgbm_utility":
         return build_live_lightgbm_decision(
             bars_by_symbol,
