@@ -18,7 +18,7 @@ from market_cycle_trader_api.tcc_u67_v1210_reference.contract import (
 
 
 def test_tcc_u67_source_identity_is_pinned() -> None:
-    assert API_VERSION == "10.8.87"
+    assert API_VERSION == "10.8.88"
     assert TCC_U67_CONTROL_OPERATIONAL_MODE == (
         "COMPOUND_ROTATION_SWING_TCC_U67_V1210"
     )

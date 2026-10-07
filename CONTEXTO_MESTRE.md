@@ -1,5 +1,45 @@
 # CONTEXTO_MESTRE
 
+## 2026-10-07 - API v10.8.88 manual current-session control
+
+Depois da promocao bem-sucedida da Strategy #29 para Winner, os botoes de
+Manual Recovery permaneceram desabilitados quando nao existia um Paper run
+agendado para a sessao regular atual.
+
+A causa estava no contrato de `paper_market_manual_recovery_status()`:
+`can_prepare` exigia simultaneamente mercado aberto e um scheduled Paper run
+para a sessao corrente.
+
+A v10.8.88 remove apenas essa dependencia do scheduler.
+
+Novo comportamento:
+
+- `Reanalyze Winner for today` fica disponivel durante o mercado regular
+  aberto mesmo sem scheduled run;
+- o runtime reconcilia Mongo x Alpaca, atualiza os dados do Winner, recalibra
+  usando apenas barras diarias concluidas e cria um Paper plan para a sessao
+  atual;
+- se nao existir run agendado, o plano usa a abertura regular das 09:30
+  America/New_York da sessao corrente;
+- nenhuma ordem e enviada durante a reanalise;
+- `Retry plan on Alpaca` habilita depois que existir um plano preparado ou
+  uma contingencia recuperavel.
+
+Protecoes mantidas:
+
+- mercado regular precisa estar aberto;
+- plano `executing`, `recovering` ou `executed` nao pode ser substituido;
+- planos executados nao sao sobrescritos;
+- execucao manual continua exigindo confirmacao explicita;
+- reconciliacao Mongo x Alpaca e checagem de ordens conflitantes continuam;
+- `paused`/`stopped` bloqueiam execucao normal;
+- `exit_only` continua impedindo nova entrada;
+- a mudanca nao altera a Strategy #29, seus parametros, a posicao XSD ou o
+  backtest validado.
+
+Branch: `feature/v10.8.88-manual-current-session-control`.
+
+
 ## 2026-10-07 - API v10.8.87 stale live-market refresh lock recovery
 
 Producao confirmou que a Strategy #29 U67 ja esta compativel com Trader:

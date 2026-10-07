@@ -92,6 +92,12 @@ def _utc_stamp(value: Any) -> pd.Timestamp:
     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
 
 
+def _current_regular_session_open_utc(session: str) -> pd.Timestamp:
+    """Return the regular XNYS open for an already-open current session."""
+    local_open = pd.Timestamp(f"{session} 09:30:00", tz=EASTERN)
+    return local_open.tz_convert("UTC")
+
+
 def _public_run(document: dict[str, Any] | None) -> dict[str, Any] | None:
     if document is None:
         return None
@@ -398,15 +404,13 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
         and failure_code in RECOVERABLE_CONTINGENCY_FAILURES
     )
     current_plan_status = str(current_plan.get("status") or "").lower()
-    blocked_current_plan = current_plan_status in {"executing", "recovering"} or bool(current_plan.get("contingency_execution_in_progress"))
+    blocked_current_plan = current_plan_status in {"executing", "recovering", "executed"} or bool(current_plan.get("contingency_execution_in_progress"))
     blocked_execution_plan = plan_status in {"executing", "recovering"} or bool(plan.get("contingency_execution_in_progress"))
-    can_prepare = market_open and run_present and not blocked_current_plan
+    can_prepare = market_open and not blocked_current_plan
     can_execute = market_open and (plan_status == "prepared" or recoverable_contingency) and not blocked_execution_plan
 
     if not market_open:
-        prepare_reason = "Manual same-session recovery is available only while the regular market is open."
-    elif not run_present:
-        prepare_reason = "No scheduled Paper run exists for the current regular session."
+        prepare_reason = "Manual same-session analysis is available only while the regular market is open."
     elif blocked_current_plan:
         prepare_reason = f"The current-session Paper plan cannot be replaced while status={current_plan_status}."
     else:
@@ -424,7 +428,8 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
         execute_reason = None
 
     return {
-        "available": bool(market_open and (run_present or plan.get("plan_id"))),
+        "available": bool(market_open),
+        "scheduled_run_required": False,
         "market_open": market_open,
         "current_session": context["current_session"],
         "can_prepare": can_prepare,
@@ -462,16 +467,19 @@ def prepare_manual_current_session_plan(
     existing = context["plan"]
     if not bool(clock.get("is_open")):
         raise RuntimeError("Manual same-session analysis requires the regular market to be open.")
-    if run is None:
-        raise RuntimeError("No scheduled Paper run exists for the current regular session.")
-    existing_status = str((existing or {}).get("status") or "")
-    if existing_status == "executing":
+    existing_status = str((existing or {}).get("status") or "").lower()
+    if existing_status in {"executing", "recovering", "executed"} or bool(
+        (existing or {}).get("contingency_execution_in_progress")
+    ):
         raise RuntimeError(
-            f"The current-session Paper plan cannot be replaced while status={existing_status}."
+            f"The current-session Paper plan cannot be replaced while status={existing_status or 'unknown'}."
         )
-    expected_open = run.get("expected_market_open")
+
+    expected_open = (run or {}).get("expected_market_open")
     if expected_open is None:
-        raise RuntimeError("The scheduled Paper run does not contain expected_market_open.")
+        expected_open = _current_regular_session_open_utc(
+            context["current_session"]
+        )
 
     plan = prepare_next_paper_plan(
         db,
@@ -482,22 +490,27 @@ def prepare_manual_current_session_plan(
         refresh_source="manual_current_session_recovery",
     )
     now = utc_now()
-    db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-        {"run_id": str(run["run_id"])},
-        {"$set": {
-            "manual_recovery_prepared_at": now,
-            "manual_recovery_plan_id": str(plan["plan_id"]),
-            "manual_recovery_actor_email": (actor_email or "").strip().lower() or None,
-            "updated_at": now,
-        }},
-    )
+    if run is not None:
+        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": str(run["run_id"])},
+            {"$set": {
+                "manual_recovery_prepared_at": now,
+                "manual_recovery_plan_id": str(plan["plan_id"]),
+                "manual_recovery_actor_email": (actor_email or "").strip().lower() or None,
+                "updated_at": now,
+            }},
+        )
     mode = _control_mode(_automation_document(db))
     _record_admin_operation(
         db,
         action="manual_current_session_analysis",
         previous_mode=mode,
         new_mode=mode,
-        reason=f"Prepared manual recovery plan {plan['plan_id']} for {context['current_session']}.",
+        reason=(
+            f"Prepared manual current-session plan {plan['plan_id']} "
+            f"for {context['current_session']} "
+            f"({'scheduled run' if run is not None else 'ad hoc'})."
+        ),
         actor_email=actor_email,
     )
     return {
