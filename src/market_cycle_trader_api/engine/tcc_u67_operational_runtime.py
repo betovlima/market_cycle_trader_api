@@ -84,6 +84,7 @@ def tcc_u67_contract_issues(config: Any) -> list[str]:
         "timeframe": "1Day",
         "market_data_provider": "alpaca",
         "alpaca_historical_feed": "sip",
+        "alpaca_live_feed": "iex",
         "alpaca_adjustment": "raw",
         "rotation_horizon_days": 40,
         "rotation_target_horizons": [5, 10, 20, 40, 60],
