@@ -15,7 +15,15 @@ import pandas as pd
 from pydantic import ValidationError
 from pymongo import ReturnDocument
 
-from ..core.config import API_VERSION, PACKAGE_DIR
+from ..core.config import (
+    API_VERSION,
+    PACKAGE_DIR,
+    TCC_U67_CONTROL_OPERATIONAL_MODE,
+)
+from ..engine.tcc_u67_operational_runtime import (
+    tcc_u67_contract_issues,
+    tcc_u67_model_snapshot_issues,
+)
 from ..infrastructure.persistence.mongo_repository import (
     JOBS_COLLECTION,
     MODEL_TUNING_RUNS_COLLECTION,
@@ -575,7 +583,78 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     engine_binding = str(
         document.get("backtest_engine_binding") or ""
     ).strip()
-    strategy_kind = str(document.get("strategy_kind") or "standard").strip().lower()
+    strategy_kind = str(
+        document.get("strategy_kind") or "standard"
+    ).strip().lower()
+    variant = str(
+        document.get("temporal_strategy_variant") or ""
+    ).strip().lower()
+    snapshot = (
+        document.get("research_model_snapshot")
+        if isinstance(document.get("research_model_snapshot"), dict)
+        else document.get("winner_model_snapshot")
+    )
+    model_family = (
+        str((snapshot or {}).get("family") or "").strip().lower()
+        or None
+    )
+    configuration = (
+        document.get("configuration")
+        if isinstance(document.get("configuration"), dict)
+        else {}
+    )
+    strategy_mode = str(configuration.get("strategy_mode") or "")
+
+    if strategy_mode == TCC_U67_CONTROL_OPERATIONAL_MODE:
+        expected_binding = "tcc_u67_v1210_operational_backtest"
+        if engine_binding != expected_binding:
+            return {
+                "eligible": False,
+                "code": "tcc_u67_engine_binding_mismatch",
+                "reason": (
+                    "TCC U67 requires its protected backtest/live engine "
+                    f"binding {expected_binding!r}."
+                ),
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+                "backtest_engine_binding": engine_binding or None,
+            }
+        model_issues = tcc_u67_model_snapshot_issues(snapshot)
+        if model_family != "lightgbm_utility" or model_issues:
+            return {
+                "eligible": False,
+                "code": "tcc_u67_model_contract_mismatch",
+                "reason": (
+                    "TCC U67 requires its protected LightGBM snapshot: "
+                    + "; ".join(model_issues[:5])
+                ),
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+                "backtest_engine_binding": engine_binding,
+            }
+        issues = tcc_u67_contract_issues(configuration)
+        if issues:
+            return {
+                "eligible": False,
+                "code": "tcc_u67_contract_mismatch",
+                "reason": (
+                    "TCC U67 configuration differs from its protected "
+                    "operational contract: "
+                    + "; ".join(issues[:5])
+                ),
+                "strategy_kind": strategy_kind,
+                "model_family": model_family,
+                "backtest_engine_binding": engine_binding,
+            }
+        return {
+            "eligible": True,
+            "code": "tcc_u67_live_runtime_ready",
+            "reason": None,
+            "strategy_kind": strategy_kind,
+            "model_family": model_family,
+            "backtest_engine_binding": engine_binding,
+        }
+
     if engine_binding:
         return {
             "eligible": False,
@@ -585,29 +664,9 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "engine and cannot be promoted to the protected live Trader."
             ),
             "strategy_kind": strategy_kind,
-            "model_family": (
-                str(
-                    (
-                        document.get("research_model_snapshot")
-                        if isinstance(
-                            document.get("research_model_snapshot"),
-                            dict,
-                        )
-                        else {}
-                    ).get("family")
-                    or ""
-                )
-                or None
-            ),
+            "model_family": model_family,
             "backtest_engine_binding": engine_binding,
         }
-    variant = str(document.get("temporal_strategy_variant") or "").strip().lower()
-    snapshot = (
-        document.get("research_model_snapshot")
-        if isinstance(document.get("research_model_snapshot"), dict)
-        else document.get("winner_model_snapshot")
-    )
-    model_family = str((snapshot or {}).get("family") or "").strip().lower() or None
 
     if model_family == "iqn":
         return {
@@ -621,7 +680,10 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         return {
             "eligible": False,
             "code": "unsupported_live_model",
-            "reason": "The Strategy model is not supported by the installed protected live Trader engine.",
+            "reason": (
+                "The Strategy model is not supported by the installed "
+                "protected live Trader engine."
+            ),
             "strategy_kind": strategy_kind,
             "model_family": model_family,
         }
@@ -635,13 +697,20 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
             "model_family": model_family,
         }
 
-    if strategy_kind == "temporal_intelligence" and variant == "winner_transition_stateful":
-        stateful_ready = bool(str(document.get("source_stateful_replay_id") or "").strip())
+    if (
+        strategy_kind == "temporal_intelligence"
+        and variant == "winner_transition_stateful"
+    ):
+        stateful_ready = bool(
+            str(document.get("source_stateful_replay_id") or "").strip()
+        )
         if not stateful_ready:
             return {
                 "eligible": False,
                 "code": "stateful_runtime_snapshot_missing",
-                "reason": "The Stateful Strategy is missing its live runtime snapshot.",
+                "reason": (
+                    "The Stateful Strategy is missing its live runtime snapshot."
+                ),
                 "strategy_kind": strategy_kind,
                 "model_family": model_family,
             }
@@ -653,7 +722,10 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
             "model_family": model_family,
         }
 
-    if strategy_kind == "temporal_intelligence" and variant == "milp_decision_overlay":
+    if (
+        strategy_kind == "temporal_intelligence"
+        and variant == "milp_decision_overlay"
+    ):
         if _milp_identity_overlay(document):
             return {
                 "eligible": True,
@@ -665,7 +737,11 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         return {
             "eligible": False,
             "code": "milp_overlay_requires_live_runtime",
-            "reason": "This MILP overlay changes Control decisions and requires an equivalent live execution runtime before it can be the Trader Winner.",
+            "reason": (
+                "This MILP overlay changes Control decisions and requires an "
+                "equivalent live execution runtime before it can be the "
+                "Trader Winner."
+            ),
             "strategy_kind": strategy_kind,
             "model_family": model_family,
         }
