@@ -219,27 +219,79 @@ def download_u67_operational_snapshot(
                     f"{symbol}: snapshot contains a future session."
                 )
 
-            provenance = dict(getattr(cleaned, "attrs", {}) or {})
+            raw_attrs = dict(getattr(raw, "attrs", {}) or {})
+            requested_start = pd.Timestamp("2016-01-01", tz="UTC")
+            actual_start = pd.Timestamp(cleaned.index.min()).tz_convert("UTC")
+            start_tolerance = pd.Timedelta(
+                days=int(
+                    getattr(
+                        fresh_config,
+                        "market_data_history_start_tolerance_days",
+                        10,
+                    )
+                )
+            )
+            dividend_count = sum(
+                1
+                for action in actions
+                if str(action.get("action_type") or "")
+                in {"cash_dividend", "stock_dividend"}
+            )
+            provenance = dict(
+                cleaned.attrs.get("market_data_provenance", {}) or {}
+            )
             provenance.update(
                 {
+                    "provider": "alpaca",
+                    "effective_provider": "alpaca",
+                    "historical_feed": "sip",
+                    "live_feed": str(
+                        getattr(fresh_config, "alpaca_live_feed", "iex")
+                    ),
+                    "adjustment": "raw",
+                    "requested_start": "2016-01-01",
+                    "actual_start": actual_start.isoformat(),
+                    "history_complete": bool(
+                        actual_start <= requested_start + start_tolerance
+                    ),
+                    "initial_rows": int(len(raw)),
+                    "history_backfill_rows": 0,
                     "research_market_data_protocol": "raw_total_causal_v1",
+                    "research_market_data_refresh_mode": "full",
+                    "full_refresh_performed": True,
                     "research_access_path": "fresh_u67_operational_snapshot",
+                    "research_bar_loader": raw_attrs.get(
+                        "research_bar_loader"
+                    )
+                    or raw_attrs.get("market_bar_loader")
+                    or "alpaca_current_daily_single_request_v1",
+                    "research_bar_request_limit": raw_attrs.get(
+                        "research_bar_request_limit"
+                    )
+                    or 10_000,
+                    "research_bar_end_mode": raw_attrs.get(
+                        "research_bar_end_mode"
+                    ),
+                    "research_bar_chunking": False,
                     "source_adjustment": "raw",
                     "effective_adjustment": (
                         "raw_plus_causal_split_normalization"
                     ),
+                    "raw_sha256": _history_frame_sha256(raw),
                     "corporate_action_source": "alpaca",
                     "corporate_action_count": int(len(actions)),
                     "splits_applied": int(len(applied)),
                     "split_events": applied,
                     "split_normalization_direction": "pre_ex_date_history",
                     "split_normalization_uses_future_events": True,
+                    "dividend_event_count": int(dividend_count),
                     "dividend_adjustment_applied": False,
+                    "dividend_events_used_by_model": False,
                     "structural_identity_verified": True,
                     "fresh_snapshot_job_id": str(job_id),
                 }
             )
-            cleaned.attrs.update(provenance)
+            cleaned.attrs["market_data_provenance"] = provenance
 
             hashes[f"normalized_bars/{symbol}.csv"] = _write_bytes(
                 temporary,
