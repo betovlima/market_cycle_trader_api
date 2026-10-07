@@ -10,8 +10,19 @@ import pandas as pd
 from pydantic import ValidationError
 from pymongo import ReturnDocument
 
-from ..core.config import RESEARCH_ONLY_SWING_STRATEGY_MODES, SWING_STRATEGY_MODES
+from ..core.config import (
+    RESEARCH_ONLY_SWING_STRATEGY_MODES,
+    SWING_STRATEGY_MODES,
+    TCC_U67_CONTROL_OPERATIONAL_MODE,
+)
 from ..engine.live_model_signal import build_live_model_decision
+from ..engine.tcc_u67_operational_market_data import (
+    download_u67_operational_snapshot,
+)
+from ..engine.tcc_u67_operational_runtime import (
+    assert_tcc_u67_model_snapshot,
+    assert_tcc_u67_operational_contract,
+)
 from ..engine.market_data import (
     latest_safe_completed_xnys_session,
     load_market_bars,
@@ -168,6 +179,12 @@ def _validated_context(
         raise RuntimeError(
             f"Trader Winner model {winner_model['family']!r} does not have a protected live engine."
         )
+    if str(strategy.strategy_mode) == TCC_U67_CONTROL_OPERATIONAL_MODE:
+        try:
+            assert_tcc_u67_operational_contract(strategy)
+            assert_tcc_u67_model_snapshot(winner_model)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
     if strategy.market_data_provider != "alpaca":
         raise RuntimeError("Paper trading requires market_data_provider='alpaca'.")
     if strategy.end_date is not None:
@@ -545,8 +562,6 @@ def prepare_next_paper_plan(
     if allow_open_market and not market_is_open:
         raise RuntimeError("Manual current-session recovery requires the regular market to be open.")
 
-    live_market = refresh_trader_live_market_data(db, source=refresh_source, force=True)
-
     _assert_no_conflicting_orders(client, assets=strategy.assets)
     _reconcile_state_with_account(
         client,
@@ -555,12 +570,78 @@ def prepare_next_paper_plan(
     )
 
     bars_by_symbol: dict[str, pd.DataFrame] = {}
-    for symbol in strategy.assets:
-        bars = validate_and_clean_bars(load_market_bars(symbol, strategy), strategy)
-        bars = _trim_incomplete_daily_session(bars, clock=clock)
-        if bars.empty:
-            raise RuntimeError(f"No completed daily bars are available for {symbol}.")
-        bars_by_symbol[symbol] = bars
+    if str(strategy.strategy_mode) == TCC_U67_CONTROL_OPERATIONAL_MODE:
+        target_session = latest_safe_completed_xnys_session().date().isoformat()
+        live_job_id = (
+            f"trader-u67-{target_session}-"
+            f"{uuid.uuid4().hex[:10]}"
+        )
+        snapshot_config = strategy.model_copy(
+            update={"analysis_end_date": target_session}
+        )
+        snapshot = download_u67_operational_snapshot(
+            job_id=live_job_id,
+            config=snapshot_config,
+        )
+        bars_by_symbol = {
+            symbol: _trim_incomplete_daily_session(
+                frame,
+                clock=clock,
+            )
+            for symbol, frame in snapshot.frames.items()
+        }
+        empty = [
+            symbol
+            for symbol, frame in bars_by_symbol.items()
+            if frame.empty
+        ]
+        if empty:
+            raise RuntimeError(
+                "U67 live snapshot has no completed bars for: "
+                + ", ".join(empty)
+            )
+        live_metadata = update_trader_live_market_cutoff(
+            db,
+            cutoff=target_session,
+            source=refresh_source,
+        )
+        live_market = {
+            **live_metadata,
+            "live_market_cutoff": target_session,
+            "target_session": target_session,
+            "refreshed": True,
+            "full_daily_history_refresh": True,
+            "u67_snapshot_job_id": live_job_id,
+            "u67_snapshot_sha256": snapshot.manifest.get(
+                "snapshot_sha256"
+            ),
+            "u67_requested_assets": list(
+                snapshot.manifest.get("requested_assets") or []
+            ),
+            "u67_eligible_assets": list(
+                snapshot.manifest.get("eligible_assets") or []
+            ),
+            "u67_structural_exclusions": list(
+                snapshot.manifest.get("structural_exclusions") or []
+            ),
+        }
+    else:
+        live_market = refresh_trader_live_market_data(
+            db,
+            source=refresh_source,
+            force=True,
+        )
+        for symbol in strategy.assets:
+            bars = validate_and_clean_bars(
+                load_market_bars(symbol, strategy),
+                strategy,
+            )
+            bars = _trim_incomplete_daily_session(bars, clock=clock)
+            if bars.empty:
+                raise RuntimeError(
+                    f"No completed daily bars are available for {symbol}."
+                )
+            bars_by_symbol[symbol] = bars
 
     decision = build_live_model_decision(
         bars_by_symbol,
@@ -688,6 +769,12 @@ def prepare_next_paper_plan(
         "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
         "live_market_cutoff": live_market.get("live_market_cutoff"),
+        "u67_live_snapshot_job_id": live_market.get("u67_snapshot_job_id"),
+        "u67_live_snapshot_sha256": live_market.get("u67_snapshot_sha256"),
+        "u67_live_effective_assets": live_market.get("u67_eligible_assets"),
+        "u67_live_structural_exclusions": live_market.get(
+            "u67_structural_exclusions"
+        ),
         "manual_current_session_recovery": bool(allow_open_market),
         "plan_source": refresh_source,
         "stateful_intervention": bool((stateful_decision or {}).get("stateful_intervention")),
