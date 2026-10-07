@@ -1,5 +1,87 @@
 # CONTEXTO_MESTRE
 
+## Fechamento validado 2026-10-07 - Strategy #13 reproduzida no TCC
+
+A Strategy #13 do MCT foi reproduzida independentemente dentro do TCC com
+paridade exata.
+
+Referencia auditada:
+
+- Strategy #13, revisao 2;
+- job: `20261007T095423-60e489c0`;
+- branch MCT: `feature/v10.8.85-tcc-u67-control-operational`;
+- API: `10.8.85`;
+- modo: `COMPOUND_ROTATION_SWING_TCC_U67_V1210`;
+- 67 ativos configurados na Strategy;
+- 65 ativos efetivamente entregues ao modelo;
+- exclusoes de runtime observadas: DOC e CLMT;
+- Alpaca 1Day, SIP, RAW, full refresh;
+- capital em 2026-09-17: US$ 78.782.538,31270888;
+- capital em 2026-10-06: US$ 76.927.051,38897176;
+- CAGR: 322,7752607%;
+- Sharpe: 2,56904268;
+- MaxDD: -30,3589700%;
+- pior fold: +282,5895543%.
+
+A validacao independente foi executada na branch TCC
+`research/tcc-mct-u67-parity-v1`.
+
+Evidencias de paridade:
+
+- 65/65 hashes RAW do OHLCV coincidiram;
+- 65/65 hashes normalizados coincidiram;
+- 1.560 linhas de decisoes/predictions coincidiram;
+- 674 trades coincidiram;
+- capital em 2026-09-17 coincidiu ate o centavo;
+- capital em 2026-10-06 coincidiu ate o centavo;
+- nenhum ativo, score, margem ou trade precisou ser forçado.
+
+Margens efetivas reproduzidas pela calibracao:
+
+- fold 1: 0,0005;
+- fold 2: 0,0100;
+- fold 3: 0,0005.
+
+O engine cientifico usado pelo MCT permanece vendorizado a partir do TCC e a
+auditoria anterior confirmou igualdade byte a byte dos modulos centrais de
+rotacao, LightGBM, execucao e configuracao.
+
+A divergencia observada em tentativas intermediarias de reproducao no TCC nao
+veio de logica escondida no MCT. Ela foi causada pela ida e volta por CSV no
+TCC: valores `float64` gravados com `%.17g` e relidos pelo parser padrao do
+pandas podiam voltar com diferenca de 1 ULP. Usando
+`float_precision="round_trip"`, o TCC recuperou os mesmos valores usados pelo
+MCT e reproduziu integralmente hashes, calibracao, decisoes, trades e capital.
+
+Conclusao operacional da auditoria:
+
+> O backtest de aproximadamente US$ 78,78 milhoes em 2026-09-17 e
+> US$ 76,93 milhoes em 2026-10-06 e matematicamente consistente e
+> reproduzivel. Nao foi encontrada logica que force as rotacoes para produzir
+> esse capital.
+
+Importante sobre o universo:
+
+A Strategy #13 continua configurada nominalmente com os 67 ativos U67. O
+runtime desse backtest operou com 65 porque DOC e CLMT foram filtrados antes do
+modelo. A exclusao de CLMT reproduz o comportamento do job auditado, mas CUSIP
+isoladamente nao deve ser tratado como criterio cientifico geral para remover
+ativos.
+
+Estado para integracao:
+
+- branch: `feature/v10.8.85-tcc-u67-control-operational`;
+- PR: #34;
+- resultado de backtest: validado;
+- destino: `main` do MCT;
+- tag de fechamento recomendada: `v10.8.85`.
+
+A integracao desta branch na `main` nao equivale, por si so, a promover a
+Strategy #13 para Winner nem a habilita para envio de ordens. O modo continua
+com as protecoes de Research/backtest e os gates de live/shadow devem ser
+tratados separadamente antes de qualquer promocao operacional.
+
+
 ## 2026-10-07 — TCC main U67 -> MCT API v10.8.85
 
 ### Objetivo
