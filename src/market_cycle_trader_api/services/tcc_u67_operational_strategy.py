@@ -241,7 +241,7 @@ def install_tcc_u67_operational_strategy(
                 "$set": {
                     "operational_stage": "protected_live_runtime",
                     "live_trader_eligible": True,
-                    "live_runtime_version": "10.8.86",
+                    "live_runtime_version": "10.8.87",
                     "updated_at": now,
                     "updated_by": actor,
                 }
@@ -324,7 +324,7 @@ def install_tcc_u67_operational_strategy(
                 "reference_checkpoint_is_optimization_target": False,
                 "operational_stage": "protected_live_runtime",
                 "live_trader_eligible": True,
-                "live_runtime_version": "10.8.86",
+                "live_runtime_version": "10.8.87",
                 "shadow_validated": False,
                 "source_git_commit_message": (
                     "TCC main U67 v1.21.0 Control migration "
