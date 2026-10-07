@@ -1,5 +1,45 @@
 # CONTEXTO_MESTRE
 
+## 2026-10-07 - API v10.8.87 stale live-market refresh lock recovery
+
+Producao confirmou que a Strategy #29 U67 ja esta compativel com Trader:
+
+- `trader_compatibility.eligible=true`;
+- `code=tcc_u67_live_runtime_ready`.
+
+O botao Promote to WINNER continuou desabilitado porque o documento de controle
+manteve um lock stale de sincronizacao:
+
+- `live_market_refresh_in_progress=true`;
+- `live_market_refresh_started_at=2026-09-28T23:21:42.578Z`;
+- `live_market_refresh_source=premarket_plan_refresh`;
+- `winner_promotion_guard.code=daily_calibration_data_sync`.
+
+A v10.8.87 cria o endpoint administrativo protegido:
+
+`POST /api/research/tcc-u67/recover-stale-live-market-lock`
+
+Ele so libera o lock quando estiver com mais de seis horas e nao houver:
+
+- Paper run em preparacao/calibracao;
+- Paper run executando ordens;
+- trade plan com status `executing`.
+
+A recuperacao nao envia ordens, nao muda Winner, nao reinicializa Paper State e
+nao altera a posicao XSD.
+
+Fluxo apos deploy:
+
+1. chamar o endpoint de recovery;
+2. esperar `code=stale_lock_released`;
+3. consultar `GET /api/admin/strategies/control`;
+4. confirmar `live_market_refresh_in_progress=false`;
+5. confirmar `winner_promotion_guard.available=true`;
+6. atualizar o frontend e promover a Strategy #29.
+
+Branch: `feature/v10.8.87-stale-refresh-lock-recovery`.
+
+
 ## 2026-10-07 - API v10.8.86 U67 protected live runtime
 
 Branch ativa: `feature/v10.8.86-tcc-u67-live-runtime`.
