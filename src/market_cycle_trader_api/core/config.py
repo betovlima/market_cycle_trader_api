@@ -4,13 +4,18 @@ import os
 from pathlib import Path
 from typing import Any
 
-API_VERSION = "10.8.38"
+API_VERSION = "10.8.85"
 ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PACKAGE_DIR.parent
 ENGINE_PATH = PACKAGE_DIR / "engine" / "compound_rotation_backtest.py"
 
+TCC_U67_CONTROL_OPERATIONAL_MODE = "COMPOUND_ROTATION_SWING_TCC_U67_V1210"
+TCC_V106_LEGACY_MODE = "COMPOUND_ROTATION_SWING_TCC_CONTROL_V106"
+
 STRATEGY_LABELS = {
+    TCC_U67_CONTROL_OPERATIONAL_MODE: "TCC U67 v1.21.0 — Control Operational",
+    TCC_V106_LEGACY_MODE: "TCC v1.0.6 — Legacy Reference",
     "COMPOUND_ROTATION_SWING_LIGHTGBM": "Compound Capital Rotation — Utility",
     "COMPOUND_ROTATION_SWING_XGBOOST": "Compound Capital Rotation — Utility",
     "COMPOUND_ROTATION_SWING_RISK_OFF": "Compound Capital Rotation — Explicit Risk-Off",
@@ -23,6 +28,8 @@ STRATEGY_LABELS = {
 }
 SWING_STRATEGY_MODES = frozenset(STRATEGY_LABELS)
 RESEARCH_ONLY_SWING_STRATEGY_MODES = frozenset({
+    TCC_U67_CONTROL_OPERATIONAL_MODE,
+    TCC_V106_LEGACY_MODE,
     "COMPOUND_ROTATION_SWING_OPPORTUNITY_CASH_GATE",
     "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
     "COMPOUND_ROTATION_SWING_OPTIMIZED_ALLOCATION",

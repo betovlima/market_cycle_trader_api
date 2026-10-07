@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE
 from ..core.environment import load_project_environment
 
 
@@ -31,6 +32,13 @@ from ..infrastructure.persistence.mongo_repository import (
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
 from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
+from .tcc_u67_operational_runtime import (
+    assert_tcc_u67_operational_contract,
+    run_tcc_u67_operational_backtest,
+)
+from .tcc_u67_operational_market_data import (
+    download_u67_operational_snapshot,
+)
 from .market_data import validate_and_clean_bars
 from .research_market_data import (
     StructuralResearchAssetExclusion,
@@ -307,16 +315,76 @@ def run_job(
     BacktestExecutionRequest,
 ]:
     effective_config = effective_research_config(config)
+    tcc_u67_runtime = (
+        str(effective_config.strategy_mode)
+        == TCC_U67_CONTROL_OPERATIONAL_MODE
+    )
+    if tcc_u67_runtime:
+        assert_tcc_u67_operational_contract(effective_config)
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
     structural_exclusions: list[dict[str, Any]] = []
+    u67_snapshot = None
 
     emit_progress(2.0, "Preparing shared-capital rotation")
+
+    if tcc_u67_runtime:
+        emit_progress(
+            3.0,
+            "TCC U67 downloading fresh Alpaca RAW/SIP snapshot",
+        )
+
+        def u67_snapshot_progress(
+            phase: str,
+            position: int,
+            total: int,
+            symbol: str,
+        ) -> None:
+            fraction = position / max(1, total)
+            emit_progress(
+                3.0 + 12.0 * fraction,
+                (
+                    f"TCC U67 {phase} market data "
+                    f"{position}/{total} — {symbol}"
+                ),
+            )
+
+        u67_snapshot = download_u67_operational_snapshot(
+            job_id=job_id,
+            config=effective_config,
+            progress_callback=u67_snapshot_progress,
+        )
+        bars_by_symbol = {
+            symbol: frame.copy()
+            for symbol, frame in u67_snapshot.frames.items()
+        }
+        structural_exclusions = [
+            dict(item)
+            for item in (
+                u67_snapshot.manifest.get("structural_exclusions") or []
+            )
+            if isinstance(item, dict)
+        ]
+        for issue in structural_exclusions:
+            print(
+                "MARKET_DATA_EXCLUSION|"
+                f"{issue.get('symbol')}|"
+                f"reason={issue.get('reason')}|"
+                f"action={issue.get('action_type')}|"
+                f"acquirer={issue.get('acquirer_symbol')}",
+                flush=True,
+            )
+
+    assets_to_load = (
+        []
+        if tcc_u67_runtime
+        else list(effective_config.assets)
+    )
     total_assets = max(1, len(effective_config.assets))
     calendar_anchor_assets = set(effective_config.calendar_anchor_assets)
 
     for asset_position, symbol in enumerate(
-        effective_config.assets,
+        assets_to_load,
         start=1,
     ):
         emit_progress(
@@ -540,6 +608,20 @@ def run_job(
             "dividend_events_used_by_model": False,
             "split_normalization_direction": "pre_ex_date_history",
             "split_normalization_uses_future_events": True,
+            "u67_fresh_snapshot": bool(u67_snapshot is not None),
+            "u67_snapshot_sha256": (
+                str(
+                    u67_snapshot.manifest.get("snapshot_sha256")
+                    or ""
+                )
+                if u67_snapshot is not None
+                else None
+            ),
+            "u67_snapshot_directory": (
+                str(u67_snapshot.directory)
+                if u67_snapshot is not None
+                else None
+            ),
         }
     )
 
@@ -566,16 +648,26 @@ def run_job(
     )
     heartbeat_stop, heartbeat_thread = _start_progress_heartbeat()
     try:
-        results = run_rotation_models(
-            bars_by_symbol,
-            effective_config,
-            calculate_reference_fees,
-            apply_slippage,
-            progress_callback=emit_progress,
-            trade_callback=emit_trade,
-            progress_detail_callback=emit_progress_detail,
-            technical_log_callback=emit_research_technical,
-        )
+        if tcc_u67_runtime:
+            results = run_tcc_u67_operational_backtest(
+                bars_by_symbol,
+                effective_config,
+                progress_callback=emit_progress,
+                trade_callback=emit_trade,
+                progress_detail_callback=emit_progress_detail,
+                technical_log_callback=emit_research_technical,
+            )
+        else:
+            results = run_rotation_models(
+                bars_by_symbol,
+                effective_config,
+                calculate_reference_fees,
+                apply_slippage,
+                progress_callback=emit_progress,
+                trade_callback=emit_trade,
+                progress_detail_callback=emit_progress_detail,
+                technical_log_callback=emit_research_technical,
+            )
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1.0)
