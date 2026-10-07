@@ -174,6 +174,8 @@ def test_live_policy_rotates_only_when_margin_is_met() -> None:
 def test_paper_runtime_uses_fresh_u67_snapshot_and_preserves_account_state() -> None:
     source = inspect.getsource(paper_trading.prepare_next_paper_plan)
     assert "download_u67_operational_snapshot(" in source
+    assert "append_u67_current_session_intraday(" in source
+    assert '"current_session_intraday"' in source
     assert "u67_snapshot_sha256" in source
     assert "_reconcile_state_with_account(" in source
     assert "current_asset=state.managed_symbol" in source
