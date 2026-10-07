@@ -3,7 +3,12 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+import pandas as pd
+
 from ..infrastructure.persistence.mongo_repository import (
+    PAPER_MARKET_RUNS_COLLECTION,
+    PAPER_TRADE_PLANS_COLLECTION,
+    STRATEGY_CONTROL_COLLECTION,
     STRATEGY_PROFILES_COLLECTION,
     utc_now,
 )
@@ -35,6 +40,132 @@ from .strategy_lab import (
 
 BACKTEST_ENGINE_BINDING = "tcc_u67_v1210_operational_backtest"
 REFERENCE_ENGINE_ID = "tcc-main-u67-v1.21.0-control"
+ACTIVE_PAPER_KEY = "alpaca-paper-next-session"
+STALE_LIVE_MARKET_REFRESH_AFTER = pd.Timedelta(hours=6)
+
+
+def recover_stale_live_market_refresh_lock(
+    db: Any,
+) -> dict[str, Any]:
+    """Safely clear only an orphaned market-data refresh lock."""
+    control = (
+        db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"})
+        or {}
+    )
+    if not bool(control.get("live_market_refresh_in_progress")):
+        return {
+            "released": False,
+            "code": "not_locked",
+            "reason": None,
+        }
+
+    started_at = control.get("live_market_refresh_started_at")
+    if started_at is None:
+        return {
+            "released": False,
+            "code": "missing_started_at",
+            "reason": (
+                "The refresh lock has no start timestamp and will not be "
+                "cleared automatically."
+            ),
+        }
+
+    started = pd.Timestamp(started_at)
+    started = (
+        started.tz_localize("UTC")
+        if started.tzinfo is None
+        else started.tz_convert("UTC")
+    )
+    now = pd.Timestamp(utc_now())
+    now = (
+        now.tz_localize("UTC")
+        if now.tzinfo is None
+        else now.tz_convert("UTC")
+    )
+    age = now - started
+    if age <= STALE_LIVE_MARKET_REFRESH_AFTER:
+        return {
+            "released": False,
+            "code": "refresh_not_stale",
+            "reason": (
+                "The market-data refresh lock is still within the protected "
+                "six-hour execution window."
+            ),
+            "started_at": started.isoformat(),
+            "age_seconds": float(age.total_seconds()),
+        }
+
+    active_run = db[PAPER_MARKET_RUNS_COLLECTION].find_one(
+        {"active_key": ACTIVE_PAPER_KEY},
+        {
+            "_id": 0,
+            "run_id": 1,
+            "status": 1,
+            "phase": 1,
+            "plan_id": 1,
+        },
+    )
+    status = str((active_run or {}).get("status") or "").strip().lower()
+    phase = str((active_run or {}).get("phase") or "").strip().lower()
+    calibration_running = status == "preparing" or phase in {
+        "refreshing_market_data_and_preparing_premarket_plan",
+        "preparing_premarket_plan",
+        "refreshing_market_data_and_preparing_post_close_plan",
+        "market_open_recalibration",
+    }
+    execution_running = status == "executing" or phase == (
+        "submitting_alpaca_paper_orders"
+    )
+    executing_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+        {"status": "executing"},
+        {"_id": 0, "plan_id": 1, "status": 1},
+    )
+    if calibration_running or execution_running or executing_plan is not None:
+        return {
+            "released": False,
+            "code": "active_pipeline_detected",
+            "reason": (
+                "A Paper calibration or order execution is active; "
+                "the refresh lock was not cleared."
+            ),
+            "active_run_id": (active_run or {}).get("run_id"),
+            "active_run_status": (active_run or {}).get("status"),
+            "active_run_phase": (active_run or {}).get("phase"),
+            "executing_plan_id": (executing_plan or {}).get("plan_id"),
+        }
+
+    source = control.get("live_market_refresh_source")
+    result = db[STRATEGY_CONTROL_COLLECTION].update_one(
+        {
+            "_id": "default",
+            "live_market_refresh_in_progress": True,
+            "live_market_refresh_started_at": started_at,
+        },
+        {
+            "$set": {
+                "live_market_refresh_in_progress": False,
+                "live_market_refresh_started_at": None,
+                "last_stale_live_market_refresh_recovered_at": utc_now(),
+                "last_stale_live_market_refresh_started_at": started_at,
+                "last_stale_live_market_refresh_source": source,
+            }
+        },
+    )
+    return {
+        "released": bool(result.modified_count),
+        "code": (
+            "stale_lock_released"
+            if result.modified_count
+            else "lock_changed_before_recovery"
+        ),
+        "reason": None,
+        "previous_started_at": started.isoformat(),
+        "previous_source": source,
+        "age_seconds": float(age.total_seconds()),
+        "broker_interaction_performed": False,
+        "paper_state_changed": False,
+        "winner_changed": False,
+    }
 
 
 def _tcc_lightgbm_values() -> dict[str, Any]:
