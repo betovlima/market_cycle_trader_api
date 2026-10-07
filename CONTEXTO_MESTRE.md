@@ -1,5 +1,42 @@
 # CONTEXTO_MESTRE
 
+## 2026-10-07 - Recuperacao segura de lock stale de market-data
+
+Producao confirmou que a Strategy #29 ja esta compativel com o runtime live U67:
+
+- `trader_compatibility.eligible=true`;
+- `code=tcc_u67_live_runtime_ready`.
+
+O botao Promote to WINNER permaneceu desabilitado por outro motivo:
+`winner_promotion_guard.code=daily_calibration_data_sync`.
+
+O documento de controle mostrou um lock antigo:
+
+- `live_market_refresh_in_progress=true`;
+- `live_market_refresh_started_at=2026-09-28T23:21:42.578Z`;
+- `live_market_refresh_source=premarket_plan_refresh`.
+
+Esse lock estava stale por varios dias e nao representava uma sincronizacao
+ativa atual.
+
+A v10.8.86 passa a expor:
+
+`POST /api/research/tcc-u67/recover-stale-live-market-lock`
+
+O endpoint so libera o lock quando:
+
+1. o lock tem mais de seis horas;
+2. nao existe Paper run em preparacao/calibracao;
+3. nao existe execucao de ordens;
+4. nao existe plano com status `executing`.
+
+A recuperacao altera apenas metadados do lock. Nao envia ordens, nao altera
+Winner, nao reinicializa Paper State e nao modifica a posicao atual XSD.
+
+Depois da recuperacao, `GET /api/admin/strategies/control` deve retornar
+`winner_promotion_guard.available=true` antes da promocao da Strategy #29.
+
+
 ## 2026-10-07 - API v10.8.86 U67 protected live runtime
 
 Branch ativa: `feature/v10.8.86-tcc-u67-live-runtime`.
