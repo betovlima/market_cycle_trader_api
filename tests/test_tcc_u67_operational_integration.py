@@ -25,10 +25,10 @@ from market_cycle_trader_api.tcc_u67_v1210_reference.contract import (
 )
 
 
-def test_u67_operational_mode_is_research_only() -> None:
+def test_u67_operational_mode_has_protected_live_runtime() -> None:
     assert (
         TCC_U67_CONTROL_OPERATIONAL_MODE
-        in RESEARCH_ONLY_SWING_STRATEGY_MODES
+        not in RESEARCH_ONLY_SWING_STRATEGY_MODES
     )
     assert BACKTEST_ENGINE_BINDING == (
         "tcc_u67_v1210_operational_backtest"
@@ -60,7 +60,7 @@ def test_clmt_is_removed_by_operational_identity_policy() -> None:
     assert issue["new_cusip"] == "131428104"
 
 
-def test_u67_research_router_exposes_install_and_backtest_only() -> None:
+def test_u67_research_router_exposes_install_and_backtest_endpoint() -> None:
     paths = {
         (route.path, tuple(sorted(route.methods or [])))
         for route in router.routes
