@@ -659,7 +659,7 @@ def _apply_live_u67_policy(
     if type(holding_sessions) is not int or holding_sessions < 0:
         raise ValueError("holding_sessions must be a nonnegative integer.")
     if not np.isfinite(utilities[1:]).any():
-        raise ValueError("No finite U67 utility is available for the completed session.")
+        raise ValueError("No finite U67 utility is available for the latest scoring observation.")
 
     current_position = labels.index(current_label)
     best = int(np.nanargmax(utilities))
@@ -709,7 +709,7 @@ def build_live_tcc_u67_decision(
     current_asset: str | None,
     holding_sessions: int,
 ) -> LiveLightGBMDecision:
-    """Build one protected next-open U67 decision from completed daily bars only."""
+    """Build one protected U67 decision from the latest supplied observation."""
     assert_tcc_u67_operational_contract(config)
     frames, symbols, common_dates, scientific_config = _prepare_live_u67_panel(
         bars_by_symbol,
