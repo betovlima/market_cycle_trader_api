@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE
 from ..core.environment import load_project_environment
 
 
@@ -31,6 +32,10 @@ from ..infrastructure.persistence.mongo_repository import (
 from ..schemas.requests import BacktestExecutionRequest, BacktestRequest
 from ..services.reproducibility import build_reproducibility_manifest
 from .capital_rotation import run_rotation_models
+from .tcc_u67_operational_runtime import (
+    assert_tcc_u67_operational_contract,
+    run_tcc_u67_operational_backtest,
+)
 from .market_data import validate_and_clean_bars
 from .research_market_data import (
     StructuralResearchAssetExclusion,
@@ -307,6 +312,12 @@ def run_job(
     BacktestExecutionRequest,
 ]:
     effective_config = effective_research_config(config)
+    tcc_u67_runtime = (
+        str(effective_config.strategy_mode)
+        == TCC_U67_CONTROL_OPERATIONAL_MODE
+    )
+    if tcc_u67_runtime:
+        assert_tcc_u67_operational_contract(effective_config)
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
     structural_exclusions: list[dict[str, Any]] = []
@@ -566,16 +577,26 @@ def run_job(
     )
     heartbeat_stop, heartbeat_thread = _start_progress_heartbeat()
     try:
-        results = run_rotation_models(
-            bars_by_symbol,
-            effective_config,
-            calculate_reference_fees,
-            apply_slippage,
-            progress_callback=emit_progress,
-            trade_callback=emit_trade,
-            progress_detail_callback=emit_progress_detail,
-            technical_log_callback=emit_research_technical,
-        )
+        if tcc_u67_runtime:
+            results = run_tcc_u67_operational_backtest(
+                bars_by_symbol,
+                effective_config,
+                progress_callback=emit_progress,
+                trade_callback=emit_trade,
+                progress_detail_callback=emit_progress_detail,
+                technical_log_callback=emit_research_technical,
+            )
+        else:
+            results = run_rotation_models(
+                bars_by_symbol,
+                effective_config,
+                calculate_reference_fees,
+                apply_slippage,
+                progress_callback=emit_progress,
+                trade_callback=emit_trade,
+                progress_detail_callback=emit_progress_detail,
+                technical_log_callback=emit_research_technical,
+            )
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1.0)
