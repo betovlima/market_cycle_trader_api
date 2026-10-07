@@ -448,7 +448,30 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
         "current_asset": plan.get("current_asset"),
         "target_asset": plan.get("target_asset"),
         "action": plan.get("action"),
-        "manual_current_session_recovery": bool(plan.get("manual_current_session_recovery")),
+        "manual_current_session_recovery": bool(
+            plan.get("manual_current_session_recovery")
+        ),
+        "analysis_mode": plan.get("analysis_mode"),
+        "analysis_timestamp_utc": bson_value(
+            plan.get("analysis_timestamp_utc")
+        ),
+        "historical_cutoff": plan.get("historical_cutoff"),
+        "live_session": plan.get("live_session"),
+        "current_session_live_feed": plan.get(
+            "current_session_live_feed"
+        ),
+        "current_session_live_timeframe": plan.get(
+            "current_session_live_timeframe"
+        ),
+        "current_session_intraday_asset_count": plan.get(
+            "current_session_intraday_asset_count"
+        ),
+        "current_session_earliest_last_bar_utc": bson_value(
+            plan.get("current_session_earliest_last_bar_utc")
+        ),
+        "current_session_latest_last_bar_utc": bson_value(
+            plan.get("current_session_latest_last_bar_utc")
+        ),
         "failure_code": failure_code,
         "recovery_required": recovery_required,
         "failed_execution_stage": plan.get("failed_execution_stage"),

@@ -51,6 +51,13 @@ def test_u67_operational_contract_rejects_asset_drift() -> None:
     assert any("exact U67" in issue for issue in issues)
 
 
+def test_u67_operational_contract_rejects_live_feed_drift() -> None:
+    payload = tcc_u67_strategy_updates()
+    payload["alpaca_live_feed"] = "sip"
+    issues = tcc_u67_contract_issues(SimpleNamespace(**payload))
+    assert any("alpaca_live_feed" in issue for issue in issues)
+
+
 def test_clmt_is_removed_by_operational_identity_policy() -> None:
     issue = _structural_issue("CLMT", [])
     assert issue is not None

@@ -313,3 +313,50 @@ Executar o primeiro backtest operacional U67 com dados atuais e auditar:
 
 Somente após essa validação será criado o shadow prospectivo. O modo continua
 inelegível para o Trader até que a paridade live seja demonstrada.
+
+## 2026-10-07 — API v10.8.89 — recuperação manual U67 com sessão corrente intraday
+
+### Causa
+A v10.8.88 liberou a reanálise manual durante o pregão, porém o plano ainda era
+calculado exclusivamente com candles diários concluídos. Assim, em 07/10/2026,
+a tela preparou uma decisão com `decision_date=2026-10-06` (XSD -> MAN), embora
+o objetivo do botão seja recalcular o Winner usando também o movimento já
+observado na sessão aberta de 07/10 antes de permitir execução manual.
+
+### Alteração
+- Mantidos os endpoints existentes de manual recovery.
+- O U67 baixa o snapshot histórico diário completo até a última sessão segura.
+- Durante mercado aberto, agrega barras Alpaca live de 1 minuto da sessão
+  corrente em um candle diário parcial.
+- Esse candle parcial entra apenas como observação prospectiva de scoring.
+- Treino/calibração continuam protegidos pelo purge U67 e por sessões históricas.
+- O plano manual passa a usar a própria sessão corrente como `decision_date` e
+  `execution_session`.
+- O plano registra provenance intraday: horário da análise, cutoff histórico,
+  feed, timeframe e timestamps das barras atuais.
+- Falha fechada se um ativo elegível não tiver barra intraday atual.
+- A reanálise continua sem enviar ordens. Somente o endpoint explícito de
+  execução pode operar na Alpaca Paper.
+
+### Versão e branch
+- API `10.8.89`
+- `feature/v10.8.89-current-session-intraday-recovery`
+
+### Impacto
+O botão **Reanalyze Winner for today** passa a representar o mercado observado
+até o momento da sessão aberta, em vez de apenas repetir a decisão do fechamento
+anterior. O botão **Retry plan on Alpaca** continua restrito ao plano
+`prepared` e ao mercado regular aberto.
+
+### Testes
+- agregação OHLCV/VWAP/trade_count da sessão corrente;
+- uso do feed live IEX e timeframe de 1 minuto;
+- falha fechada sem barras da sessão;
+- presença obrigatória do caminho intraday no runtime Paper U67.
+
+### Próximos passos
+Validar em Paper que uma reanálise durante a sessão produz
+`analysis_mode=current_session_intraday`, `decision_date` igual à sessão
+corrente e, após confirmação explícita, reconcilia corretamente a rotação na
+Alpaca.
+

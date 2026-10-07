@@ -63,6 +63,7 @@ def _adjustment_value(adjustment: str):
 def _timeframe_value(timeframe: str):
     *_, TimeFrame, TimeFrameUnit = _require_alpaca()
     mapping = {
+        "1Min": TimeFrame.Minute,
         "5Min": TimeFrame(5, TimeFrameUnit.Minute),
         "15Min": TimeFrame(15, TimeFrameUnit.Minute),
         "30Min": TimeFrame(30, TimeFrameUnit.Minute),
