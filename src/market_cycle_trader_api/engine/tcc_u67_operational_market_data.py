@@ -10,10 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from ..core.environment import PROJECT_ROOT
+from ..infrastructure.market_data.alpaca import download_stock_bars
+from ..infrastructure.persistence.mongo_repository import get_alpaca_credentials
 from ..tcc_u67_v1210_reference.contract import U67_REQUESTED_ASSETS
 from .market_data import (
     _download_alpaca_bars,
@@ -29,6 +32,8 @@ from .research_market_data import (
 DATA_DIRECTORY = PROJECT_ROOT / "dados" / "tcc_u67_operational" / "snapshots"
 SOURCE_CONTRACT = "alpaca_raw_sip_ca_split_normalized_u67_v1"
 ProgressCallback = Callable[[str, int, int, str], None]
+EASTERN = ZoneInfo("America/New_York")
+LIVE_INTRADAY_TIMEFRAME = "1Min"
 
 # This identity break was explicitly adjudicated by the TCC pipeline.
 KNOWN_U67_STRUCTURAL_EXCLUSIONS: dict[str, dict[str, Any]] = {
@@ -81,6 +86,195 @@ def _structural_issue(
     if known is not None:
         return dict(known)
     return structural_identity_issue(symbol, actions)
+
+
+def _current_session_intraday_bar(
+    frame: pd.DataFrame,
+    *,
+    session: str,
+) -> pd.DataFrame:
+    """Aggregate completed intraday bars into one in-progress daily bar."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    intraday = frame.copy()
+    intraday.index = pd.to_datetime(intraday.index, utc=True)
+    session_date = pd.Timestamp(session).date()
+    local_dates = intraday.index.tz_convert(EASTERN).date
+    intraday = intraday.loc[local_dates == session_date]
+    if intraday.empty:
+        return pd.DataFrame()
+
+    intraday = intraday.sort_index()
+    volume = pd.to_numeric(intraday["volume"], errors="coerce").fillna(0.0)
+    total_volume = float(volume.sum())
+    row: dict[str, float] = {
+        "open": float(intraday["open"].iloc[0]),
+        "high": float(pd.to_numeric(intraday["high"], errors="coerce").max()),
+        "low": float(pd.to_numeric(intraday["low"], errors="coerce").min()),
+        "close": float(intraday["close"].iloc[-1]),
+        "volume": total_volume,
+    }
+    if "vwap" in intraday.columns:
+        vwap = pd.to_numeric(intraday["vwap"], errors="coerce")
+        valid = vwap.notna() & volume.notna()
+        weighted_volume = float(volume.loc[valid].sum())
+        if weighted_volume > 0:
+            row["vwap"] = float(
+                (vwap.loc[valid] * volume.loc[valid]).sum()
+                / weighted_volume
+            )
+    if "trade_count" in intraday.columns:
+        row["trade_count"] = float(
+            pd.to_numeric(
+                intraday["trade_count"],
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+
+    session_timestamp = pd.Timestamp(
+        session_date,
+        tz=EASTERN,
+    ).tz_convert("UTC")
+    result = pd.DataFrame([row], index=pd.DatetimeIndex([session_timestamp]))
+    result.index.name = "timestamp"
+    result.attrs["intraday_source_last_timestamp_utc"] = pd.Timestamp(
+        intraday.index[-1]
+    ).isoformat()
+    result.attrs["intraday_source_rows"] = int(len(intraday))
+    return result
+
+
+def append_u67_current_session_intraday(
+    frames: dict[str, pd.DataFrame],
+    config: Any,
+    *,
+    session: str,
+    now: datetime | pd.Timestamp | None = None,
+    per_asset_pause_seconds: float = 0.05,
+) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+    """Append today's in-progress regular-session bar for a manual live decision.
+
+    Historical training/calibration remains daily and completed-session only.
+    The appended row is used only as the prospective scoring observation.
+    """
+    session_date = pd.Timestamp(session).date()
+    stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+    stamp = (
+        stamp.tz_localize("UTC")
+        if stamp.tzinfo is None
+        else stamp.tz_convert("UTC")
+    )
+    local_now = stamp.tz_convert(EASTERN)
+    if local_now.date() != session_date:
+        raise RuntimeError(
+            "CurrentSessionIntradayDateMismatch: "
+            f"requested={session_date.isoformat()}, "
+            f"now={local_now.date().isoformat()}."
+        )
+
+    regular_open = pd.Timestamp(
+        f"{session_date.isoformat()} 09:30:00",
+        tz=EASTERN,
+    ).tz_convert("UTC")
+    if stamp <= regular_open:
+        raise RuntimeError(
+            "CurrentSessionIntradayNotStarted: regular XNYS trading "
+            "has not started for the requested session."
+        )
+
+    credentials = get_alpaca_credentials()
+    live_feed = str(
+        getattr(config, "alpaca_live_feed", "iex") or "iex"
+    ).strip().lower()
+    augmented: dict[str, pd.DataFrame] = {}
+    per_asset: dict[str, dict[str, Any]] = {}
+    last_bar_timestamps: list[pd.Timestamp] = []
+    symbols = list(frames)
+    total = len(symbols)
+
+    for position, symbol in enumerate(symbols, start=1):
+        intraday = download_stock_bars(
+            api_key_id=credentials["api_key_id"],
+            secret_key=credentials["secret_key"],
+            symbol=symbol,
+            timeframe=LIVE_INTRADAY_TIMEFRAME,
+            start=regular_open.to_pydatetime(),
+            end=stamp.to_pydatetime(),
+            feed=live_feed,
+            adjustment="raw",
+        )
+        current_bar = _current_session_intraday_bar(
+            intraday,
+            session=session_date.isoformat(),
+        )
+        if current_bar.empty:
+            raise RuntimeError(
+                "CurrentSessionIntradayDataMissing: "
+                f"{symbol} has no {live_feed.upper()} regular-session bars "
+                f"for {session_date.isoformat()}."
+            )
+
+        historical = frames[symbol].copy()
+        historical.index = pd.to_datetime(historical.index, utc=True)
+        historical_dates = historical.index.tz_convert(EASTERN).date
+        historical = historical.loc[historical_dates != session_date]
+        combined = pd.concat([historical, current_bar]).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+        combined.attrs.update(dict(getattr(frames[symbol], "attrs", {}) or {}))
+        combined.attrs.update(
+            {
+                "current_session_intraday": True,
+                "current_session": session_date.isoformat(),
+                "current_session_live_feed": live_feed,
+                "current_session_timeframe": LIVE_INTRADAY_TIMEFRAME,
+                "current_session_analysis_timestamp_utc": stamp.isoformat(),
+            }
+        )
+        augmented[symbol] = combined
+
+        last_bar = pd.Timestamp(
+            current_bar.attrs["intraday_source_last_timestamp_utc"]
+        )
+        last_bar = (
+            last_bar.tz_localize("UTC")
+            if last_bar.tzinfo is None
+            else last_bar.tz_convert("UTC")
+        )
+        last_bar_timestamps.append(last_bar)
+        per_asset[symbol] = {
+            "intraday_rows": int(
+                current_bar.attrs["intraday_source_rows"]
+            ),
+            "last_intraday_bar_utc": last_bar.isoformat(),
+            "open": float(current_bar["open"].iloc[0]),
+            "high": float(current_bar["high"].iloc[0]),
+            "low": float(current_bar["low"].iloc[0]),
+            "close": float(current_bar["close"].iloc[0]),
+            "volume": float(current_bar["volume"].iloc[0]),
+        }
+        if per_asset_pause_seconds > 0 and position != total:
+            time.sleep(per_asset_pause_seconds)
+
+    return augmented, {
+        "analysis_mode": "current_session_intraday",
+        "live_session": session_date.isoformat(),
+        "analysis_timestamp_utc": stamp.isoformat(),
+        "live_feed": live_feed,
+        "live_timeframe": LIVE_INTRADAY_TIMEFRAME,
+        "intraday_asset_count": int(len(augmented)),
+        "earliest_last_intraday_bar_utc": (
+            min(last_bar_timestamps).isoformat()
+            if last_bar_timestamps
+            else None
+        ),
+        "latest_last_intraday_bar_utc": (
+            max(last_bar_timestamps).isoformat()
+            if last_bar_timestamps
+            else None
+        ),
+        "per_asset": per_asset,
+    }
 
 
 def download_u67_operational_snapshot(
