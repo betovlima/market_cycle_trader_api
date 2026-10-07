@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from market_cycle_trader_api.api.routers.tcc_u67_operational import router
+from market_cycle_trader_api.schemas.requests import BacktestRequest
 from market_cycle_trader_api.core.config import (
     RESEARCH_ONLY_SWING_STRATEGY_MODES,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
@@ -80,3 +81,11 @@ def test_u67_research_router_exposes_install_and_backtest_only() -> None:
 
 def test_u67_source_commit_remains_main_checkpoint() -> None:
     assert SOURCE_COMMIT == "4b5f16030afa8b850790747bb0e3e3063d233e79"
+
+
+
+def test_legacy_tcc_v106_profile_still_validates() -> None:
+    payload = tcc_u67_strategy_updates()
+    payload["strategy_mode"] = "COMPOUND_ROTATION_SWING_TCC_CONTROL_V106"
+    request = BacktestRequest.model_validate(payload)
+    assert request.strategy_mode == "COMPOUND_ROTATION_SWING_TCC_CONTROL_V106"
