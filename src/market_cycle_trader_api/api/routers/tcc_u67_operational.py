@@ -58,9 +58,10 @@ def get_u67_operational_engine() -> dict[str, Any]:
         "structural_identity_policy": (
             "exclude; never bridge or reconstruct"
         ),
-        "stage": "backtest_only",
-        "trader_eligible": False,
-        "order_submission": "never",
+        "stage": "protected_live_runtime",
+        "trader_eligible": True,
+        "winner_promotion_preserves_operational_state": True,
+        "backtest_order_submission": "never",
     }
 
 
@@ -68,7 +69,7 @@ def get_u67_operational_engine() -> dict[str, Any]:
 def install_u67_strategy(
     identity: AdminIdentity,
 ) -> dict[str, Any]:
-    """Create/reuse U67 and select it only for Research/Backtest."""
+    """Create/reuse U67 and select it for Research with protected live runtime."""
     try:
         return install_tcc_u67_operational_strategy(
             database(),
@@ -86,7 +87,7 @@ def install_u67_strategy(
 
 @router.post("/jobs", status_code=202)
 def create_u67_operational_backtest() -> dict[str, Any]:
-    """Run fresh-data U67 backtest only; never certify or promote a Strategy."""
+    """Run fresh-data U67 backtest; this endpoint never submits orders."""
     db = database()
     configuration, selected_strategy = get_research_strategy_context(db)
     if (
