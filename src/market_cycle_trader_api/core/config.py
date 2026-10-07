@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-API_VERSION = "10.8.85"
+API_VERSION = "10.8.86"
 ENGINE_MODULE = "market_cycle_trader_api.engine.compound_rotation_backtest"
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PACKAGE_DIR.parent
@@ -28,7 +28,6 @@ STRATEGY_LABELS = {
 }
 SWING_STRATEGY_MODES = frozenset(STRATEGY_LABELS)
 RESEARCH_ONLY_SWING_STRATEGY_MODES = frozenset({
-    TCC_U67_CONTROL_OPERATIONAL_MODE,
     TCC_V106_LEGACY_MODE,
     "COMPOUND_ROTATION_SWING_OPPORTUNITY_CASH_GATE",
     "COMPOUND_ROTATION_SWING_ABSOLUTE_UTILITY_CASH_GATE",
