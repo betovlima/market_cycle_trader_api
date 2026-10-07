@@ -22,6 +22,7 @@ from ...services.tcc_u67_operational_strategy import (
     BACKTEST_ENGINE_BINDING,
     REFERENCE_ENGINE_ID,
     install_tcc_u67_operational_strategy,
+    recover_stale_live_market_refresh_lock,
 )
 from ...tcc_u67_v1210_reference.contract import (
     EXPECTED_ENDING_CAPITAL,
@@ -83,6 +84,14 @@ def install_u67_strategy(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/recover-stale-live-market-lock")
+def recover_u67_stale_live_market_lock(
+    _: AdminIdentity,
+) -> dict[str, Any]:
+    """Clear only an orphaned refresh lock after safety checks."""
+    return recover_stale_live_market_refresh_lock(database())
 
 
 @router.post("/jobs", status_code=202)
