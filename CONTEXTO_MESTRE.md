@@ -1,5 +1,73 @@
 # CONTEXTO_MESTRE
 
+## 2026-10-07 - API v10.8.86 U67 protected live runtime
+
+Branch ativa: `feature/v10.8.86-tcc-u67-live-runtime`.
+
+Motivo:
+
+A Strategy #29 U67 foi instalada e o backtest de producao foi concluido com o
+resultado homologado, mas a promocao para Winner permanecia bloqueada pelo
+gate `research_reference_engine_not_live`. A causa era intencional na
+v10.8.85: o U67 possuia apenas runtime protegido de backtest.
+
+Precedente historico:
+
+O mesmo problema apareceu na linha TCC v1.0.6 e foi tratado na branch
+`feature/v10.8.62-tcc-control-operational-runtime` / PR #31, criando um
+runtime live separado do engine cientifico congelado e permitindo Trader
+somente quando o contrato completo fosse compativel.
+
+Implementacao v10.8.86:
+
+- `COMPOUND_ROTATION_SWING_TCC_U67_V1210` deixa de ser Research-only;
+- o backtest U67 continua usando o mesmo engine cientifico v1.21.0;
+- novo `build_live_tcc_u67_decision()` prepara uma decisao prospectiva de
+  next-open apenas com barras concluidas;
+- cada preparacao live baixa novamente todo o historico Alpaca RAW/SIP,
+  Corporate Actions e aplica a mesma normalizacao de splits e exclusoes do
+  backtest homologado;
+- o live runtime usa o mesmo calendario U56 elegivel, LightGBM, calibracao,
+  minimum holding, cash threshold, expected edge e switch margin;
+- a compatibilidade para Winner exige o binding
+  `tcc_u67_v1210_operational_backtest`, configuracao U67 exata e snapshot
+  LightGBM exato;
+- qualquer drift de contrato bloqueia a promocao;
+- o endpoint de instalacao U67 passa a marcar o perfil como
+  `protected_live_runtime` e `live_trader_eligible=true`.
+
+Preservacao da posicao operacional:
+
+A promocao para Winner continua sem interacao com a corretora e sem
+reinicializar Paper State. Os campos existentes permanecem:
+
+- `broker_interaction_performed=false`;
+- `operational_state_preserved=true`;
+- `paper_state_reinitialization_required=false`;
+- `current_position_preserved=true`.
+
+No estado atual de producao, a conta/Mongo esta comprada em XSD. Ao promover a
+Strategy #29, XSD deve permanecer intacto. Na primeira avaliacao U67, o runtime
+recebe `current_asset=XSD` e o `holding_sessions` existente. XSD so pode ser
+vendido por uma decisao normal da politica U67 para outro ativo ou CASH.
+
+Auditoria de dados live:
+
+Cada decisao U67 cria snapshot imutavel em
+`dados/tcc_u67_operational/snapshots/trader-u67-<session>-<id>/` e registra no
+Paper plan o cutoff, snapshot ID, SHA-256, ativos efetivos e exclusoes
+estruturais.
+
+Protecoes mantidas:
+
+- promocao bloqueada durante execucao de ordens;
+- promocao bloqueada durante calibracao/refresh critico;
+- reconciliacao obrigatoria Mongo x Alpaca antes de preparar plano;
+- nenhuma ordem e enviada pelo ato de promocao;
+- nenhum parametro de backtest foi alterado para habilitar live;
+- a main permanece intocada ate merge explicito.
+
+
 ## Fechamento validado 2026-10-07 - Strategy #13 reproduzida no TCC
 
 A Strategy #13 do MCT foi reproduzida independentemente dentro do TCC com
