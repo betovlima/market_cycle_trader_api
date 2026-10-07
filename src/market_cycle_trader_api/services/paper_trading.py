@@ -17,6 +17,7 @@ from ..core.config import (
 )
 from ..engine.live_model_signal import build_live_model_decision
 from ..engine.tcc_u67_operational_market_data import (
+    append_u67_current_session_intraday,
     download_u67_operational_snapshot,
 )
 from ..engine.tcc_u67_operational_runtime import (
@@ -600,6 +601,27 @@ def prepare_next_paper_plan(
                 "U67 live snapshot has no completed bars for: "
                 + ", ".join(empty)
             )
+
+        intraday_metadata: dict[str, Any] = {}
+        if allow_open_market:
+            current_session = pd.Timestamp(clock["timestamp"])
+            current_session = (
+                current_session.tz_localize("UTC")
+                if current_session.tzinfo is None
+                else current_session.tz_convert("UTC")
+            )
+            current_session = (
+                current_session.tz_convert(EASTERN).date().isoformat()
+            )
+            bars_by_symbol, intraday_metadata = (
+                append_u67_current_session_intraday(
+                    bars_by_symbol,
+                    strategy,
+                    session=current_session,
+                    now=clock["timestamp"],
+                )
+            )
+
         live_metadata = update_trader_live_market_cutoff(
             db,
             cutoff=target_session,
@@ -611,6 +633,25 @@ def prepare_next_paper_plan(
             "target_session": target_session,
             "refreshed": True,
             "full_daily_history_refresh": True,
+            "analysis_mode": (
+                intraday_metadata.get("analysis_mode")
+                or "completed_daily"
+            ),
+            "analysis_timestamp_utc": intraday_metadata.get(
+                "analysis_timestamp_utc"
+            ),
+            "live_session": intraday_metadata.get("live_session"),
+            "live_feed": intraday_metadata.get("live_feed"),
+            "live_timeframe": intraday_metadata.get("live_timeframe"),
+            "intraday_asset_count": intraday_metadata.get(
+                "intraday_asset_count"
+            ),
+            "earliest_last_intraday_bar_utc": intraday_metadata.get(
+                "earliest_last_intraday_bar_utc"
+            ),
+            "latest_last_intraday_bar_utc": intraday_metadata.get(
+                "latest_last_intraday_bar_utc"
+            ),
             "u67_snapshot_job_id": live_job_id,
             "u67_snapshot_sha256": snapshot.manifest.get(
                 "snapshot_sha256"
@@ -695,22 +736,50 @@ def prepare_next_paper_plan(
                 f"requested={execution_session}, current={current_session}."
             )
 
-    calendar_start = (expected_open.tz_convert(EASTERN).date() - timedelta(days=14))
+    calendar_start = (
+        expected_open.tz_convert(EASTERN).date() - timedelta(days=14)
+    )
     calendar_end = expected_open.tz_convert(EASTERN).date()
     sessions = calendar_session_dates(
         client,
         start_date=calendar_start,
         end_date=calendar_end,
     )
-    completed_sessions = [item for item in sessions if item < execution_session]
-    if not completed_sessions:
-        raise RuntimeError("Alpaca calendar did not return a completed session before the next open.")
-    expected_decision_date = completed_sessions[-1]
+    current_session_intraday = bool(
+        allow_open_market
+        and str(strategy.strategy_mode)
+        == TCC_U67_CONTROL_OPERATIONAL_MODE
+        and live_market.get("analysis_mode")
+        == "current_session_intraday"
+    )
+    if current_session_intraday:
+        if execution_session not in sessions:
+            raise RuntimeError(
+                "Alpaca calendar does not identify the requested current "
+                f"session as a regular trading session: {execution_session}."
+            )
+        expected_decision_date = execution_session
+    else:
+        completed_sessions = [
+            item for item in sessions if item < execution_session
+        ]
+        if not completed_sessions:
+            raise RuntimeError(
+                "Alpaca calendar did not return a completed session before "
+                "the next open."
+            )
+        expected_decision_date = completed_sessions[-1]
+
     if decision_date != expected_decision_date:
+        expected_kind = (
+            "current intraday session"
+            if current_session_intraday
+            else "most recent completed Alpaca session"
+        )
         raise RuntimeError(
-            "The latest aligned daily candle is not the most recent completed Alpaca session: "
-            f"data={decision_date}, expected={expected_decision_date}. "
-            "Wait for the daily market-data bar/cache to refresh before preparing the order plan."
+            "The latest aligned U67 observation does not match the expected "
+            f"{expected_kind}: data={decision_date}, "
+            f"expected={expected_decision_date}."
         )
 
     current = decision.current_asset
@@ -769,6 +838,21 @@ def prepare_next_paper_plan(
         "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
         "live_market_cutoff": live_market.get("live_market_cutoff"),
+        "analysis_mode": live_market.get("analysis_mode") or "completed_daily",
+        "analysis_timestamp_utc": live_market.get("analysis_timestamp_utc"),
+        "historical_cutoff": live_market.get("target_session"),
+        "live_session": live_market.get("live_session"),
+        "current_session_live_feed": live_market.get("live_feed"),
+        "current_session_live_timeframe": live_market.get("live_timeframe"),
+        "current_session_intraday_asset_count": live_market.get(
+            "intraday_asset_count"
+        ),
+        "current_session_earliest_last_bar_utc": live_market.get(
+            "earliest_last_intraday_bar_utc"
+        ),
+        "current_session_latest_last_bar_utc": live_market.get(
+            "latest_last_intraday_bar_utc"
+        ),
         "u67_live_snapshot_job_id": live_market.get("u67_snapshot_job_id"),
         "u67_live_snapshot_sha256": live_market.get("u67_snapshot_sha256"),
         "u67_live_effective_assets": live_market.get("u67_eligible_assets"),
