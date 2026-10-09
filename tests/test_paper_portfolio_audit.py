@@ -71,6 +71,7 @@ class PaperPortfolioAuditTests(unittest.TestCase):
         self.assertTrue(rows[0]["economic_fill"])
         self.assertEqual(rows[0]["status"], "canceled")
         self.assertAlmostEqual(rows[0]["filled_value"], 6888.0, places=6)
+        self.assertAlmostEqual(rows[0]["realized_pnl"], 28.0, places=6)
         self.assertEqual(pnl[0]["symbol"], "MSFT")
         self.assertAlmostEqual(pnl[0]["realized_pnl"], 28.0, places=6)
         self.assertAlmostEqual(pnl[0]["open_quantity"], 6.0, places=6)
