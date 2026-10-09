@@ -360,3 +360,48 @@ Validar em Paper que uma reanálise durante a sessão produz
 corrente e, após confirmação explícita, reconcilia corretamente a rotação na
 Alpaca.
 
+## 2026-10-09 — API v10.8.90 — auditoria operacional integrada ao Portfolio
+
+### Objetivo
+Exibir na própria tela do Portfolio a auditoria das operações Paper e a
+explicação das decisões do dia, sem depender da exportação ZIP para análise
+manual.
+
+### Escopo
+- somente leitura;
+- nenhuma alteração no caminho de execução de ordens;
+- nenhuma alteração em Winner, modelo, parâmetros ou política operacional;
+- nenhuma alteração no scheduler.
+
+### Dados adicionados ao Portfolio
+- capital atual, pico, distância ao pico e maximum drawdown;
+- histórico enriquecido com peak e drawdown;
+- P/L realizado e não realizado por ativo;
+- operações com filled value e realized P/L;
+- partial fill com filled_quantity > 0 tratado como execução econômica mesmo
+  quando o status final for canceled;
+- decisão mais recente com ranking completo;
+- utility atual, utility alvo e utility do líder bruto;
+- deltas contra o ativo atual e o líder;
+- switch margin e indicação de passagem;
+- holding sessions e mínimo exigido;
+- motivo de seleção/hold;
+- provenance de execução.
+
+### Novos campos persistidos
+Planos criados a partir desta versão registram:
+- holding_sessions_at_decision;
+- minimum_holding_sessions.
+
+### Observação operacional
+A rotação XSD -> MAN executada por manual recovery durante a implantação da
+versão intraday é comportamento conhecido e esperado da fase de testes/
+implantação. O dashboard preserva essa provenance para auditoria, sem tratá-la
+como decisão manual do modelo.
+
+### Versão
+API 10.8.90
+
+### Branch
+feature/v10.8.90-portfolio-audit-dashboard
+

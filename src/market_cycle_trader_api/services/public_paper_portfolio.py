@@ -50,6 +50,7 @@ def public_paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
         "last_execution_session",
         "market_clock",
         "history",
+        "audit",
     )
     output = {key: source.get(key) for key in allowed}
     output["recent_orders"] = [
