@@ -340,6 +340,50 @@ def pnl_by_asset(
     return rows
 
 
+def _realized_pnl_by_order(
+    orders: list[dict[str, Any]],
+) -> dict[str, float]:
+    ledgers: dict[str, dict[str, float]] = {}
+    realized: dict[str, float] = {}
+
+    for index, order in enumerate(orders):
+        symbol = str(order.get("symbol") or "").strip().upper()
+        side = str(order.get("side") or "").strip().lower()
+        quantity = _finite_float(order.get("filled_quantity"))
+        price = _finite_float(order.get("filled_average_price"))
+        if not symbol or side not in {"buy", "sell"} or quantity is None or price is None:
+            continue
+        if quantity <= 0:
+            continue
+
+        item = ledgers.setdefault(
+            symbol,
+            {"quantity": 0.0, "average_cost": 0.0},
+        )
+        if side == "buy":
+            prior_quantity = item["quantity"]
+            new_quantity = prior_quantity + quantity
+            if new_quantity > 0:
+                item["average_cost"] = (
+                    prior_quantity * item["average_cost"] + quantity * price
+                ) / new_quantity
+            item["quantity"] = new_quantity
+            continue
+
+        matched = min(quantity, max(0.0, item["quantity"]))
+        if matched <= 0:
+            continue
+        pnl = matched * (price - item["average_cost"])
+        key = str(order.get("client_order_id") or f"index:{index}")
+        realized[key] = pnl
+        item["quantity"] = max(0.0, item["quantity"] - matched)
+        if item["quantity"] <= 1e-10:
+            item["quantity"] = 0.0
+            item["average_cost"] = 0.0
+
+    return realized
+
+
 def operation_rows(
     orders: list[dict[str, Any]],
     plan_map: dict[str, dict[str, Any]],
@@ -347,12 +391,18 @@ def operation_rows(
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for order in reversed(orders[-max(0, int(limit)):]):
+    realized_by_order = _realized_pnl_by_order(orders)
+    visible_orders = orders[-max(0, int(limit)):]
+    for reverse_index, order in enumerate(reversed(visible_orders)):
+        original_index = len(orders) - 1 - reverse_index
         filled_quantity = _finite_float(order.get("filled_quantity"))
         fill_price = _finite_float(order.get("filled_average_price"))
         economic_fill = bool(filled_quantity is not None and filled_quantity > 0)
         plan_id = str(order.get("plan_id") or "")
         audit = decision_audit(plan_map.get(plan_id), candidate_limit=8) if plan_id else None
+        realized_key = str(
+            order.get("client_order_id") or f"index:{original_index}"
+        )
         rows.append(
             {
                 key: bson_value(order.get(key))
@@ -380,6 +430,7 @@ def operation_rows(
                     if economic_fill and fill_price is not None
                     else None
                 ),
+                "realized_pnl": realized_by_order.get(realized_key),
                 "decision_available": audit is not None,
                 "execution_origin": (
                     audit.get("execution_origin") if audit else "historical_unknown"
