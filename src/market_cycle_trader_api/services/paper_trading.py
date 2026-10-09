@@ -834,6 +834,8 @@ def prepare_next_paper_plan(
     document = {
         **plan.model_dump(mode="python"),
         "raw_best_asset": decision.raw_best_asset,
+        "holding_sessions_at_decision": int(state.holding_sessions),
+        "minimum_holding_sessions": int(strategy.rotation_min_holding_days),
         "effective_compute_device": decision.effective_compute_device,
         "compute_fallback_reason": decision.compute_fallback_reason,
         "paper_account_id": account["id"],
