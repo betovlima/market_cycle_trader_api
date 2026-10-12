@@ -152,6 +152,7 @@ def append_u67_current_session_intraday(
     session: str,
     now: datetime | pd.Timestamp | None = None,
     per_asset_pause_seconds: float = 0.05,
+    current_asset: str | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
     """Append today's in-progress regular-session bar for a manual live decision.
 
@@ -190,6 +191,9 @@ def append_u67_current_session_intraday(
     augmented: dict[str, pd.DataFrame] = {}
     per_asset: dict[str, dict[str, Any]] = {}
     last_bar_timestamps: list[pd.Timestamp] = []
+    fallback_assets: list[str] = []
+    missing_assets: list[str] = []
+    missing_reasons: dict[str, str] = {}
     symbols = list(frames)
     total = len(symbols)
 
@@ -208,12 +212,55 @@ def append_u67_current_session_intraday(
             intraday,
             session=session_date.isoformat(),
         )
+        source_feed = live_feed
+        sip_error = None
+        if current_bar.empty and live_feed == "iex":
+            # IEX is only one execution venue; an active US stock may have
+            # no IEX trades today. SIP has consolidated market coverage.
+            # Use an as-of cutoff compatible with delayed SIP entitlements.
+            sip_end = stamp - pd.Timedelta(minutes=20)
+            if sip_end > regular_open:
+                try:
+                    sip_bars = download_stock_bars(
+                        api_key_id=credentials["api_key_id"],
+                        secret_key=credentials["secret_key"],
+                        symbol=symbol,
+                        timeframe=LIVE_INTRADAY_TIMEFRAME,
+                        start=regular_open.to_pydatetime(),
+                        end=sip_end.to_pydatetime(),
+                        feed="sip",
+                        adjustment="raw",
+                    )
+                    current_bar = _current_session_intraday_bar(
+                        sip_bars,
+                        session=session_date.isoformat(),
+                    )
+                    if not current_bar.empty:
+                        source_feed = "sip"
+                        fallback_assets.append(symbol)
+                except Exception as exc:
+                    # An IEX-only entitlement can reject SIP. Report that
+                    # limitation without inventing a current-session price.
+                    sip_error = f"{type(exc).__name__}: {exc}"
+            else:
+                sip_error = "delayed SIP window has not started"
         if current_bar.empty:
-            raise RuntimeError(
-                "CurrentSessionIntradayDataMissing: "
-                f"{symbol} has no {live_feed.upper()} regular-session bars "
-                f"for {session_date.isoformat()}."
+            missing_assets.append(symbol)
+            missing_reasons[symbol] = (
+                f"no {live_feed.upper()} current-session bars"
+                + (f"; SIP fallback: {sip_error}" if sip_error
+                   else "; no consolidated SIP bars")
             )
+            if str(current_asset or "").upper() == symbol.upper():
+                raise RuntimeError(
+                    "CurrentSessionIntradayDataMissing: "
+                    f"{symbol} is the currently held asset and has no "
+                    f"current-session market price for {session_date.isoformat()}; "
+                    + missing_reasons[symbol]
+                )
+            # Temporarily omit this symbol from the present decision only.
+            # Never fabricate an OHLCV bar or remove its historical identity.
+            continue
 
         historical = frames[symbol].copy()
         historical.index = pd.to_datetime(historical.index, utc=True)
@@ -226,7 +273,7 @@ def append_u67_current_session_intraday(
             {
                 "current_session_intraday": True,
                 "current_session": session_date.isoformat(),
-                "current_session_live_feed": live_feed,
+                "current_session_live_feed": source_feed,
                 "current_session_timeframe": LIVE_INTRADAY_TIMEFRAME,
                 "current_session_analysis_timestamp_utc": stamp.isoformat(),
             }
@@ -243,6 +290,7 @@ def append_u67_current_session_intraday(
         )
         last_bar_timestamps.append(last_bar)
         per_asset[symbol] = {
+            "feed": source_feed,
             "intraday_rows": int(
                 current_bar.attrs["intraday_source_rows"]
             ),
@@ -256,12 +304,23 @@ def append_u67_current_session_intraday(
         if per_asset_pause_seconds > 0 and position != total:
             time.sleep(per_asset_pause_seconds)
 
+    if not augmented:
+        raise RuntimeError(
+            "CurrentSessionIntradayDataMissing: none of the "
+            f"{len(symbols)} assets has current-session bars for "
+            f"{session_date.isoformat()}. Details: {missing_reasons}"
+        )
     return augmented, {
         "analysis_mode": "current_session_intraday",
         "live_session": session_date.isoformat(),
         "analysis_timestamp_utc": stamp.isoformat(),
-        "live_feed": live_feed,
+        "live_feed": (
+            "mixed_iex_sip" if fallback_assets else live_feed
+        ),
         "live_timeframe": LIVE_INTRADAY_TIMEFRAME,
+        "intraday_fallback_assets": fallback_assets,
+        "intraday_missing_assets": missing_assets,
+        "intraday_missing_reasons": missing_reasons,
         "intraday_asset_count": int(len(augmented)),
         "earliest_last_intraday_bar_utc": (
             min(last_bar_timestamps).isoformat()
