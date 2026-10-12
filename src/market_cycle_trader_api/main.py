@@ -88,6 +88,15 @@ def create_app() -> FastAPI:
             "Trading engines are isolated from HTTP orchestration."
         ),
         lifespan=lifespan,
+        swagger_ui_parameters={
+            # Native Swagger UI filtering searches OpenAPI tag groups.
+            "filter": True,
+            # Large APIs are easier to navigate with only tags initially visible.
+            "docExpansion": "none",
+            "tagsSorter": "alpha",
+            "operationsSorter": "alpha",
+            "deepLinking": True,
+        },
     )
     application.add_middleware(
         CORSMiddleware,
