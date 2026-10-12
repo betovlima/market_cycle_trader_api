@@ -520,3 +520,99 @@ Para confirmar o incidente, comparar o ID devolvido por
 `POST /api/research/tcc-u77-fixed/jobs` com
 `GET /api/jobs/{job_id}`, verificando `status`, `strategy_profile_id`,
 `backtest_engine_binding`, `return_code` e `interruption_reason`.
+
+## 2026-10-12 — Backtest operacional U77 concluído: Strategy #14, 605,91 milhões
+
+**Artefato de origem analisado:** `market_cycle_trader_20261012T160830-82a943f6.zip`.
+Job `20261012T160830-82a943f6`, status `completed`, Strategy #14
+(`strategy-4279030d66214811a0b19090308610ea`), revisão 2,
+modo configurado `COMPOUND_ROTATION_SWING_TCC_U77_FIXED_V141`,
+modelo `lightgbm_utility`, API 10.8.92, código Git
+`de32f977b0e11f964ff3f89594cbecb73f8da383`. A execução consumiu
+aproximadamente 11 minutos (16:08:30–16:19:38 UTC).
+O Winner em fila foi preservado:
+`candidate-a-conservative-stateful-2026-08-eacf2298-41254743`.
+Nenhuma mudança de Winner é comprovada por esse pacote.
+
+### Resultados confirmados no ZIP
+
+```text
+capital inicial                      US$ 10.000,00
+capital final em 2026-10-09          US$ 605.911.159,6194662
+retorno total                       +6.059.011,596%
+CAGR                                 +488,172%
+Sharpe                                2,732241
+drawdown máximo                     -41,682836%
+benchmark U77 buy-and-hold           US$ 31.025,4869783
+rotações                              355
+compras                               356
+vendas incl. liquidação final         356
+tempo em mercado                      100%
+duração média holding                 4,39 pregões
+taxas SEC/TAF/CAT                     US$ 318.987,82
+slippage                              0 bps
+comissões                             0
+frações de ações                      permitidas
+ativo solicitado/efetivo              77 / 75
+exclusões estruturais                 DOC / CLMT
+período OOS                           2020-07-22 a 2026-10-09
+fold 1                               504 sessões; final US$ 67.999,95
+fold 2                               504 sessões; final US$ 10.968.842,01
+fold 3                               555 sessões; final US$ 605.911.159,62
+```
+
+### Paridade com pesquisa congelada no mesmo cutoff
+
+O checkpoint do TCC v1.4.1 em **2026-10-06**, com liquidação final, é
+US$ 587.165.941,1330212. No MCT, em 2026-10-06, o capital marcado a mercado
+antes da liquidação era **US$ 587.178.274,1030213**, diferença de
+**US$ 12.332,97 = 0,0021004%**. Uma liquidação hipotética da posição
+CAPR naquele momento implica taxas regulatórias da ordem de US$ 12.332,95,
+praticamente explicando a diferença de US$ 0,02. Este é um sinal muito forte
+de paridade financeira do caminho histórico até o cutoff, embora **não seja
+uma comparação hash-a-hash das decisões e OHLCV**. O manifesto não fez
+comparação de histórico previamente cacheado (`compared_asset_count=0`).
+`deterministic_execution=False` também impede declarar prova de
+determinismo de execuções independentes.
+
+O acréscimo de US$ 18.745.218,49 contra o checkpoint do TCC decorre quase
+inteiramente das sessões posteriores ao cutoff, pois o MCT avança até
+2026-10-09. Isso representa +3,19249% entre as **liquidações finais de
+datas distintas**, não descoberta de novo conjunto nem reotimização.
+
+### Atenção à capacidade econômica, sem imposição de gate
+
+O replay executou aproximadamente **US$ 29,559 bilhões em volume financeiro
+somado de compras e vendas**, e ordens individuais de até
+**US$ 655,6 milhões**. Houve compras de CAPR por cerca de US$ 652,34 milhões
+(aproximadamente **75,76 milhões de ações**) em uma única sessão e venda
+de CAPR por cerca de US$ 655,60 milhões em outra.
+Foram 85 pernas de negociação acima de US$ 100 milhões.
+CAPR (+US$ 143,14 mi em PnL realizado), AMS (+US$ 153,71 mi) e WDAY
+(+US$ 103,46 mi) responderam por aproximadamente US$ 400,30 mi,
+**66,07%** do ganho nominal líquido total. O maior drawdown do capital foi
+de **-41,68%**, entre US$ 467,40 mi e US$ 272,58 mi, entre
+2026-07-27 e 2026-07-31.
+
+**Este backtest não modelou slippage ou impacto de mercado, e o pacote
+não fornece volumes diários históricos/ADV suficientes para verificar a
+execução efetiva dessas ordens.** A quantia é resultado do simulador, não
+uma afirmação sobre capacidade de preenchimento pela corretora.
+Este diagnóstico informa a decisão do autor, sem criar restrições extras
+de Candidate/Winner. Não editar a estratégia U77 nem disparar promoções
+automaticamente por causa desta análise.
+
+### Origem e reproducibilidade
+
+Alpaca `sip`, ajuste `raw`, protocolo `raw_total_causal_v1`;
+203.100 linhas de barras elegíveis, 20 splits causais normalizados,
+2.309 eventos de dividendos apenas auditados (sem ajuste de target).
+`market_data_signature_sha256`:
+`557ef9aa6eb32233e01db618cf20e08b0d8c6537ef1e72666d5a5ef774293bf4`.
+`strategy_configuration_sha256`:
+`147a38334709d29e8c48668d0c6b1f01802610fce256656ca3b07cf532ce7dcc`.
+
+Próximo passo técnico opcional: execução de cenário de slippage de 5/10 bps
+com configuração controlada, comparação do U67 nas mesmas datas, auditoria
+de volumes ADV e ordens por ativo. Não alterar parâmetros do Winner ou
+impor procedimentos adicionais de autorização sem solicitação.
