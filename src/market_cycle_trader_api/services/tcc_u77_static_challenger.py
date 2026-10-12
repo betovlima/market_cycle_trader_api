@@ -1,7 +1,4 @@
-"""Idempotent Strategy Catalog installer for the fixed 77-asset Challenger.
-
-Does not certify a Candidate, promote the Winner, modify Paper State or place orders.
-"""
+"""Idempotent Strategy Catalog installer for the fixed 77-asset Challenger."""
 from __future__ import annotations
 
 from typing import Any
@@ -51,7 +48,7 @@ def install_tcc_u77_fixed_challenger(
     *,
     actor_email: str | None,
 ) -> dict[str, Any]:
-    """Install once, then select only Research; old Winner remains unchanged."""
+    """Install once, then select the Challenger as the research Strategy."""
     actor = str(actor_email or "").strip().lower() or None
     existing = db[STRATEGY_PROFILES_COLLECTION].find_one(
         {
@@ -60,12 +57,24 @@ def install_tcc_u77_fixed_challenger(
         }
     )
     if existing is not None:
+        db[STRATEGY_PROFILES_COLLECTION].update_one(
+            {"_id": existing["_id"]},
+            {
+                "$set": {
+                    "operational_stage": "strategy_catalog",
+                    "live_trader_eligible": True,
+                    "updated_at": utc_now(),
+                    "updated_by": actor,
+                },
+                "$unset": {"shadow_validated": ""},
+            },
+        )
         control = get_strategy_control(db)
         selected = select_research_strategy_only(
             db,
             str(existing["_id"]),
             expected_control_revision=int(control["revision"]),
-            note="Select frozen U67+10 Challenger for Backtest only",
+            note="Select frozen U67+10 Challenger for Backtest",
             actor_email=actor,
         )
         return {
@@ -102,7 +111,7 @@ def install_tcc_u77_fixed_challenger(
         configuration=config,
         name=str(created.get("name") or ""),
         description="Fixed U67+10 Challenger from the frozen v1.4.1 research",
-        note="Create isolated U77 static Challenger (backtest only)",
+        note="Create isolated U77 static Challenger (standard strategy)",
         expected_revision=int(model["revision"]),
         actor_email=actor,
     )
@@ -114,7 +123,6 @@ def install_tcc_u77_fixed_challenger(
                 "backtest_engine_binding": BACKTEST_ENGINE_BINDING,
                 "reference_engine_id": REFERENCE_ENGINE_ID,
                 "strategy_kind": "standard",
-                "tuning_target": "protected_external_policy",
                 "research_reference_assets": list(U77_REQUESTED_ASSETS),
                 "reference_source_repository": SOURCE_REPOSITORY,
                 "reference_source_branch": "research/u67-mct-asset-expansion-v1",
@@ -125,9 +133,8 @@ def install_tcc_u77_fixed_challenger(
                 "reference_checkpoint_capital": REFERENCE_CAPITAL,
                 "reference_checkpoint_date": REFERENCE_END_DATE,
                 "reference_checkpoint_is_optimization_target": False,
-                "operational_stage": "backtest_only",
-                "live_trader_eligible": False,
-                "shadow_validated": False,
+                "operational_stage": "strategy_catalog",
+                "live_trader_eligible": True,
                 "source_git_commit_message": (
                     "Frozen U67+10 Challenger research " + SOURCE_COMMIT[:12]
                 ),
@@ -141,7 +148,7 @@ def install_tcc_u77_fixed_challenger(
         db,
         strategy_id,
         expected_control_revision=int(control["revision"]),
-        note="Select frozen U67+10 static Challenger for Backtest only",
+        note="Select frozen U67+10 static Challenger for Backtest",
         actor_email=actor,
     )
     return {
