@@ -417,7 +417,7 @@ a composição estática que atingiu US$ 587.165.941,1330212 no cutoff congelado
 
 Tag de congelamento do TCC:
 `research-u67plus10-challenger-v1.4.1`, commit científico
-`0719366790c56bfe3935aaa556fe45211b9965da`.
+`e5d0c4cc2ae92fcb994cc0006f357d775b486721`.
 A tag ainda precisa ser criada/publicada pelo operador com `git tag -a` e
 `git push`; não afirmar que ela já existe sem verificar o remoto.
 
