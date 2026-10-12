@@ -281,6 +281,7 @@ def download_u67_operational_snapshot(
     *,
     job_id: str,
     config: Any,
+    requested_assets: tuple[str, ...] = U67_REQUESTED_ASSETS,
     progress_callback: ProgressCallback | None = None,
     data_directory: Path | None = None,
     per_asset_pause_seconds: float = 0.20,
@@ -301,7 +302,7 @@ def download_u67_operational_snapshot(
 
     fresh_config = config.model_copy(
         update={
-            "assets": list(U67_REQUESTED_ASSETS),
+            "assets": list(requested_assets),
             "start_date": "2016-01-01",
             "end_date": None,
             "analysis_end_date": analysis_end,
@@ -329,10 +330,10 @@ def download_u67_operational_snapshot(
     exclusions: list[dict[str, Any]] = []
     records: dict[str, Any] = {}
     hashes: dict[str, str] = {}
-    total = len(U67_REQUESTED_ASSETS)
+    total = len(requested_assets)
 
     try:
-        for position, symbol in enumerate(U67_REQUESTED_ASSETS, start=1):
+        for position, symbol in enumerate(requested_assets, start=1):
             if progress_callback is not None:
                 progress_callback("download", position - 1, total, symbol)
 
@@ -535,10 +536,10 @@ def download_u67_operational_snapshot(
             "downloaded_at_utc": datetime.now(
                 timezone.utc
             ).isoformat(),
-            "requested_assets": list(U67_REQUESTED_ASSETS),
+            "requested_assets": list(requested_assets),
             "eligible_assets": [
                 symbol
-                for symbol in U67_REQUESTED_ASSETS
+                for symbol in requested_assets
                 if symbol in frames
             ],
             "structural_exclusions": exclusions,
