@@ -4,9 +4,10 @@ from typing import Any
 
 import pandas as pd
 
-from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
 from .live_lightgbm_signal import build_live_lightgbm_decision
 from .tcc_u67_operational_runtime import build_live_tcc_u67_decision
+from .tcc_u77_static_challenger import U77_REQUESTED_ASSETS
 
 
 def build_live_model_decision(
@@ -29,6 +30,18 @@ def build_live_model_decision(
             config,
             current_asset=current_asset,
             holding_sessions=holding_sessions,
+        )
+    if (
+        model_family == "lightgbm_utility"
+        and str(getattr(config, "strategy_mode", ""))
+        == TCC_U77_FIXED_CHALLENGER_MODE
+    ):
+        return build_live_tcc_u67_decision(
+            bars_by_symbol,
+            config,
+            current_asset=current_asset,
+            holding_sessions=holding_sessions,
+            requested_assets=U77_REQUESTED_ASSETS,
         )
     if model_family == "lightgbm_utility":
         return build_live_lightgbm_decision(
