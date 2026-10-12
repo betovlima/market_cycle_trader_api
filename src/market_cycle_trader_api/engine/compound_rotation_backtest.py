@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
 from ..core.environment import load_project_environment
 
 
@@ -35,6 +35,10 @@ from .capital_rotation import run_rotation_models
 from .tcc_u67_operational_runtime import (
     assert_tcc_u67_operational_contract,
     run_tcc_u67_operational_backtest,
+)
+from .tcc_u77_static_challenger import (
+    U77_REQUESTED_ASSETS,
+    assert_tcc_u77_contract,
 )
 from .tcc_u67_operational_market_data import (
     download_u67_operational_snapshot,
@@ -319,8 +323,15 @@ def run_job(
         str(effective_config.strategy_mode)
         == TCC_U67_CONTROL_OPERATIONAL_MODE
     )
+    tcc_u77_runtime = (
+        str(effective_config.strategy_mode)
+        == TCC_U77_FIXED_CHALLENGER_MODE
+    )
     if tcc_u67_runtime:
         assert_tcc_u67_operational_contract(effective_config)
+    if tcc_u77_runtime:
+        assert_tcc_u77_contract(effective_config)
+    tcc_protected_runtime = tcc_u67_runtime or tcc_u77_runtime
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
     structural_exclusions: list[dict[str, Any]] = []
@@ -328,7 +339,7 @@ def run_job(
 
     emit_progress(2.0, "Preparing shared-capital rotation")
 
-    if tcc_u67_runtime:
+    if tcc_protected_runtime:
         emit_progress(
             3.0,
             "TCC U67 downloading fresh Alpaca RAW/SIP snapshot",
@@ -352,6 +363,11 @@ def run_job(
         u67_snapshot = download_u67_operational_snapshot(
             job_id=job_id,
             config=effective_config,
+            requested_assets=(
+                U77_REQUESTED_ASSETS
+                if tcc_u77_runtime
+                else tuple(config.assets)
+            ),
             progress_callback=u67_snapshot_progress,
         )
         bars_by_symbol = {
@@ -377,7 +393,7 @@ def run_job(
 
     assets_to_load = (
         []
-        if tcc_u67_runtime
+        if tcc_protected_runtime
         else list(effective_config.assets)
     )
     total_assets = max(1, len(effective_config.assets))
@@ -648,10 +664,15 @@ def run_job(
     )
     heartbeat_stop, heartbeat_thread = _start_progress_heartbeat()
     try:
-        if tcc_u67_runtime:
+        if tcc_protected_runtime:
             results = run_tcc_u67_operational_backtest(
                 bars_by_symbol,
                 effective_config,
+                requested_assets=(
+                    U77_REQUESTED_ASSETS
+                    if tcc_u77_runtime
+                    else tuple(config.assets)
+                ),
                 progress_callback=emit_progress,
                 trade_callback=emit_trade,
                 progress_detail_callback=emit_progress_detail,
