@@ -66,7 +66,7 @@ def install_tcc_u77_fixed_challenger(
                     "updated_at": utc_now(),
                     "updated_by": actor,
                 },
-                "$unset": {"shadow_validated": ""},
+                "$unset": {"shadow_validated": "", "tuning_target": ""},
             },
         )
         control = get_strategy_control(db)
