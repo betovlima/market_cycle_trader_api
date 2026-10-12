@@ -41,6 +41,7 @@ from .tcc_u77_static_challenger import (
     assert_tcc_u77_contract,
 )
 from .tcc_u67_operational_market_data import (
+    DATA_DIRECTORY as TCC_U67_DATA_DIRECTORY,
     download_u67_operational_snapshot,
 )
 from .market_data import validate_and_clean_bars
@@ -369,6 +370,12 @@ def run_job(
                 else tuple(config.assets)
             ),
             progress_callback=u67_snapshot_progress,
+            data_directory=(
+                TCC_U67_DATA_DIRECTORY.parent.parent
+                / "tcc_u77_fixed_challenger" / "snapshots"
+                if tcc_u77_runtime
+                else None
+            ),
         )
         bars_by_symbol = {
             symbol: frame.copy()
