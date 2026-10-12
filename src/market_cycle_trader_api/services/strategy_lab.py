@@ -19,7 +19,9 @@ from ..core.config import (
     API_VERSION,
     PACKAGE_DIR,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
+    TCC_U77_FIXED_CHALLENGER_MODE,
 )
+from ..engine.tcc_u77_static_challenger import tcc_u77_contract_issues
 from ..engine.tcc_u67_operational_runtime import (
     tcc_u67_contract_issues,
     tcc_u67_model_snapshot_issues,
@@ -605,8 +607,16 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     )
     strategy_mode = str(configuration.get("strategy_mode") or "")
 
-    if strategy_mode == TCC_U67_CONTROL_OPERATIONAL_MODE:
-        expected_binding = "tcc_u67_v1210_operational_backtest"
+    if strategy_mode in {
+        TCC_U67_CONTROL_OPERATIONAL_MODE,
+        TCC_U77_FIXED_CHALLENGER_MODE,
+    }:
+        u77_mode = strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
+        expected_binding = (
+            "tcc_u77_fixed_challenger_backtest"
+            if u77_mode
+            else "tcc_u67_v1210_operational_backtest"
+        )
         if engine_binding != expected_binding:
             return {
                 "eligible": False,
@@ -632,7 +642,11 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "model_family": model_family,
                 "backtest_engine_binding": engine_binding,
             }
-        issues = tcc_u67_contract_issues(configuration)
+        issues = (
+            tcc_u77_contract_issues(configuration)
+            if u77_mode
+            else tcc_u67_contract_issues(configuration)
+        )
         if issues:
             return {
                 "eligible": False,
@@ -648,7 +662,11 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
             }
         return {
             "eligible": True,
-            "code": "tcc_u67_live_runtime_ready",
+            "code": (
+                "tcc_u77_live_runtime_ready"
+                if u77_mode
+                else "tcc_u67_live_runtime_ready"
+            ),
             "reason": None,
             "strategy_kind": strategy_kind,
             "model_family": model_family,
