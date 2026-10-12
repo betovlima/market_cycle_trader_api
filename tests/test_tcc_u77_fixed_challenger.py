@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import unittest
+from unittest.mock import patch
 
 from market_cycle_trader_api.api.routers.tcc_u77_static_challenger import router
 from market_cycle_trader_api.core.config import (
@@ -11,6 +12,7 @@ from market_cycle_trader_api.core.config import (
     TCC_U77_FIXED_CHALLENGER_MODE,
 )
 from market_cycle_trader_api.engine import compound_rotation_backtest
+from market_cycle_trader_api.engine.live_model_signal import build_live_model_decision
 from market_cycle_trader_api.engine.tcc_u77_static_challenger import (
     BACKTEST_ENGINE_BINDING,
     REFERENCE_CAPITAL,
@@ -26,6 +28,10 @@ from market_cycle_trader_api.engine.tcc_u67_operational_runtime import (
     tcc_u67_strategy_updates,
 )
 from market_cycle_trader_api.schemas.requests import BacktestRequest
+from market_cycle_trader_api.services.model_research import (
+    execution_settings_from_values,
+    model_execution_snapshot,
+)
 from market_cycle_trader_api.services.tcc_u77_static_challenger import (
     _strategy_configuration,
 )
@@ -93,18 +99,43 @@ class FixedChallengerTests(unittest.TestCase):
         assert any("rotation_purge_days" in x for x in tcc_u77_contract_issues(data))
 
 
-    def test_u77_backtest_only_not_trader_eligible(self) -> None:
-        assert TCC_U77_FIXED_CHALLENGER_MODE in RESEARCH_ONLY_SWING_STRATEGY_MODES
+    def test_u77_uses_normal_trader_catalog_flow(self) -> None:
+        assert TCC_U77_FIXED_CHALLENGER_MODE not in RESEARCH_ONLY_SWING_STRATEGY_MODES
         assert BACKTEST_ENGINE_BINDING == "tcc_u77_fixed_challenger_backtest"
+        settings = execution_settings_from_values(
+            "lightgbm_utility",
+            _tcc_lightgbm_values(),
+            settings_revision=1,
+            profile_id="strategy",
+        )
+        snapshot = model_execution_snapshot("lightgbm_utility", settings)
+        config = _strategy_configuration(_complete_u67_request())
         compatibility = _trader_runtime_compatibility(
             {
                 "strategy_kind": "standard",
                 "backtest_engine_binding": BACKTEST_ENGINE_BINDING,
-                "research_model_snapshot": {"family": "lightgbm_utility"},
-                "configuration": tcc_u77_strategy_updates(),
+                "research_model_snapshot": snapshot,
+                "configuration": config.model_dump(mode="python"),
             }
         )
-        assert compatibility["eligible"] is False
+        assert compatibility["eligible"] is True
+        assert compatibility["code"] == "tcc_u77_live_runtime_ready"
+
+    def test_u77_dispatches_to_control_live_engine(self) -> None:
+        config = _strategy_configuration(_complete_u67_request())
+        with patch(
+            "market_cycle_trader_api.engine.live_model_signal.build_live_tcc_u67_decision",
+            return_value="U77_DECISION",
+        ) as mock_decision:
+            result = build_live_model_decision(
+                {},
+                config,
+                model_family="lightgbm_utility",
+                current_asset="CASH",
+                holding_sessions=0,
+            )
+        assert result == "U77_DECISION"
+        assert mock_decision.call_args.kwargs["requested_assets"] == U77_REQUESTED_ASSETS
 
 
     def test_jobs_have_independent_u77_snapshot_and_replay(self) -> None:
