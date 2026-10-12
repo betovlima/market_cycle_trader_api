@@ -25,6 +25,9 @@ from market_cycle_trader_api.engine.tcc_u67_operational_runtime import (
     tcc_u67_strategy_updates,
 )
 from market_cycle_trader_api.schemas.requests import BacktestRequest
+from market_cycle_trader_api.services.tcc_u77_static_challenger import (
+    _strategy_configuration,
+)
 from market_cycle_trader_api.services.strategy_lab import (
     _trader_runtime_compatibility,
 )
@@ -90,3 +93,16 @@ def test_install_and_jobs_endpoints_exist() -> None:
     assert ("/api/research/tcc-u77-fixed", ("GET",)) in routes
     assert ("/api/research/tcc-u77-fixed/strategy", ("POST",)) in routes
     assert ("/api/research/tcc-u77-fixed/jobs", ("POST",)) in routes
+
+
+
+def test_catalog_installer_builds_exact_challenger_configuration() -> None:
+    source = BacktestRequest.model_validate({
+        **tcc_u67_strategy_updates(),
+        "rotation_models": ["xgboost_utility"],
+    })
+    installed = _strategy_configuration(source)
+
+    assert tuple(installed.assets) == U77_REQUESTED_ASSETS
+    assert installed.strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
+    assert tcc_u77_contract_issues(installed) == []
