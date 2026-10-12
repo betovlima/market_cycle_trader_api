@@ -545,7 +545,7 @@ def run_tcc_u67_operational_backtest(
             ),
             "tcc_source_repository": SOURCE_REPOSITORY,
             "tcc_source_commit": (
-                "0719366790c56bfe3935aaa556fe45211b9965da"
+                "e5d0c4cc2ae92fcb994cc0006f357d775b486721"
                 if len(requested_assets) == 77
                 else SOURCE_COMMIT
             ),
