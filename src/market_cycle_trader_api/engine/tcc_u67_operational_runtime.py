@@ -364,15 +364,18 @@ def run_tcc_u67_operational_backtest(
             0,
         )
 
+    benchmark_assets = (
+        eligible_assets if len(requested_assets) == 77 else u56_eligible
+    )
     benchmark = _benchmark_pesos_iguais(
         {
             symbol: frames[symbol]
-            for symbol in u56_eligible
+            for symbol in benchmark_assets
             if symbol in frames
         },
         [
             symbol
-            for symbol in u56_eligible
+            for symbol in benchmark_assets
             if symbol in frames
         ],
         all_decision_dates[1:],
@@ -538,7 +541,9 @@ def run_tcc_u67_operational_backtest(
         ),
         benchmark_override=benchmark,
         benchmark_override_name=(
-            "Fixed eligible U56 equal-weight buy-and-hold"
+            "Fixed eligible U77 equal-weight buy-and-hold"
+            if len(requested_assets) == 77
+            else "Fixed eligible U56 equal-weight buy-and-hold"
         ),
     )
     result.metrics.update(
