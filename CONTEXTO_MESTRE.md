@@ -462,3 +462,27 @@ holding_sessions e regras de exclusão; só então habilitar Winner.
 Não fazer bypass dos gates existentes.
 
 Mais detalhes: `docs/changes/v10.8.91-u77-fixed-challenger.md`.
+
+
+### 2026-10-12 — Correção de escopo do U77 antes da integração
+
+O responsável pelo projeto recusou as condições adicionais impostas na
+primeira proposta: `backtest-only`, `RESEARCH_ONLY`, veto artificial de
+promoção e obrigação de estudos adicionais. O fluxo solicitado é o ciclo
+normal da Strategy no MCT: criar, backtest, selecionar Candidate e promover
+Winner pelo catálogo quando decidir.
+
+A branch `feature/v10.8.91-u77-fixed-challenger` passa a usar o runtime
+prospectivo do mesmo LightGBM Control com 77 ativos solicitados e contratos
+específicos U77, conservando o U67 histórico. O modo U77 foi excluído da
+categoria de estratégias apenas de pesquisa, a checagem de compatibilidade
+com o Trader foi estendida, e a instalação do catálogo não cria mais campos
+de impedimento artificial. O endpoint de backtest utiliza a certificação
+normal e não promove automaticamente o Winner.
+
+As verificações gerais e existentes de integridade dos dados, ordens e posições
+não foram removidas. Esta correção também não executa operações nem altera
+a Strategy Winner atual. O estado dos testes está registrado no GitHub Actions
+da branch e deve ser confirmado no respectivo commit.
+
+Documentação detalhada: `docs/changes/v10.8.91-u77-fixed-challenger.md`.
