@@ -14,9 +14,12 @@ from ..core.config import (
     RESEARCH_ONLY_SWING_STRATEGY_MODES,
     SWING_STRATEGY_MODES,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
+    TCC_U77_FIXED_CHALLENGER_MODE,
 )
 from ..engine.live_model_signal import build_live_model_decision
+from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
 from ..engine.tcc_u67_operational_market_data import (
+    DATA_DIRECTORY as TCC_U67_DATA_DIRECTORY,
     append_u67_current_session_intraday,
     download_u67_operational_snapshot,
 )
@@ -571,7 +574,12 @@ def prepare_next_paper_plan(
     )
 
     bars_by_symbol: dict[str, pd.DataFrame] = {}
-    if str(strategy.strategy_mode) == TCC_U67_CONTROL_OPERATIONAL_MODE:
+    frozen_control_mode = str(strategy.strategy_mode) in {
+        TCC_U67_CONTROL_OPERATIONAL_MODE,
+        TCC_U77_FIXED_CHALLENGER_MODE,
+    }
+    u77_mode = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
+    if frozen_control_mode:
         target_session = latest_safe_completed_xnys_session().date().isoformat()
         live_job_id = (
             f"trader-u67-{target_session}-"
@@ -583,6 +591,14 @@ def prepare_next_paper_plan(
         snapshot = download_u67_operational_snapshot(
             job_id=live_job_id,
             config=snapshot_config,
+            requested_assets=(
+                U77_REQUESTED_ASSETS if u77_mode else tuple(strategy.assets)
+            ),
+            data_directory=(
+                TCC_U67_DATA_DIRECTORY.parent.parent
+                / "tcc_u77_fixed_challenger" / "snapshots"
+                if u77_mode else None
+            ),
         )
         bars_by_symbol = {
             symbol: _trim_incomplete_daily_session(
@@ -747,8 +763,10 @@ def prepare_next_paper_plan(
     )
     current_session_intraday = bool(
         allow_open_market
-        and str(strategy.strategy_mode)
-        == TCC_U67_CONTROL_OPERATIONAL_MODE
+        and str(strategy.strategy_mode) in {
+            TCC_U67_CONTROL_OPERATIONAL_MODE,
+            TCC_U77_FIXED_CHALLENGER_MODE,
+        }
         and live_market.get("analysis_mode")
         == "current_session_intraday"
     )
