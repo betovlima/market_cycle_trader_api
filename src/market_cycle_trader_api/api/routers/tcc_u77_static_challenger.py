@@ -1,4 +1,4 @@
-"""Research-only control surface for frozen U67+10 static Challenger."""
+"""Strategy catalog and backtest entrypoints for the fixed U67+10 Control."""
 from __future__ import annotations
 
 import threading
@@ -52,8 +52,8 @@ def read_static_challenger_contract() -> dict[str, Any]:
         "checkpoint_is_optimization_target": False,
         "configured_assets": list(U77_REQUESTED_ASSETS),
         "configured_asset_count": len(U77_REQUESTED_ASSETS),
-        "stage": "backtest_only",
-        "trader_eligible": False,
+        "stage": "strategy_catalog",
+        "trader_eligible": True,
         "order_submission": "never",
     }
 
@@ -79,7 +79,7 @@ def install_static_challenger(identity: AdminIdentity) -> dict[str, Any]:
 def create_static_challenger_backtest(
     _: AdminIdentity,
 ) -> dict[str, Any]:
-    """Enqueue fresh Alpaca replay; no orders and no Winner changes."""
+    """Enqueue standard Strategy backtest with audited fresh Alpaca data."""
     db = database()
     configuration, selected = get_research_strategy_context(db)
     if str(selected.get("backtest_engine_binding") or "") != BACKTEST_ENGINE_BINDING:
@@ -93,10 +93,7 @@ def create_static_challenger_backtest(
             detail="The selected Strategy no longer matches the frozen U77 universe.",
         )
 
-    queued = queue_backtest_job(
-        start_thread=False,
-        certify_strategy=False,
-    )
+    queued = queue_backtest_job(start_thread=False)
     job_id = str(queued["id"])
     db[JOBS_COLLECTION].update_one(
         {"id": job_id},
@@ -109,7 +106,7 @@ def create_static_challenger_backtest(
                 "reference_reproduction_version": SOURCE_VERSION,
                 "reference_checkpoint_capital": REFERENCE_CAPITAL,
                 "reference_checkpoint_is_optimization_target": False,
-                "certifies_strategy": False,
+                "certifies_strategy": True,
                 "order_submission": "never",
                 "updated_at": utc_now(),
             },
