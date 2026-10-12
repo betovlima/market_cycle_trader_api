@@ -486,3 +486,22 @@ a Strategy Winner atual. O estado dos testes está registrado no GitHub Actions
 da branch e deve ser confirmado no respectivo commit.
 
 Documentação detalhada: `docs/changes/v10.8.91-u77-fixed-challenger.md`.
+
+
+## 2026-10-12 — API v10.8.92 — Busca nativa de endpoints em /docs
+
+Solicitação: permitir a localização rápida de endpoints no Swagger, especialmente
+os de cadastro e backtest do U67+10, sem navegar por dezenas de grupos.
+
+Implementação exclusivamente de interface de documentação:
+`swagger_ui_parameters` na aplicação FastAPI com
+`filter=True`, `docExpansion="none"`, `tagsSorter="alpha"`,
+`operationsSorter="alpha"` e `deepLinking=True`.
+O filtro nativo busca por nome de tag; não é busca de texto completo por
+caminho ou descrição. Exemplos: `tcc-u77-fixed-challenger` e `jobs`.
+
+Versão API `10.8.92`, branch
+`feature/v10.8.92-swagger-endpoint-search`. Nenhuma alteração no catálogo,
+rotas de execução, auth, Backtest, Candidate, Winner, modelos, dados Alpaca ou
+MongoDB. A `main` permanece como referência até eventual merge.
+Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
