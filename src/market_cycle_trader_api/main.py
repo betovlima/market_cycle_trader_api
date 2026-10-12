@@ -34,6 +34,7 @@ from .api.routers import (
     system_settings,
     tcc_v106_reference,
     tcc_u67_operational,
+    tcc_u77_static_challenger,
     temporal_intelligence,
     temporal_research_settings,
     temporal_rotation_quality,
@@ -118,6 +119,10 @@ def create_app() -> FastAPI:
     )
     application.include_router(
         tcc_u67_operational.router,
+        dependencies=research_access,
+    )
+    application.include_router(
+        tcc_u77_static_challenger.router,
         dependencies=research_access,
     )
     application.include_router(temporal_intelligence.router)
