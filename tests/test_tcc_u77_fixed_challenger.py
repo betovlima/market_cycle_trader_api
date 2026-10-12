@@ -29,10 +29,34 @@ from market_cycle_trader_api.schemas.requests import BacktestRequest
 from market_cycle_trader_api.services.tcc_u77_static_challenger import (
     _strategy_configuration,
 )
+from market_cycle_trader_api.services.tcc_u67_operational_strategy import (
+    _tcc_lightgbm_values,
+)
 from market_cycle_trader_api.services.strategy_lab import (
     _trader_runtime_compatibility,
 )
 from market_cycle_trader_api.tcc_u67_v1210_reference.contract import U67_REQUESTED_ASSETS
+
+
+def _complete_u67_request() -> BacktestRequest:
+    lgbm = _tcc_lightgbm_values()
+    data = {
+        **tcc_u67_strategy_updates(),
+        "rotation_models": ["xgboost_utility"],
+        "rotation_xgb_n_estimators": int(lgbm["n_estimators"]),
+        "rotation_xgb_learning_rate": float(lgbm["learning_rate"]),
+        "rotation_xgb_max_depth": int(lgbm["max_depth"]),
+        "xgb_min_child_weight": float(lgbm["min_child_weight"]),
+        "xgb_subsample": float(lgbm["subsample"]),
+        "xgb_colsample_bytree": float(lgbm["colsample_bytree"]),
+        "xgb_reg_alpha": float(lgbm["reg_alpha"]),
+        "xgb_reg_lambda": float(lgbm["reg_lambda"]),
+        "xgb_n_jobs": int(lgbm["n_jobs"]),
+        "mongo_cache_enabled": False,
+        "mongo_refresh_overlap_days": 5,
+        "mongo_write_batch_size": 100,
+    }
+    return BacktestRequest.model_validate(data)
 
 
 class FixedChallengerTests(unittest.TestCase):
@@ -53,9 +77,11 @@ class FixedChallengerTests(unittest.TestCase):
         assert tcc_u77_contract_issues(challenger) == []
         assert original["strategy_mode"] == TCC_U67_CONTROL_OPERATIONAL_MODE
         assert challenger["strategy_mode"] == TCC_U77_FIXED_CHALLENGER_MODE
-        assert BacktestRequest.model_validate(
-            {**challenger, "rotation_models": ["xgboost_utility"]}
-        ).strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
+        baseline = _complete_u67_request()
+        validated = BacktestRequest.model_validate(
+            {**baseline.model_dump(mode="python"), **challenger}
+        )
+        assert validated.strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
 
 
     def test_u77_rejects_contract_drift(self) -> None:
@@ -99,10 +125,7 @@ class FixedChallengerTests(unittest.TestCase):
 
 
     def test_catalog_installer_builds_exact_challenger_configuration(self) -> None:
-        source = BacktestRequest.model_validate({
-            **tcc_u67_strategy_updates(),
-            "rotation_models": ["xgboost_utility"],
-        })
+        source = _complete_u67_request()
         installed = _strategy_configuration(source)
 
         assert tuple(installed.assets) == U77_REQUESTED_ASSETS
