@@ -27,6 +27,7 @@ from market_cycle_trader_api.engine.tcc_u67_operational_runtime import (
     tcc_u67_contract_issues,
     tcc_u67_strategy_updates,
 )
+from market_cycle_trader_api.services.jobs import public_job
 from market_cycle_trader_api.schemas.requests import BacktestRequest
 from market_cycle_trader_api.services.model_research import (
     execution_settings_from_values,
@@ -162,3 +163,34 @@ class FixedChallengerTests(unittest.TestCase):
         assert tuple(installed.assets) == U77_REQUESTED_ASSETS
         assert installed.strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
         assert tcc_u77_contract_issues(installed) == []
+
+
+
+class InterruptedBacktestDisplayTests(unittest.TestCase):
+    def test_restart_interruption_reports_actual_job_and_reason(self) -> None:
+        job = public_job(
+            {
+                "id": "20261012T101000-abc123",
+                "status": "interrupted",
+                "stage": "The API was restarted before the run finished.",
+                "strategy_profile_id": "strategy-u77",
+                "strategy_profile_name": "Strategy #99",
+                "research_model_label": "LightGBM Utility",
+                "backtest_engine_binding": "tcc_u77_fixed_challenger_backtest",
+                "progress": 10.2,
+                "logs": ["Backtest queued."],
+            }
+        )
+        assert job is not None
+        assert job["status"] == "interrupted"
+        assert job["progress"] == 10.2
+        assert "reiniciada" in job["interruption_reason"]
+        assert job["strategy_profile_id"] == "strategy-u77"
+        assert job["backtest_engine_binding"] == "tcc_u77_fixed_challenger_backtest"
+        assert job["research_model_label"] == "LightGBM Utility"
+
+    def test_unrelated_failed_job_does_not_invent_restart_reason(self) -> None:
+        job = public_job({"id": "failed", "status": "failed", "stage": "Backtest failed"})
+        assert job is not None
+        assert job["status"] == "failed"
+        assert "interruption_reason" not in job
