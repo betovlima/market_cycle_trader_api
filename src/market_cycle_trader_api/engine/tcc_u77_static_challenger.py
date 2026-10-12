@@ -14,7 +14,7 @@ from .tcc_u67_operational_runtime import (
 )
 
 SOURCE_REPOSITORY = "betovlima/tcc_mba_usp_data_science_analytics"
-SOURCE_COMMIT = "0719366790c56bfe3935aaa556fe45211b9965da"
+SOURCE_COMMIT = "e5d0c4cc2ae92fcb994cc0006f357d775b486721"
 SOURCE_TAG = "research-u67plus10-challenger-v1.4.1"
 SOURCE_VERSION = "u67-asset-expansion-v1.4.1"
 REFERENCE_END_DATE = "2026-10-06"
