@@ -486,3 +486,37 @@ a Strategy Winner atual. O estado dos testes está registrado no GitHub Actions
 da branch e deve ser confirmado no respectivo commit.
 
 Documentação detalhada: `docs/changes/v10.8.91-u77-fixed-challenger.md`.
+
+
+## 2026-10-12 — Diagnóstico do Backtest local interrompido em 10,2%
+
+O operador enviou captura com Backtest "Interrompido", 0/1 execuções e 10,2%
+progresso após executar os endpoints da Strategy U67+10. A tela mostrava
+Strategy #13 / TCC U67 v1.21.0, mas **essa identidade não prova a identidade
+do job interrompido**: a versão anterior do frontend usava a Strategy
+selecionada atualmente quando o status deixava de ser `running`.
+
+Causa plausível, identificada no código: `core/runtime.py`, função
+`initialize_mongo(role="api")`, marca todas as jobs `queued`/`running` como
+`interrupted` em cada reinício da API. O serviço `services/jobs.py`
+transformava o motivo registrado em `stage="Interrupted"` e suprimia a
+explicação no payload público. É compatível com execução sob Uvicorn
+`--reload` e modificações de arquivo durante o backtest. A confirmação
+específica depende do ID e do status do job no Mongo; não se deve atribuir
+causa com 100% de certeza só pela imagem.
+
+Correção na branch: `public_job` agora informa `interruption_reason` quando
+o Mongo registra reinício da API, inclui `research_model_label` e preserva
+`strategy_profile_id`, `strategy_profile_name` e `return_code`.
+O frontend complementar v10.7.21 usa o identificador correto do job e exibe
+o motivo de interrupção. Essas alterações são somente de diagnóstico e
+não introduzem travas de backtest ou Winner.
+
+Execução local recomendada durante jobs demorados: iniciar a API sem
+`--reload` e evitar reiniciá-la até o término. Esta atualização não implementa
+retomada automática após reinício; requer execução estável.
+
+Para confirmar o incidente, comparar o ID devolvido por
+`POST /api/research/tcc-u77-fixed/jobs` com
+`GET /api/jobs/{job_id}`, verificando `status`, `strategy_profile_id`,
+`backtest_engine_binding`, `return_code` e `interruption_reason`.
