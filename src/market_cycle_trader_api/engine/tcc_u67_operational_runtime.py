@@ -293,6 +293,7 @@ def run_tcc_u67_operational_backtest(
     bars_by_symbol: dict[str, pd.DataFrame],
     base_config: Any,
     *,
+    requested_assets: tuple[str, ...] = U67_REQUESTED_ASSETS,
     progress_callback: Callable[[float, str, int], None] | None = None,
     trade_callback: Callable[[dict[str, Any]], None] | None = None,
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -301,7 +302,7 @@ def run_tcc_u67_operational_backtest(
     """Replay the protected U67 policy on current, already-audited MCT bars."""
     eligible_assets = tuple(
         symbol
-        for symbol in U67_REQUESTED_ASSETS
+        for symbol in requested_assets
         if symbol in bars_by_symbol
     )
     if len(eligible_assets) < 2:
@@ -515,7 +516,7 @@ def run_tcc_u67_operational_backtest(
         decision_to_fold,
     )
     result = _simular_exato(
-        "tcc_u67_v1210_control",
+        ("tcc_u77_fixed_challenger" if len(requested_assets) == 77 else "tcc_u67_v1210_control"),
         scheduled,
         frames,
         symbols,
@@ -537,17 +538,31 @@ def run_tcc_u67_operational_backtest(
     )
     result.metrics.update(
         {
-            "operational_contract": U67_OPERATIONAL_CONTRACT,
-            "tcc_source_repository": SOURCE_REPOSITORY,
-            "tcc_source_commit": SOURCE_COMMIT,
-            "tcc_reproduction_version": REPRODUCTION_VERSION,
-            "tcc_reference_checkpoint_capital": (
-                U67_REFERENCE_CHECKPOINT_CAPITAL
+            "operational_contract": (
+                "tcc_u77_fixed_challenger_v1.4.1"
+                if len(requested_assets) == 77
+                else U67_OPERATIONAL_CONTRACT
             ),
-            "tcc_requested_asset_count": U67_COUNT,
+            "tcc_source_repository": SOURCE_REPOSITORY,
+            "tcc_source_commit": (
+                "0719366790c56bfe3935aaa556fe45211b9965da"
+                if len(requested_assets) == 77
+                else SOURCE_COMMIT
+            ),
+            "tcc_reproduction_version": (
+                "u67-asset-expansion-v1.4.1"
+                if len(requested_assets) == 77
+                else REPRODUCTION_VERSION
+            ),
+            "tcc_reference_checkpoint_capital": (
+                587_165_941.1330212
+                if len(requested_assets) == 77
+                else U67_REFERENCE_CHECKPOINT_CAPITAL
+            ),
+            "tcc_requested_asset_count": len(requested_assets),
             "tcc_eligible_asset_count": len(symbols),
             "tcc_structural_reductions": sorted(
-                set(U67_REQUESTED_ASSETS).difference(symbols)
+                set(requested_assets).difference(symbols)
             ),
             "tcc_reference_calendar_source": str(reference_source),
             "tcc_checkpoint_is_optimization_target": False,
