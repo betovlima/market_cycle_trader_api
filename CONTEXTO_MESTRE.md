@@ -505,3 +505,73 @@ Versão API `10.8.92`, branch
 rotas de execução, auth, Backtest, Candidate, Winner, modelos, dados Alpaca ou
 MongoDB. A `main` permanece como referência até eventual merge.
 Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
+
+
+## 2026-10-12 — Correção intradiária AMS / API v10.8.93
+
+### Evento observado
+
+Em produção, ao solicitar a análise da sessão corrente XNYS de 2026-10-12,
+o Trader reportou:
+`CurrentSessionIntradayDataMissing: AMS has no IEX regular-session bars for 2026-10-12.`
+
+O ZIP `market_cycle_trader_20261012T170547-7a034113.zip` submetido
+simultaneamente é do **backtest histórico concluído**, Strategy #30,
+`COMPOUND_ROTATION_SWING_TCC_U77_FIXED_V141`, 77 ativos solicitados
+e 75 elegíveis, capital final US$ 605.911.159,62. O ZIP registra
+`trader_winner_strategy_name_at_queue="Strategy #29"`, mas não
+contém o traceback da tentativa live nem confirma que o Winner
+efetivamente usado no momento da exceção era o U77.
+
+A causa de código foi identificada em
+`engine/tcc_u67_operational_market_data.py`: a função
+`append_u67_current_session_intraday` exigia ao menos uma barra
+1Min IEX da sessão atual para **todos** os ativos e falhava
+inteiramente ao encontrar símbolo sem negociação na IEX.
+A IEX não representa todo o mercado consolidado e ativos pouco
+líquidos podem não negociar nessa bolsa durante a janela solicitada.
+
+### Versão de correção
+
+Branch `fix/v10.8.93-intraday-iex-sip-fallback`; API 10.8.93.
+
+O loader mantém a IEX como prioridade e, se o ativo não tem barra
+IEX hoje, busca barras SIP consolidadas RAW 1Min até
+`timestamp_atual - 20 minutos`, respeitando planos SIP atrasados.
+Se SIP fornecer barras, elas compõem o OHLCV **parcial observável** e
+a fonte SIP fica registrada em metadata.
+
+Se nenhuma fonte retorna barras, ou SIP não está disponível por
+permissão, o ativo não detido é omitido **somente na decisão corrente**,
+com `intraday_missing_assets` e `intraday_missing_reasons`.
+Isso não remove permanentemente AMS, não altera os 77 ativos da
+configuração, não inventa preços nem toca nos CSVs do TCC.
+
+A função recebe `current_asset=state.managed_symbol` e distingue a
+posição efetivamente detida: se faltar cotação para o ativo detido,
+a ausência é reportada explicitamente em vez de gerar uma nova ordem
+com uma observação sintética ou obsoleta. Se não houver cotação
+para nenhum ativo, a execução também informa essa indisponibilidade.
+
+Metadados de auditoria repassados no retorno do Trader:
+`intraday_fallback_assets`, `intraday_missing_assets`,
+`intraday_missing_reasons`, `intraday_asset_count` e
+`live_feed` (incluindo `mixed_iex_sip`).
+
+Sem alteração de Candidate, Winner, permissões, regras de promoção,
+modelos, backtest histórico, universo persistido ou execução de ordens.
+Esta é uma correção de disponibilidade da fonte de dados, não a
+inclusão de uma trava estratégica.
+
+### Testes e próximos passos
+
+Testes cobrem IEX disponível, IEX vazio + SIP disponível,
+ausência em ambos para ativo não detido, ausência em ambos
+para ativo detido e indisponibilidade de permissão SIP.
+A verificação de dados SIP reais de AMS exige execução no ambiente
+com as credenciais Alpaca do operador. A aplicação da correção
+em produção exige merge/deploy separado; não efetuar ordens
+nem promoção como parte do patch.
+
+Detalhamento em
+`docs/changes/v10.8.93-intraday-iex-sip-fallback.md`.
