@@ -405,3 +405,60 @@ API 10.8.90
 ### Branch
 feature/v10.8.90-portfolio-audit-dashboard
 
+
+
+## 2026-10-12 — API v10.8.91 — Strategy Challenger U67+10 estática
+
+### Solicitação e decisão de escopo
+
+O autor encerrou a etapa de descoberta do TCC e decidiu transferir para o MCT
+a composição estática que atingiu US$ 587.165.941,1330212 no cutoff congelado
+2026-10-06, mantendo separadas pesquisa e operação real.
+
+Tag de congelamento do TCC:
+`research-u67plus10-challenger-v1.4.1`, commit científico
+`0719366790c56bfe3935aaa556fe45211b9965da`.
+A tag ainda precisa ser criada/publicada pelo operador com `git tag -a` e
+`git push`; não afirmar que ela já existe sem verificar o remoto.
+
+Universo: U67 existente (mesma ordem e mesmos dados estruturais) + CRT, NBR,
+CAPR, PNBK, PENN, JBL, STAG, MCHB, LAD, TOWN. São 77 solicitados e 75
+efetivos na janela histórica. O TCC alerta sobre o PBO da otimização
+(53,57% log-growth, 59,52% Sharpe) e ausência de validação nested completa.
+
+### Implementação operacional
+
+Branch: `feature/v10.8.91-u77-fixed-challenger`
+API: `10.8.91`
+
+O contrato do U67 atual bloqueia alteração da lista de 67 ativos. Portanto
+foi criado um NOVO modo, contrato, binding, instalador idempotente e endpoint
+de Backtest. Ele usa Alpaca RAW/SIP atualizado e exclui identidades
+estruturalmente inválidas, sem reconstrução histórica manual.
+
+```text
+mode: COMPOUND_ROTATION_SWING_TCC_U77_FIXED_V141
+binding: tcc_u77_fixed_challenger_backtest
+GET  /api/research/tcc-u77-fixed
+POST /api/research/tcc-u77-fixed/strategy
+POST /api/research/tcc-u77-fixed/jobs
+```
+
+### Preservação do Winner e do estado de execução
+
+Esta versão é **backtest-only**. O instalador seleciona somente Research,
+não toca Winner, ordem Alpaca, posição corrente ou Paper State.
+A promoção permanece bloqueada por ausência de runtime live U77 homologado.
+
+A intenção do autor é executar primeiro o Backtest na infraestrutura MCT
+com dados atualizados, revisar a auditoria e depois decidir se promove. O
+resultado do TCC é referência histórica, não projeção garantida e não deve
+ser usado para automatizar promoção.
+
+A próxima entrega, separada e versionada, precisa implementar o runtime
+prospectivo de 77 ativos com paridade entre backtest e Trader; validar
+reconciliação Mongo/Alpaca, XNYS fechado para promoção, posição atual,
+holding_sessions e regras de exclusão; só então habilitar Winner.
+Não fazer bypass dos gates existentes.
+
+Mais detalhes: `docs/changes/v10.8.91-u77-fixed-challenger.md`.
