@@ -454,7 +454,11 @@ def download_u67_operational_snapshot(
                     "research_market_data_protocol": "raw_total_causal_v1",
                     "research_market_data_refresh_mode": "full",
                     "full_refresh_performed": True,
-                    "research_access_path": "fresh_u67_operational_snapshot",
+                    "research_access_path": (
+                        "fresh_u77_fixed_challenger_snapshot"
+                        if len(requested_assets) == 77
+                        else "fresh_u67_operational_snapshot"
+                    ),
                     "research_bar_loader": raw_attrs.get(
                         "research_bar_loader"
                     )
@@ -525,7 +529,11 @@ def download_u67_operational_snapshot(
 
         manifest: dict[str, Any] = {
             "schema_version": 1,
-            "source_contract": SOURCE_CONTRACT,
+            "source_contract": (
+                "alpaca_raw_sip_ca_split_normalized_u77_fixed_v1"
+                if len(requested_assets) == 77
+                else SOURCE_CONTRACT
+            ),
             "source": "alpaca",
             "feed": "sip",
             "download_adjustment": "raw",
