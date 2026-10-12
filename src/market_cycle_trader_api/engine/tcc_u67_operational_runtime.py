@@ -526,10 +526,15 @@ def run_tcc_u67_operational_backtest(
         aplicar_deslizamento,
         decision_metadata=decision_metadata,
         trade_callback=trade_callback,
-        model_label="TCC U67 v1.21.0 Control",
+        model_label=(
+            "TCC U67+10 Static Challenger v1.4.1"
+            if len(requested_assets) == 77
+            else "TCC U67 v1.21.0 Control"
+        ),
         method_line=(
-            "- Protected U67 policy vendored from TCC main; "
-            "current MCT audited market data."
+            "- TCC U67+10 static Challenger, pinned source and fresh audited data."
+            if len(requested_assets) == 77
+            else "- Protected U67 policy vendored from TCC main; current MCT audited market data."
         ),
         benchmark_override=benchmark,
         benchmark_override_name=(
@@ -565,6 +570,7 @@ def run_tcc_u67_operational_backtest(
                 set(requested_assets).difference(symbols)
             ),
             "tcc_reference_calendar_source": str(reference_source),
+            "tcc_static_challenger": len(requested_assets) == 77,
             "tcc_checkpoint_is_optimization_target": False,
         }
     )
