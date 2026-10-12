@@ -133,6 +133,7 @@ PUBLIC_JOB_FIELDS = frozenset({
     "strategy_configuration_hash",
     "backtest_engine_binding",
     "reference_engine_id",
+    "research_model_label",
     "progress_detail",
 })
 
@@ -300,6 +301,18 @@ def public_job(document: dict[str, Any] | None) -> dict[str, Any] | None:
         payload["stage"] = "Backtest failed"
     elif status in {"interrupted", "cancelled"}:
         payload["stage"] = "Interrupted"
+        original_stage = str(document.get("stage") or "")
+        if status == "interrupted" and "API was restarted" in original_stage:
+            payload["interruption_reason"] = (
+                "A API foi reiniciada durante a execução. "
+                "Em ambiente local, evite iniciar backtests com Uvicorn --reload."
+            )
+        elif status == "cancelled":
+            payload["interruption_reason"] = "O backtest foi cancelado."
+        else:
+            payload["interruption_reason"] = (
+                "A execução foi interrompida antes da conclusão."
+            )
     elif status == "completed":
         payload["stage"] = "Completed"
     else:
