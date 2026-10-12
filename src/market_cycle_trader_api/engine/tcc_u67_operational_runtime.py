@@ -736,12 +736,23 @@ def build_live_tcc_u67_decision(
     *,
     current_asset: str | None,
     holding_sessions: int,
+    requested_assets: tuple[str, ...] = U67_REQUESTED_ASSETS,
 ) -> LiveLightGBMDecision:
-    """Build one protected U67 decision from the latest supplied observation."""
-    assert_tcc_u67_operational_contract(config)
+    """Produce one prospective decision for a frozen Control universe."""
+    if requested_assets == U67_REQUESTED_ASSETS:
+        assert_tcc_u67_operational_contract(config)
+    else:
+        from .tcc_u77_static_challenger import (
+            U77_REQUESTED_ASSETS,
+            assert_tcc_u77_contract,
+        )
+        if requested_assets != U77_REQUESTED_ASSETS:
+            raise ValueError("Unknown frozen Control universe")
+        assert_tcc_u77_contract(config)
     frames, symbols, common_dates, scientific_config = _prepare_live_u67_panel(
         bars_by_symbol,
         config,
+        requested_assets=requested_assets,
     )
     if len(common_dates) < 2:
         raise ValueError("TCC U67 live runtime has insufficient aligned history.")
