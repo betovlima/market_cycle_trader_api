@@ -1,6 +1,6 @@
-"""Immutable U67+10 static Challenger contract, isolated from the U67 Winner.
+"""Frozen U67+10 Control contract for the standard MCT Strategy lifecycle.
 
-Research/backtest only until independently validated live runtime is delivered.
+The historical U67 configuration remains independent of this 77-asset variant.
 """
 from __future__ import annotations
 
