@@ -183,9 +183,15 @@ def _validated_context(
         raise RuntimeError(
             f"Trader Winner model {winner_model['family']!r} does not have a protected live engine."
         )
-    if str(strategy.strategy_mode) == TCC_U67_CONTROL_OPERATIONAL_MODE:
+    if str(strategy.strategy_mode) in {
+        TCC_U67_CONTROL_OPERATIONAL_MODE,
+        TCC_U77_FIXED_CHALLENGER_MODE,
+    }:
         try:
-            assert_tcc_u67_operational_contract(strategy)
+            if str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE:
+                assert_tcc_u77_contract(strategy)
+            else:
+                assert_tcc_u67_operational_contract(strategy)
             assert_tcc_u67_model_snapshot(winner_model)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
