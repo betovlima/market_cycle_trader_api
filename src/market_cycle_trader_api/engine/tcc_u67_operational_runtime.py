@@ -591,6 +591,8 @@ def run_tcc_u67_operational_backtest(
 def _prepare_live_u67_panel(
     bars_by_symbol: dict[str, pd.DataFrame],
     config: Any,
+    *,
+    requested_assets: tuple[str, ...] = U67_REQUESTED_ASSETS,
 ) -> tuple[
     dict[str, pd.DataFrame],
     list[str],
@@ -599,7 +601,7 @@ def _prepare_live_u67_panel(
 ]:
     eligible_assets = tuple(
         symbol
-        for symbol in U67_REQUESTED_ASSETS
+        for symbol in requested_assets
         if symbol in bars_by_symbol
     )
     if len(eligible_assets) < 2:
@@ -636,7 +638,7 @@ def _prepare_live_u67_panel(
     )
     symbols = [
         symbol
-        for symbol in U67_REQUESTED_ASSETS
+        for symbol in requested_assets
         if symbol in frames
     ]
     if len(symbols) < 2:
