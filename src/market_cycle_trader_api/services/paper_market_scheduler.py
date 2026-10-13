@@ -1738,6 +1738,9 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "status": status,
         "phase": str(controller.get("phase") or (latest or {}).get("phase") or status),
         "scheduler_alive": bool(runtime.get("scheduler_alive")),
+        "position_observer_alive": bool(runtime.get("position_observer_alive")),
+        "last_position_observation_at": runtime.get("last_position_observation_at"),
+        "position_observation_seconds": runtime.get("position_observation_seconds"),
         "scheduler_started_at": runtime.get("scheduler_started_at"),
         "last_scheduler_tick_at": runtime.get("last_scheduler_tick_at"),
         "last_successful_scheduler_tick_at": runtime.get("last_successful_scheduler_tick_at"),
@@ -1756,6 +1759,7 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         output.update({
             "scheduler_worker_id": runtime.get("scheduler_worker_id"),
             "scheduler_last_error": runtime.get("scheduler_last_error"),
+            "position_observation_error": runtime.get("position_observation_error"),
             "poll_seconds": runtime.get("poll_seconds"),
             "last_error": controller.get("last_error"),
             "next_retry_at": bson_value(controller.get("next_retry_at")),
