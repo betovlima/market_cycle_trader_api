@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from pydantic import ValidationError
@@ -18,9 +19,11 @@ from ..infrastructure.trading.alpaca_paper import (
     clock_snapshot,
     create_paper_trading_client,
     position_snapshots,
+    calendar_session_dates,
 )
 from ..schemas.paper_trading import PaperTradingState
 from .paper_market_scheduler import latest_paper_market_run
+from .paper_position_excursion import most_recent_open_buy, position_excursion_audit
 from .paper_portfolio_audit import (
     decision_audit,
     enrich_portfolio_history,
@@ -91,8 +94,58 @@ def _record_snapshot(db: Any, snapshot: dict[str, Any]) -> None:
             "total_pnl": snapshot["total_pnl"],
             "total_return": snapshot["total_return"],
             "managed_symbol": snapshot["position"]["symbol"] if snapshot["position"] else None,
+            "position_quantity": snapshot["position"].get("quantity") if snapshot["position"] else None,
+            "position_price": snapshot["position"].get("current_price") if snapshot["position"] else None,
+            "position_cost_basis": snapshot["position"].get("cost_basis") if snapshot["position"] else None,
+            "position_market_value": snapshot["position"].get("market_value") if snapshot["position"] else None,
+            "position_unrealized_return": snapshot["position"].get("unrealized_return") if snapshot["position"] else None,
+            "position_unrealized_pnl": snapshot["position"].get("unrealized_pnl") if snapshot["position"] else None,
         }
     )
+
+
+def record_paper_position_observation(db: Any) -> dict[str, Any]:
+    """Take a lightweight intraday Paper position sample; no model or orders.
+
+    Called by the Paper scheduler independently of Portfolio page views.
+    The scheduler enforces the 5-minute cadence; _record_snapshot also
+    avoids writing duplicate observations within 60 seconds.
+    """
+    raw = get_paper_trading_state(db)
+    symbol = str(raw.get("managed_symbol") or "").strip().upper()
+    if not symbol:
+        return {"status": "skipped", "reason": "no_open_position"}
+    client = create_paper_trading_client(db)
+    clock = clock_snapshot(client)
+    if not bool(clock.get("is_open")):
+        return {"status": "skipped", "reason": "regular_market_closed"}
+    actual = position_snapshots(client).get(symbol)
+    if actual is None:
+        return {"status": "skipped", "reason": "position_not_in_broker"}
+    market_value = float(actual["market_value"])
+    initial = float(raw.get("initial_capital") or 0.0)
+    cash = float(raw.get("strategy_cash") or 0.0)
+    portfolio = cash + market_value
+    quantity = float(actual["quantity"])
+    basis = quantity * float(actual["average_entry_price"])
+    position = {
+        "symbol": symbol,
+        "quantity": quantity,
+        "current_price": float(actual["current_price"]),
+        "cost_basis": _round_money(basis),
+        "market_value": _round_money(market_value),
+        "unrealized_return": (market_value / basis - 1.0) if basis > 0 else None,
+        "unrealized_pnl": _round_money(market_value - basis),
+    }
+    _record_snapshot(db, {
+        "portfolio_value": _round_money(portfolio),
+        "strategy_cash": _round_money(cash),
+        "market_value": _round_money(market_value),
+        "total_pnl": _round_money(portfolio - initial),
+        "total_return": (portfolio / initial - 1.0) if initial > 0 else None,
+        "position": position,
+    })
+    return {"status": "observed", "symbol": symbol, "sampled_at": utc_now()}
 
 
 def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
@@ -171,6 +224,10 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
         "next_session_run": latest_paper_market_run(db),
     }
 
+    if position is not None:
+        position["observed_at"] = snapshot["recorded_at"]
+        position["portfolio_value"] = snapshot["portfolio_value"]
+
     _record_snapshot(db, snapshot)
 
     history = list(
@@ -197,6 +254,30 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
     latest_plan = plans[-1] if plans else None
     latest_decision = decision_audit(latest_plan, candidate_limit=None)
 
+    # This is a read-only diagnostic. Calendars are queried only while
+    # we have an open position and failures never prevent portfolio display.
+    session_dates: list[str] = []
+    if position is not None:
+        opening = most_recent_open_buy(position["symbol"], all_orders)
+        if opening is not None:
+            start_date = opening["entry_timestamp"].astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            end_date = _as_utc(snapshot["recorded_at"]).astimezone(
+                ZoneInfo("America/New_York")
+            ).date()
+            try:
+                session_dates = calendar_session_dates(
+                    client, start_date=start_date, end_date=end_date
+                )
+            except Exception:
+                session_dates = []
+    excursion = position_excursion_audit(
+        position, all_orders, public_history,
+        completed_sessions=session_dates,
+        decision=latest_decision,
+    )
+
     snapshot["history"] = public_history
     snapshot["recent_orders"] = [
         {
@@ -222,6 +303,7 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
         },
         "history": audit_history,
         "latest_decision": latest_decision,
+        "position_excursion": excursion,
         "operations": operation_rows(
             all_orders,
             plan_map,
