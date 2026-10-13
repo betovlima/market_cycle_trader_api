@@ -187,6 +187,10 @@ def build_paper_portfolio_export(db: Any) -> bytes:
         'portfolio_value', 'realized_pnl', 'unrealized_pnl', 'total_pnl', 'total_return',
         'position', 'last_decision_date', 'last_execution_session', 'market_clock',
     )}
+    excursion = ((current.get('audit') or {}).get('position_excursion') or {})
+    excursion_observations = excursion.get('observations') or []
+    excursion_summary = {key: value for key, value in excursion.items() if key != 'observations'}
+
     manifest = {
         'schema_version': 1,
         'package_kind': 'market_cycle_trader_paper_transaction_audit',
@@ -197,6 +201,7 @@ def build_paper_portfolio_export(db: Any) -> bytes:
         'candidate_row_count': len(candidate_rows),
         'portfolio_snapshot_count': len(history),
         'decision_linked_order_count': sum(1 for row in transaction_rows if row['decision_available']),
+        'position_observation_count': len(excursion_observations),
     }
     package = {
         'manifest': manifest,
@@ -205,6 +210,7 @@ def build_paper_portfolio_export(db: Any) -> bytes:
         'decisions': _json_safe(decision_rows),
         'decision_candidates': _json_safe(candidate_rows),
         'portfolio_history': _json_safe(history),
+        'position_excursion': _json_safe(excursion),
     }
 
     transaction_fields = [
@@ -234,7 +240,28 @@ def build_paper_portfolio_export(db: Any) -> bytes:
     ]
     history_fields = [
         'recorded_at', 'portfolio_value', 'strategy_cash', 'market_value', 'total_pnl',
-        'total_return', 'managed_symbol',
+        'total_return', 'managed_symbol', 'position_quantity', 'position_price',
+        'position_cost_basis', 'position_market_value', 'position_unrealized_return',
+        'position_unrealized_pnl',
+    ]
+    excursion_fields = [
+        'symbol', 'status', 'measurement', 'entry_filled_at', 'entry_price',
+        'current_price', 'observation_count', 'observed_peak_at',
+        'observed_peak_return', 'observed_trough_at',
+        'observed_trough_return', 'current_return', 'observed_peak_profit',
+        'current_unrealized_profit', 'profit_given_back',
+        'fraction_of_peak_profit_given_back',
+        'position_drawdown_from_observed_peak',
+        'account_peak_value_during_position', 'account_peak_at',
+        'account_value_given_back', 'recorded_holding_sessions',
+        'observed_completed_sessions_since_entry', 'holding_discrepancy',
+        'decision_date', 'plan_holding_sessions',
+        'observed_sessions_at_decision', 'decision_holding_discrepancy',
+        'quantity_unchanged_in_order_ledger', 'limitations',
+    ]
+    observation_fields = [
+        'recorded_at', 'unrealized_return', 'market_value',
+        'portfolio_value', 'source',
     ]
 
     buffer = io.BytesIO()
@@ -245,4 +272,10 @@ def build_paper_portfolio_export(db: Any) -> bytes:
         archive.writestr('paper_decisions.csv', _csv_text(decision_rows, decision_fields))
         archive.writestr('paper_decision_candidates.csv', _csv_text(candidate_rows, candidate_fields))
         archive.writestr('portfolio_history.csv', _csv_text(history, history_fields))
+        archive.writestr('position_excursion_summary.csv', _csv_text(
+            [excursion_summary] if excursion_summary else [], excursion_fields
+        ))
+        archive.writestr('position_excursion_observations.csv', _csv_text(
+            excursion_observations, observation_fields
+        ))
     return buffer.getvalue()
