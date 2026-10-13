@@ -272,6 +272,11 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
                 )
             except Exception:
                 session_dates = []
+    if bool(clock.get("is_open")):
+        today_et = _as_utc(snapshot["recorded_at"]).astimezone(
+            ZoneInfo("America/New_York")
+        ).date().isoformat()
+        session_dates = [day for day in session_dates if day < today_et]
     excursion = position_excursion_audit(
         position, all_orders, public_history,
         completed_sessions=session_dates,
