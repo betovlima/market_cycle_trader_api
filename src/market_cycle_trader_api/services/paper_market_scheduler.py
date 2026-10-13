@@ -1611,7 +1611,8 @@ class PaperMarketScheduler:
         if not due:
             return
         local = pd.Timestamp(now)
-        local = local.tz_localize("UTC") if local.tzinfo is None else local.tz_convert(EASTERN)
+        local = local.tz_localize("UTC") if local.tzinfo is None else local
+        local = local.tz_convert(EASTERN)
         # Outside normal market hours, do not query the Paper broker simply
         # to collect a skipped observation. Actual early closes are checked
         # by clock_snapshot inside the recorder.
