@@ -277,8 +277,22 @@ def paper_portfolio_snapshot(db: Any) -> dict[str, Any]:
             ZoneInfo("America/New_York")
         ).date().isoformat()
         session_dates = [day for day in session_dates if day < today_et]
+    # The UI history is intentionally capped at 500 rows, but a trade can
+    # remain open for longer. Search ALL observations since this entry
+    # when finding its maximum; never let a rolling UI window erase its peak.
+    position_history = public_history
+    if position is not None:
+        opening = most_recent_open_buy(position["symbol"], all_orders)
+        if opening is not None:
+            since_entry = list(
+                db[PAPER_PORTFOLIO_SNAPSHOTS_COLLECTION].find(
+                    {"recorded_at": {"$gte": opening["entry_timestamp"]}},
+                    {"_id": 0},
+                ).sort("recorded_at", 1)
+            )
+            position_history = [bson_value(item) for item in since_entry]
     excursion = position_excursion_audit(
-        position, all_orders, public_history,
+        position, all_orders, position_history,
         completed_sessions=session_dates,
         decision=latest_decision,
     )
