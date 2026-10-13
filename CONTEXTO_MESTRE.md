@@ -1,3 +1,46 @@
+## 2026-10-13 — API v10.8.93 — observabilidade da máxima e devolução de lucro Paper
+
+**Causa:** episódio da MAN (compra 07/10) expôs ausência de curva de
+lucro por operação, possíveis máximas intradiárias não capturadas pela
+amostragem existente, e divergência entre dias de negociação decorridos
+e `holding_sessions`. Os planos de `hold` recentes ainda constavam
+como `prepared`; isso demanda investigação de execução, **não**
+mudança de política automática.
+
+**Branch:** `feature/v10.8.93-position-excursion-observability`;
+**Front correspondente:** `feature/v10.7.21-position-excursion-observability`.
+
+**Implementado:** captura da posição Paper a cada cinco minutos durante
+mercado aberto pelo próprio scheduler, sem depender do frontend;
+amostras persistem cotação, quantidade, custo e ganho não realizado.
+Uma auditoria por fill calcula MFE/MAE observados, instante do pico,
+giveback do lucro da posição e do patrimônio, limitações de
+amostragem e comparação do contador persistido com sessões do
+calendário da Alpaca. Novos CSVs no ZIP de auditoria e gráfico no
+Portfolio. Nenhum código de envio de ordens, política LightGBM,
+Winner ou mínimo de dois pregões foi alterado. Falha de coleta não
+impede a operação. Não adicionamos hash, gate de desempenho ou venda
+automática.
+
+**Evidência inicial (snapshot, não máximo real de bolsa):**
+patrimônio durante MAN máximo observado US$ 10.733,61,
+último US$ 10.159,16, diferença US$ 574,45;
+pico de rentabilidade observado da MAN +2,52%, portanto
+a afirmação de +20% não está comprovada pelos ZIPs
+e não deve ser apresentada como resultado calculado.
+O contador mostrado foi 1; calendário desde o fill
+08/10, 09/10, 12/10 e 13/10: quatro pregões
+decorridos na data do relatório.
+
+**Próximos passos:** CI e coleta prospectiva em Paper,
+exportar novo pacote e validar horários/quantidade/estado.
+Investigar separadamente os planos hold pendentes que
+podem impedir atualização do contador. Somente mediante
+nova solicitação considerar mudança de regras de venda.
+Documentação: `docs/changes/v10.8.93-position-excursion-observability.md`.
+
+---
+
 # CONTEXTO_MESTRE
 
 ## 2026-10-07 - API v10.8.88 manual current-session control
