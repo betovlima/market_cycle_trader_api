@@ -1587,6 +1587,7 @@ class PaperMarketScheduler:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._observation_thread: threading.Thread | None = None
         self._worker_id = f"paper-market-worker-{uuid.uuid4().hex[:10]}"
         self._lock = threading.Lock()
         self._started_at = None
@@ -1608,6 +1609,13 @@ class PaperMarketScheduler:
             if due:
                 self._last_observation_attempt_at = now
         if not due:
+            return
+        local = pd.Timestamp(now)
+        local = local.tz_localize("UTC") if local.tzinfo is None else local.tz_convert(EASTERN)
+        # Outside normal market hours, do not query the Paper broker simply
+        # to collect a skipped observation. Actual early closes are checked
+        # by clock_snapshot inside the recorder.
+        if local.weekday() >= 5 or not (9 <= local.hour < 17):
             return
         # Lazy import prevents a dependency cycle: the public Portfolio
         # service references this scheduler only for its read-only status.
@@ -1639,17 +1647,30 @@ class PaperMarketScheduler:
             daemon=True,
         )
         self._thread.start()
+        self._observation_thread = threading.Thread(
+            target=self._observe_loop,
+            name="alpaca-paper-position-observer",
+            daemon=True,
+        )
+        self._observation_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self._observation_thread is not None:
+            self._observation_thread.join(timeout=5)
         self._thread = None
+        self._observation_thread = None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "scheduler_alive": bool(self._thread is not None and self._thread.is_alive()),
+                "position_observer_alive": bool(
+                    self._observation_thread is not None
+                    and self._observation_thread.is_alive()
+                ),
                 "scheduler_worker_id": self._worker_id,
                 "scheduler_started_at": bson_value(self._started_at),
                 "last_scheduler_tick_at": bson_value(self._last_tick_at),
@@ -1663,6 +1684,16 @@ class PaperMarketScheduler:
                 "poll_seconds": scheduler_poll_seconds(),
             }
 
+    def _observe_loop(self) -> None:
+        """Independent sampling; slow model training cannot pause the observer."""
+        while not self._stop.is_set():
+            try:
+                self._observe_portfolio_if_due(database(), utc_now())
+            except Exception as exc:
+                with self._lock:
+                    self._last_position_observation_error = str(exc)
+            self._stop.wait(min(30.0, position_observation_seconds()))
+
     def _run(self) -> None:
         while not self._stop.is_set():
             tick = utc_now()
@@ -1672,7 +1703,6 @@ class PaperMarketScheduler:
                 db = database()
                 _recover_stale_runs(db)
                 _advance_one(db, self._worker_id)
-                self._observe_portfolio_if_due(db, tick)
                 with self._lock:
                     self._last_successful_tick_at = utc_now()
                     self._last_error = None
