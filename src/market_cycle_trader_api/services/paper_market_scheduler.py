@@ -75,6 +75,14 @@ def preparation_retry_seconds() -> float:
     )
 
 
+def position_observation_seconds() -> float:
+    """Sampling telemetry only; independent of order/decision cadence."""
+    return _positive_float_env(
+        "PAPER_PORTFOLIO_OBSERVATION_SECONDS", 300.0,
+        minimum=60.0,
+    )
+
+
 def _paper_settings(db: Any) -> PaperTradingSettings:
     return PaperTradingSettings.model_validate(get_paper_trading_settings(db))
 
@@ -1585,6 +1593,36 @@ class PaperMarketScheduler:
         self._last_tick_at = None
         self._last_successful_tick_at = None
         self._last_error = None
+        self._last_observation_attempt_at = None
+        self._last_position_observation_at = None
+        self._last_position_observation_error = None
+
+    def _observe_portfolio_if_due(self, db: Any, now: Any) -> None:
+        with self._lock:
+            previous = self._last_observation_attempt_at
+            due = (
+                previous is None
+                or (pd.Timestamp(now) - pd.Timestamp(previous)).total_seconds()
+                >= position_observation_seconds()
+            )
+            if due:
+                self._last_observation_attempt_at = now
+        if not due:
+            return
+        # Lazy import prevents a dependency cycle: the public Portfolio
+        # service references this scheduler only for its read-only status.
+        try:
+            from .paper_portfolio import record_paper_position_observation
+
+            outcome = record_paper_position_observation(db)
+            with self._lock:
+                if outcome.get("status") == "observed":
+                    self._last_position_observation_at = now
+                self._last_position_observation_error = None
+        except Exception as exc:
+            # A telemetry outage must never stop order processing.
+            with self._lock:
+                self._last_position_observation_error = str(exc)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -1617,6 +1655,11 @@ class PaperMarketScheduler:
                 "last_scheduler_tick_at": bson_value(self._last_tick_at),
                 "last_successful_scheduler_tick_at": bson_value(self._last_successful_tick_at),
                 "scheduler_last_error": self._last_error,
+                "last_position_observation_at": bson_value(
+                    self._last_position_observation_at
+                ),
+                "position_observation_error": self._last_position_observation_error,
+                "position_observation_seconds": position_observation_seconds(),
                 "poll_seconds": scheduler_poll_seconds(),
             }
 
@@ -1629,6 +1672,7 @@ class PaperMarketScheduler:
                 db = database()
                 _recover_stale_runs(db)
                 _advance_one(db, self._worker_id)
+                self._observe_portfolio_if_due(db, tick)
                 with self._lock:
                     self._last_successful_tick_at = utc_now()
                     self._last_error = None
