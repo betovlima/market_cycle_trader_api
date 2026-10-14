@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+
+from market_cycle_trader_api.services import paper_trading
+from market_cycle_trader_api.schemas.paper_trading import PaperTradingState
 
 from market_cycle_trader_api.services.paper_position_excursion import (
     completed_sessions_after_entry,
@@ -103,6 +109,153 @@ class PaperPositionExcursionTests(unittest.TestCase):
         result = position_excursion_audit(self.position, [], self.history)
         self.assertEqual(result["status"], "entry_fill_unavailable")
         self.assertEqual(result["observations"], [])
+
+
+class PaperHoldingReconciliationTests(unittest.TestCase):
+    """Real MAN fill, interrupted hold plans and market calendar."""
+
+    def setUp(self):
+        self.state = PaperTradingState(
+            initial_capital=10000,
+            strategy_cash=0,
+            managed_symbol="MAN",
+            managed_quantity=196.730176625,
+            average_entry_price=53.22,
+            holding_sessions=1,
+            realized_pnl=0,
+            last_decision_date="2026-10-06",
+            last_execution_session="2026-10-07",
+        )
+        self.fills = [
+            {
+                "symbol": "MAN",
+                "side": "buy",
+                "status": "filled",
+                "filled_at": "2026-10-07T19:12:03.483+00:00",
+                "filled_quantity": 196.730176625,
+            },
+        ]
+        self.order_collection = MagicMock()
+        self.order_collection.find.return_value = self.fills
+        self.state_collection = MagicMock()
+        self.state_collection.update_one.return_value.matched_count = 1
+        self.db = {
+            paper_trading.PAPER_TRADE_ORDERS_COLLECTION: self.order_collection,
+            paper_trading.PAPER_TRADING_STATE_COLLECTION: self.state_collection,
+        }
+        self.sessions = [
+            "2026-10-07", "2026-10-08", "2026-10-09",
+            "2026-10-12", "2026-10-13", "2026-10-14",
+        ]
+
+    def _reconcile(self, *, is_open, safe_cutoff="2026-10-13"):
+        with (
+            patch.object(
+                paper_trading, "latest_safe_completed_xnys_session",
+                return_value=pd.Timestamp(safe_cutoff),
+            ),
+            patch.object(
+                paper_trading, "calendar_session_dates",
+                return_value=self.sessions,
+            ) as calendar,
+        ):
+            result = paper_trading._reconcile_paper_holding_sessions(
+                self.db,
+                MagicMock(),
+                self.state,
+                clock={
+                    "is_open": is_open,
+                    "timestamp": "2026-10-14T15:25:46Z",
+                },
+            )
+            return result, calendar
+
+    def test_stale_man_counter_recovered_from_real_fill(self):
+        actual, calendar = self._reconcile(is_open=True)
+        # The purchase starts holding session 1. Four full trading
+        # sessions after the fill make the effective age 5, not 1.
+        self.assertEqual(actual.holding_sessions, 5)
+        self.assertEqual(self.state.holding_sessions, 1)
+        self.assertEqual(calendar.call_args.kwargs["end_date"].isoformat(), "2026-10-13")
+        filter_doc, update_doc = self.state_collection.update_one.call_args.args
+        self.assertEqual(filter_doc["managed_symbol"], "MAN")
+        self.assertEqual(filter_doc["holding_sessions"], 1)
+        self.assertEqual(filter_doc["last_execution_session"], "2026-10-07")
+        self.assertEqual(update_doc["$set"]["holding_sessions"], 5)
+
+    def test_incomplete_intraday_candle_never_increments_holding(self):
+        # Deliberately supply an over-generous historical cutoff.
+        actual, calendar = self._reconcile(is_open=True, safe_cutoff="2026-10-14")
+        self.assertEqual(actual.holding_sessions, 5)
+        self.assertEqual(calendar.call_args.kwargs["end_date"].isoformat(), "2026-10-13")
+
+    def test_persisted_counter_matches_purchase_session(self):
+        state = self.state.model_copy(update={"holding_sessions": 1})
+        with (
+            patch.object(paper_trading, "latest_safe_completed_xnys_session",
+                         return_value=pd.Timestamp("2026-10-07")),
+            patch.object(paper_trading, "calendar_session_dates",
+                         return_value=["2026-10-07"]),
+        ):
+            result = paper_trading._reconcile_paper_holding_sessions(
+                self.db, MagicMock(), state,
+                clock={"is_open": False, "timestamp": "2026-10-07T22:00:00Z"},
+            )
+        self.assertEqual(result.holding_sessions, 1)
+        self.state_collection.update_one.assert_not_called()
+
+    def test_cancelled_hold_plans_do_not_change_fill_based_age(self):
+        # No execution of cancelled or prepared hold plans occurred.
+        self.order_collection.find.return_value = list(self.fills)
+        actual, _ = self._reconcile(is_open=True)
+        self.assertEqual(actual.holding_sessions, 5)
+
+    def test_no_confirmed_fill_does_not_unlock_rotation(self):
+        self.order_collection.find.return_value = [
+            {"symbol": "MAN", "side": "buy",
+             "created_at": "2026-10-07T19:12:00Z",
+             "filled_quantity": 196.730176625}
+        ]
+        with self.assertRaisesRegex(RuntimeError, "no open entry"):
+            self._reconcile(is_open=True)
+        self.state_collection.update_one.assert_not_called()
+
+    def test_ledger_quantity_conflict_blocks_reconciliation(self):
+        self.fills[0]["filled_quantity"] = 150.0
+        with self.assertRaisesRegex(RuntimeError, "quantity"):
+            self._reconcile(is_open=True)
+        self.state_collection.update_one.assert_not_called()
+
+    def test_concurrent_state_change_is_not_overwritten(self):
+        self.state_collection.update_one.return_value.matched_count = 0
+        with self.assertRaisesRegex(RuntimeError, "changed during"):
+            self._reconcile(is_open=True)
+
+    def test_cash_position_requires_no_calendar_or_ledger(self):
+        state = self.state.model_copy(
+            update={
+                "managed_symbol": None, "managed_quantity": 0.0,
+                "average_entry_price": None, "holding_sessions": 0,
+            }
+        )
+        self.assertIs(
+            paper_trading._reconcile_paper_holding_sessions(
+                self.db, MagicMock(), state, clock={},
+            ),
+            state,
+        )
+        self.order_collection.find.assert_not_called()
+
+    def test_sell_then_repurchase_resets_age(self):
+        self.order_collection.find.return_value = [
+            {"symbol": "MAN", "side": "buy", "filled_quantity": 15,
+             "filled_at": "2026-09-22T14:00:00Z"},
+            {"symbol": "MAN", "side": "sell", "filled_quantity": 15,
+             "filled_at": "2026-10-06T15:00:00Z"},
+            *self.fills,
+        ]
+        actual, _ = self._reconcile(is_open=True)
+        self.assertEqual(actual.holding_sessions, 5)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ from ..infrastructure.trading.alpaca_paper import (
 )
 from ..schemas.paper_trading import PaperTradePlan, PaperTradingSettings, PaperTradingState
 from ..schemas.requests import BacktestRequest
+from .paper_position_excursion import completed_sessions_after_entry, most_recent_open_buy
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings, get_system_settings
 from .strategy_lab import (
@@ -84,6 +85,125 @@ def _et_date(value: Any) -> str:
     stamp = pd.Timestamp(value)
     stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
     return stamp.tz_convert(EASTERN).date().isoformat()
+
+
+def _reconcile_paper_holding_sessions(
+    db: Any,
+    client: Any,
+    state: PaperTradingState,
+    *,
+    clock: dict[str, Any],
+) -> PaperTradingState:
+    """Rebuild Paper holding age from real fills and completed XNYS sessions.
+
+    Buying starts holding session 1; every subsequently *completed* trading
+    session adds one. A prepared, cancelled or missed hold plan must never
+    freeze the age of an already open position. No orders are submitted here.
+    """
+    symbol = str(state.managed_symbol or "").strip().upper()
+    if not symbol:
+        return state
+
+    orders = list(
+        db[PAPER_TRADE_ORDERS_COLLECTION].find(
+            {"symbol": symbol},
+            {"symbol": 1, "side": 1, "filled_at": 1, "filled_quantity": 1},
+        )
+    )
+    # created_at is not a substitute for a confirmed fill when deciding
+    # whether a trading restriction has expired.
+    confirmed_fills = [order for order in orders if order.get("filled_at")]
+    opening = most_recent_open_buy(symbol, confirmed_fills)
+    if opening is None:
+        raise RuntimeError(
+            f"Cannot verify holding age for {symbol}: the filled Paper "
+            "order ledger has no open entry. Reconcile the broker and "
+            "MongoDB before preparing another trading decision."
+        )
+
+    ledger_quantity = float(opening["filled_quantity_ledger"])
+    current_quantity = float(state.managed_quantity)
+    tolerance = max(1e-6, abs(current_quantity) * 1e-6)
+    if abs(ledger_quantity - current_quantity) > tolerance:
+        raise RuntimeError(
+            f"Cannot verify holding age for {symbol}: Paper fill ledger "
+            f"quantity={ledger_quantity:.9f}, managed quantity="
+            f"{current_quantity:.9f}. Reconcile the position before trading."
+        )
+
+    entry_day = pd.Timestamp(opening["entry_timestamp"]).tz_convert(
+        EASTERN
+    ).date()
+    completed_cutoff = pd.Timestamp(
+        latest_safe_completed_xnys_session()
+    ).date()
+    if bool(clock.get("is_open")):
+        # A current-session intraday signal does not turn the unfinished
+        # execution day into another completed holding session.
+        current_day = pd.Timestamp(clock["timestamp"])
+        current_day = (
+            current_day.tz_localize("UTC")
+            if current_day.tzinfo is None
+            else current_day.tz_convert("UTC")
+        ).tz_convert(EASTERN).date()
+        completed_cutoff = min(
+            completed_cutoff,
+            current_day - timedelta(days=1),
+        )
+    if completed_cutoff < entry_day:
+        # The purchase may have filled during the current, unfinished day.
+        completed_after_entry = 0
+    else:
+        sessions = calendar_session_dates(
+            client,
+            start_date=entry_day,
+            end_date=completed_cutoff,
+        )
+        completed_after_entry = completed_sessions_after_entry(
+            opening["entry_timestamp"],
+            sessions,
+            as_of_session=completed_cutoff.isoformat(),
+        )
+        if completed_after_entry is None:
+            raise RuntimeError(
+                f"Cannot verify holding age for {symbol}: Alpaca returned "
+                "no usable trading calendar for the open position."
+            )
+        if entry_day.isoformat() not in set(sessions):
+            raise RuntimeError(
+                f"Cannot verify holding age for {symbol}: entry date "
+                f"{entry_day.isoformat()} is absent from the Alpaca calendar."
+            )
+
+    actual_holding = 1 + int(completed_after_entry)
+    recorded_holding = int(state.holding_sessions)
+    if actual_holding == recorded_holding:
+        return state
+
+    # Compare-and-set: do not overwrite a concurrent fill or Paper execution.
+    result = db[PAPER_TRADING_STATE_COLLECTION].update_one(
+        {
+            "_id": "default",
+            "managed_symbol": state.managed_symbol,
+            "managed_quantity": state.managed_quantity,
+            "last_execution_session": state.last_execution_session,
+            "holding_sessions": state.holding_sessions,
+        },
+        {"$set": {"holding_sessions": actual_holding}},
+    )
+    if result.matched_count != 1:
+        raise RuntimeError(
+            "Paper position changed during holding-age reconciliation. "
+            "Discard this plan and retry with the latest broker state."
+        )
+    print(
+        "[paper-holding] Reconciled completed-session age from Paper "
+        f"fills: symbol={symbol} entry={entry_day.isoformat()} "
+        f"recorded={recorded_holding} actual={actual_holding} "
+        f"cutoff={completed_cutoff.isoformat()}",
+        flush=True,
+    )
+    return state.model_copy(update={"holding_sessions": actual_holding})
 
 
 def _acquire_live_market_refresh_lock(db: Any, *, source: str) -> bool:
@@ -577,6 +697,9 @@ def prepare_next_paper_plan(
         client,
         assets=strategy.assets,
         state=state,
+    )
+    state = _reconcile_paper_holding_sessions(
+        db, client, state, clock=clock,
     )
 
     bars_by_symbol: dict[str, pd.DataFrame] = {}
