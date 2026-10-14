@@ -606,6 +606,11 @@ def prepare_manual_current_session_plan(
                     "last_error": str(exc),
                     "last_message": "Manual reanalysis failed; no Paper order was submitted.",
                     "updated_at": utc_now(),
+                },
+                 "$unset": {
+                    "manual_recovery_plan_id": "",
+                    "action": "",
+                    "target_asset": "",
                 }},
             )
         raise
@@ -1758,6 +1763,26 @@ def _advance_one(db: Any, worker_id: str) -> None:
     if str(run.get("status") or "") in {
         "manual_preparing", "manual_pending", "manual_executing",
     }:
+        if str(run.get("status") or "") == "manual_executing":
+            # The API may have restarted after Alpaca confirmed the fill but
+            # before the matching scheduler run was closed.
+            finished_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+                {"plan_id": str(run.get("plan_id") or "")},
+                {"status": 1, "execution_origin": 1, "final_state": 1},
+            ) or {}
+            if str(finished_plan.get("status") or "") == "executed":
+                _finish_run(
+                    db, str(run["run_id"]),
+                    status="completed",
+                    message="Recovered confirmed manual Paper execution after restart.",
+                    extra={
+                        "execution_origin": "manual_recovery",
+                        "execution_result": bson_value(
+                            finished_plan.get("final_state") or {}
+                        ),
+                    },
+                )
+                return
         today = utc_now().astimezone(EASTERN).date().isoformat()
         if today > str(run.get("execution_session") or ""):
             if str(run.get("status")) == "manual_executing":
