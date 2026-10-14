@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from typing import Annotated, Any, Literal
+from datetime import timedelta, time
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
+from ...infrastructure.persistence.mongo_repository import PAPER_TRADE_PLANS_COLLECTION, utc_now
 from ...services.paper_market_scheduler import (
     execute_manual_current_session_plan,
     list_admin_operation_logs,
@@ -28,6 +31,42 @@ class TraderControlRequest(BaseModel):
 class ManualRecoveryExecuteRequest(BaseModel):
     confirm: Literal["EXECUTE_TODAY"]
     plan_id: str | None = Field(default=None, max_length=160)
+
+
+@router.post("/paper-plans/close-old")
+def close_old_paper_plans(
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """One MongoDB update for completed-session plans left as prepared.
+
+    Administrative database cleanup only. Does not cancel broker orders,
+    change positions, or affect the Paper scheduler.
+    """
+    now = utc_now()
+    market_now = now.astimezone(ZoneInfo("America/New_York"))
+    # Only sessions whose regular trading window has already ended.
+    last_closed_session = market_now.date()
+    if market_now.time() < time(16, 0):
+        last_closed_session -= timedelta(days=1)
+    cutoff = last_closed_session.isoformat()
+
+    result = database()[PAPER_TRADE_PLANS_COLLECTION].update_many(
+        {
+            "status": "prepared",
+            "execution_session": {"$lte": cutoff},
+        },
+        {"$set": {
+            "status": "cancelled",
+            "cancelled_at": now,
+            "cancel_reason": "Historical prepared plan closed administratively.",
+            "updated_at": now,
+        }},
+    )
+    return {
+        "status": "completed",
+        "closed_count": result.modified_count,
+        "closed_through_session": cutoff,
+    }
 
 
 @router.get("/status")
