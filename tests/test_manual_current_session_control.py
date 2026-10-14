@@ -308,6 +308,7 @@ def test_manual_prepare_failure_does_not_release_stale_automatic_plan():
             raise AssertionError("Manual calibration failure must be reported.")
     assert runs.update_one.call_args.args[1]["$set"]["status"] == "manual_pending"
     assert runs.update_one.call_args.args[1]["$set"]["phase"] == "manual_reanalysis_failed"
+    assert "manual_recovery_plan_id" in runs.update_one.call_args.args[1]["$unset"]
 
 
 def test_manual_recovery_status_prefers_approved_plan_over_unrelated_contingency():
@@ -321,3 +322,24 @@ def test_manual_recovery_status_prefers_approved_plan_over_unrelated_contingency
     assert result["plan_id"] == "manual-7"
 
 
+
+def test_restart_recovers_already_executed_manual_plan_without_new_order():
+    run = _manual_run(status="manual_executing")
+    db, runs, plans = _manual_db()
+    plans.find_one.return_value = {
+        "plan_id": "manual-7", "status": "executed",
+        "execution_origin": "manual_recovery",
+        "final_state": {"managed_symbol": "MAN", "holding_sessions": 1},
+    }
+    with (
+        patch.object(scheduler, "_automation_document", return_value={"control_mode": "active"}),
+        patch.object(scheduler, "_ensure_continuous_run", return_value=run),
+        patch.object(scheduler, "utc_now", return_value=datetime(2026, 10, 7, 18, 0, tzinfo=timezone.utc)),
+        patch.object(scheduler, "refresh_trader_live_market_data") as refresh,
+        patch.object(scheduler, "execute_prepared_paper_plan") as execute,
+    ):
+        scheduler._advance_one(db, "worker-test")
+    refresh.assert_not_called()
+    execute.assert_not_called()
+    assert runs.update_one.call_args.args[1]["$set"]["status"] == "completed"
+    assert runs.update_one.call_args.args[1]["$unset"]["active_key"] == ""
