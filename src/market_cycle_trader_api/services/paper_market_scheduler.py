@@ -383,7 +383,15 @@ def _manual_recovery_context(db: Any) -> dict[str, Any]:
         "run": run,
         "plan": current_plan,
         "contingency_plan": contingency_plan,
-        "execution_plan": contingency_plan or current_plan,
+        "execution_plan": (
+            current_plan
+            if (
+                current_plan is not None
+                and str(current_plan.get("status") or "") == "prepared"
+                and str(current_plan.get("plan_source") or "") == "manual_current_session_recovery"
+            )
+            else contingency_plan or current_plan
+        ),
     }
 
 
@@ -414,24 +422,55 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
     current_plan_status = str(current_plan.get("status") or "").lower()
     blocked_current_plan = current_plan_status in {"executing", "recovering", "executed"} or bool(current_plan.get("contingency_execution_in_progress"))
     blocked_execution_plan = plan_status in {"executing", "recovering"} or bool(plan.get("contingency_execution_in_progress"))
-    can_prepare = market_open and not blocked_current_plan
-    can_execute = market_open and (plan_status == "prepared" or recoverable_contingency) and not blocked_execution_plan
+    active_run = _active_manual_session_run(context)
+    run_busy = bool(active_run) and (
+        str(active_run.get("status") or "") in {
+            "preparing", "executing", "manual_preparing", "manual_executing",
+            "review_required",
+        }
+        or str(active_run.get("phase") or "") == "market_open_recalibration"
+    )
+    can_prepare = market_open and not blocked_current_plan and not run_busy
+    manual_plan_is_current = (
+        str(plan.get("execution_session") or "") == str(context["current_session"])
+        and str(plan.get("plan_source") or "") == "manual_current_session_recovery"
+    )
+    scheduled_manual_matches = (
+        not active_run
+        or (
+            str(active_run.get("status") or "") == "manual_pending"
+            and str(active_run.get("plan_id") or "") == str(plan.get("plan_id") or "")
+            and str(active_run.get("manual_recovery_plan_id") or "") == str(plan.get("plan_id") or "")
+        )
+    )
+    can_execute = (
+        market_open and not blocked_execution_plan and not run_busy
+        and (
+            recoverable_contingency
+            or (plan_status == "prepared" and manual_plan_is_current
+                and scheduled_manual_matches)
+        )
+    )
 
     if not market_open:
         prepare_reason = "Manual same-session analysis is available only while the regular market is open."
     elif blocked_current_plan:
         prepare_reason = f"The current-session Paper plan cannot be replaced while status={current_plan_status}."
+    elif run_busy:
+        prepare_reason = "The scheduled Paper run is busy; wait for its current operation to finish."
     else:
         prepare_reason = None
 
     if not market_open:
         execute_reason = "Manual contingency execution requires the regular market to be open."
-    elif blocked_execution_plan:
-        execute_reason = "A Paper execution is already in progress."
+    elif blocked_execution_plan or run_busy:
+        execute_reason = "A Paper operation is already in progress."
     elif recoverable_contingency:
         execute_reason = None
     elif plan_status != "prepared":
         execute_reason = "No prepared or unresolved contingency Paper plan is available."
+    elif not manual_plan_is_current or not scheduled_manual_matches:
+        execute_reason = "Reanalyze the Winner to approve a current-session manual plan."
     else:
         execute_reason = None
 
@@ -487,6 +526,18 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
     }
 
 
+def _active_manual_session_run(context: dict[str, Any]) -> dict[str, Any] | None:
+    """Use only the active scheduled run for the current regular session."""
+    run = context.get("run")
+    if (
+        isinstance(run, dict)
+        and run.get("active_key") == ACTIVE_KEY
+        and str(run.get("execution_session") or "") == str(context["current_session"])
+    ):
+        return run
+    return None
+
+
 def prepare_manual_current_session_plan(
     db: Any,
     *,
@@ -494,7 +545,7 @@ def prepare_manual_current_session_plan(
 ) -> dict[str, Any]:
     context = _manual_recovery_context(db)
     clock = context["clock"]
-    run = context["run"]
+    run = _active_manual_session_run(context)
     existing = context["plan"]
     if not bool(clock.get("is_open")):
         raise RuntimeError("Manual same-session analysis requires the regular market to be open.")
@@ -512,25 +563,88 @@ def prepare_manual_current_session_plan(
             context["current_session"]
         )
 
-    plan = prepare_next_paper_plan(
-        db,
-        replace=existing is not None,
-        allow_open_market=True,
-        execution_session_override=context["current_session"],
-        expected_market_open_override=expected_open,
-        refresh_source="manual_current_session_recovery",
-    )
+    # Claim the scheduled run BEFORE model training. Otherwise its worker can
+    # execute the original prepared plan while manual reanalysis is running.
+    previous_plan_id = str((run or {}).get("plan_id") or "")
+    if run is not None:
+        claimed = db[PAPER_MARKET_RUNS_COLLECTION].find_one_and_update(
+            {
+                "run_id": str(run["run_id"]),
+                "active_key": ACTIVE_KEY,
+                "status": {"$in": ["armed", "prepared", "manual_pending"]},
+                "phase": {"$ne": "market_open_recalibration"},
+            },
+            {"$set": {
+                "status": "manual_preparing",
+                "phase": "manual_winner_reanalysis",
+                "manual_recovery_preparing_at": utc_now(),
+                "updated_at": utc_now(),
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if claimed is None:
+            raise RuntimeError(
+                "The scheduled Paper run is busy or no longer active. "
+                "Refresh Trader status before starting manual reanalysis."
+            )
+    try:
+        plan = prepare_next_paper_plan(
+            db,
+            replace=existing is not None,
+            allow_open_market=True,
+            execution_session_override=context["current_session"],
+            expected_market_open_override=expected_open,
+            refresh_source="manual_current_session_recovery",
+        )
+    except Exception as exc:
+        if run is not None:
+            db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+                {"run_id": str(run["run_id"]), "status": "manual_preparing"},
+                {"$set": {
+                    "status": "manual_pending",
+                    "phase": "manual_reanalysis_failed",
+                    "last_error": str(exc),
+                    "last_message": "Manual reanalysis failed; no Paper order was submitted.",
+                    "updated_at": utc_now(),
+                },
+                 "$unset": {
+                    "manual_recovery_plan_id": "",
+                    "action": "",
+                    "target_asset": "",
+                }},
+            )
+        raise
+
     now = utc_now()
     if run is not None:
-        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-            {"run_id": str(run["run_id"])},
+        changed = db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": str(run["run_id"]), "status": "manual_preparing",
+             "active_key": ACTIVE_KEY},
             {"$set": {
+                "status": "manual_pending",
+                "phase": "awaiting_manual_paper_execution",
+                "plan_id": str(plan["plan_id"]),
+                "action": str(plan["action"]),
+                "target_asset": str(plan["target_asset"]),
+                "decision_date": str(plan.get("decision_date") or ""),
                 "manual_recovery_prepared_at": now,
                 "manual_recovery_plan_id": str(plan["plan_id"]),
                 "manual_recovery_actor_email": (actor_email or "").strip().lower() or None,
                 "updated_at": now,
-            }},
+                "last_message": "Manual Winner plan prepared; waiting for explicit execution.",
+            },
+             "$unset": {"last_error": ""},
+             "$push": {"logs": {"$each": [
+                 f"{now.isoformat()} — Manual reanalysis selected plan "
+                 f"{plan['plan_id']} (previous={previous_plan_id or 'none'}); "
+                 "awaiting explicit manual execution."
+             ], "$slice": -100}}},
         )
+        if changed.matched_count != 1:
+            raise RuntimeError(
+                "The scheduled run changed during manual plan preparation. "
+                "Do not execute; review the current Trader state."
+            )
     mode = _control_mode(_automation_document(db))
     _record_admin_operation(
         db,
@@ -610,6 +724,16 @@ def execute_manual_current_session_plan(
             raise RuntimeError(
                 f"The current-session Paper plan is not prepared or recoverable: status={plan_status or 'unknown'}."
             )
+        if str(plan.get("execution_session") or "") != str(context["current_session"]):
+            raise RuntimeError(
+                "The prepared Paper plan belongs to a different session. "
+                "Reanalyze the Winner for the current session before executing."
+            )
+        if str(plan.get("plan_source") or "") != "manual_current_session_recovery":
+            raise RuntimeError(
+                "A new manual Winner reanalysis is required before using "
+                "Execute current plan on Alpaca."
+            )
         if mode in {"paused", "stopped"}:
             raise RuntimeError(
                 f"Manual execution is blocked while Trader control mode is {mode}. Start the Trader first."
@@ -619,6 +743,34 @@ def execute_manual_current_session_plan(
             raise RuntimeError(
                 f"Manual action {action!r} is blocked by exit-only Trader mode."
             )
+        run = _active_manual_session_run(context)
+        if run is not None:
+            if (
+                str(run.get("status") or "") != "manual_pending"
+                or str(run.get("manual_recovery_plan_id") or "") != str(plan["plan_id"])
+                or str(run.get("plan_id") or "") != str(plan["plan_id"])
+            ):
+                raise RuntimeError(
+                    "Manual plan does not match the active scheduled run. "
+                    "Reanalyze the Winner before execution."
+                )
+            claimed = db[PAPER_MARKET_RUNS_COLLECTION].find_one_and_update(
+                {"run_id": str(run["run_id"]), "active_key": ACTIVE_KEY,
+                 "status": "manual_pending", "plan_id": str(plan["plan_id"]),
+                 "manual_recovery_plan_id": str(plan["plan_id"])},
+                {"$set": {
+                    "status": "manual_executing",
+                    "phase": "manual_paper_execution",
+                    "manual_execution_started_at": utc_now(),
+                    "updated_at": utc_now(),
+                }},
+                return_document=ReturnDocument.AFTER,
+            )
+            if claimed is None:
+                raise RuntimeError(
+                    "Manual plan was already claimed or the run changed. "
+                    "No duplicate Alpaca order was submitted."
+                )
         now = utc_now()
         db[PAPER_TRADE_PLANS_COLLECTION].update_one(
             {"plan_id": str(plan["plan_id"])},
@@ -633,6 +785,29 @@ def execute_manual_current_session_plan(
         try:
             result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
+            if run is not None:
+                latest = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+                    {"plan_id": str(plan["plan_id"])}
+                ) or {}
+                if str(latest.get("status") or "") == "prepared":
+                    db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+                        {"run_id": str(run["run_id"]),
+                         "status": "manual_executing"},
+                        {"$set": {
+                            "status": "manual_pending",
+                            "phase": "manual_execution_retry_requires_review",
+                            "last_error": str(exc),
+                            "updated_at": utc_now(),
+                        }},
+                    )
+                else:
+                    _mark_review_required(
+                        db, str(run["run_id"]),
+                        message=(
+                            "Manual Paper execution failed after its plan was "
+                            f"claimed; reconcile Alpaca orders first: {exc}"
+                        ),
+                    )
             _record_admin_operation(
                 db,
                 action="manual_current_session_execution",
@@ -644,17 +819,30 @@ def execute_manual_current_session_plan(
             )
             raise
 
-    run = context["run"] or {}
-    if run.get("run_id") and str(run.get("execution_session") or "") == str(plan.get("execution_session") or ""):
+    run = _active_manual_session_run(context)
+    if run is not None and str(run.get("manual_recovery_plan_id") or "") == str(plan["plan_id"]):
         now = utc_now()
         db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-            {"run_id": str(run["run_id"])},
+            {"run_id": str(run["run_id"]), "status": "manual_executing"},
             {"$set": {
                 "manual_recovery_executed_at": now,
                 "manual_recovery_execution_result": bson_value(result),
                 "manual_recovery_actor_email": (actor_email or "").strip().lower() or None,
                 "updated_at": now,
             }},
+        )
+        _finish_run(
+            db,
+            str(run["run_id"]),
+            status="completed",
+            message=(
+                f"Manual Paper execution completed for plan {plan['plan_id']}; "
+                "scheduled run closed without any additional orders."
+            ),
+            extra={
+                "execution_origin": "manual_recovery",
+                "execution_result": bson_value(result),
+            },
         )
     _record_admin_operation(
         db,
@@ -1251,10 +1439,14 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
         strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
         if bool(strategy_control.get("winner_promotion_in_progress")):
             return
-        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-            {"run_id": run_id, "status": "prepared"},
+        recalibration_claim = db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "prepared",
+             "phase": {"$ne": "market_open_recalibration"}},
             {"$set": {"phase": "market_open_recalibration", "updated_at": utc_now()}},
         )
+        if recalibration_claim.matched_count != 1:
+            # Manual reanalysis may have claimed the same scheduled run.
+            return
         try:
             recalibrated = prepare_next_paper_plan(
                 db,
@@ -1564,6 +1756,58 @@ def _advance_one(db: Any, worker_id: str) -> None:
 
     run = _ensure_continuous_run(db)
     if run is None:
+        return
+
+    # A manually prepared plan awaits explicit user consent. Never submit it
+    # from the automatic scheduler, and never run the superseded plan instead.
+    if str(run.get("status") or "") in {
+        "manual_preparing", "manual_pending", "manual_executing",
+    }:
+        if str(run.get("status") or "") == "manual_executing":
+            # The API may have restarted after Alpaca confirmed the fill but
+            # before the matching scheduler run was closed.
+            finished_plan = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+                {"plan_id": str(run.get("plan_id") or "")},
+                {"status": 1, "execution_origin": 1, "final_state": 1},
+            ) or {}
+            if str(finished_plan.get("status") or "") == "executed":
+                _finish_run(
+                    db, str(run["run_id"]),
+                    status="completed",
+                    message="Recovered confirmed manual Paper execution after restart.",
+                    extra={
+                        "execution_origin": "manual_recovery",
+                        "execution_result": bson_value(
+                            finished_plan.get("final_state") or {}
+                        ),
+                    },
+                )
+                return
+        today = utc_now().astimezone(EASTERN).date().isoformat()
+        if today > str(run.get("execution_session") or ""):
+            if str(run.get("status")) == "manual_executing":
+                _mark_review_required(
+                    db, str(run["run_id"]),
+                    message="Manual execution crossed the session boundary; "
+                            "verify Alpaca fills before releasing the run.",
+                )
+            else:
+                plan_id = str(run.get("manual_recovery_plan_id") or "")
+                if plan_id:
+                    db[PAPER_TRADE_PLANS_COLLECTION].update_one(
+                        {"plan_id": plan_id, "status": "prepared"},
+                        {"$set": {
+                            "status": "cancelled",
+                            "cancel_reason": "Manual execution was not confirmed by session end.",
+                            "cancelled_at": utc_now(),
+                            "updated_at": utc_now(),
+                        }},
+                    )
+                _finish_run(
+                    db, str(run["run_id"]),
+                    status="failed",
+                    message="Manual Winner plan was not executed before the session ended.",
+                )
         return
 
     # Keep the immutable Winner's mutable market-data position current only when
