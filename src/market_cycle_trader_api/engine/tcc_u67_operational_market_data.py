@@ -34,6 +34,9 @@ SOURCE_CONTRACT = "alpaca_raw_sip_ca_split_normalized_u67_v1"
 ProgressCallback = Callable[[str, int, int, str], None]
 EASTERN = ZoneInfo("America/New_York")
 LIVE_INTRADAY_TIMEFRAME = "1Min"
+# Alpaca basic plans restrict SIP bars in the latest 15 minutes. Five
+# additional minutes protect the boundary, transport and clock rounding.
+SIP_HISTORICAL_DELAY_MINUTES = 20
 
 # This identity break was explicitly adjudicated by the TCC pipeline.
 KNOWN_U67_STRUCTURAL_EXCLUSIONS: dict[str, dict[str, Any]] = {
@@ -154,11 +157,12 @@ def append_u67_current_session_intraday(
     per_asset_pause_seconds: float = 0.05,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
-    """Score the current session using one uniform, complete live feed.
+    """Score the current session using a uniform feed and as-of cutoff.
 
-    IEX may have no trades for an otherwise valid security (such as AMS).
-    Only in that situation, retry the ENTIRE eligible universe using SIP.
-    Never mix IEX and SIP inside one live decision or invent missing bars.
+    Missing IEX data triggers complete-universe SIP; an explicit Alpaca
+    recent-SIP entitlement error permits a delayed SIP retry with a single
+    20-minute-old cutoff for EVERY eligible asset. Otherwise fail closed.
+    The in-progress row is for scoring only, never model training.
     """
     session_date = pd.Timestamp(session).date()
     stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
@@ -194,7 +198,9 @@ def append_u67_current_session_intraday(
     symbols = list(frames)
     total = len(symbols)
 
-    def _load_feed(feed: str) -> tuple[
+    def _load_feed(
+        feed: str, *, as_of: pd.Timestamp, phase: str | None = None,
+    ) -> tuple[
         dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[pd.Timestamp]
     ]:
         augmented: dict[str, pd.DataFrame] = {}
@@ -202,17 +208,23 @@ def append_u67_current_session_intraday(
         last_bar_timestamps: list[pd.Timestamp] = []
         for position, symbol in enumerate(symbols, start=1):
             if progress_callback is not None:
-                progress_callback(f"intraday_{feed}", position - 1, total, symbol)
+                progress_callback(phase or f"intraday_{feed}", position - 1, total, symbol)
             intraday = download_stock_bars(
                 api_key_id=credentials["api_key_id"],
                 secret_key=credentials["secret_key"],
                 symbol=symbol,
                 timeframe=LIVE_INTRADAY_TIMEFRAME,
                 start=regular_open.to_pydatetime(),
-                end=stamp.to_pydatetime(),
+                end=as_of.to_pydatetime(),
                 feed=feed,
                 adjustment="raw",
             )
+            # Provider end timestamps may be rounded; do not accidentally
+            # score a bar which starts at/after the approved as-of cutoff.
+            if intraday is not None and not intraday.empty:
+                intraday = intraday.loc[
+                    pd.to_datetime(intraday.index, utc=True) < as_of
+                ]
             current_bar = _current_session_intraday_bar(
                 intraday, session=session_date.isoformat(),
             )
@@ -237,6 +249,7 @@ def append_u67_current_session_intraday(
                     "current_session_live_feed": feed,
                     "current_session_timeframe": LIVE_INTRADAY_TIMEFRAME,
                     "current_session_analysis_timestamp_utc": stamp.isoformat(),
+                    "current_session_market_data_cutoff_utc": as_of.isoformat(),
                 }
             )
             augmented[symbol] = combined
@@ -260,34 +273,80 @@ def append_u67_current_session_intraday(
                 "volume": float(current_bar["volume"].iloc[0]),
             }
             if progress_callback is not None:
-                progress_callback(f"intraday_{feed}", position, total, symbol)
+                progress_callback(phase or f"intraday_{feed}", position, total, symbol)
             if per_asset_pause_seconds > 0 and position != total:
                 time.sleep(per_asset_pause_seconds)
         return augmented, per_asset, last_bar_timestamps
 
     fallback_reason = None
     feed_used = preferred_feed
+    as_of = stamp
+    delay_minutes = 0
     try:
-        augmented, per_asset, last_bar_timestamps = _load_feed(feed_used)
+        augmented, per_asset, last_bar_timestamps = _load_feed(
+            feed_used, as_of=stamp,
+        )
     except RuntimeError as exc:
-        # A feed-wide SIP retry is justified only for missing IEX trades.
-        # Network or authentication failures on IEX must remain visible.
-        if feed_used != "iex" or not str(exc).startswith(
+        if feed_used == "iex" and str(exc).startswith(
             "CurrentSessionIntradayDataMissing:"
         ):
-            raise
-        fallback_reason = str(exc)
-        feed_used = "sip"
-        try:
-            augmented, per_asset, last_bar_timestamps = _load_feed(feed_used)
-        except Exception as sip_exc:
-            raise RuntimeError(
-                "CurrentSessionIntradayCoverageUnavailable: "
-                f"{fallback_reason} Complete-universe SIP retry failed: "
-                f"{sip_exc}. No manual plan was prepared and no Alpaca "
-                "orders were submitted. Check Alpaca SIP entitlement "
-                "and live data coverage."
-            ) from sip_exc
+            # SIP must cover the entire same universe, never just the
+            # illiquid symbol whose IEX data was missing.
+            fallback_reason = str(exc)
+            feed_used = "sip"
+            try:
+                augmented, per_asset, last_bar_timestamps = _load_feed(
+                    feed_used, as_of=stamp,
+                )
+            except Exception as sip_exc:
+                exc = sip_exc
+            else:
+                exc = None
+        if exc is not None:
+            # Only the exact Alpaca recent-SIP subscription restriction
+            # permits a historical cutoff retry. All other errors fail.
+            entitlement = (
+                feed_used == "sip"
+                and "subscription does not permit querying recent sip data"
+                in str(exc).lower()
+            )
+            if not entitlement:
+                if fallback_reason is None:
+                    raise
+                raise RuntimeError(
+                    "CurrentSessionIntradayCoverageUnavailable: "
+                    f"{fallback_reason} Complete-universe SIP retry failed: "
+                    f"{exc}. No plan was prepared and no orders submitted."
+                ) from exc
+
+            as_of = stamp - pd.Timedelta(
+                minutes=SIP_HISTORICAL_DELAY_MINUTES
+            )
+            if as_of <= regular_open:
+                raise RuntimeError(
+                    "CurrentSessionIntradayDelayedSIPNotReady: "
+                    "The regular session has not accumulated enough "
+                    f"history for a {SIP_HISTORICAL_DELAY_MINUTES}-minute "
+                    "delayed SIP decision. No orders were submitted."
+                ) from exc
+            delay_minutes = SIP_HISTORICAL_DELAY_MINUTES
+            fallback_reason = (
+                f"{fallback_reason + ' ' if fallback_reason else ''}"
+                "Alpaca denied recent SIP bars; using a consistent "
+                f"{delay_minutes}-minute historical SIP cutoff."
+            )
+            try:
+                augmented, per_asset, last_bar_timestamps = _load_feed(
+                    "sip", as_of=as_of, phase="intraday_sip_delayed",
+                )
+            except Exception as delayed_exc:
+                raise RuntimeError(
+                    "CurrentSessionIntradayCoverageUnavailable: "
+                    f"{fallback_reason} Delayed complete-universe SIP "
+                    f"retry failed at cutoff {as_of.isoformat()}: "
+                    f"{delayed_exc}. No plan was prepared and no orders "
+                    "were submitted."
+                ) from delayed_exc
 
     return augmented, {
         "analysis_mode": "current_session_intraday",
@@ -296,6 +355,9 @@ def append_u67_current_session_intraday(
         "live_feed": feed_used,
         "live_feed_fallback_reason": fallback_reason,
         "live_timeframe": LIVE_INTRADAY_TIMEFRAME,
+        "intraday_market_data_cutoff_utc": as_of.isoformat(),
+        "intraday_data_delay_minutes": delay_minutes,
+        "intraday_feed_mode": "delayed_sip" if delay_minutes else "live",
         "intraday_asset_count": int(len(augmented)),
         "earliest_last_intraday_bar_utc": (
             min(last_bar_timestamps).isoformat() if last_bar_timestamps else None
