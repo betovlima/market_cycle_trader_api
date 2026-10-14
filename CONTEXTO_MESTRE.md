@@ -1,3 +1,17 @@
+## 2026-10-14 — API v10.8.100 — colisão de data da decisão Paper
+
+**Evidência operacional:** ciclo automático `paper-market-2026-10-15-f6c3dcc8` permaneceu em `preparing`, com 22 tentativas e `E11000 duplicate key` no índice `uq_paper_plan_decision_date`, `decision_date=2026-10-14`. Já havia uma decisão manual executada na própria sessão de 14/10, MAN → CAPR, com a mesma `decision_date`. A decisão automática para a sessão **15/10** usa legitimamente o último pregão fechado, **14/10**, e não podia ser inserida devido à chave única incompleta. Antes disso, a coleta diária ainda estava atrasada em 13/10, mas a falha persistente passou a ser exclusivamente o conflito de índice.
+
+**Branch:** `fix/v10.8.100-paper-decision-session-index`, criada a partir da main API 10.8.99. Sem alteração da estratégia congelada do TCC, política LightGBM, coleta Alpaca, execução de ordens ou estados antigos.
+
+**Correção pontual:** migrar o índice único de `(decision_date)` para `(decision_date, execution_session)`. Criar primeiro o índice novo, depois retirar apenas a definição antiga do índice, sem excluir ou modificar documentos do Mongo. Alterar o `replace_one(..., upsert=True)` para localizar somente o mesmo par data-decisão/sessão-execução. Assim, a decisão manual `(14/10, 14/10)` e a decisão automática `(14/10, 15/10)` podem coexistir, sem sobrescrever um plano executado.
+
+**Testes:** `tests/test_paper_plan_decision_session_key.py` exercita coexistência entre plano manual executado e plano automático preparado, replacement restrito ao par correto e migração idempotente que preserva documentos. CI antes de merge; não foram feitas ordens Alpaca nem atualizações em Mongo produção.
+
+**Validação após deploy:** confirmar versão 10.8.100 e status `prepared` do ciclo 15/10 no `GET /api/paper-market/status`, com plano cuja `execution_session=2026-10-15` e `decision_date=2026-10-14`, sem erro E11000. Reinício/deploy é necessário para aplicar a migração no `ensure_database`; merge na main não reinicia processos. Nenhuma chamada de limpeza de plano antigo resolve esse problema de índice.
+
+---
+
 ## 2026-10-14 — API v10.8.98 — histórico SIP atrasado para Winner manual
 
 **Causa confirmada no ambiente operacional:** a reanálise manual
