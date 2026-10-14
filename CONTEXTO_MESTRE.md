@@ -1,3 +1,63 @@
+## 2026-10-14 — API v10.8.95 — continuidade do Trader após recuperação manual
+
+**Incidente:** operação Paper MAN de 07/10/2026 foi deliberadamente
+acionada pelo administrador na ordem **Reanalisar Winner agora →
+Executar plano atual na Alpaca**. A auditoria de 14/10 evidenciou
+ordem manual preenchida, mas ciclos automáticos subsequentes
+`prepared`/`cancelled`, com divergência de contador já corrigida
+na v10.8.94. O fluxo manual anterior registrava
+`manual_recovery_plan_id` e `manual_recovery_executed_at`, mas
+não concluía o `paper_market_runs` associado, que podia continuar
+apontando para o `plan_id` substituído.
+
+**Branch:** `fix/v10.8.95-manual-paper-scheduler-handoff`
+a partir da `main` `a8322516f2220df414a69985943cb6fb3b26c59c`.
+
+**Correção operacional:** a reanálise manual, quando existe run
+agendado ativo para a sessão, reivindica o run de forma atômica
+antes de executar calibração e registra seu novo `plan_id`,
+ação, alvo e status `manual_pending`. A disputa pela recalibração
+automática na abertura também passa a exigir reivindicação
+condicional do run, sem prosseguir se a etapa manual o tomou.
+Enquanto um plano manual espera confirmação, o scheduler não
+envia ordens nem tenta executar a referência automática antiga.
+O botão de execução manual aceita apenas um plano preparado
+pela reanálise Winner na sessão atual e, se existir run ativo,
+exige que os identificadores coincidam. Após execução
+confirmada, encerra o run como `completed`, registra
+a origem manual e o resultado e libera a chave ativa para a
+próxima sessão. Erros incertos após reclamar o plano entram
+em `review_required`, e um plano manual abandonado é
+cancelado quando passa para a sessão seguinte, impedindo que
+o robô permaneça indefinidamente preso ao run antigo.
+
+**Calibração:** a ação manual de análise já recalcula o Winner.
+O botão de execução NÃO recalibra silenciosamente, preservando
+exatamente o plano analisado e aprovado. Nenhuma modificação
+no modelo, hiperparâmetros, ranking, universo ou permanência
+mínima de dois pregões. Correção compatível com a reconciliação
+de fills reais da v10.8.94.
+
+**Testes de regressão:** criação e vinculação do plano manual
+ao run, execução única e liberação da chave ativa, rejeição
+de plano antigo ou de outra sessão, falha incerta com
+bloqueio para revisão, ausência de execução automática
+enquanto aguarda aprovação, expiração de plano não executado,
+falha de recalibração, preservação do fluxo ad hoc sem run,
+e sinalização de elegibilidade no status do robô.
+
+**Limites e validação:** o CI GitHub e o PR devem passar antes
+de integrar à `main`. Nenhuma ordem foi enviada à Alpaca
+durante o desenvolvimento e nenhuma coleção de produção foi
+alterada. A análise histórica de motivos específicos de
+`cancelled` em 08–12/10 continua dependente dos registros
+de `paper_market_runs`, `paper_trade_plans` e operações
+administrativas. Depois do deploy, confirmar API v10.8.95,
+a versão de backend, o status e a continuidade dos próximos
+pregões. A instância produtiva não é implantada só pelo merge.
+
+---
+
 ## 2026-10-14 — API v10.8.94 — correção de permanência Paper por fills reais
 
 **Incidente:** pacote `mct_paper_transaction_audit_20261014T152546Z.zip`
