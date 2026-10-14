@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from market_cycle_trader_api.services import paper_market_scheduler as scheduler
+from market_cycle_trader_api.api.routers import admin_trader
 
 
 def _open_context(*, run=None, plan=None):
@@ -499,3 +500,50 @@ def test_robot_public_status_contains_bounded_log_but_redacts_broker_error():
     assert response["manual_reanalysis"]["error"].startswith("AMS:")
     assert "credential" not in response["manual_execution"]["error"]
     assert response["manual_operation_log"][0]["operation"] == "analysis"
+
+
+def test_close_old_paper_plans_uses_single_mongo_update_after_close() -> None:
+    plans = MagicMock()
+    plans.update_many.return_value.modified_count = 2
+    db = {admin_trader.PAPER_TRADE_PLANS_COLLECTION: plans}
+    # 21:16 UTC is 17:16 New York in October: regular session is closed.
+    with (
+        patch.object(admin_trader, "database", return_value=db),
+        patch.object(
+            admin_trader, "utc_now",
+            return_value=datetime(2026, 10, 14, 21, 16, tzinfo=timezone.utc),
+        ),
+    ):
+        result = admin_trader.close_old_paper_plans(SimpleNamespace(email="admin@example.com"))
+    assert result == {
+        "status": "completed", "closed_count": 2,
+        "closed_through_session": "2026-10-14",
+    }
+    plans.update_many.assert_called_once()
+    filters, update = plans.update_many.call_args.args
+    assert filters == {
+        "status": "prepared", "execution_session": {"$lte": "2026-10-14"},
+    }
+    assert update["$set"]["status"] == "cancelled"
+    assert update["$set"]["cancel_reason"]
+
+
+def test_close_old_paper_plans_preserves_current_session_before_close() -> None:
+    plans = MagicMock()
+    plans.update_many.return_value.modified_count = 0
+    with (
+        patch.object(
+            admin_trader, "database",
+            return_value={admin_trader.PAPER_TRADE_PLANS_COLLECTION: plans},
+        ),
+        patch.object(
+            admin_trader, "utc_now",
+            return_value=datetime(2026, 10, 14, 18, 16, tzinfo=timezone.utc),
+        ),
+    ):
+        result = admin_trader.close_old_paper_plans(SimpleNamespace(email="admin@example.com"))
+    assert result["closed_through_session"] == "2026-10-13"
+    assert result["closed_count"] == 0
+    assert plans.update_many.call_args.args[0]["execution_session"] == {
+        "$lte": "2026-10-13",
+    }
