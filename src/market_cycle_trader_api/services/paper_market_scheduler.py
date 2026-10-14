@@ -383,7 +383,15 @@ def _manual_recovery_context(db: Any) -> dict[str, Any]:
         "run": run,
         "plan": current_plan,
         "contingency_plan": contingency_plan,
-        "execution_plan": contingency_plan or current_plan,
+        "execution_plan": (
+            current_plan
+            if (
+                current_plan is not None
+                and str(current_plan.get("status") or "") == "prepared"
+                and str(current_plan.get("plan_source") or "") == "manual_current_session_recovery"
+            )
+            else contingency_plan or current_plan
+        ),
     }
 
 
@@ -414,24 +422,52 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
     current_plan_status = str(current_plan.get("status") or "").lower()
     blocked_current_plan = current_plan_status in {"executing", "recovering", "executed"} or bool(current_plan.get("contingency_execution_in_progress"))
     blocked_execution_plan = plan_status in {"executing", "recovering"} or bool(plan.get("contingency_execution_in_progress"))
-    can_prepare = market_open and not blocked_current_plan
-    can_execute = market_open and (plan_status == "prepared" or recoverable_contingency) and not blocked_execution_plan
+    active_run = _active_manual_session_run(context)
+    run_busy = bool(active_run) and str(active_run.get("status") or "") in {
+        "preparing", "executing", "manual_preparing", "manual_executing",
+        "review_required",
+    }
+    can_prepare = market_open and not blocked_current_plan and not run_busy
+    manual_plan_is_current = (
+        str(plan.get("execution_session") or "") == str(context["current_session"])
+        and str(plan.get("plan_source") or "") == "manual_current_session_recovery"
+    )
+    scheduled_manual_matches = (
+        not active_run
+        or (
+            str(active_run.get("status") or "") == "manual_pending"
+            and str(active_run.get("plan_id") or "") == str(plan.get("plan_id") or "")
+            and str(active_run.get("manual_recovery_plan_id") or "") == str(plan.get("plan_id") or "")
+        )
+    )
+    can_execute = (
+        market_open and not blocked_execution_plan and not run_busy
+        and (
+            recoverable_contingency
+            or (plan_status == "prepared" and manual_plan_is_current
+                and scheduled_manual_matches)
+        )
+    )
 
     if not market_open:
         prepare_reason = "Manual same-session analysis is available only while the regular market is open."
     elif blocked_current_plan:
         prepare_reason = f"The current-session Paper plan cannot be replaced while status={current_plan_status}."
+    elif run_busy:
+        prepare_reason = "The scheduled Paper run is busy; wait for its current operation to finish."
     else:
         prepare_reason = None
 
     if not market_open:
         execute_reason = "Manual contingency execution requires the regular market to be open."
-    elif blocked_execution_plan:
-        execute_reason = "A Paper execution is already in progress."
+    elif blocked_execution_plan or run_busy:
+        execute_reason = "A Paper operation is already in progress."
     elif recoverable_contingency:
         execute_reason = None
     elif plan_status != "prepared":
         execute_reason = "No prepared or unresolved contingency Paper plan is available."
+    elif not manual_plan_is_current or not scheduled_manual_matches:
+        execute_reason = "Reanalyze the Winner to approve a current-session manual plan."
     else:
         execute_reason = None
 
