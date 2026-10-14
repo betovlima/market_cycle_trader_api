@@ -641,6 +641,7 @@ def prepare_next_paper_plan(
                     strategy,
                     session=current_session,
                     now=clock["timestamp"],
+                    current_asset=state.managed_symbol,
                 )
             )
 
@@ -667,6 +668,15 @@ def prepare_next_paper_plan(
             "live_timeframe": intraday_metadata.get("live_timeframe"),
             "intraday_asset_count": intraday_metadata.get(
                 "intraday_asset_count"
+            ),
+            "intraday_fallback_assets": intraday_metadata.get(
+                "intraday_fallback_assets", []
+            ),
+            "intraday_missing_assets": intraday_metadata.get(
+                "intraday_missing_assets", []
+            ),
+            "intraday_missing_reasons": intraday_metadata.get(
+                "intraday_missing_reasons", {}
             ),
             "earliest_last_intraday_bar_utc": intraday_metadata.get(
                 "earliest_last_intraday_bar_utc"
