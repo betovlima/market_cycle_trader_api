@@ -204,11 +204,18 @@ def ensure_database(db: Database) -> None:
         [("captured_at", DESCENDING)],
         name="ix_paper_settings_history_captured",
     )
-    db[PAPER_TRADE_PLANS_COLLECTION].create_index(
-        [("decision_date", DESCENDING)],
+    plans_collection = db[PAPER_TRADE_PLANS_COLLECTION]
+    # A decision for today's manual session and a next-open decision may
+    # legitimately use the same completed trading date. Keep them separate.
+    plans_collection.create_index(
+        [("decision_date", DESCENDING), ("execution_session", ASCENDING)],
         unique=True,
-        name="uq_paper_plan_decision_date",
+        name="uq_paper_plan_decision_execution_session",
     )
+    # Migrate the legacy constraint only AFTER the composite index exists.
+    # No plan, order, portfolio state or historical decision is modified.
+    if "uq_paper_plan_decision_date" in plans_collection.index_information():
+        plans_collection.drop_index("uq_paper_plan_decision_date")
     db[PAPER_TRADE_PLANS_COLLECTION].create_index(
         [("status", ASCENDING), ("expected_market_open", ASCENDING)],
         name="ix_paper_plan_status_open",
@@ -614,7 +621,10 @@ def insert_paper_trade_plan(db: Database, plan: dict[str, Any], *, replace: bool
     document = {**bson_value(plan), "updated_at": utc_now()}
     if replace:
         db[PAPER_TRADE_PLANS_COLLECTION].replace_one(
-            {"decision_date": document["decision_date"]},
+            {
+                "decision_date": document["decision_date"],
+                "execution_session": document["execution_session"],
+            },
             document,
             upsert=True,
         )
