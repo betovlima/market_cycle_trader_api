@@ -2041,7 +2041,7 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         # The public status route has no administrative authentication.
         # Do not leak raw broker exceptions, response URLs or credentials.
         raw_error = str(manual_reanalysis["error"])
-        missing_symbol = re.search(r"\\b([A-Z]{1,5}) has no IEX", raw_error)
+        missing_symbol = re.search(r"\b([A-Z]{1,5}) has no IEX", raw_error)
         if missing_symbol is not None:
             manual_reanalysis["error"] = (
                 f"{missing_symbol.group(1)}: IEX session bars are missing; "
