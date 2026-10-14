@@ -821,15 +821,13 @@ MongoDB. A `main` permanece como referência até eventual merge.
 Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
 
  
-## API v10.8.99: reconciliação restrita de status históricos Paper (2026-10-14)
+## API v10.8.99: limpeza simples de planos Paper antigos (2026-10-14)
 
-- **Branch**: `fix/v10.8.99-paper-plan-status-reconciliation` (ainda não integrada à `main`).
-- **Causa**: ciclos encerrados, especialmente em falha, podem deixar o plano `paper_trade_plans` como `prepared`, mesmo depois da sessão prevista. Isso confunde o histórico; os guards de sessão/identidade impedem o reuso direto dos planos antigos.
-- **Auditoria que motivou a mudança**: o pacote de 14/10/2026 identifica dois HOLDs antigos em MAN, com sessão de 13/10 (`lightgbm-2026-10-12-ea070a26`) e de 14/10 (`lightgbm-2026-10-13-4cdbd908`), ainda `prepared`. MAN→CAPR em 14/10 foi executado em plano separado. Não inferir ausência de ordens simplesmente do status de um plano.
-- **GET `/api/admin/trader-control/plan-reconciliation/preview`**: apenas leitura; avalia planos `prepared`, sinaliza candidatos e motivos de bloqueio. Paginação limitada a 250 resultados por varredura; `truncated=true` indica revisão necessária.
-- **POST `/api/admin/trader-control/plan-reconciliation/close`** com `{"confirm":"RECONCILE_EXPIRED_PREPARED_PLANS","plan_ids":["..."]}`: administrador autenticado, seleção explícita, validação integral prévia, revalidação por plano e update atômico compare-and-set. Apenas `hold`/`stay_in_cash` sem ordens relacionadas, sem indicação de execução e sem run ativo ou em revisão, com sessão **anterior** ao dia atual de Nova York. Sem tentativa de fechamento automático de plano da sessão corrente.
-- **Rastreabilidade**: preserva documento original, valores da decisão e utilidades; transita apenas `prepared → cancelled`; registra motivo, autor, data e `status_reconciliation` no próprio documento, além do log administrativo quando disponível. A falha do log externo não elimina a prova da atualização no plano.
-- **Proibições**: nenhum envio/alteração de ordem Alpaca; nenhuma atualização de `paper_trading_state`, das barras históricas, da Winner, da estratégia ou das decisões. Planos que envolvem `rotate`/`buy`/`sell_to_cash`, qualquer registro de ordem, execução iniciada ou ciclo não terminal continuam pendentes para análise manual.
-- **Uso seguro**: primeiro consultar a prévia; somente após checar os candidatos, informar os IDs escolhidos ao POST. O plano de 14/10 não pode ser encerrado em 14/10; fica elegível apenas a partir de 15/10, caso todas as demais verificações continuem satisfeitas.
-- **Testes**: `tests/test_paper_plan_reconciliation.py` cobre prévia somente leitura, bloqueios de sessão corrente/ordens parciais/execução/ciclo ativo, preflight sem efeitos colaterais e escrita CAS. 
-- **Próximos passos**: aguardar CI e validar prévia com Mongo real; se surgir evidência de falha em ativos/ordens, não corrigir por esse endpoint. Implantação não implica nem autoriza a execução do POST por conta própria.
+- Branch `fix/v10.8.99-paper-plan-status-reconciliation` (PR #49; `main` permanece intacta).
+- Causa: dois planos históricos de `hold` em MAN ficaram com `status=prepared` para as sessões 13/10 e 14/10, embora houvesse plano manual distinto executado em CAPR em 14/10.
+- Única API: `POST /api/admin/trader-control/paper-plans/close-old`. Requer a sessão administrativa existente; não requer body. Faz apenas um `update_many` na coleção MongoDB `paper_trade_plans`.
+- Filtro: `status=prepared`, `execution_session <= ultima_sessao_encerrada` conforme relógio de Nova York (após 16h, inclui a data atual; antes, apenas até o dia anterior). A resposta informa `closed_count` e `closed_through_session`.
+- Campos alterados: `status=cancelled`, `cancelled_at`, `cancel_reason`, `updated_at`. Sem correlação com ordens e runs antigos, sem preflight, sem consulta Alpaca; intenção é a limpeza de status remanescente de desenvolvimento, sem atribuir execução fictícia.
+- O endpoint **não cancela ordens na corretora** e **não reclassifica** o registro de execução de ordens `paper_trade_orders`, pois os casos comprovados como incorretos são planos `prepared`, não ordens preenchidas. Não altera posição, capital, Winner, cotações, agendador, decisão nem regras da estratégia.
+- Sem novas travas de negócio ou manutenção automática que interfira nas escolhas futuras; encerramento é apenas sob chamada do administrador e idempotente para planos já cancelados.
+- CI: dois testes da chamada única e janela temporal foram adicionados em `tests/test_manual_current_session_control.py`; asserção de versão atualizada em `tests/test_tcc_v106_main_integration.py`.
