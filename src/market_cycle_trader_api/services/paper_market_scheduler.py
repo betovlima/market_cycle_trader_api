@@ -423,10 +423,13 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
     blocked_current_plan = current_plan_status in {"executing", "recovering", "executed"} or bool(current_plan.get("contingency_execution_in_progress"))
     blocked_execution_plan = plan_status in {"executing", "recovering"} or bool(plan.get("contingency_execution_in_progress"))
     active_run = _active_manual_session_run(context)
-    run_busy = bool(active_run) and str(active_run.get("status") or "") in {
-        "preparing", "executing", "manual_preparing", "manual_executing",
-        "review_required",
-    }
+    run_busy = bool(active_run) and (
+        str(active_run.get("status") or "") in {
+            "preparing", "executing", "manual_preparing", "manual_executing",
+            "review_required",
+        }
+        or str(active_run.get("phase") or "") == "market_open_recalibration"
+    )
     can_prepare = market_open and not blocked_current_plan and not run_busy
     manual_plan_is_current = (
         str(plan.get("execution_session") or "") == str(context["current_session"])
@@ -569,6 +572,7 @@ def prepare_manual_current_session_plan(
                 "run_id": str(run["run_id"]),
                 "active_key": ACTIVE_KEY,
                 "status": {"$in": ["armed", "prepared", "manual_pending"]},
+                "phase": {"$ne": "market_open_recalibration"},
             },
             {"$set": {
                 "status": "manual_preparing",
@@ -1430,10 +1434,14 @@ def _execute_run(db: Any, run: dict[str, Any], worker_id: str) -> None:
         strategy_control = db[STRATEGY_CONTROL_COLLECTION].find_one({"_id": "default"}, {"winner_promotion_in_progress": 1}) or {}
         if bool(strategy_control.get("winner_promotion_in_progress")):
             return
-        db[PAPER_MARKET_RUNS_COLLECTION].update_one(
-            {"run_id": run_id, "status": "prepared"},
+        recalibration_claim = db[PAPER_MARKET_RUNS_COLLECTION].update_one(
+            {"run_id": run_id, "status": "prepared",
+             "phase": {"$ne": "market_open_recalibration"}},
             {"$set": {"phase": "market_open_recalibration", "updated_at": utc_now()}},
         )
+        if recalibration_claim.matched_count != 1:
+            # Manual reanalysis may have claimed the same scheduled run.
+            return
         try:
             recalibrated = prepare_next_paper_plan(
                 db,
