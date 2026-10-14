@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field
 
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
+from ...services.paper_plan_reconciliation import (
+    preview_paper_plan_reconciliation,
+    close_obsolete_paper_plans,
+)
 from ...services.paper_market_scheduler import (
     execute_manual_current_session_plan,
     list_admin_operation_logs,
@@ -28,6 +32,33 @@ class TraderControlRequest(BaseModel):
 class ManualRecoveryExecuteRequest(BaseModel):
     confirm: Literal["EXECUTE_TODAY"]
     plan_id: str | None = Field(default=None, max_length=160)
+
+
+class HistoricalPlanReconciliationRequest(BaseModel):
+    confirm: Literal["RECONCILE_EXPIRED_PREPARED_PLANS"]
+    plan_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+@router.get("/plan-reconciliation/preview")
+def preview_historical_paper_plans(
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Read-only, with explicit eligibility and blockers for each prepared plan."""
+    return preview_paper_plan_reconciliation(database())
+
+
+@router.post("/plan-reconciliation/close")
+def close_historical_paper_plans(
+    payload: HistoricalPlanReconciliationRequest,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """An explicitly confirmed, audited close of eligible historical HOLD plans."""
+    try:
+        return close_obsolete_paper_plans(
+            database(), plan_ids=payload.plan_ids, actor_email=identity.email,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
 
 @router.get("/status")
