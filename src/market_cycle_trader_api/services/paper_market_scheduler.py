@@ -511,6 +511,15 @@ def paper_market_manual_recovery_status(db: Any) -> dict[str, Any]:
         "current_session_live_timeframe": plan.get(
             "current_session_live_timeframe"
         ),
+        "current_session_data_cutoff_utc": plan.get(
+            "current_session_data_cutoff_utc"
+        ),
+        "current_session_data_delay_minutes": plan.get(
+            "current_session_data_delay_minutes"
+        ),
+        "current_session_feed_mode": plan.get(
+            "current_session_feed_mode"
+        ),
         "current_session_intraday_asset_count": plan.get(
             "current_session_intraday_asset_count"
         ),
@@ -611,6 +620,8 @@ def _record_manual_reanalysis_progress(
     symbol: str = "",
     error: str | None = None,
     plan_id: str | None = None,
+    data_cutoff_utc: str | None = None,
+    data_delay_minutes: int = 0,
     log_event: bool = False,
 ) -> None:
     """Persist bounded operation logs and live progress in MongoDB.
@@ -630,6 +641,8 @@ def _record_manual_reanalysis_progress(
                 "symbol": str(symbol),
                 "error": str(error) if error else None,
                 "plan_id": str(plan_id) if plan_id else None,
+                "data_cutoff_utc": data_cutoff_utc,
+                "data_delay_minutes": int(data_delay_minutes),
                 "updated_at": stamp,
             },
         },
@@ -789,7 +802,12 @@ def prepare_manual_current_session_plan(
         db, attempt_id=analysis_attempt_id, status="prepared",
         phase="completed", completed=1, total=1,
         symbol=str(plan.get("target_asset") or ""),
-        plan_id=str(plan["plan_id"]), log_event=True,
+        plan_id=str(plan["plan_id"]),
+        data_cutoff_utc=plan.get("current_session_data_cutoff_utc"),
+        data_delay_minutes=int(
+            plan.get("current_session_data_delay_minutes") or 0
+        ),
+        log_event=True,
     )
     mode = _control_mode(_automation_document(db))
     _record_admin_operation(

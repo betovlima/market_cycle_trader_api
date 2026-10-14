@@ -796,6 +796,16 @@ def prepare_next_paper_plan(
             "intraday_asset_count": intraday_metadata.get(
                 "intraday_asset_count"
             ),
+            "intraday_market_data_cutoff_utc": intraday_metadata.get(
+                "intraday_market_data_cutoff_utc"
+            ),
+            "intraday_data_delay_minutes": intraday_metadata.get(
+                "intraday_data_delay_minutes"
+            ),
+            "intraday_feed_mode": intraday_metadata.get("intraday_feed_mode"),
+            "intraday_fallback_reason": intraday_metadata.get(
+                "live_feed_fallback_reason"
+            ),
             "earliest_last_intraday_bar_utc": intraday_metadata.get(
                 "earliest_last_intraday_bar_utc"
             ),
@@ -1002,6 +1012,16 @@ def prepare_next_paper_plan(
         "live_session": live_market.get("live_session"),
         "current_session_live_feed": live_market.get("live_feed"),
         "current_session_live_timeframe": live_market.get("live_timeframe"),
+        "current_session_data_cutoff_utc": live_market.get(
+            "intraday_market_data_cutoff_utc"
+        ),
+        "current_session_data_delay_minutes": live_market.get(
+            "intraday_data_delay_minutes"
+        ),
+        "current_session_feed_mode": live_market.get("intraday_feed_mode"),
+        "current_session_feed_fallback_reason": live_market.get(
+            "intraday_fallback_reason"
+        ),
         "current_session_intraday_asset_count": live_market.get(
             "intraday_asset_count"
         ),

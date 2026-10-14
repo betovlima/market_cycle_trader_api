@@ -1,3 +1,59 @@
+## 2026-10-14 — API v10.8.98 — histórico SIP atrasado para Winner manual
+
+**Causa confirmada no ambiente operacional:** a reanálise manual
+U77 de 14/10/2026 parou em `AMS` (sem barras IEX do pregão),
+tentou SIP para todos os ativos, mas a conta Alpaca recusou a
+primeira consulta SIP recente de `NVDA`:
+`subscription does not permit querying recent SIP data`.
+Nenhum plano manual nem ordem foi criado. O agendador para
+15/10 permaneceu armado.
+
+**Branch:** `fix/v10.8.98-delayed-sip-intraday`, da main
+API v10.8.97. Não altera a pesquisa congelada do TCC.
+
+**Mudança controlada:** preservar preferência IEX; quando um
+ativo elegível não tiver barras IEX, tentar SIP fresco no
+universo inteiro, como na v10.8.96. **Somente** para a mensagem
+específica de assinatura que proíbe SIP recente, repetir
+a coleta SIP de **todos os elegíveis** usando o mesmo horário
+de corte, `timestamp_da_análise - 20 minutos` (15 min de
+restrição + 5 min de margem). Compara cada barra com esse
+corte estritamente exclusivo, impedindo vazamento de dados
+posteriores. Se ainda faltar qualquer ativo, ou não houver
+20 minutos de sessão, falhar fechado sem plano nem ordens.
+
+**Metadados auditáveis:** o documento do plano persiste
+`current_session_feed_mode=delayed_sip`,
+`current_session_data_delay_minutes=20`,
+`current_session_data_cutoff_utc` e a razão do fallback.
+O retorno protegido `manual_recovery` e o acompanhamento
+`manual_reanalysis` expõem o horário de corte e a defasagem,
+sem mascarar a hora real da operação. O frontend
+v10.7.24 destaca explicitamente o atraso antes da decisão
+manual. O usuário continua obrigado a confirmar separadamente
+`Executar plano atual na Alpaca`.
+
+**Restrições:** a barra diária intradiária sintética somente
+alimenta a inferência; treinamento/calibração permanecem com
+sessões diárias fechadas. O sistema não mistura feeds entre
+ativos; não inventa preços; não retira AMS do universo por
+ausência de negócios no IEX. Não modifica ordens nem o fluxo
+de seleção do Winner.
+
+**Testes:** a suíte cobre retorno real de assinatura recusada,
+retry histórico completo, timestamp exclusivo, bloqueio
+antes dos 20 minutos e falha de cobertura. CI obrigatório
+antes de integrar à main. Nenhuma ordem Alpaca submetida
+durante esta implementação.
+
+**Atenção:** essa mitigação altera a atualidade dos sinais
+manual intraday (informações até 20 minutos anteriores),
+portanto o comportamento precisa ser validado em Paper
+Trading com inspeção do plano aprovado. O merge Git não
+implanta automaticamente os serviços de produção.
+
+---
+
 ## 2026-10-14 — API v10.8.97 — log operacional e status das ações Winner
 
 **Solicitação:** disponibilizar barra de status e um histórico

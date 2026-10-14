@@ -278,3 +278,176 @@ def test_configured_sip_never_uses_iex():
     assert metadata["live_feed"] == "sip"
     assert metadata["live_feed_fallback_reason"] is None
     assert download.call_args.kwargs["feed"] == "sip"
+
+
+def test_recent_sip_subscription_denial_retries_delayed_entire_universe():
+    frames = {"MAN": _daily_frame("MAN"), "AMS": _daily_frame("AMS")}
+    calls = []
+    progress = []
+    historical_cutoff = pd.Timestamp("2026-10-07T16:40:00Z").to_pydatetime()
+    recent_cutoff = pd.Timestamp("2026-10-07T17:00:00Z").to_pydatetime()
+
+    def fake_bars(**kwargs):
+        calls.append((kwargs["symbol"], kwargs["feed"], kwargs["end"]))
+        if kwargs["feed"] == "iex" and kwargs["symbol"] == "AMS":
+            return pd.DataFrame()
+        if kwargs["feed"] == "sip" and kwargs["end"] == recent_cutoff:
+            raise RuntimeError(
+                'Alpaca historical data request failed for MAN after 3 attempts: '
+                '{"message":"subscription does not permit querying recent SIP data"}'
+            )
+        return _intraday_frame()
+
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
+    ):
+        result, metadata = market_data.append_u67_current_session_intraday(
+            frames, SimpleNamespace(alpaca_live_feed="iex"),
+            session="2026-10-07",
+            now=pd.Timestamp("2026-10-07T17:00:00Z"),
+            per_asset_pause_seconds=0,
+            progress_callback=lambda *args: progress.append(args),
+        )
+
+    assert calls == [
+        ("MAN", "iex", recent_cutoff),
+        ("AMS", "iex", recent_cutoff),
+        ("MAN", "sip", recent_cutoff),
+        ("MAN", "sip", historical_cutoff),
+        ("AMS", "sip", historical_cutoff),
+    ]
+    assert metadata["live_feed"] == "sip"
+    assert metadata["intraday_feed_mode"] == "delayed_sip"
+    assert metadata["intraday_data_delay_minutes"] == 20
+    assert metadata["intraday_market_data_cutoff_utc"] == "2026-10-07T16:40:00+00:00"
+    assert metadata["intraday_asset_count"] == 2
+    assert all(x.attrs["current_session_live_feed"] == "sip" for x in result.values())
+    assert all(x.attrs["current_session_market_data_cutoff_utc"]
+               == metadata["intraday_market_data_cutoff_utc"] for x in result.values())
+    assert any(row[0] == "intraday_sip_delayed" for row in progress)
+
+
+def test_delayed_sip_still_fails_closed_when_any_asset_has_no_bars():
+    frames = {"MAN": _daily_frame("MAN"), "AMS": _daily_frame("AMS")}
+    def fake_bars(**kwargs):
+        if kwargs["feed"] == "iex" and kwargs["symbol"] == "AMS":
+            return pd.DataFrame()
+        if kwargs["feed"] == "sip" and kwargs["end"] == pd.Timestamp(
+            "2026-10-07T17:00:00Z"
+        ).to_pydatetime():
+            raise RuntimeError(
+                "subscription does not permit querying recent SIP data"
+            )
+        if kwargs["feed"] == "sip" and kwargs["symbol"] == "AMS":
+            return pd.DataFrame()
+        return _intraday_frame()
+
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
+    ):
+        try:
+            market_data.append_u67_current_session_intraday(
+                frames, SimpleNamespace(alpaca_live_feed="iex"),
+                session="2026-10-07",
+                now=pd.Timestamp("2026-10-07T17:00:00Z"),
+                per_asset_pause_seconds=0,
+            )
+        except RuntimeError as exc:
+            assert "CurrentSessionIntradayCoverageUnavailable" in str(exc)
+            assert "AMS" in str(exc)
+            assert "Delayed complete-universe SIP retry failed" in str(exc)
+        else:
+            raise AssertionError("Partial delayed SIP universe must not score.")
+
+
+def test_delayed_sip_not_allowed_before_enough_session_history():
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars",
+                     side_effect=RuntimeError(
+                         "subscription does not permit querying recent SIP data"
+                     )),
+    ):
+        try:
+            market_data.append_u67_current_session_intraday(
+                {"MAN": _daily_frame("MAN")},
+                SimpleNamespace(alpaca_live_feed="sip"),
+                session="2026-10-07",
+                now=pd.Timestamp("2026-10-07T13:45:00Z"),
+                per_asset_pause_seconds=0,
+            )
+        except RuntimeError as exc:
+            assert "CurrentSessionIntradayDelayedSIPNotReady" in str(exc)
+        else:
+            raise AssertionError("Premature delayed SIP scoring should be blocked.")
+
+
+def test_configured_sip_recent_entitlement_uses_delayed_cutoff():
+    end_recent = pd.Timestamp("2026-10-07T17:00:00Z").to_pydatetime()
+    calls = []
+
+    def fake_bars(**kwargs):
+        calls.append(kwargs)
+        if kwargs["end"] == end_recent:
+            raise RuntimeError(
+                "subscription does not permit querying recent SIP data"
+            )
+        return _intraday_frame()
+
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
+    ):
+        _, meta = market_data.append_u67_current_session_intraday(
+            {"MAN": _daily_frame("MAN")},
+            SimpleNamespace(alpaca_live_feed="sip"),
+            session="2026-10-07",
+            now=pd.Timestamp("2026-10-07T17:00:00Z"),
+            per_asset_pause_seconds=0,
+        )
+    assert [x["feed"] for x in calls] == ["sip", "sip"]
+    assert meta["intraday_data_delay_minutes"] == 20
+
+
+def test_delayed_sip_does_not_use_any_bar_at_or_after_cutoff():
+    today_after_cutoff_only = pd.DataFrame(
+        [{
+            "open": 1.0, "high": 1.0, "low": 1.0,
+            "close": 1.0, "volume": 100.0,
+        }],
+        index=pd.DatetimeIndex(
+            [pd.Timestamp("2026-10-07T16:41:00Z")],
+            name="timestamp",
+        ),
+    )
+    calls = []
+    def fake_bars(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError(
+                "subscription does not permit querying recent SIP data"
+            )
+        return today_after_cutoff_only
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
+    ):
+        try:
+            market_data.append_u67_current_session_intraday(
+                {"MAN": _daily_frame("MAN")},
+                SimpleNamespace(alpaca_live_feed="sip"),
+                session="2026-10-07",
+                now=pd.Timestamp("2026-10-07T17:00:00Z"),
+                per_asset_pause_seconds=0,
+            )
+        except RuntimeError as exc:
+            assert "CurrentSessionIntradayDataMissing" in str(exc)
+        else:
+            raise AssertionError("Out-of-cutoff future bar must not score.")
