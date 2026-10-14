@@ -1,3 +1,62 @@
+## 2026-10-14 — API v10.8.94 — correção de permanência Paper por fills reais
+
+**Incidente:** pacote `mct_paper_transaction_audit_20261014T152546Z.zip`
+(API v10.8.93, Strategy #30 revisão 2). MAN foi comprado em
+07/10/2026, sem nova venda/recompra, mas os planos posteriores
+de 09, 12 e 13/10 mantiveram `holding_sessions=1`. O plano de
+13/10 exibiu CAPR como melhor bruto (utilidade 0,429718), MAN
+0,246669, margem aprovada, porém a decisão reteve MAN pela
+restrição de dois pregões. Os quatro pregões *concluídos após
+a entrada* até 13/10 são 08, 09, 12 e 13/10; na semântica
+da execução Paper a compra vale a primeira sessão, logo o
+contador operacional reconciliado passa de 1 para 5.
+
+**Causa no runtime anterior:** `prepare_next_paper_plan` recebia
+`state.holding_sessions` diretamente do MongoDB. O contador só
+era incrementado em `execute_prepared_paper_plan` ao executar
+uma ação de hold. Planos cancelados ou ainda preparados não
+executavam esse caminho, congelando o contador mesmo que dias
+de negociação tivessem transcorrido. O relatório de auditoria
+detectava a discrepância, mas não a corrigia para a decisão.
+
+**Branch:** `fix/v10.8.94-paper-holding-fill-reconciliation`, a
+partir da `main` `c70681db91ce4d391ac9fadc0b218bd1e02e5e19`.
+
+**Correção:** antes de gerar qualquer previsão/decisão, o
+Paper consulta exclusivamente os fills efetivos registrados no
+Mongo, localiza a entrada da posição contínua atual, reconcilia
+a quantidade com o estado já conferido contra a Alpaca e conta
+as sessões regulares de XNYS *efetivamente concluídas* desde
+a compra, sem incluir pregão intradiário ainda aberto. Usa
+`1 + sessões completas após o fill` para respeitar o contrato
+original de incremento em cada execução (compra inicia em 1).
+Corrige o contador persistido com compare-and-set, protegendo
+trocas simultâneas de posição. Se não houver fill confirmado,
+o calendário faltar ou o livro de ordens divergir, a preparação
+falha com erro explícito e não envia ordens. Em caixa não há
+ação. Não altera parâmetros, modelo, regra mínima de dois
+pregões, ranking, compras/vendas ou contabilidade financeira.
+
+**Testes:** casos de MAN com lacunas de execução, exclusão da
+sessão corrente intradiária, data inicial da posição,
+reentrada após liquidação, ausência de fill, conflito de
+quantidade, atualização concorrente e carteira em caixa.
+Os testes precisam ser aprovados no workflow GitHub antes
+de levar a correção à `main`. A revisão não executa
+ordens Paper nem atualiza diretamente o banco de produção.
+
+**Observação operacional:** a correção evita bloquear decisões
+futuras com um contador congelado, mas não explica por que os
+planos Paper históricos ficaram `prepared`/`cancelled`.
+Verificar logs e status do agendador e janela de execução
+em produção. Um novo plano deve ser gerado após o deploy,
+e não é seguro executar um plano antigo de CAPR apenas
+porque o indicador bruto foi o maior. Não há garantia de
+que CAPR passaria todos os critérios de elegibilidade
+em um novo pregão.
+
+---
+
 ## 2026-10-13 — API v10.8.93 — observabilidade da máxima e devolução de lucro Paper
 
 **Causa:** episódio da MAN (compra 07/10) expôs ausência de curva de
