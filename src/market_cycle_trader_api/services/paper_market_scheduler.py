@@ -950,10 +950,10 @@ def execute_manual_current_session_plan(
         try:
             result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
+            latest = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+                {"plan_id": str(plan["plan_id"])}
+            ) or {}
             if run is not None:
-                latest = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
-                    {"plan_id": str(plan["plan_id"])}
-                ) or {}
                 if str(latest.get("status") or "") == "prepared":
                     db[PAPER_MARKET_RUNS_COLLECTION].update_one(
                         {"run_id": str(run["run_id"]),
@@ -2154,6 +2154,13 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
     except Exception:
         trader_winner = None
     manual_reanalysis = dict(controller.get("manual_reanalysis") or {})
+    manual_execution = dict(controller.get("manual_execution") or {})
+    manual_operation_log = list(controller.get("manual_operation_log") or [])[-90:]
+    if public and manual_execution.get("error"):
+        manual_execution["error"] = (
+            "Alpaca execution was not confirmed. Check Trader administration "
+            "and reconcile the broker before any new order."
+        )
     if public and manual_reanalysis.get("error"):
         # The public status route has no administrative authentication.
         # Do not leak raw broker exceptions, response URLs or credentials.
@@ -2186,6 +2193,8 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "next_market_open": bson_value((active or {}).get("expected_market_open") or controller.get("next_market_open")),
         "next_execution_session": (active or {}).get("execution_session") or controller.get("next_execution_session"),
         "manual_reanalysis": bson_value(manual_reanalysis) if manual_reanalysis else None,
+        "manual_execution": bson_value(manual_execution) if manual_execution else None,
+        "manual_operation_log": bson_value(manual_operation_log),
         "next_premarket_analysis_at": bson_value((active or {}).get("premarket_analysis_at")),
         "premarket_analysis_minutes": (active or {}).get("premarket_analysis_minutes"),
         "active_run": _public_robot_run(active),
