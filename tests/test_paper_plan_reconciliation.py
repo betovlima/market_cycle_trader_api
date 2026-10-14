@@ -136,7 +136,7 @@ class PaperPlanReconciliationTests(unittest.TestCase):
         self.assertEqual(db[reconcile.PAPER_TRADE_PLANS_COLLECTION].docs[0]["status"], "prepared")
 
     def test_active_or_review_required_run_blocks_close(self):
-        for status in ("armed", "prepared", "executing", "review_required"):
+        for status in ("armed", "prepared", "executing", "review_required", "completed"):
             with self.subTest(status=status):
                 db = make_db(
                     [sample_plan("old-hold", "2026-10-13")],
@@ -146,7 +146,7 @@ class PaperPlanReconciliationTests(unittest.TestCase):
                     }],
                 )
                 result = reconcile.preview_paper_plan_reconciliation(db)
-                self.assertIn("linked_run_not_terminal", result["items"][0]["blockers"])
+                self.assertIn("linked_run_not_safely_unexecuted", result["items"][0]["blockers"])
 
     def test_trading_plan_and_execution_evidence_block_close(self):
         for changed in (
