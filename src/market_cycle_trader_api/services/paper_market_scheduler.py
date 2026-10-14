@@ -539,6 +539,67 @@ def _active_manual_session_run(context: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
+def _manual_operation_event(
+    *,
+    operation: str,
+    attempt_id: str,
+    status: str,
+    phase: str,
+    completed: int = 0,
+    total: int = 0,
+    symbol: str = "",
+) -> dict[str, Any]:
+    """Bounded, safe operational telemetry: no credentials or raw exceptions."""
+    return {
+        "at": utc_now(),
+        "operation": operation,
+        "attempt_id": attempt_id,
+        "status": status,
+        "phase": phase,
+        "completed": max(0, int(completed)),
+        "total": max(0, int(total)),
+        "symbol": str(symbol or "")[:16],
+    }
+
+
+def _record_manual_execution_progress(
+    db: Any,
+    *,
+    attempt_id: str,
+    plan_id: str,
+    target_asset: str,
+    status: str,
+    phase: str,
+    error: str | None = None,
+) -> None:
+    stamp = utc_now()
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].update_one(
+        {"_id": AUTOMATION_ID},
+        {
+            "$set": {
+                "manual_execution": {
+                    "attempt_id": attempt_id,
+                    "status": status,
+                    "phase": phase,
+                    "plan_id": str(plan_id),
+                    "target_asset": str(target_asset),
+                    "error": str(error) if error else None,
+                    "updated_at": stamp,
+                },
+            },
+            "$push": {
+                "manual_operation_log": {
+                    "$each": [_manual_operation_event(
+                        operation="execution", attempt_id=attempt_id,
+                        status=status, phase=phase, symbol=target_asset,
+                    )],
+                    "$slice": -90,
+                },
+            },
+        },
+    )
+
+
 def _record_manual_reanalysis_progress(
     db: Any,
     *,
@@ -550,15 +611,16 @@ def _record_manual_reanalysis_progress(
     symbol: str = "",
     error: str | None = None,
     plan_id: str | None = None,
+    log_event: bool = False,
 ) -> None:
-    """Persist real progress independently from the synchronous HTTP request.
+    """Persist bounded operation logs and live progress in MongoDB.
 
-    Works even when today's scheduled run has already failed and tomorrow's
-    run is armed. The status API can be polled from a separate connection.
+    Pollable from another connection while the prepare POST is still running.
+    Do not put raw broker failures in unauthenticated event logs.
     """
-    db[PAPER_MARKET_AUTOMATION_COLLECTION].update_one(
-        {"_id": AUTOMATION_ID},
-        {"$set": {
+    stamp = utc_now()
+    update: dict[str, Any] = {
+        "$set": {
             "manual_reanalysis": {
                 "attempt_id": attempt_id,
                 "status": status,
@@ -568,9 +630,23 @@ def _record_manual_reanalysis_progress(
                 "symbol": str(symbol),
                 "error": str(error) if error else None,
                 "plan_id": str(plan_id) if plan_id else None,
-                "updated_at": utc_now(),
+                "updated_at": stamp,
             },
-        }},
+        },
+    }
+    if log_event:
+        update["$push"] = {
+            "manual_operation_log": {
+                "$each": [_manual_operation_event(
+                    operation="analysis", attempt_id=attempt_id,
+                    status=status, phase=phase, completed=completed,
+                    total=total, symbol=symbol,
+                )],
+                "$slice": -90,
+            },
+        }
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].update_one(
+        {"_id": AUTOMATION_ID}, update,
     )
 
 
@@ -626,16 +702,25 @@ def prepare_manual_current_session_plan(
     analysis_attempt_id = f"manual-analysis-{uuid.uuid4().hex[:12]}"
     _record_manual_reanalysis_progress(
         db, attempt_id=analysis_attempt_id, status="running",
-        phase="validating", symbol="Winner",
+        phase="validating", symbol="Winner", log_event=True,
     )
+
+    last_logged_stage = {"value": "validating"}
 
     def _report_progress(
         stage: str, completed: int, total: int, symbol: str,
     ) -> None:
+        changed = stage != last_logged_stage["value"]
+        should_log = changed or (
+            total > 1 and completed > 0
+            and (completed == total or completed % 10 == 0)
+        )
         _record_manual_reanalysis_progress(
             db, attempt_id=analysis_attempt_id, status="running",
             phase=stage, completed=completed, total=total, symbol=symbol,
+            log_event=should_log,
         )
+        last_logged_stage["value"] = stage
 
     try:
         plan = prepare_next_paper_plan(
@@ -650,7 +735,7 @@ def prepare_manual_current_session_plan(
     except Exception as exc:
         _record_manual_reanalysis_progress(
             db, attempt_id=analysis_attempt_id, status="failed",
-            phase="failed", error=str(exc),
+            phase="failed", error=str(exc), log_event=True,
         )
         if run is not None:
             db[PAPER_MARKET_RUNS_COLLECTION].update_one(
@@ -704,7 +789,7 @@ def prepare_manual_current_session_plan(
         db, attempt_id=analysis_attempt_id, status="prepared",
         phase="completed", completed=1, total=1,
         symbol=str(plan.get("target_asset") or ""),
-        plan_id=str(plan["plan_id"]),
+        plan_id=str(plan["plan_id"]), log_event=True,
     )
     mode = _control_mode(_automation_document(db))
     _record_admin_operation(
@@ -755,7 +840,15 @@ def execute_manual_current_session_plan(
         and failure_code in RECOVERABLE_CONTINGENCY_FAILURES
     )
 
+    execution_attempt_id = f"manual-execution-{uuid.uuid4().hex[:12]}"
+    execution_target = str(plan.get("target_asset") or "")
+
     if recoverable_contingency:
+        _record_manual_execution_progress(
+            db, attempt_id=execution_attempt_id,
+            plan_id=str(plan["plan_id"]), target_asset=execution_target,
+            status="running", phase="broker_execution",
+        )
         now = utc_now()
         db[PAPER_TRADE_PLANS_COLLECTION].update_one(
             {"plan_id": str(plan["plan_id"])},
@@ -770,6 +863,12 @@ def execute_manual_current_session_plan(
         try:
             result = execute_failed_paper_plan_contingency(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
+            _record_manual_execution_progress(
+                db, attempt_id=execution_attempt_id,
+                plan_id=str(plan["plan_id"]), target_asset=execution_target,
+                status="review_required", phase="failed",
+                error=str(exc),
+            )
             _record_admin_operation(
                 db,
                 action="manual_contingency_execution",
@@ -832,6 +931,11 @@ def execute_manual_current_session_plan(
                     "Manual plan was already claimed or the run changed. "
                     "No duplicate Alpaca order was submitted."
                 )
+        _record_manual_execution_progress(
+            db, attempt_id=execution_attempt_id,
+            plan_id=str(plan["plan_id"]), target_asset=execution_target,
+            status="running", phase="broker_execution",
+        )
         now = utc_now()
         db[PAPER_TRADE_PLANS_COLLECTION].update_one(
             {"plan_id": str(plan["plan_id"])},
@@ -846,10 +950,10 @@ def execute_manual_current_session_plan(
         try:
             result = execute_prepared_paper_plan(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
+            latest = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
+                {"plan_id": str(plan["plan_id"])}
+            ) or {}
             if run is not None:
-                latest = db[PAPER_TRADE_PLANS_COLLECTION].find_one(
-                    {"plan_id": str(plan["plan_id"])}
-                ) or {}
                 if str(latest.get("status") or "") == "prepared":
                     db[PAPER_MARKET_RUNS_COLLECTION].update_one(
                         {"run_id": str(run["run_id"]),
@@ -869,6 +973,14 @@ def execute_manual_current_session_plan(
                             f"claimed; reconcile Alpaca orders first: {exc}"
                         ),
                     )
+            _record_manual_execution_progress(
+                db, attempt_id=execution_attempt_id,
+                plan_id=str(plan["plan_id"]), target_asset=execution_target,
+                status="review_required" if (
+                    str(latest.get("status") or "") != "prepared"
+                ) else "failed",
+                phase="failed", error=str(exc),
+            )
             _record_admin_operation(
                 db,
                 action="manual_current_session_execution",
@@ -905,6 +1017,11 @@ def execute_manual_current_session_plan(
                 "execution_result": bson_value(result),
             },
         )
+    _record_manual_execution_progress(
+        db, attempt_id=execution_attempt_id,
+        plan_id=str(plan["plan_id"]), target_asset=execution_target,
+        status="completed", phase="completed",
+    )
     _record_admin_operation(
         db,
         action="manual_contingency_execution" if recoverable_contingency else "manual_current_session_execution",
@@ -2037,6 +2154,13 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
     except Exception:
         trader_winner = None
     manual_reanalysis = dict(controller.get("manual_reanalysis") or {})
+    manual_execution = dict(controller.get("manual_execution") or {})
+    manual_operation_log = list(controller.get("manual_operation_log") or [])[-90:]
+    if public and manual_execution.get("error"):
+        manual_execution["error"] = (
+            "Alpaca execution was not confirmed. Check Trader administration "
+            "and reconcile the broker before any new order."
+        )
     if public and manual_reanalysis.get("error"):
         # The public status route has no administrative authentication.
         # Do not leak raw broker exceptions, response URLs or credentials.
@@ -2069,6 +2193,8 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "next_market_open": bson_value((active or {}).get("expected_market_open") or controller.get("next_market_open")),
         "next_execution_session": (active or {}).get("execution_session") or controller.get("next_execution_session"),
         "manual_reanalysis": bson_value(manual_reanalysis) if manual_reanalysis else None,
+        "manual_execution": bson_value(manual_execution) if manual_execution else None,
+        "manual_operation_log": bson_value(manual_operation_log),
         "next_premarket_analysis_at": bson_value((active or {}).get("premarket_analysis_at")),
         "premarket_analysis_minutes": (active or {}).get("premarket_analysis_minutes"),
         "active_run": _public_robot_run(active),

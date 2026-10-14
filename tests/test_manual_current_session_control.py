@@ -215,6 +215,15 @@ def test_manual_execution_finalizes_active_run_without_duplicate_order():
     assert finishing["$set"]["execution_origin"] == "manual_recovery"
     assert finishing["$unset"]["active_key"] == ""
     assert finishing["$set"]["execution_result"]["target_asset"] == "MAN"
+    updates = [
+        call.args[1] for call in
+        db[scheduler.PAPER_MARKET_AUTOMATION_COLLECTION].update_one.call_args_list
+    ]
+    assert [row["$set"]["manual_execution"]["status"] for row in updates] == [
+        "running", "completed",
+    ]
+    assert [row["$push"]["manual_operation_log"]["$each"][0]["operation"]
+            for row in updates] == ["execution", "execution"]
 
 
 def test_manual_execution_rejects_old_or_unapproved_plan_without_orders():
@@ -410,3 +419,83 @@ def test_failed_manual_reanalysis_publishes_actual_data_coverage_error():
             raise AssertionError("Missing intraday bars must fail.")
     assert history[-1]["status"] == "failed"
     assert "AMS" in history[-1]["error"]
+
+
+def test_manual_analysis_log_records_milestones_without_raw_errors():
+    db, _, _ = _manual_db()
+    automated = db[scheduler.PAPER_MARKET_AUTOMATION_COLLECTION]
+
+    scheduler._record_manual_reanalysis_progress(
+        db, attempt_id="audit-run-1", status="running",
+        phase="intraday_iex", completed=10, total=75,
+        symbol="AMS", log_event=True,
+    )
+    update = automated.update_one.call_args.args[1]
+    assert update["$set"]["manual_reanalysis"]["total"] == 75
+    entry = update["$push"]["manual_operation_log"]["$each"][0]
+    assert update["$push"]["manual_operation_log"]["$slice"] == -90
+    assert entry["operation"] == "analysis"
+    assert entry["phase"] == "intraday_iex"
+    assert entry["symbol"] == "AMS"
+    assert entry["completed"] == 10
+    assert entry["total"] == 75
+
+    scheduler._record_manual_reanalysis_progress(
+        db, attempt_id="audit-run-1", status="failed",
+        phase="failed", error="broker private key: xxx",
+        log_event=True,
+    )
+    update = automated.update_one.call_args.args[1]
+    assert "broker private key" in update["$set"]["manual_reanalysis"]["error"]
+    assert "error" not in update["$push"]["manual_operation_log"]["$each"][0]
+
+
+def test_manual_execution_log_records_broker_reconciliation_without_private_details():
+    db, _, _ = _manual_db()
+    automated = db[scheduler.PAPER_MARKET_AUTOMATION_COLLECTION]
+    scheduler._record_manual_execution_progress(
+        db, attempt_id="execution-a", plan_id="plan-12",
+        target_asset="MAN", status="review_required",
+        phase="failed", error="broker secret=never-public",
+    )
+    update = automated.update_one.call_args.args[1]
+    assert update["$set"]["manual_execution"]["status"] == "review_required"
+    assert update["$push"]["manual_operation_log"]["$slice"] == -90
+    event = update["$push"]["manual_operation_log"]["$each"][0]
+    assert event["operation"] == "execution"
+    assert event["symbol"] == "MAN"
+    assert "error" not in event
+    assert "secret" not in str(event)
+
+
+def test_robot_public_status_contains_bounded_log_but_redacts_broker_error():
+    db, _, _ = _manual_db()
+    db[scheduler.STRATEGY_CONTROL_COLLECTION] = MagicMock()
+    db[scheduler.STRATEGY_CONTROL_COLLECTION].find_one.return_value = {}
+    runs = db[scheduler.PAPER_MARKET_RUNS_COLLECTION]
+    runs.find_one.return_value = None
+    controller = {
+        "enabled": True, "status": "active", "control_mode": "active",
+        "manual_reanalysis": {
+            "status": "failed", "phase": "failed",
+            "error": "CurrentSessionIntradayDataMissing: AMS has no IEX regular-session bars",
+        },
+        "manual_execution": {
+            "status": "review_required", "phase": "failed",
+            "error": "private credential=xxx",
+        },
+        "manual_operation_log": [
+            {"at": pd.Timestamp("2026-10-14T17:01:00Z"),
+             "operation": "analysis", "status": "failed",
+             "phase": "failed", "symbol": "AMS"},
+        ],
+    }
+    with (
+        patch.object(scheduler, "_automation_document", return_value=controller),
+        patch.object(scheduler, "get_trader_winner_summary", return_value=None),
+        patch.object(scheduler._SCHEDULER, "snapshot", return_value={}),
+    ):
+        response = scheduler.paper_market_robot_status(db, public=True)
+    assert response["manual_reanalysis"]["error"].startswith("AMS:")
+    assert "credential" not in response["manual_execution"]["error"]
+    assert response["manual_operation_log"][0]["operation"] == "analysis"
