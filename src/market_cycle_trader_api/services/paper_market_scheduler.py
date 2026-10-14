@@ -840,7 +840,15 @@ def execute_manual_current_session_plan(
         and failure_code in RECOVERABLE_CONTINGENCY_FAILURES
     )
 
+    execution_attempt_id = f"manual-execution-{uuid.uuid4().hex[:12]}"
+    execution_target = str(plan.get("target_asset") or "")
+
     if recoverable_contingency:
+        _record_manual_execution_progress(
+            db, attempt_id=execution_attempt_id,
+            plan_id=str(plan["plan_id"]), target_asset=execution_target,
+            status="running", phase="broker_execution",
+        )
         now = utc_now()
         db[PAPER_TRADE_PLANS_COLLECTION].update_one(
             {"plan_id": str(plan["plan_id"])},
@@ -855,6 +863,12 @@ def execute_manual_current_session_plan(
         try:
             result = execute_failed_paper_plan_contingency(db, plan_id=str(plan["plan_id"]))
         except Exception as exc:
+            _record_manual_execution_progress(
+                db, attempt_id=execution_attempt_id,
+                plan_id=str(plan["plan_id"]), target_asset=execution_target,
+                status="review_required", phase="failed",
+                error=str(exc),
+            )
             _record_admin_operation(
                 db,
                 action="manual_contingency_execution",
@@ -917,6 +931,11 @@ def execute_manual_current_session_plan(
                     "Manual plan was already claimed or the run changed. "
                     "No duplicate Alpaca order was submitted."
                 )
+        _record_manual_execution_progress(
+            db, attempt_id=execution_attempt_id,
+            plan_id=str(plan["plan_id"]), target_asset=execution_target,
+            status="running", phase="broker_execution",
+        )
         now = utc_now()
         db[PAPER_TRADE_PLANS_COLLECTION].update_one(
             {"plan_id": str(plan["plan_id"])},
@@ -954,6 +973,14 @@ def execute_manual_current_session_plan(
                             f"claimed; reconcile Alpaca orders first: {exc}"
                         ),
                     )
+            _record_manual_execution_progress(
+                db, attempt_id=execution_attempt_id,
+                plan_id=str(plan["plan_id"]), target_asset=execution_target,
+                status="review_required" if (
+                    str(latest.get("status") or "") != "prepared"
+                ) else "failed",
+                phase="failed", error=str(exc),
+            )
             _record_admin_operation(
                 db,
                 action="manual_current_session_execution",
@@ -990,6 +1017,11 @@ def execute_manual_current_session_plan(
                 "execution_result": bson_value(result),
             },
         )
+    _record_manual_execution_progress(
+        db, attempt_id=execution_attempt_id,
+        plan_id=str(plan["plan_id"]), target_asset=execution_target,
+        status="completed", phase="completed",
+    )
     _record_admin_operation(
         db,
         action="manual_contingency_execution" if recoverable_contingency else "manual_current_session_execution",
