@@ -53,7 +53,10 @@ def test_manual_reanalysis_does_not_require_scheduled_run() -> None:
 def test_manual_reanalysis_without_run_uses_current_session_open() -> None:
     context = _open_context(run=None, plan=None)
     plans = MagicMock()
-    db = {scheduler.PAPER_MARKET_RUNS_COLLECTION: MagicMock()}
+    db = {
+        scheduler.PAPER_MARKET_RUNS_COLLECTION: MagicMock(),
+        scheduler.PAPER_MARKET_AUTOMATION_COLLECTION: MagicMock(),
+    }
 
     prepared_plan = {
         "plan_id": "plan-current-session",
@@ -156,6 +159,7 @@ def _manual_db():
     return {
         scheduler.PAPER_MARKET_RUNS_COLLECTION: runs,
         scheduler.PAPER_TRADE_PLANS_COLLECTION: plans,
+        scheduler.PAPER_MARKET_AUTOMATION_COLLECTION: MagicMock(),
     }, runs, plans
 
 
@@ -343,3 +347,66 @@ def test_restart_recovers_already_executed_manual_plan_without_new_order():
     execute.assert_not_called()
     assert runs.update_one.call_args.args[1]["$set"]["status"] == "completed"
     assert runs.update_one.call_args.args[1]["$unset"]["active_key"] == ""
+
+
+def test_manual_reanalysis_persists_real_progress_even_without_today_run():
+    context = _open_context(run=None, plan=None)
+    prepared_plan = _man_manual_plan()
+    progress_messages = []
+
+    def simulate_preparation(db, *, progress_callback=None, **kwargs):
+        assert progress_callback is not None
+        for step in [
+            ("download", 1, 77, "NVDA"),
+            ("intraday_iex", 52, 75, "MAN"),
+            ("intraday_sip", 75, 75, "AMS"),
+            ("training", 1, 1, "LightGBM"),
+            ("saving_plan", 1, 1, "manual-7"),
+        ]:
+            progress_callback(*step)
+        return prepared_plan
+
+    db, _, _ = _manual_db()
+    automated = db[scheduler.PAPER_MARKET_AUTOMATION_COLLECTION]
+    def record_progress(filter_doc, update_doc, **kwargs):
+        progress_messages.append(update_doc["$set"]["manual_reanalysis"])
+
+    automated.update_one.side_effect = record_progress
+    with (
+        patch.object(scheduler, "_manual_recovery_context", return_value=context),
+        patch.object(scheduler, "prepare_next_paper_plan", side_effect=simulate_preparation),
+        patch.object(scheduler, "_automation_document", return_value={"control_mode": "active"}),
+        patch.object(scheduler, "_record_admin_operation"),
+        patch.object(scheduler, "paper_market_manual_recovery_status", return_value={}),
+    ):
+        result = scheduler.prepare_manual_current_session_plan(db)
+    assert result["status"] == "prepared"
+    assert progress_messages[0]["status"] == "running"
+    assert any(row["phase"] == "intraday_sip" and row["completed"] == 75
+               for row in progress_messages)
+    assert progress_messages[-1]["status"] == "prepared"
+    assert progress_messages[-1]["plan_id"] == "manual-7"
+
+
+def test_failed_manual_reanalysis_publishes_actual_data_coverage_error():
+    db, _, _ = _manual_db()
+    history = []
+    automated = db[scheduler.PAPER_MARKET_AUTOMATION_COLLECTION]
+    automated.update_one.side_effect = lambda selector, update, **kw: history.append(
+        update["$set"]["manual_reanalysis"]
+    )
+    with (
+        patch.object(scheduler, "_manual_recovery_context",
+                     return_value=_open_context(run=None, plan=None)),
+        patch.object(scheduler, "prepare_next_paper_plan",
+                     side_effect=RuntimeError(
+                         "CurrentSessionIntradayCoverageUnavailable: AMS IEX missing; SIP denied")),
+    ):
+        try:
+            scheduler.prepare_manual_current_session_plan(db)
+        except RuntimeError as exc:
+            assert "AMS" in str(exc)
+        else:
+            raise AssertionError("Missing intraday bars must fail.")
+    assert history[-1]["status"] == "failed"
+    assert "AMS" in history[-1]["error"]

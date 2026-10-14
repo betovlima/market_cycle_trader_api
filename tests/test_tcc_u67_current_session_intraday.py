@@ -156,8 +156,125 @@ def test_append_current_session_fails_closed_without_live_bars() -> None:
                 per_asset_pause_seconds=0,
             )
         except RuntimeError as exc:
-            assert "CurrentSessionIntradayDataMissing" in str(exc)
+            assert "CurrentSessionIntradayCoverageUnavailable" in str(exc)
+            assert "SIP retry failed" in str(exc)
         else:
             raise AssertionError(
                 "Expected missing current-session data to fail closed."
             )
+
+
+def test_missing_iex_ams_retries_entire_universe_on_uniform_sip():
+    frames = {
+        "MAN": _daily_frame("MAN"),
+        "AMS": _daily_frame("AMS"),
+        "CAPR": _daily_frame("CAPR"),
+    }
+    calls = []
+
+    def fake_bars(**kwargs):
+        calls.append((kwargs["symbol"], kwargs["feed"]))
+        if kwargs["symbol"] == "AMS" and kwargs["feed"] == "iex":
+            return pd.DataFrame()
+        return _intraday_frame()
+
+    progress = []
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
+    ):
+        result, metadata = market_data.append_u67_current_session_intraday(
+            frames, SimpleNamespace(alpaca_live_feed="iex"),
+            session="2026-10-07",
+            now=pd.Timestamp("2026-10-07T17:00:00Z"),
+            per_asset_pause_seconds=0,
+            progress_callback=lambda stage, n, total, sym: progress.append(
+                (stage, n, total, sym)
+            ),
+        )
+    assert calls == [
+        ("MAN", "iex"), ("AMS", "iex"),
+        ("MAN", "sip"), ("AMS", "sip"), ("CAPR", "sip"),
+    ]
+    assert metadata["live_feed"] == "sip"
+    assert "AMS" in metadata["live_feed_fallback_reason"]
+    assert metadata["intraday_asset_count"] == 3
+    assert list(result) == ["MAN", "AMS", "CAPR"]
+    assert all(frame.attrs["current_session_live_feed"] == "sip"
+               for frame in result.values())
+    assert any(stage == "intraday_sip" for stage, _, _, _ in progress)
+
+
+def test_missing_iex_sip_unauthorized_fails_without_returning_partial_data():
+    frames = {"MAN": _daily_frame("MAN"), "AMS": _daily_frame("AMS")}
+    calls = []
+
+    def fake_bars(**kwargs):
+        calls.append((kwargs["symbol"], kwargs["feed"]))
+        if kwargs["feed"] == "sip":
+            raise RuntimeError("403 forbidden: SIP entitlement required")
+        return _intraday_frame() if kwargs["symbol"] == "MAN" else pd.DataFrame()
+
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
+    ):
+        try:
+            market_data.append_u67_current_session_intraday(
+                frames, SimpleNamespace(alpaca_live_feed="iex"),
+                session="2026-10-07",
+                now=pd.Timestamp("2026-10-07T17:00:00Z"),
+                per_asset_pause_seconds=0,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            assert "CurrentSessionIntradayCoverageUnavailable" in message
+            assert "AMS" in message
+            assert "SIP entitlement" in message
+        else:
+            raise AssertionError("The live Winner must not use a partial feed.")
+    assert calls == [("MAN", "iex"), ("AMS", "iex"), ("MAN", "sip")]
+
+
+def test_no_sip_fallback_for_other_iex_data_failures():
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars",
+                     side_effect=RuntimeError("IEX provider unavailable")) as download,
+    ):
+        try:
+            market_data.append_u67_current_session_intraday(
+                {"MAN": _daily_frame("MAN")},
+                SimpleNamespace(alpaca_live_feed="iex"),
+                session="2026-10-07",
+                now=pd.Timestamp("2026-10-07T17:00:00Z"),
+                per_asset_pause_seconds=0,
+            )
+        except RuntimeError as exc:
+            assert str(exc) == "IEX provider unavailable"
+        else:
+            raise AssertionError("Unexpected automatic feed substitution.")
+    assert download.call_count == 1
+    assert download.call_args.kwargs["feed"] == "iex"
+
+
+def test_configured_sip_never_uses_iex():
+    with (
+        patch.object(market_data, "get_alpaca_credentials",
+                     return_value={"api_key_id": "key", "secret_key": "secret"}),
+        patch.object(market_data, "download_stock_bars",
+                     return_value=_intraday_frame()) as download,
+    ):
+        _, metadata = market_data.append_u67_current_session_intraday(
+            {"MAN": _daily_frame("MAN")},
+            SimpleNamespace(alpaca_live_feed="sip"),
+            session="2026-10-07",
+            now=pd.Timestamp("2026-10-07T17:00:00Z"),
+            per_asset_pause_seconds=0,
+        )
+    assert metadata["live_feed"] == "sip"
+    assert metadata["live_feed_fallback_reason"] is None
+    assert download.call_args.kwargs["feed"] == "sip"

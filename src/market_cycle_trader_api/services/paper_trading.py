@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -674,7 +674,10 @@ def prepare_next_paper_plan(
     execution_session_override: str | None = None,
     expected_market_open_override: Any | None = None,
     refresh_source: str = "premarket_plan_refresh",
+    progress_callback: Callable[[str, int, int, str], None] | None = None,
 ) -> dict[str, Any]:
+    if progress_callback is not None:
+        progress_callback("validating", 0, 1, "Winner")
     runtime_training = get_system_settings(db)["training"]
     if not bool(runtime_training["enabled"]):
         raise RuntimeError("Model training is disabled in System Settings.")
@@ -719,6 +722,7 @@ def prepare_next_paper_plan(
         )
         snapshot = download_u67_operational_snapshot(
             job_id=live_job_id,
+            progress_callback=progress_callback,
             config=snapshot_config,
             requested_assets=(
                 U77_REQUESTED_ASSETS if u77_mode else tuple(strategy.assets)
@@ -764,6 +768,7 @@ def prepare_next_paper_plan(
                     strategy,
                     session=current_session,
                     now=clock["timestamp"],
+                    progress_callback=progress_callback,
                 )
             )
 
@@ -829,6 +834,8 @@ def prepare_next_paper_plan(
                 )
             bars_by_symbol[symbol] = bars
 
+    if progress_callback is not None:
+        progress_callback("training", 0, 1, "LightGBM")
     decision = build_live_model_decision(
         bars_by_symbol,
         strategy,
@@ -836,6 +843,8 @@ def prepare_next_paper_plan(
         current_asset=state.managed_symbol,
         holding_sessions=state.holding_sessions,
     )
+    if progress_callback is not None:
+        progress_callback("training", 1, 1, "LightGBM")
     stateful_decision = None
     if (
         str(winner_profile.get("strategy_kind") or "") == "temporal_intelligence"
@@ -1020,7 +1029,11 @@ def prepare_next_paper_plan(
         "stateful_confidence_threshold": (stateful_decision or {}).get("confidence_threshold"),
         "stateful_risk_family": (stateful_decision or {}).get("risk_family"),
     }
+    if progress_callback is not None:
+        progress_callback("saving_plan", 0, 1, str(plan_id))
     insert_paper_trade_plan(db, document, replace=replace)
+    if progress_callback is not None:
+        progress_callback("saving_plan", 1, 1, str(plan_id))
     return document
 
 

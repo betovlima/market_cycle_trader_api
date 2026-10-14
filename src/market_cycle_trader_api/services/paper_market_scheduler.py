@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import uuid
 from datetime import timedelta
@@ -538,6 +539,41 @@ def _active_manual_session_run(context: dict[str, Any]) -> dict[str, Any] | None
     return None
 
 
+def _record_manual_reanalysis_progress(
+    db: Any,
+    *,
+    attempt_id: str,
+    status: str,
+    phase: str,
+    completed: int = 0,
+    total: int = 0,
+    symbol: str = "",
+    error: str | None = None,
+    plan_id: str | None = None,
+) -> None:
+    """Persist real progress independently from the synchronous HTTP request.
+
+    Works even when today's scheduled run has already failed and tomorrow's
+    run is armed. The status API can be polled from a separate connection.
+    """
+    db[PAPER_MARKET_AUTOMATION_COLLECTION].update_one(
+        {"_id": AUTOMATION_ID},
+        {"$set": {
+            "manual_reanalysis": {
+                "attempt_id": attempt_id,
+                "status": status,
+                "phase": phase,
+                "completed": int(completed),
+                "total": int(total),
+                "symbol": str(symbol),
+                "error": str(error) if error else None,
+                "plan_id": str(plan_id) if plan_id else None,
+                "updated_at": utc_now(),
+            },
+        }},
+    )
+
+
 def prepare_manual_current_session_plan(
     db: Any,
     *,
@@ -587,9 +623,24 @@ def prepare_manual_current_session_plan(
                 "The scheduled Paper run is busy or no longer active. "
                 "Refresh Trader status before starting manual reanalysis."
             )
+    analysis_attempt_id = f"manual-analysis-{uuid.uuid4().hex[:12]}"
+    _record_manual_reanalysis_progress(
+        db, attempt_id=analysis_attempt_id, status="running",
+        phase="validating", symbol="Winner",
+    )
+
+    def _report_progress(
+        stage: str, completed: int, total: int, symbol: str,
+    ) -> None:
+        _record_manual_reanalysis_progress(
+            db, attempt_id=analysis_attempt_id, status="running",
+            phase=stage, completed=completed, total=total, symbol=symbol,
+        )
+
     try:
         plan = prepare_next_paper_plan(
             db,
+            progress_callback=_report_progress,
             replace=existing is not None,
             allow_open_market=True,
             execution_session_override=context["current_session"],
@@ -597,6 +648,10 @@ def prepare_manual_current_session_plan(
             refresh_source="manual_current_session_recovery",
         )
     except Exception as exc:
+        _record_manual_reanalysis_progress(
+            db, attempt_id=analysis_attempt_id, status="failed",
+            phase="failed", error=str(exc),
+        )
         if run is not None:
             db[PAPER_MARKET_RUNS_COLLECTION].update_one(
                 {"run_id": str(run["run_id"]), "status": "manual_preparing"},
@@ -645,6 +700,12 @@ def prepare_manual_current_session_plan(
                 "The scheduled run changed during manual plan preparation. "
                 "Do not execute; review the current Trader state."
             )
+    _record_manual_reanalysis_progress(
+        db, attempt_id=analysis_attempt_id, status="prepared",
+        phase="completed", completed=1, total=1,
+        symbol=str(plan.get("target_asset") or ""),
+        plan_id=str(plan["plan_id"]),
+    )
     mode = _control_mode(_automation_document(db))
     _record_admin_operation(
         db,
@@ -1975,6 +2036,23 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
             trader_winner = {"name": trader_winner.get("name")}
     except Exception:
         trader_winner = None
+    manual_reanalysis = dict(controller.get("manual_reanalysis") or {})
+    if public and manual_reanalysis.get("error"):
+        # The public status route has no administrative authentication.
+        # Do not leak raw broker exceptions, response URLs or credentials.
+        raw_error = str(manual_reanalysis["error"])
+        missing_symbol = re.search(r"\b([A-Z]{1,5}) has no IEX", raw_error)
+        if missing_symbol is not None:
+            manual_reanalysis["error"] = (
+                f"{missing_symbol.group(1)}: IEX session bars are missing; "
+                "the complete-universe SIP retry was unavailable. "
+                "Consult Trader administration for diagnostics."
+            )
+        else:
+            manual_reanalysis["error"] = (
+                "Manual Winner reanalysis failed. "
+                "Consult Trader administration for diagnostics."
+            )
     output: dict[str, Any] = {
         "enabled": enabled,
         "control_mode": control_mode,
@@ -1990,6 +2068,7 @@ def paper_market_robot_status(db: Any, *, public: bool = False) -> dict[str, Any
         "last_successful_scheduler_tick_at": runtime.get("last_successful_scheduler_tick_at"),
         "next_market_open": bson_value((active or {}).get("expected_market_open") or controller.get("next_market_open")),
         "next_execution_session": (active or {}).get("execution_session") or controller.get("next_execution_session"),
+        "manual_reanalysis": bson_value(manual_reanalysis) if manual_reanalysis else None,
         "next_premarket_analysis_at": bson_value((active or {}).get("premarket_analysis_at")),
         "premarket_analysis_minutes": (active or {}).get("premarket_analysis_minutes"),
         "active_run": _public_robot_run(active),
