@@ -1,3 +1,45 @@
+## 2026-10-14 — API v10.8.97 — log operacional e status das ações Winner
+
+**Solicitação:** disponibilizar barra de status e um histórico
+cronológico na tela para **Reanalisar Winner agora** e
+**Executar plano atual na Alpaca**, mantendo registro das
+etapas, contagens reais, ativos, horários, erros e resultados.
+
+**Branch:** `fix/v10.8.97-winner-operations-log`, originada na
+`main` v10.8.96. **Causa operacional:** v10.8.96 registrava
+apenas o progresso mais recente da reanálise
+(`manual_reanalysis`), sem histórico cronológico e sem um
+status equivalente para a execução manual na Alpaca.
+
+**Mudança:** `paper_market_automation.manual_operation_log`
+é um histórico persistido e limitado às últimas 90 entradas
+com hora UTC, tipo de operação, etapa real, estado, contagem
+de ativos e ticker. Um evento é registrado ao iniciar a
+reanálise, na mudança de etapa, a cada dez ativos (ou no
+conclusivo), na conclusão ou na falha. Dados sensíveis e
+exceções brutas não integram o log público. Para execução
+manual, `manual_execution` e os eventos associados distinguem
+início, confirmação e falha / revisão obrigatória,
+mantendo o caminho de ordens inalterado.
+
+O endpoint de status do robô retorna os campos
+`manual_reanalysis`, `manual_execution` e
+`manual_operation_log`. A rota pública sanitiza mensagens
+de exceção da corretora; administradores ainda podem
+consultar o erro detalhado na rota protegida. A renderização
+no Portfólio é implementada no frontend v10.7.23; o
+componente dos botões do Trader não está identificado no
+código da `main` do frontend disponível.
+
+**Testes e escopo:** testar telemetria de execução,
+milestones, limitação de log e sanitização dos erros.
+Nenhuma ordem enviada à Alpaca; preservados regras de
+negociação, treino, universo, permissões, TCC e estado
+financeiro. Integrar na `main` somente após CI verde.
+A implantação da API e frontend continua separada do merge.
+
+---
+
 ## 2026-10-14 — API v10.8.96 — AMS sem barras IEX e progresso da reanálise Winner
 
 **Incidente:** após **Reanalisar Winner agora**, o endpoint
