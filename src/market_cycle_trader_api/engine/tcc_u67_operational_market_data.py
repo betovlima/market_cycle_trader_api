@@ -152,11 +152,13 @@ def append_u67_current_session_intraday(
     session: str,
     now: datetime | pd.Timestamp | None = None,
     per_asset_pause_seconds: float = 0.05,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
-    """Append today's in-progress regular-session bar for a manual live decision.
+    """Score the current session using one uniform, complete live feed.
 
-    Historical training/calibration remains daily and completed-session only.
-    The appended row is used only as the prospective scoring observation.
+    IEX may have no trades for an otherwise valid security (such as AMS).
+    Only in that situation, retry the ENTIRE eligible universe using SIP.
+    Never mix IEX and SIP inside one live decision or invent missing bars.
     """
     session_date = pd.Timestamp(session).date()
     stamp = pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
@@ -184,94 +186,122 @@ def append_u67_current_session_intraday(
         )
 
     credentials = get_alpaca_credentials()
-    live_feed = str(
+    preferred_feed = str(
         getattr(config, "alpaca_live_feed", "iex") or "iex"
     ).strip().lower()
-    augmented: dict[str, pd.DataFrame] = {}
-    per_asset: dict[str, dict[str, Any]] = {}
-    last_bar_timestamps: list[pd.Timestamp] = []
+    if preferred_feed not in {"iex", "sip"}:
+        raise ValueError(f"Unsupported Alpaca live feed: {preferred_feed}")
     symbols = list(frames)
     total = len(symbols)
 
-    for position, symbol in enumerate(symbols, start=1):
-        intraday = download_stock_bars(
-            api_key_id=credentials["api_key_id"],
-            secret_key=credentials["secret_key"],
-            symbol=symbol,
-            timeframe=LIVE_INTRADAY_TIMEFRAME,
-            start=regular_open.to_pydatetime(),
-            end=stamp.to_pydatetime(),
-            feed=live_feed,
-            adjustment="raw",
-        )
-        current_bar = _current_session_intraday_bar(
-            intraday,
-            session=session_date.isoformat(),
-        )
-        if current_bar.empty:
-            raise RuntimeError(
-                "CurrentSessionIntradayDataMissing: "
-                f"{symbol} has no {live_feed.upper()} regular-session bars "
-                f"for {session_date.isoformat()}."
+    def _load_feed(feed: str) -> tuple[
+        dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[pd.Timestamp]
+    ]:
+        augmented: dict[str, pd.DataFrame] = {}
+        per_asset: dict[str, dict[str, Any]] = {}
+        last_bar_timestamps: list[pd.Timestamp] = []
+        for position, symbol in enumerate(symbols, start=1):
+            if progress_callback is not None:
+                progress_callback(f"intraday_{feed}", position - 1, total, symbol)
+            intraday = download_stock_bars(
+                api_key_id=credentials["api_key_id"],
+                secret_key=credentials["secret_key"],
+                symbol=symbol,
+                timeframe=LIVE_INTRADAY_TIMEFRAME,
+                start=regular_open.to_pydatetime(),
+                end=stamp.to_pydatetime(),
+                feed=feed,
+                adjustment="raw",
             )
+            current_bar = _current_session_intraday_bar(
+                intraday, session=session_date.isoformat(),
+            )
+            if current_bar.empty:
+                raise RuntimeError(
+                    "CurrentSessionIntradayDataMissing: "
+                    f"{symbol} has no {feed.upper()} regular-session bars "
+                    f"for {session_date.isoformat()}."
+                )
 
-        historical = frames[symbol].copy()
-        historical.index = pd.to_datetime(historical.index, utc=True)
-        historical_dates = historical.index.tz_convert(EASTERN).date
-        historical = historical.loc[historical_dates != session_date]
-        combined = pd.concat([historical, current_bar]).sort_index()
-        combined = combined[~combined.index.duplicated(keep="last")]
-        combined.attrs.update(dict(getattr(frames[symbol], "attrs", {}) or {}))
-        combined.attrs.update(
-            {
-                "current_session_intraday": True,
-                "current_session": session_date.isoformat(),
-                "current_session_live_feed": live_feed,
-                "current_session_timeframe": LIVE_INTRADAY_TIMEFRAME,
-                "current_session_analysis_timestamp_utc": stamp.isoformat(),
+            historical = frames[symbol].copy()
+            historical.index = pd.to_datetime(historical.index, utc=True)
+            historical_dates = historical.index.tz_convert(EASTERN).date
+            historical = historical.loc[historical_dates != session_date]
+            combined = pd.concat([historical, current_bar]).sort_index()
+            combined = combined[~combined.index.duplicated(keep="last")]
+            combined.attrs.update(dict(getattr(frames[symbol], "attrs", {}) or {}))
+            combined.attrs.update(
+                {
+                    "current_session_intraday": True,
+                    "current_session": session_date.isoformat(),
+                    "current_session_live_feed": feed,
+                    "current_session_timeframe": LIVE_INTRADAY_TIMEFRAME,
+                    "current_session_analysis_timestamp_utc": stamp.isoformat(),
+                }
+            )
+            augmented[symbol] = combined
+
+            last_bar = pd.Timestamp(
+                current_bar.attrs["intraday_source_last_timestamp_utc"]
+            )
+            last_bar = (
+                last_bar.tz_localize("UTC")
+                if last_bar.tzinfo is None
+                else last_bar.tz_convert("UTC")
+            )
+            last_bar_timestamps.append(last_bar)
+            per_asset[symbol] = {
+                "intraday_rows": int(current_bar.attrs["intraday_source_rows"]),
+                "last_intraday_bar_utc": last_bar.isoformat(),
+                "open": float(current_bar["open"].iloc[0]),
+                "high": float(current_bar["high"].iloc[0]),
+                "low": float(current_bar["low"].iloc[0]),
+                "close": float(current_bar["close"].iloc[0]),
+                "volume": float(current_bar["volume"].iloc[0]),
             }
-        )
-        augmented[symbol] = combined
+            if progress_callback is not None:
+                progress_callback(f"intraday_{feed}", position, total, symbol)
+            if per_asset_pause_seconds > 0 and position != total:
+                time.sleep(per_asset_pause_seconds)
+        return augmented, per_asset, last_bar_timestamps
 
-        last_bar = pd.Timestamp(
-            current_bar.attrs["intraday_source_last_timestamp_utc"]
-        )
-        last_bar = (
-            last_bar.tz_localize("UTC")
-            if last_bar.tzinfo is None
-            else last_bar.tz_convert("UTC")
-        )
-        last_bar_timestamps.append(last_bar)
-        per_asset[symbol] = {
-            "intraday_rows": int(
-                current_bar.attrs["intraday_source_rows"]
-            ),
-            "last_intraday_bar_utc": last_bar.isoformat(),
-            "open": float(current_bar["open"].iloc[0]),
-            "high": float(current_bar["high"].iloc[0]),
-            "low": float(current_bar["low"].iloc[0]),
-            "close": float(current_bar["close"].iloc[0]),
-            "volume": float(current_bar["volume"].iloc[0]),
-        }
-        if per_asset_pause_seconds > 0 and position != total:
-            time.sleep(per_asset_pause_seconds)
+    fallback_reason = None
+    feed_used = preferred_feed
+    try:
+        augmented, per_asset, last_bar_timestamps = _load_feed(feed_used)
+    except RuntimeError as exc:
+        # A feed-wide SIP retry is justified only for missing IEX trades.
+        # Network or authentication failures on IEX must remain visible.
+        if feed_used != "iex" or not str(exc).startswith(
+            "CurrentSessionIntradayDataMissing:"
+        ):
+            raise
+        fallback_reason = str(exc)
+        feed_used = "sip"
+        try:
+            augmented, per_asset, last_bar_timestamps = _load_feed(feed_used)
+        except Exception as sip_exc:
+            raise RuntimeError(
+                "CurrentSessionIntradayCoverageUnavailable: "
+                f"{fallback_reason} Complete-universe SIP retry failed: "
+                f"{sip_exc}. No manual plan was prepared and no Alpaca "
+                "orders were submitted. Check Alpaca SIP entitlement "
+                "and live data coverage."
+            ) from sip_exc
 
     return augmented, {
         "analysis_mode": "current_session_intraday",
         "live_session": session_date.isoformat(),
         "analysis_timestamp_utc": stamp.isoformat(),
-        "live_feed": live_feed,
+        "live_feed": feed_used,
+        "live_feed_fallback_reason": fallback_reason,
         "live_timeframe": LIVE_INTRADAY_TIMEFRAME,
         "intraday_asset_count": int(len(augmented)),
         "earliest_last_intraday_bar_utc": (
-            min(last_bar_timestamps).isoformat()
-            if last_bar_timestamps
-            else None
+            min(last_bar_timestamps).isoformat() if last_bar_timestamps else None
         ),
         "latest_last_intraday_bar_utc": (
-            max(last_bar_timestamps).isoformat()
-            if last_bar_timestamps
-            else None
+            max(last_bar_timestamps).isoformat() if last_bar_timestamps else None
         ),
         "per_asset": per_asset,
     }
