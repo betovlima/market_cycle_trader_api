@@ -23,7 +23,7 @@ from ..infrastructure.persistence.mongo_repository import (
 )
 
 EASTERN = ZoneInfo("America/New_York")
-TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+SAFE_NONEXECUTED_RUN_STATUSES = frozenset({"failed", "cancelled"})
 SCAN_LIMIT = 250
 RECONCILIATION_REASON = "Past-session, non-trading plan expired without execution."
 
@@ -87,10 +87,10 @@ def inspect_plan(db: Any, plan: dict[str, Any], *, today: date) -> dict[str, Any
             blockers.append("run_history_truncated")
         if any(
             bool(run.get("active_key"))
-            or str(run.get("status") or "") not in TERMINAL_RUN_STATUSES
+            or str(run.get("status") or "") not in SAFE_NONEXECUTED_RUN_STATUSES
             for run in runs
         ):
-            blockers.append("linked_run_not_terminal")
+            blockers.append("linked_run_not_safely_unexecuted")
 
     return {
         "plan_id": plan_id,
