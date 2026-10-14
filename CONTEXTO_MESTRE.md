@@ -1,3 +1,57 @@
+## 2026-10-14 — API v10.8.96 — AMS sem barras IEX e progresso da reanálise Winner
+
+**Incidente:** após **Reanalisar Winner agora**, o endpoint
+`POST /api/admin/trader-control/manual-recovery/prepare` terminou
+com `CurrentSessionIntradayDataMissing: AMS has no IEX
+regular-session bars for 2026-10-14`. O plano existente de 13/10,
+`lightgbm-2026-10-13-4cdbd908`, não era um plano manual de 14/10
+(`manual_current_session_recovery=false`) e a API acertadamente
+impediu a execução do botão seguinte.
+
+**Branch:** `fix/v10.8.96-intraday-sip-recovery`.
+
+**Causa:** a preparação U67+10 exigia um agregado intradiário
+`1Min` de todos os ativos elegíveis usando o feed IEX configurado.
+Na primeira ausência de barras de uma sessão, a operação falhava.
+A ausência no IEX não é evidência de problema estrutural do ativo.
+
+**Correção:** se e somente se uma consulta IEX não tiver barras,
+refazer a coleta **de todo o universo elegível** em SIP; jamais
+misturar dados IEX/SIP entre ativos na mesma decisão. Se SIP não
+estiver autorizado pela conta ou não cobrir todos os ativos, falhar
+explicitamente, sem inventar barras e sem enviar ordens. A
+metainformação da decisão registra `live_feed=sip` e o motivo do
+fallback para auditoria. Treinamento e calibração seguem nas
+barras diárias concluídas, sem uso do agregado intradiário
+incompleto para treinamento.
+
+**Progresso observável:** a preparação manual continua sem
+envio de ordens e informa etapas e contagens reais de
+validação, coleta histórica, coleta intradiária IEX/SIP,
+treinamento e persistência. O documento
+`paper_market_automation.manual_reanalysis` permite acompanhar
+o andamento e o erro final mesmo se o run automático da sessão
+corrente já estiver `failed` e o de amanhã já `armed`.
+O endpoint de status do robô repassa esse documento; o frontend
+pode exibir as etapas sem inventar percentuais.
+
+**Validação:** testes adicionados para ausência IEX em AMS,
+retry SIP uniforme, SIP não autorizado, erro de IEX que não
+justifica fallback, feed SIP configurado, progresso ad hoc e
+exibição do erro de cobertura. Os testes devem passar no CI
+antes do merge à main. Não houve ordens Alpaca nem alteração
+da posição Paper no desenvolvimento.
+
+**Nota:** a requisição de preparo permanece síncrona; o
+progresso persistido é consultável por outra conexão. Um
+workflow assíncrono completo para o botão (com polling no
+próprio componente da tela de Trader) exige alterar o código
+dessa tela, que não foi localizado no repositório frontend
+consultado. Não alegar que o botão foi reabilitado sem
+validação da implantação.
+
+---
+
 ## 2026-10-14 — API v10.8.95 — continuidade do Trader após recuperação manual
 
 **Incidente:** operação Paper MAN de 07/10/2026 foi deliberadamente
