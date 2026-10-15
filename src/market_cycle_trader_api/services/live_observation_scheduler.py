@@ -13,6 +13,7 @@ from ..core.runtime import database
 from .live_control import live_control_status
 from .live_portfolio import live_portfolio_snapshot
 from .strategy_lab import get_trader_winner_summary
+from .live_winner_session import plan_next_live_session
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
 _POLL_SECONDS = 300.0
@@ -78,7 +79,10 @@ class LiveObservationScheduler:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                result = observe_live_cycle(database())
+                db = database()
+                result = observe_live_cycle(db)
+                if result["status"] == "observed":
+                    plan_next_live_session(db)
                 if result["status"] == "observed":
                     self._last_observed_at = result["recorded_at"]
                 self._last_error = None
