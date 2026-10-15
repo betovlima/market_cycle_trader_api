@@ -1,0 +1,144 @@
+"""Independent, read-only Winner signal calculation for a CASH-only Live account.
+
+Reuses the exact operational Winner model functions; never reads Paper positions,
+never creates Paper plans and never submits broker orders. Unsupported account
+states fail closed instead of silently borrowing Paper state.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from pymongo import ReturnDocument
+
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
+from ..engine.live_model_signal import build_live_model_decision
+from ..engine.market_data import latest_safe_completed_xnys_session
+from ..engine.tcc_u67_operational_market_data import (
+    DATA_DIRECTORY as TCC_U67_DATA_DIRECTORY,
+    download_u67_operational_snapshot,
+)
+from ..engine.tcc_u67_operational_runtime import assert_tcc_u67_model_snapshot, assert_tcc_u67_operational_contract
+from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
+from ..infrastructure.trading.alpaca_live import create_live_readonly_client
+from .model_research import apply_execution_profile
+from .system_settings import apply_training_runtime_settings, get_system_settings
+from .strategy_lab import get_trader_winner_context, get_trader_winner_model_snapshot
+from .live_winner_session import LIVE_RUNS
+
+_ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE})
+
+
+def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
+    """Prepare a non-executable Winner signal for a flat Live account.
+
+    This entry point is not a trading or rebalancing function. Any existing
+    position or pending order requires a separate reconciled Live executor.
+    """
+    run = db[LIVE_RUNS].find_one({"execution_session": session})
+    if not run:
+        raise RuntimeError("No Live session is armed.")
+    if run.get("status") == "signal_prepared":
+        return {"status": "signal_prepared", "execution_session": session,
+                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+    if run.get("status") != "waiting_for_winner_signal":
+        raise RuntimeError("Live session is not eligible for Winner preparation.")
+    if not bool(get_system_settings(db)["training"]["enabled"]):
+        raise RuntimeError("Winner training is disabled in system settings.")
+
+    config, profile = get_trader_winner_context(db)
+    model = get_trader_winner_model_snapshot(db)
+    if (str(profile["id"]) != run["winner_strategy_id"] or
+        int(profile["revision"]) != run["winner_revision"] or
+        str(profile["configuration_hash"]) != run["winner_configuration_hash"]):
+        raise RuntimeError("Winner identity changed since Live session was armed.")
+    strategy = apply_training_runtime_settings(db, config)
+    strategy = apply_execution_profile(
+        strategy, model["family"], model.get("settings_snapshot") or {}
+    )
+    strategy = strategy.model_copy(update={
+        "research_model_family": model["family"],
+        "research_model_settings": model.get("settings_snapshot") or {},
+    })
+    if str(strategy.strategy_mode) not in _ALLOWED or model["family"] != "lightgbm_utility":
+        raise RuntimeError("Live Winner is not supported by this locked execution profile.")
+    if str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE:
+        assert_tcc_u77_contract(strategy)
+    else:
+        assert_tcc_u67_operational_contract(strategy)
+    assert_tcc_u67_model_snapshot(model)
+
+    broker = create_live_readonly_client()
+    account = broker.get_account()
+    if str(getattr(account, "id", "") or "") != run["live_account_id"]:
+        raise RuntimeError("Live account identity changed.")
+    clock = broker.get_clock()
+    if bool(getattr(clock, "is_open", True)):
+        raise RuntimeError("Winner preparation requires closed regular market.")
+    if broker.get_all_positions():
+        raise RuntimeError("Live Winner preparation for existing holdings requires separate reconciliation.")
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
+        raise RuntimeError("Outstanding Live orders require reconciliation.")
+
+    now = datetime.now(timezone.utc)
+    claimed = db[LIVE_RUNS].find_one_and_update(
+        {"_id": f'{run["live_account_id"]}:{session}',
+         "status": "waiting_for_winner_signal"},
+        {"$set": {"status": "preparing_signal", "phase": "winner_model_training",
+                  "preparation_started_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        raise RuntimeError("Live preparation was already claimed.")
+
+    try:
+        cutoff = latest_safe_completed_xnys_session().date().isoformat()
+        u77 = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
+        snapshot = download_u67_operational_snapshot(
+            job_id=f"live-{session}-{now.strftime('%Y%m%d%H%M%S%f')}",
+            config=strategy.model_copy(update={"analysis_end_date": cutoff}),
+            requested_assets=(U77_REQUESTED_ASSETS if u77 else tuple(strategy.assets)),
+            data_directory=TCC_U67_DATA_DIRECTORY.parent.parent / "live_winner" / "snapshots",
+        )
+        if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
+            raise RuntimeError("Incomplete Alpaca snapshot for Live Winner.")
+        decision = build_live_model_decision(
+            snapshot.frames, strategy, model_family=model["family"],
+            current_asset="CASH", holding_sessions=0,
+        )
+        decision_date = str(decision.decision_date)[:10]
+        if decision_date != cutoff:
+            raise RuntimeError(f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}")
+        target = str(decision.target_asset).upper()
+        if not target or (target != "CASH" and target not in strategy.assets):
+            raise RuntimeError("Winner signal target is not a permitted asset.")
+        saved = db[LIVE_RUNS].find_one_and_update(
+            {"_id": claimed["_id"], "status": "preparing_signal",
+             "winner_configuration_hash": run["winner_configuration_hash"]},
+            {"$set": {"status": "signal_prepared",
+                      "phase": "winner_signal_prepared_execution_disabled",
+                      "decision_date": decision_date,
+                      "target_asset": target,
+                      "action": "stay_in_cash" if target == "CASH" else "buy",
+                      "winner_signal_prepared": True,
+                      "snapshot_sha256": snapshot.manifest.get("snapshot_sha256"),
+                      "signal_prepared_at": datetime.now(timezone.utc),
+                      "order_submission_enabled": False}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not saved:
+            raise RuntimeError("Live Winner plan changed during preparation.")
+        return {"status": "signal_prepared", "execution_session": session,
+                "decision_date": decision_date, "target_asset": target,
+                "action": saved["action"], "order_submission_enabled": False}
+    except Exception as exc:
+        db[LIVE_RUNS].update_one(
+            {"_id": claimed["_id"], "status": "preparing_signal"},
+            {"$set": {"status": "review_required",
+                      "phase": "winner_signal_failed",
+                      "failure_type": type(exc).__name__,
+                      "order_submission_enabled": False}},
+        )
+        raise
