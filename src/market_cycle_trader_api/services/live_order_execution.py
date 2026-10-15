@@ -192,8 +192,10 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     max_daily_loss = _number_env("ALPACA_LIVE_MAX_DAILY_LOSS_FRACTION", 0.05, floor=0.001, ceiling=0.25)
     baseline = float(run.get("session_equity_baseline") or 0)
     equity = float(getattr(account, "equity", 0) or 0)
-    if baseline <= 0 or equity <= 0 or equity < baseline * (1 - max_daily_loss):
-        raise RuntimeError("Live equity baseline or daily-loss limit is invalid.")
+    if baseline <= 0 or equity <= 0:
+        raise RuntimeError("Live account equity baseline is invalid.")
+    if equity < baseline * (1 - max_daily_loss) and action in {"buy", "rotate"}:
+        raise RuntimeError("Daily-loss threshold blocks new Live exposure; risk-reducing exits remain permitted.")
     if action in {"buy", "rotate"}:
         asset = asset_snapshot(broker, target)
         if (not asset["tradable"] or not asset["fractionable"]
