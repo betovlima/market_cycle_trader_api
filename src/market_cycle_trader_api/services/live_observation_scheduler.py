@@ -13,9 +13,13 @@ from ..core.runtime import database
 from .live_control import live_control_status
 from .live_portfolio import live_portfolio_snapshot
 from .strategy_lab import get_trader_winner_summary
+from .live_winner_session import plan_next_live_session
+from .live_winner_signal import prepare_live_cash_winner_signal
+from .live_winner_recalibration import recalibrate_live_cash_winner_signal
+from .live_order_execution import execute_recalibrated_live_winner_session, order_submission_opted_in
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
-_POLL_SECONDS = 300.0
+_POLL_SECONDS = 60.0
 
 
 def observe_live_cycle(db: Any) -> dict[str, Any]:
@@ -78,7 +82,18 @@ class LiveObservationScheduler:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                result = observe_live_cycle(database())
+                db = database()
+                result = observe_live_cycle(db)
+                if result["status"] == "observed":
+                    armed = plan_next_live_session(db)
+                    if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
+                        prepare_live_cash_winner_signal(db, armed["execution_session"])
+                    elif armed.get("status") == "signal_prepared" and result["market_open"]:
+                        recalibrated = recalibrate_live_cash_winner_signal(db, armed["execution_session"])
+                        if recalibrated.get("status") == "recalibrated_no_orders" and order_submission_opted_in():
+                            execute_recalibrated_live_winner_session(db, armed["execution_session"])
+                    elif armed.get("status") == "recalibrated_no_orders" and result["market_open"] and order_submission_opted_in():
+                        execute_recalibrated_live_winner_session(db, armed["execution_session"])
                 if result["status"] == "observed":
                     self._last_observed_at = result["recorded_at"]
                 self._last_error = None

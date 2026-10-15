@@ -13,6 +13,7 @@ from alpaca.trading.requests import GetOrdersRequest
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .strategy_lab import get_trader_winner_summary
 from .live_control import live_control_status
+from .live_winner_session import latest_live_session
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
 
@@ -166,18 +167,28 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
 
 
 def live_robot_status(db: Any) -> dict[str, Any]:
-    """Independent Live observation; Winner execution is not connected yet."""
+    """Independent Live Winner cycle and current real-order authorization."""
     from .live_observation_scheduler import live_observation_status
+    from .live_order_execution import order_submission_opted_in
     observation = live_observation_status()
+    run = latest_live_session(db)
+    control = live_control_status(db)
+    opted_in = order_submission_opted_in()
+    execution_active = opted_in and control["control_mode"] in {"active", "exit_only"}
     return {
-        **live_control_status(db),
-        "mode": "live_readonly",
+        **control,
+        "mode": "live_operational" if opted_in else "live_readonly",
+        "real_orders_armed": opted_in,
+        "execution_enabled": execution_active,
+        "order_submission_enabled": execution_active,
+        "phase": run.get("phase") if run else control.get("phase"),
         "position_observer_alive": observation["scheduler_alive"],
         "scheduler_alive": observation["scheduler_alive"],
         "last_position_observation_at": observation["last_observed_at"],
         "observation_last_error": observation["last_error"],
-        "next_execution_session": None,
-        "active_run": None,
+        "next_execution_session": run.get("execution_session") if run else None,
+        "active_run": run if run and run.get("status") not in {"completed", "cancelled"} else None,
+        "latest_run": run,
         "trader_winner": get_trader_winner_summary(db),
     }
 

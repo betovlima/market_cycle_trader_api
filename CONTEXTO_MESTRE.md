@@ -1,3 +1,23 @@
+## 2026-10-15 — API v10.8.103: ciclo Winner Live isolado (não autorizar ordens ainda)
+
+Branch `feature/live-winner-session-scheduler-v1`, PR #54. O botão Iniciar já controla `active` na coleção `live_trader_control`. Scheduler Live separado arma a próxima sessão, verifica conta Alpaca Live, calcula um sinal pós-fechamento com o motor U77/LightGBM da mesma Winner #30 e recalibra após a abertura com dados intraday, mantendo `live_winner_session_runs`, `live_trader_strategy_state` e `live_winner_broker_orders` separadas do Paper. Sessão, alvo, ação, status e data aparecem no endpoint de status. Estado da carteira Live é reconciliado contra o broker antes do cálculo e de qualquer ordem. Executor real foi implementado sob opt-in explícito **DESATIVADO por padrão**, com limite padrão por ordem US$25, exposição máxima 95%, perda diária máxima 5%, validação de mercado, revisão, CAS/ledger determinístico e bloqueio de novas entradas em exit_only.
+
+**Segurança:** não configurar `ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM` até haver teste end-to-end em dry-run com dados Live, validação das decisões Winner nas duas janelas, testes de reinicialização/falha parcial, revisão manual de riscos e consistência da interface. O CI unitário não constitui essa validação. Permissão: `ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM=I_ACKNOWLEDGE_LIVE_REAL_MONEY_ORDERS` somente após aprovação explícita em mudança separada e implantação coordenada com Front v10.7.27. Não usar capital real para validar software. Os métodos de envio são via broker Live pinado, sem roteamento Paper.
+
+---
+
+## 2026-10-15 — Prévia de sinal Winner Live em caixa
+
+`live_winner_signal.py` usa o motor compartilhado `build_live_model_decision`, a configuração Winner protegida e o snapshot U67/U77 em caminho de arquivos separado, exclusivamente para conta Live sem posições e sem ordens abertas. O observador chama a preparação após fechamento para sessão armada. Grava alvo, ação, cutoff e hash na coleção Live, nunca em planos Paper. Não existe executor de ordens reais, segunda recalibração no início do pregão nem suporte a posições existentes. Falha exige revisão manual. **Não habilitar ordens Live antes de completar/paridade/validar riscos e recuperação.**
+
+---
+
+## 2026-10-15 — Sessão Live independente (armamento não executável)
+
+Branch `feature/live-winner-session-scheduler-v1`: observador Live em active/exit_only consulta o próximo horário de abertura da Alpaca e arma registro único da sessão em `live_winner_session_runs` com conta, Winner e hash de identidade. Endpoint `/api/live-market/robot/status` expõe `next_execution_session` e `active_run`. A identidade divergente exige revisão. `winner_signal_prepared=false`, `order_submission_enabled=false` por desenho: ainda faltam dados/modelo Live independentes, plano calculado, recalibração e executor real com recuperação e controle de risco. Nenhum cliente Paper foi reutilizado, nenhum dinheiro movimentado. Testes de unidade adicionados, aguardando CI. 
+
+---
+
 ## 2026-10-15 — Preflight independente Winner/Live
 
 Na branch `feature/live-winner-operational-parity-v1`, adicionado POST `/api/live-market/winner/preflight` que registra identidade da Winner, identidade da conta Alpaca Live e próximo horário de mercado na coleção `live_winner_preflight_snapshots`. Nunca lê posições Paper nem envia ordens. Requer estado Live active/exit_only; parado retorna skipped. Teste de isolamento adicionado `tests/test_live_winner_preflight.py`, ainda não executado. Esta etapa não produz decisões Winner; scheduler de trading Live e ordens reais não estão implementados. Main intocada; PR #53.

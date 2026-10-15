@@ -47,6 +47,7 @@ class LivePaperIsolationTests(unittest.TestCase):
                 live_portfolio, "get_trader_winner_summary",
                 return_value={"name": "Strategy #30"},
             ),
+            patch.object(live_portfolio, "latest_live_session", return_value=None),
             patch.object(
                 live_portfolio, "live_control_status",
                 return_value={
