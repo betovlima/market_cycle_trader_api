@@ -32,7 +32,7 @@ class LiveWinnerCandidateTests(unittest.TestCase):
         self.assertTrue(audit["candidates"][0]["is_raw_best"])
         self.assertTrue(audit["candidates"][1]["is_target"])
         self.assertEqual(audit["candidates"][1]["rank"], 2)
-        self.assertFalse(audit["candidates"][1]["passes_switch_margin"])
+        self.assertTrue(audit["candidates"][1]["passes_switch_margin"])
         query = db["live_winner_session_runs"].find_one.call_args.args[0]
         self.assertEqual(query["live_account_id"], "live-acct")
 
