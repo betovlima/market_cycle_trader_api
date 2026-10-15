@@ -13,6 +13,7 @@ from alpaca.trading.requests import GetOrdersRequest
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .strategy_lab import get_trader_winner_summary
 from .live_control import live_control_status
+from .live_winner_session import latest_live_session
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
 
@@ -168,7 +169,6 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
 def live_robot_status(db: Any) -> dict[str, Any]:
     """Independent Live observation; Winner execution is not connected yet."""
     from .live_observation_scheduler import live_observation_status
-    from .live_winner_session import latest_live_session
     observation = live_observation_status()
     run = latest_live_session(db)
     return {
