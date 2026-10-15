@@ -11,6 +11,7 @@ from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
 from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
+from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -65,6 +66,26 @@ def update_robot_mode(
 def execution_readiness() -> dict[str, Any]:
     """Operator preflight only. Never activates order execution."""
     return live_execution_readiness(database())
+
+
+class LiveDryRunRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=8, description="Hypothetical CASH or ticker target, NOT a Winner signal.")
+    max_allocation_fraction: float = Field(default=0.1, gt=0, le=1)
+
+
+@router.post("/execution/dry-run")
+def execution_dry_run(payload: LiveDryRunRequest) -> dict[str, Any]:
+    """Read-only hypothetical scenario, always blocks real order execution."""
+    try:
+        return preview_live_intent(
+            database(),
+            target=payload.target,
+            max_allocation_fraction=payload.max_allocation_fraction,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
 
 @router.get("/portfolio/export.zip")
