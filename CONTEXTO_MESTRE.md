@@ -1,3 +1,17 @@
+## 2026-10-15 — API v10.8.102 — Botões Live operacionais em modo de monitoramento
+
+**Solicitação:** disponibilizar Iniciar/Pausar/Somente saída/Parar na seção Operação do Trader · Live, sem alterar Trader Paper.
+
+**Causa:** a v10.8.101 retornava `execution_enabled=false` por segurança, e o frontend usava esse mesmo indicador para desabilitar todo o painel Live.
+
+**Correção:** novos estados administrativos em `live_trader_control` com log independente em `live_trader_control_history`. Endpoint autenticado `POST /api/live-market/robot/mode`, confirmação `LIVE_MONITORING_ONLY`, CAS por `revision`. Front v10.7.26 conecta os quatro botões e controla o refresh automático **da tela** Live; Pausado/Parado suspendem polling Live, sem afetar Paper.
+
+**Limites deliberados:** estado `active` = monitoramento apenas, não autorização de negociar; `exit_only` ainda não vende; `scheduler_alive=false`, `order_submission_enabled=false` em todos os modos. Motor de ordens Live não implementado nesta versão.
+
+**Branch:** `feature/live-paper-isolated-workspaces-v1` (mesmos PRs #51 API e #12 front), `main` preservada. **Testes:** `tests/test_live_control_modes.py`, suíte de integração e build frontend; confirmar GitHub CI. Próximo passo é executor Live segregado com testes de riscos e confirmação explícita antes de negociar.
+
+---
+
 ## 2026-10-15 — API v10.8.101 — Live/Paper isolados, primeiro marco de leitura
 
 **Branch:** `feature/live-paper-isolated-workspaces-v1` a partir da `main` (v10.8.100). **Situação:** PR para revisão; nenhuma implantação real, nenhum envio de ordens.
