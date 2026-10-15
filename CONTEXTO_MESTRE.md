@@ -1,3 +1,9 @@
+## 2026-10-15 — Sessão Live independente (armamento não executável)
+
+Branch `feature/live-winner-session-scheduler-v1`: observador Live em active/exit_only consulta o próximo horário de abertura da Alpaca e arma registro único da sessão em `live_winner_session_runs` com conta, Winner e hash de identidade. Endpoint `/api/live-market/robot/status` expõe `next_execution_session` e `active_run`. A identidade divergente exige revisão. `winner_signal_prepared=false`, `order_submission_enabled=false` por desenho: ainda faltam dados/modelo Live independentes, plano calculado, recalibração e executor real com recuperação e controle de risco. Nenhum cliente Paper foi reutilizado, nenhum dinheiro movimentado. Testes de unidade adicionados, aguardando CI. 
+
+---
+
 ## 2026-10-15 — Preflight independente Winner/Live
 
 Na branch `feature/live-winner-operational-parity-v1`, adicionado POST `/api/live-market/winner/preflight` que registra identidade da Winner, identidade da conta Alpaca Live e próximo horário de mercado na coleção `live_winner_preflight_snapshots`. Nunca lê posições Paper nem envia ordens. Requer estado Live active/exit_only; parado retorna skipped. Teste de isolamento adicionado `tests/test_live_winner_preflight.py`, ainda não executado. Esta etapa não produz decisões Winner; scheduler de trading Live e ordens reais não estão implementados. Main intocada; PR #53.
