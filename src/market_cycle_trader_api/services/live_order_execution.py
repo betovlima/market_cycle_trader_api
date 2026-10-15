@@ -26,6 +26,7 @@ from ..schemas.paper_trading import PaperTradingSettings
 from .live_control import live_control_status
 from .live_trader_state import verified_live_state, confirm_live_fill_state
 from .live_winner_session import LIVE_RUNS
+from .strategy_lab import get_trader_winner_summary
 
 ORDER_LEDGER = "live_winner_broker_orders"
 EASTERN = ZoneInfo("America/New_York")
@@ -129,6 +130,12 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     run = db[LIVE_RUNS].find_one({"execution_session": session})
     if not run or run.get("status") != "recalibrated_no_orders":
         return {"status": "no_recalibrated_live_plan", "order_submission_enabled": False}
+    winner = get_trader_winner_summary(db)
+    if (not isinstance(winner, dict)
+        or str(winner.get("id") or "") != run["winner_strategy_id"]
+        or str(winner.get("configuration_hash") or "") != run["winner_configuration_hash"]
+        or int(winner.get("revision") or 0) != int(run["winner_revision"])):
+        raise RuntimeError("Winner changed since Live recalibration; real orders blocked.")
     action = str(run.get("action") or "")
     if control["control_mode"] == "exit_only" and action not in {"hold", "stay_in_cash", "sell_to_cash"}:
         return {"status": "blocked_by_exit_only_mode", "order_submission_enabled": False}
@@ -205,6 +212,8 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
 
     try:
         if action in {"sell_to_cash", "rotate"}:
+            if live_control_status(db)["control_mode"] not in {"active", "exit_only"}:
+                raise RuntimeError("Live mode changed before sell submission.")
             fill = _execute_leg(
                 db, broker, account=account_id, session=session,
                 side="sell", symbol=state["managed_symbol"],
