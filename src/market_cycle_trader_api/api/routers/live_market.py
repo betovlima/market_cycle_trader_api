@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
 from ...services.live_control import LiveControlConflict, set_live_control_mode
+from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -58,6 +59,12 @@ def update_robot_mode(
         }
     except (LiveControlConflict, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.get("/execution/readiness")
+def execution_readiness() -> dict[str, Any]:
+    """Operator preflight only. Never activates order execution."""
+    return live_execution_readiness(database())
 
 
 @router.get("/portfolio/export.zip")
