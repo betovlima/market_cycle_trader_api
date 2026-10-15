@@ -1,3 +1,9 @@
+## 2026-10-15 — Prévia de sinal Winner Live em caixa
+
+`live_winner_signal.py` usa o motor compartilhado `build_live_model_decision`, a configuração Winner protegida e o snapshot U67/U77 em caminho de arquivos separado, exclusivamente para conta Live sem posições e sem ordens abertas. O observador chama a preparação após fechamento para sessão armada. Grava alvo, ação, cutoff e hash na coleção Live, nunca em planos Paper. Não existe executor de ordens reais, segunda recalibração no início do pregão nem suporte a posições existentes. Falha exige revisão manual. **Não habilitar ordens Live antes de completar/paridade/validar riscos e recuperação.**
+
+---
+
 ## 2026-10-15 — Sessão Live independente (armamento não executável)
 
 Branch `feature/live-winner-session-scheduler-v1`: observador Live em active/exit_only consulta o próximo horário de abertura da Alpaca e arma registro único da sessão em `live_winner_session_runs` com conta, Winner e hash de identidade. Endpoint `/api/live-market/robot/status` expõe `next_execution_session` e `active_run`. A identidade divergente exige revisão. `winner_signal_prepared=false`, `order_submission_enabled=false` por desenho: ainda faltam dados/modelo Live independentes, plano calculado, recalibração e executor real com recuperação e controle de risco. Nenhum cliente Paper foi reutilizado, nenhum dinheiro movimentado. Testes de unidade adicionados, aguardando CI. 
