@@ -113,6 +113,8 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     ))]
     cash = _float(getattr(account, "cash", 0))
     equity = _float(getattr(account, "equity", 0))
+    buying_power_raw = getattr(account, "buying_power", None)
+    non_marginable_raw = getattr(account, "non_marginable_buying_power", None)
     clock = client.get_clock()
     history = _store_observation(db, equity, cash, account_id)
     unrealized = sum(p["unrealized_pnl"] for p in positions)
@@ -125,6 +127,8 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
         "trading_blocked": bool(getattr(account, "trading_blocked", False)),
         "initial_capital": None,
         "strategy_cash": cash,
+        "buying_power": _float(buying_power_raw) if buying_power_raw is not None else None,
+        "non_marginable_buying_power": _float(non_marginable_raw) if non_marginable_raw is not None else None,
         "market_value": sum(p["market_value"] for p in positions),
         "portfolio_value": equity,
         "realized_pnl": None,
