@@ -1,3 +1,11 @@
+## 2026-10-15 — API v10.8.103: ciclo Winner Live isolado (não autorizar ordens ainda)
+
+Branch `feature/live-winner-session-scheduler-v1`, PR #54. O botão Iniciar já controla `active` na coleção `live_trader_control`. Scheduler Live separado arma a próxima sessão, verifica conta Alpaca Live, calcula um sinal pós-fechamento com o motor U77/LightGBM da mesma Winner #30 e recalibra após a abertura com dados intraday, mantendo `live_winner_session_runs`, `live_trader_strategy_state` e `live_winner_broker_orders` separadas do Paper. Sessão, alvo, ação, status e data aparecem no endpoint de status. Estado da carteira Live é reconciliado contra o broker antes do cálculo e de qualquer ordem. Executor real foi implementado sob opt-in explícito **DESATIVADO por padrão**, com limite padrão por ordem US$25, exposição máxima 95%, perda diária máxima 5%, validação de mercado, revisão, CAS/ledger determinístico e bloqueio de novas entradas em exit_only.
+
+**Segurança:** não configurar `ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM` até haver teste end-to-end em dry-run com dados Live, validação das decisões Winner nas duas janelas, testes de reinicialização/falha parcial, revisão manual de riscos e consistência da interface. O CI unitário não constitui essa validação. Permissão: `ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM=I_ACKNOWLEDGE_LIVE_REAL_MONEY_ORDERS` somente após aprovação explícita em mudança separada e implantação coordenada com Front v10.7.27. Não usar capital real para validar software. Os métodos de envio são via broker Live pinado, sem roteamento Paper.
+
+---
+
 ## 2026-10-15 — Prévia de sinal Winner Live em caixa
 
 `live_winner_signal.py` usa o motor compartilhado `build_live_model_decision`, a configuração Winner protegida e o snapshot U67/U77 em caminho de arquivos separado, exclusivamente para conta Live sem posições e sem ordens abertas. O observador chama a preparação após fechamento para sessão armada. Grava alvo, ação, cutoff e hash na coleção Live, nunca em planos Paper. Não existe executor de ordens reais, segunda recalibração no início do pregão nem suporte a posições existentes. Falha exige revisão manual. **Não habilitar ordens Live antes de completar/paridade/validar riscos e recuperação.**
