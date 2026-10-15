@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import Any
 
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
 from .live_control import live_control_status
 
 
@@ -13,6 +15,7 @@ def live_execution_readiness(db: Any) -> dict[str, Any]:
     def add(name: str, passed: bool, detail: str) -> None:
         checks.append({"name": name, "passed": passed, "detail": detail})
 
+    client = None
     try:
         client = create_live_readonly_client()
         account = client.get_account()
@@ -27,6 +30,15 @@ def live_execution_readiness(db: Any) -> dict[str, Any]:
 
     status = live_control_status(db)
     add("separate_live_control", isinstance(status.get("revision"), int), "Dedicated Live control state found.")
+    try:
+        if client is None:
+            raise RuntimeError("Live account unavailable.")
+        open_orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100))
+        add("broker_open_orders", len(open_orders) == 0,
+            "No open broker orders returned in queried window." if not open_orders else
+            f"{len(open_orders)} open broker orders require reconciliation.")
+    except Exception:
+        add("broker_open_orders", False, "Cannot establish broker open-order status.")
     # Deliberately hard-block until a reviewed execution engine and order safeguards exist.
     add("reviewed_live_executor", False, "Real-order executor is not implemented or authorized.")
     add("order_idempotency", False, "Persistent per-session order idempotency and recovery not implemented.")
