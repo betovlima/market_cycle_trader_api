@@ -12,6 +12,7 @@ from alpaca.trading.requests import GetOrdersRequest
 
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .strategy_lab import get_trader_winner_summary
+from .live_control import live_control_status
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
 
@@ -161,16 +162,11 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
 
 
 def live_robot_status(db: Any) -> dict[str, Any]:
-    """Live execution is deliberately disabled; this is not the Paper scheduler."""
+    """Independent Live monitoring policy. There is still no live order executor."""
     return {
-        "enabled": False,
-        "control_mode": "stopped",
-        "status": "stopped",
-        "phase": "live_readonly",
+        **live_control_status(db),
         "mode": "live_readonly",
-        "scheduler_alive": False,
         "position_observer_alive": False,
-        "execution_enabled": False,
         "next_execution_session": None,
         "active_run": None,
         "trader_winner": get_trader_winner_summary(db),
