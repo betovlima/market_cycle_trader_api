@@ -2,10 +2,11 @@ import unittest
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from pymongo.errors import DuplicateKeyError
 from unittest.mock import MagicMock, patch
 
 from market_cycle_trader_api.services.live_order_execution import (
-    execute_recalibrated_live_winner_session, _unique_order_id,
+    execute_recalibrated_live_winner_session, _unique_order_id, _execute_leg,
 )
 
 
@@ -79,6 +80,18 @@ class LiveOrderSafetyTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(submit.call_args.kwargs["notional"], 25.0)
         persist.assert_called_once()
+        broker.submit_order.assert_not_called()
+
+    def test_duplicate_persisted_intent_blocks_broker(self):
+        db = MagicMock()
+        db["live_winner_broker_orders"].insert_one.side_effect = DuplicateKeyError("duplicate")
+        broker = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            _execute_leg(
+                db, broker, account="acct", session="2026-10-16",
+                side="buy", symbol="NVDA", quantity=None, notional=25.0,
+                winner_hash="hash", settings=MagicMock(),
+            )
         broker.submit_order.assert_not_called()
 
     def test_deterministic_client_order_identity(self):
