@@ -19,7 +19,7 @@ from .live_winner_recalibration import recalibrate_live_cash_winner_signal
 from .live_order_execution import execute_recalibrated_live_winner_session, order_submission_opted_in
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
-_POLL_SECONDS = 300.0
+_POLL_SECONDS = 60.0
 
 
 def observe_live_cycle(db: Any) -> dict[str, Any]:
@@ -89,7 +89,9 @@ class LiveObservationScheduler:
                     if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
                     elif armed.get("status") == "signal_prepared" and result["market_open"]:
-                        recalibrate_live_cash_winner_signal(db, armed["execution_session"])
+                        recalibrated = recalibrate_live_cash_winner_signal(db, armed["execution_session"])
+                        if recalibrated.get("status") == "recalibrated_no_orders" and order_submission_opted_in():
+                            execute_recalibrated_live_winner_session(db, armed["execution_session"])
                     elif armed.get("status") == "recalibrated_no_orders" and result["market_open"] and order_submission_opted_in():
                         execute_recalibrated_live_winner_session(db, armed["execution_session"])
                 if result["status"] == "observed":
