@@ -75,20 +75,20 @@ def _order(order: Any) -> dict[str, Any]:
     }
 
 
-def _store_observation(db: Any, equity: float, cash: float) -> list[dict[str, Any]]:
+def _store_observation(db: Any, equity: float, cash: float, account_id: str) -> list[dict[str, Any]]:
     collection = db[LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION]
     now = datetime.now(timezone.utc)
-    latest = collection.find_one({}, sort=[("recorded_at", -1)])
+    latest = collection.find_one({"account_id": account_id}, sort=[("recorded_at", -1)])
     recorded_at = latest.get("recorded_at") if latest else None
     if recorded_at is None or (
         now - (recorded_at.replace(tzinfo=timezone.utc) if recorded_at.tzinfo is None else recorded_at)
     ) >= timedelta(seconds=60):
         collection.insert_one({
-            "recorded_at": now, "portfolio_value": equity,
+            "recorded_at": now, "account_id": account_id, "portfolio_value": equity,
             "strategy_cash": cash, "market": "live",
         })
     documents = list(collection.find(
-        {}, {"_id": 0, "recorded_at": 1, "portfolio_value": 1, "strategy_cash": 1},
+        {"account_id": account_id}, {"_id": 0, "recorded_at": 1, "portfolio_value": 1, "strategy_cash": 1},
     ).sort("recorded_at", -1).limit(500))
     documents.reverse()
     return [{
@@ -103,6 +103,9 @@ def _store_observation(db: Any, equity: float, cash: float) -> list[dict[str, An
 def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     client = create_live_readonly_client()
     account = client.get_account()
+    account_id = str(getattr(account, 'id', '') or '')
+    if not account_id:
+        raise RuntimeError('Live broker account has no verifiable account id.')
     positions = [_position(p) for p in client.get_all_positions()]
     orders = [_order(o) for o in client.get_orders(filter=GetOrdersRequest(
         status=QueryOrderStatus.ALL, limit=100,
@@ -110,7 +113,7 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     cash = _float(getattr(account, "cash", 0))
     equity = _float(getattr(account, "equity", 0))
     clock = client.get_clock()
-    history = _store_observation(db, equity, cash)
+    history = _store_observation(db, equity, cash, account_id)
     unrealized = sum(p["unrealized_pnl"] for p in positions)
 
     return {
