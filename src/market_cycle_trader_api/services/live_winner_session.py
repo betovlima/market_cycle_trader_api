@@ -36,7 +36,16 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
         raise RuntimeError("Live broker clock is incomplete.")
     if next_open.tzinfo is None or timestamp.tzinfo is None:
         raise RuntimeError("Live broker timestamps must be timezone-aware.")
-    session = next_open.astimezone(EASTERN).date().isoformat()
+    # During an open session, preserve the current session rather than arming
+    # tomorrow merely because Alpaca next_open already points forward.
+    if bool(getattr(clock, "is_open", False)):
+        session = timestamp.astimezone(EASTERN).date().isoformat()
+        expected_open = timestamp.astimezone(EASTERN).replace(
+            hour=9, minute=30, second=0, microsecond=0
+        )
+    else:
+        session = next_open.astimezone(EASTERN).date().isoformat()
+        expected_open = next_open
     now = datetime.now(timezone.utc)
     identity = {
         "live_account_id": account_id,
@@ -47,7 +56,7 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
     doc = {
         "market": "live",
         "execution_session": session,
-        "expected_market_open": next_open,
+        "expected_market_open": expected_open,
         "status": "waiting_for_winner_signal",
         "phase": "session_armed_without_model_decision",
         "winner_name": winner.get("name"),
@@ -76,7 +85,7 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
     return {
         "status": saved.get("status", doc["status"]),
         "execution_session": session,
-        "next_market_open": next_open.isoformat(),
+        "next_market_open": expected_open.isoformat(),
         "winner_name": saved.get("winner_name"),
         "phase": saved.get("phase", doc["phase"]),
         "winner_signal_prepared": False,
