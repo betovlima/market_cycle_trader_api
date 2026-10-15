@@ -1,3 +1,9 @@
+## 2026-10-15 — Verificações adicionais pré-depósito Live
+
+Na branch `feature/live-execution-readiness-v1`, readiness passa a consultar ordens abertas via Alpaca em modo somente leitura; o dry-run rejeita o placeholder `STRING` e valida a existência/negociabilidade do ativo via get_asset. Testes unitários foram atualizados, **não executados** nesta sessão. Nenhuma ordem real é enviada, e as condições de executor, idempotência persistente, riscos completos, paridade Winner e autorização independente continuam pendentes. Não alterar os checks para true sem validação. `main` intocada.
+
+---
+
 ## 2026-10-15 — Prévia Live hipotética (dry-run sem ordens)
 
 **Branch:** `feature/live-execution-readiness-v1`. Rota administrativa `POST /api/live-market/execution/dry-run`, parâmetros `target` (ticker ou CASH) e `max_allocation_fraction`. Consulta a carteira real por cliente Live somente leitura e calcula alocação hipotética sem enviar ordens. Não consome automaticamente a previsão Winner nem é um plano executável. `would_submit_order=false`, `ready_for_real_orders=false`, `order_submission_enabled=false` obrigatórios. Checks de sinal, risco e reconciliação permanecem false de propósito. Testes adicionados em `tests/test_live_execution_dry_run.py` (não executados nesta sessão). **Main preservada.** Próximo passo é integrar o sinal congelado da estratégia ao simulador, validar ordens existentes, regras de risco e executar testes/CI antes de pensar em ativação real.
