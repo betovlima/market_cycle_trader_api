@@ -130,6 +130,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                       "current_asset": current,
                       "current_quantity": state["managed_quantity"],
                       "live_state_revision": state["revision"],
+                      "session_equity_baseline": float(getattr(account, "equity", 0) or 0),
                       "winner_signal_prepared": True,
                       "snapshot_sha256": snapshot.manifest.get("snapshot_sha256"),
                       "signal_prepared_at": datetime.now(timezone.utc),
