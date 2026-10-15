@@ -1,3 +1,65 @@
+## 2026-10-15 — Início da separação operacional Live (observador independente)
+
+Branch `feature/live-execution-readiness-v1`. Novo `live_observation_scheduler.py`, processo de observação independente do Paper, iniciado no lifespan da API e ativado somente se Live estiver em `active` ou `exit_only`. Consulta a carteira Alpaca Live e os metadados da Winner, grava observações na coleção exclusiva `live_trader_session_observations` sem criar planos Paper nem ordens. O status Live informa o scheduler de observação. Testes de isolamento incluídos em `tests/test_live_observation_scheduler.py`, mas **não executados** nesta sessão. O scheduler ainda **não** prepara sinal Winner nem ordens Live, não tem calendário de pós-fechamento/pré-abertura e não equivale à automação Trading Paper. Não depositar dinheiro contando com execução real; os bloqueios reais permanecem ativos. Main intocada.
+
+---
+
+## 2026-10-15 — Verificações adicionais pré-depósito Live
+
+Na branch `feature/live-execution-readiness-v1`, readiness passa a consultar ordens abertas via Alpaca em modo somente leitura; o dry-run rejeita o placeholder `STRING` e valida a existência/negociabilidade do ativo via get_asset. Testes unitários foram atualizados, **não executados** nesta sessão. Nenhuma ordem real é enviada, e as condições de executor, idempotência persistente, riscos completos, paridade Winner e autorização independente continuam pendentes. Não alterar os checks para true sem validação. `main` intocada.
+
+---
+
+## 2026-10-15 — Prévia Live hipotética (dry-run sem ordens)
+
+**Branch:** `feature/live-execution-readiness-v1`. Rota administrativa `POST /api/live-market/execution/dry-run`, parâmetros `target` (ticker ou CASH) e `max_allocation_fraction`. Consulta a carteira real por cliente Live somente leitura e calcula alocação hipotética sem enviar ordens. Não consome automaticamente a previsão Winner nem é um plano executável. `would_submit_order=false`, `ready_for_real_orders=false`, `order_submission_enabled=false` obrigatórios. Checks de sinal, risco e reconciliação permanecem false de propósito. Testes adicionados em `tests/test_live_execution_dry_run.py` (não executados nesta sessão). **Main preservada.** Próximo passo é integrar o sinal congelado da estratégia ao simulador, validar ordens existentes, regras de risco e executar testes/CI antes de pensar em ativação real.
+
+---
+
+## 2026-10-15 — Pré-validação de execução Live (sem ordens reais)
+
+**Branch:** `feature/live-execution-readiness-v1` a partir de `feature/live-paper-isolated-workspaces-v1`. **Main intocada.**
+
+Criado `GET /api/live-market/execution/readiness` (autenticação administrativa herdada do router) para verificar, em modo de leitura, identidade da conta Alpaca Live, bloqueios informados pela corretora e estado separado do controle Live. Resposta deliberadamente `ready_for_real_orders=false` e `order_submission_enabled=false` enquanto não houver executor segregado, idempotência persistente, limites de risco, validação da decisão oficial e ativação independente. Nenhuma ordem pode ser iniciada por essa rota.
+
+**Railway:** segredos exclusivos do serviço API: `ALPACA_LIVE_API_KEY_ID`, `ALPACA_LIVE_SECRET_KEY` e, recomendado, `ALPACA_LIVE_ACCOUNT_ID`. Nunca colocar segredos no frontend ou Git.
+
+**Testes adicionados:** `tests/test_live_execution_readiness.py` cobre conta saudável e falha de credenciais permanecendo bloqueadas. Testes ainda não executados neste ambiente; validar na CI.
+
+**Próximos passos:** revisar executor Paper como referência sem acoplamento; implementar gateway Live com dry-run obrigatório, ordens idempotentes, plano/sessão congelados, limites de exposição/perdas, parada de emergência, reconciliação corretora/Mongo, travas de horário e ativação administrativa dupla. Somente após testes específicos e autorização de risco ativar envio real de ordens.
+
+---
+
+## 2026-10-15 — API v10.8.102 — Botões Live operacionais em modo de monitoramento
+
+**Solicitação:** disponibilizar Iniciar/Pausar/Somente saída/Parar na seção Operação do Trader · Live, sem alterar Trader Paper.
+
+**Causa:** a v10.8.101 retornava `execution_enabled=false` por segurança, e o frontend usava esse mesmo indicador para desabilitar todo o painel Live.
+
+**Correção:** novos estados administrativos em `live_trader_control` com log independente em `live_trader_control_history`. Endpoint autenticado `POST /api/live-market/robot/mode`, confirmação `LIVE_MONITORING_ONLY`, CAS por `revision`. Front v10.7.26 conecta os quatro botões e controla o refresh automático **da tela** Live; Pausado/Parado suspendem polling Live, sem afetar Paper.
+
+**Limites deliberados:** estado `active` = monitoramento apenas, não autorização de negociar; `exit_only` ainda não vende; `scheduler_alive=false`, `order_submission_enabled=false` em todos os modos. Motor de ordens Live não implementado nesta versão.
+
+**Branch:** `feature/live-paper-isolated-workspaces-v1` (mesmos PRs #51 API e #12 front), `main` preservada. **Testes:** `tests/test_live_control_modes.py`, suíte de integração e build frontend; confirmar GitHub CI. Próximo passo é executor Live segregado com testes de riscos e confirmação explícita antes de negociar.
+
+---
+
+## 2026-10-15 — API v10.8.101 — Live/Paper isolados, primeiro marco de leitura
+
+**Branch:** `feature/live-paper-isolated-workspaces-v1` a partir da `main` (v10.8.100). **Situação:** PR para revisão; nenhuma implantação real, nenhum envio de ordens.
+
+**Solicitação:** Portfolio com abas Live e Trading (Paper), mesmas telas e gráficos com fontes e auditorias próprias; Operação do Trader separada em Live/Paper; ocultar a seção visual de log de execução sem eliminar os registros persistentes.
+
+**Causa:** a integração de negociação existente é exclusivamente Paper e utiliza `paper=True` com credenciais de ambiente Paper. Reutilização direta das chaves Live criaria erro de conta e risco de mistura de execução.
+
+**Entrega parcial segura:** API Live somente leitura (`/api/live-market/portfolio`, `/robot/status`, `/portfolio/export.zip`), cliente `paper=False` com credenciais exclusivas `ALPACA_LIVE_*`, autenticação administrativa e histórico em `live_portfolio_snapshots` segregado por conta. Não usa nem altera o estado Paper, a Winner #30 ou ordens reais. A UI expõe os controles Live como inativos com explicação explícita até existir executor seguro. Histórico de ordens Live vem apenas da corretora; não inventar P/L realizado, drawdown ajustado por depósitos ou decisões da Winner.
+
+**Testes:** `tests/test_live_paper_isolation.py` e CI do PR. Configuração Railway deve utilizar variáveis de segredo distintas, sem publicar credenciais.
+
+**Próximo passo:** implementar executor Live com agendador, estados e comandos independentes (active/paused/exit_only/stopped), limites e travas de risco e autenticação reforçada antes de qualquer permissão de ordens; manter `main` intocada até revisão e aprovação.
+
+---
+
 ## 2026-10-14 — API v10.8.100 — colisão de data da decisão Paper
 
 **Evidência operacional:** ciclo automático `paper-market-2026-10-15-f6c3dcc8` permaneceu em `preparing`, com 22 tentativas e `E11000 duplicate key` no índice `uq_paper_plan_decision_date`, `decision_date=2026-10-14`. Já havia uma decisão manual executada na própria sessão de 14/10, MAN → CAPR, com a mesma `decision_date`. A decisão automática para a sessão **15/10** usa legitimamente o último pregão fechado, **14/10**, e não podia ser inserida devido à chave única incompleta. Antes disso, a coleta diária ainda estava atrasada em 13/10, mas a falha persistente passou a ser exclusivamente o conflito de índice.

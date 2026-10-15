@@ -23,6 +23,7 @@ from .api.routers import (
     exports,
     health,
     jobs,
+    live_market,
     model_research,
     model_tuning,
     paper_market,
@@ -52,6 +53,7 @@ from .services.paper_market_scheduler import (
     start_paper_market_scheduler,
     stop_paper_market_scheduler,
 )
+from .services.live_observation_scheduler import start_live_observation_scheduler, stop_live_observation_scheduler
 from .services.model_tuning import recover_integrated_model_tuning_runs
 from .services.temporal_intelligence import recover_temporal_intelligence_runs
 from .services.temporal_research_settings import ensure_temporal_research_settings
@@ -72,9 +74,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     get_access_service().ensure_storage()
     get_reviewer_access_service().ensure_storage()
     start_paper_market_scheduler()
+    start_live_observation_scheduler()
     try:
         yield
     finally:
+        stop_live_observation_scheduler()
         stop_paper_market_scheduler()
         close_mongo()
 
@@ -143,6 +147,7 @@ def create_app() -> FastAPI:
     application.include_router(analytics.router)
     application.include_router(asset_discovery.router)
     application.include_router(paper_market.router, dependencies=admin_required)
+    application.include_router(live_market.router, dependencies=admin_required)
     application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
     application.include_router(admin_rotations.router, dependencies=admin_required)
     application.include_router(admin_trader.router, dependencies=admin_required)
