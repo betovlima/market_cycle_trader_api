@@ -162,11 +162,16 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
 
 
 def live_robot_status(db: Any) -> dict[str, Any]:
-    """Independent Live monitoring policy. There is still no live order executor."""
+    """Independent Live observation; Winner execution is not connected yet."""
+    from .live_observation_scheduler import live_observation_status
+    observation = live_observation_status()
     return {
         **live_control_status(db),
         "mode": "live_readonly",
-        "position_observer_alive": False,
+        "position_observer_alive": observation["scheduler_alive"],
+        "scheduler_alive": observation["scheduler_alive"],
+        "last_position_observation_at": observation["last_observed_at"],
+        "observation_last_error": observation["last_error"],
         "next_execution_session": None,
         "active_run": None,
         "trader_winner": get_trader_winner_summary(db),
