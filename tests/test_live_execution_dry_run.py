@@ -28,7 +28,7 @@ class DryRunTests(unittest.TestCase):
 
     @patch("market_cycle_trader_api.services.live_execution_dry_run.live_control_status")
     @patch("market_cycle_trader_api.services.live_execution_dry_run.live_portfolio_snapshot")
-    def test_cash_preview_requires_no_new_buy(self, portfolio, status, client_factory):
+    def test_cash_preview_requires_no_new_buy(self, portfolio, status):
         status.return_value = {"control_mode": "stopped"}
         portfolio.return_value = {
             "portfolio_value": 1000.0,
