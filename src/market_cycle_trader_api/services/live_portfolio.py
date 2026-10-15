@@ -14,6 +14,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .strategy_lab import get_trader_winner_summary
 from .live_control import live_control_status
 from .live_winner_session import latest_live_session
+from .live_winner_candidates import latest_live_winner_decision
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
 
@@ -118,6 +119,7 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     non_marginable_raw = getattr(account, "non_marginable_buying_power", None)
     clock = client.get_clock()
     history = _store_observation(db, equity, cash, account_id)
+    latest_decision = latest_live_winner_decision(db, account_id=account_id)
     unrealized = sum(p["unrealized_pnl"] for p in positions)
 
     return {
@@ -138,7 +140,7 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
         "total_return": None,
         "position": positions[0] if len(positions) == 1 else None,
         "positions": positions,
-        "last_decision_date": None,
+        "last_decision_date": latest_decision.get("decision_date") if latest_decision else None,
         "last_execution_session": None,
         "market_clock": {
             "timestamp": _timestamp(getattr(clock, "timestamp", None)),
@@ -154,7 +156,7 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
                 "peak_portfolio_value": None,
                 "maximum_drawdown": None,
             },
-            "latest_decision": None,
+            "latest_decision": latest_decision,
             "position_excursion": None,
             "history": history,
             "pnl_by_asset": [{
