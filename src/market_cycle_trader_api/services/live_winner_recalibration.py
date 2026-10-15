@@ -22,6 +22,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from ..infrastructure.persistence.mongo_repository import get_paper_trading_settings
 from ..schemas.paper_trading import PaperTradingSettings
 from .live_winner_session import LIVE_RUNS
+from .live_trader_state import verified_live_state
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings
 from .strategy_lab import get_trader_winner_context, get_trader_winner_model_snapshot
@@ -65,8 +66,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                                 {"$set": {"status": "review_required", "phase": "execution_window_expired",
                                           "order_submission_enabled": False}})
         raise RuntimeError("Live open recalibration window expired.")
-    if broker.get_all_positions():
-        raise RuntimeError("Live holdings require an independently reconciled state.")
+    state = verified_live_state(db, broker, session=session)
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
     if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
@@ -118,7 +118,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         )
         decision = build_live_model_decision(
             augmented, strategy, model_family=model["family"],
-            current_asset="CASH", holding_sessions=0,
+            current_asset=state["managed_symbol"], holding_sessions=state["holding_sessions"],
         )
         signal_date = pd.Timestamp(decision.decision_date).date().isoformat()
         if signal_date != session:
@@ -126,6 +126,11 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         target = str(decision.target_asset).upper()
         if not target or (target != "CASH" and target not in strategy.assets):
             raise RuntimeError("Winner selected an asset outside the locked universe.")
+        current = state["managed_symbol"]
+        action = ("stay_in_cash" if target == current == "CASH" else
+                  "hold" if target == current else
+                  "buy" if current == "CASH" else
+                  "sell_to_cash" if target == "CASH" else "rotate")
         updated = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": "recalibrating",
              "winner_configuration_hash": run["winner_configuration_hash"]},
@@ -134,7 +139,10 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "phase": "ready_for_execution_review",
                 "decision_date": signal_date,
                 "target_asset": target,
-                "action": "stay_in_cash" if target == "CASH" else "buy",
+                "action": action,
+                "current_asset": current,
+                "current_quantity": state["managed_quantity"],
+                "live_state_revision": state["revision"],
                 "market_open_calibration_completed_at": datetime.now(timezone.utc),
                 "current_session_feed": metadata.get("live_feed"),
                 "current_session_market_data_cutoff_utc": metadata.get("intraday_market_data_cutoff_utc"),
