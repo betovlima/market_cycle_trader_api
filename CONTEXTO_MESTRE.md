@@ -1,3 +1,19 @@
+## 2026-10-15 — API v10.8.101 — Live/Paper isolados, primeiro marco de leitura
+
+**Branch:** `feature/live-paper-isolated-workspaces-v1` a partir da `main` (v10.8.100). **Situação:** PR para revisão; nenhuma implantação real, nenhum envio de ordens.
+
+**Solicitação:** Portfolio com abas Live e Trading (Paper), mesmas telas e gráficos com fontes e auditorias próprias; Operação do Trader separada em Live/Paper; ocultar a seção visual de log de execução sem eliminar os registros persistentes.
+
+**Causa:** a integração de negociação existente é exclusivamente Paper e utiliza `paper=True` com credenciais de ambiente Paper. Reutilização direta das chaves Live criaria erro de conta e risco de mistura de execução.
+
+**Entrega parcial segura:** API Live somente leitura (`/api/live-market/portfolio`, `/robot/status`, `/portfolio/export.zip`), cliente `paper=False` com credenciais exclusivas `ALPACA_LIVE_*`, autenticação administrativa e histórico em `live_portfolio_snapshots` segregado por conta. Não usa nem altera o estado Paper, a Winner #30 ou ordens reais. A UI expõe os controles Live como inativos com explicação explícita até existir executor seguro. Histórico de ordens Live vem apenas da corretora; não inventar P/L realizado, drawdown ajustado por depósitos ou decisões da Winner.
+
+**Testes:** `tests/test_live_paper_isolation.py` e CI do PR. Configuração Railway deve utilizar variáveis de segredo distintas, sem publicar credenciais.
+
+**Próximo passo:** implementar executor Live com agendador, estados e comandos independentes (active/paused/exit_only/stopped), limites e travas de risco e autenticação reforçada antes de qualquer permissão de ordens; manter `main` intocada até revisão e aprovação.
+
+---
+
 ## 2026-10-14 — API v10.8.100 — colisão de data da decisão Paper
 
 **Evidência operacional:** ciclo automático `paper-market-2026-10-15-f6c3dcc8` permaneceu em `preparing`, com 22 tentativas e `E11000 duplicate key` no índice `uq_paper_plan_decision_date`, `decision_date=2026-10-14`. Já havia uma decisão manual executada na própria sessão de 14/10, MAN → CAPR, com a mesma `decision_date`. A decisão automática para a sessão **15/10** usa legitimamente o último pregão fechado, **14/10**, e não podia ser inserida devido à chave única incompleta. Antes disso, a coleta diária ainda estava atrasada em 13/10, mas a falha persistente passou a ser exclusivamente o conflito de índice.
