@@ -1,3 +1,15 @@
+## 2026-10-15 — Preflight independente Winner/Live
+
+Na branch `feature/live-winner-operational-parity-v1`, adicionado POST `/api/live-market/winner/preflight` que registra identidade da Winner, identidade da conta Alpaca Live e próximo horário de mercado na coleção `live_winner_preflight_snapshots`. Nunca lê posições Paper nem envia ordens. Requer estado Live active/exit_only; parado retorna skipped. Teste de isolamento adicionado `tests/test_live_winner_preflight.py`, ainda não executado. Esta etapa não produz decisões Winner; scheduler de trading Live e ordens reais não estão implementados. Main intocada; PR #53.
+
+---
+
+## 2026-10-15 — Paridade operacional Live/Winner: início de refatoração segura
+
+Branch `feature/live-winner-operational-parity-v1`, partindo da `main`. O endpoint de portfólio Live passa a retornar os valores `buying_power` e `non_marginable_buying_power` diretamente da Alpaca (null se ausentes). Testes adicionados em `tests/test_live_buying_power.py`, ainda não executados. A preparação do plano Winner no Paper usa explicitamente o cliente Alpaca Paper e as coleções/estado Paper; portanto, **não foi habilitada ou copiada** para Live. É necessário extrair um gerador de sinal compartilhável, preservar inputs e decisões independentes, implementar idempotência e reconciliação de ordens Live, controles de risco, testes e autorização antes de enviar ordens reais. Nenhum pedido de ordem é acionado nesta branch.
+
+---
+
 ## 2026-10-15 — Início da separação operacional Live (observador independente)
 
 Branch `feature/live-execution-readiness-v1`. Novo `live_observation_scheduler.py`, processo de observação independente do Paper, iniciado no lifespan da API e ativado somente se Live estiver em `active` ou `exit_only`. Consulta a carteira Alpaca Live e os metadados da Winner, grava observações na coleção exclusiva `live_trader_session_observations` sem criar planos Paper nem ordens. O status Live informa o scheduler de observação. Testes de isolamento incluídos em `tests/test_live_observation_scheduler.py`, mas **não executados** nesta sessão. O scheduler ainda **não** prepara sinal Winner nem ordens Live, não tem calendário de pós-fechamento/pré-abertura e não equivale à automação Trading Paper. Não depositar dinheiro contando com execução real; os bloqueios reais permanecem ativos. Main intocada.

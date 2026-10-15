@@ -12,6 +12,7 @@ from ...core.runtime import database
 from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_execution_dry_run import preview_live_intent
+from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -61,6 +62,14 @@ def update_robot_mode(
     except (LiveControlConflict, RuntimeError) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
+
+@router.post("/winner/preflight")
+def winner_preflight() -> dict[str, Any]:
+    """Read-only Live Winner metadata preflight, never an order plan."""
+    try:
+        return capture_live_winner_preflight(database())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 @router.get("/execution/readiness")
 def execution_readiness() -> dict[str, Any]:
