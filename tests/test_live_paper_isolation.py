@@ -42,9 +42,20 @@ class LivePaperIsolationTests(unittest.TestCase):
         self.assertEqual(result["execution_origin"], "live_broker_history")
 
     def test_live_robot_is_explicitly_readonly(self):
-        with patch.object(
-            live_portfolio, "get_trader_winner_summary",
-            return_value={"name": "Strategy #30"},
+        with (
+            patch.object(
+                live_portfolio, "get_trader_winner_summary",
+                return_value={"name": "Strategy #30"},
+            ),
+            patch.object(
+                live_portfolio, "live_control_status",
+                return_value={
+                    "control_mode": "stopped",
+                    "status": "stopped",
+                    "execution_enabled": False,
+                    "scheduler_alive": False,
+                },
+            ),
         ):
             response = live_portfolio.live_robot_status(object())
         self.assertFalse(response["execution_enabled"])
