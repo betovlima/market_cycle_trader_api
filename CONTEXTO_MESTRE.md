@@ -1,3 +1,9 @@
+## 2026-10-15 — Prévia Live hipotética (dry-run sem ordens)
+
+**Branch:** `feature/live-execution-readiness-v1`. Rota administrativa `POST /api/live-market/execution/dry-run`, parâmetros `target` (ticker ou CASH) e `max_allocation_fraction`. Consulta a carteira real por cliente Live somente leitura e calcula alocação hipotética sem enviar ordens. Não consome automaticamente a previsão Winner nem é um plano executável. `would_submit_order=false`, `ready_for_real_orders=false`, `order_submission_enabled=false` obrigatórios. Checks de sinal, risco e reconciliação permanecem false de propósito. Testes adicionados em `tests/test_live_execution_dry_run.py` (não executados nesta sessão). **Main preservada.** Próximo passo é integrar o sinal congelado da estratégia ao simulador, validar ordens existentes, regras de risco e executar testes/CI antes de pensar em ativação real.
+
+---
+
 ## 2026-10-15 — Pré-validação de execução Live (sem ordens reais)
 
 **Branch:** `feature/live-execution-readiness-v1` a partir de `feature/live-paper-isolated-workspaces-v1`. **Main intocada.**
