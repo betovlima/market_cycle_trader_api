@@ -6,9 +6,12 @@ from market_cycle_trader_api.services.live_execution_dry_run import preview_live
 
 
 class DryRunTests(unittest.TestCase):
+    @patch("market_cycle_trader_api.services.live_execution_dry_run.create_live_readonly_client")
     @patch("market_cycle_trader_api.services.live_execution_dry_run.live_control_status")
     @patch("market_cycle_trader_api.services.live_execution_dry_run.live_portfolio_snapshot")
-    def test_hypothetical_target_remains_readonly(self, portfolio, status):
+    def test_hypothetical_target_remains_readonly(self, portfolio, status, client_factory):
+        client_factory.return_value.get_asset.return_value.symbol = "MSFT"
+        client_factory.return_value.get_asset.return_value.tradable = True
         status.return_value = {"control_mode": "active"}
         portfolio.return_value = {
             "portfolio_value": 1000.0,
@@ -25,7 +28,7 @@ class DryRunTests(unittest.TestCase):
 
     @patch("market_cycle_trader_api.services.live_execution_dry_run.live_control_status")
     @patch("market_cycle_trader_api.services.live_execution_dry_run.live_portfolio_snapshot")
-    def test_cash_preview_requires_no_new_buy(self, portfolio, status):
+    def test_cash_preview_requires_no_new_buy(self, portfolio, status, client_factory):
         status.return_value = {"control_mode": "stopped"}
         portfolio.return_value = {
             "portfolio_value": 1000.0,
