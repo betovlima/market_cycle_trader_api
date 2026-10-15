@@ -98,6 +98,9 @@ def latest_live_session(db: Any) -> dict[str, Any] | None:
         "status": doc.get("status"),
         "phase": doc.get("phase"),
         "winner_name": doc.get("winner_name"),
-        "winner_signal_prepared": False,
+        "winner_signal_prepared": bool(doc.get("winner_signal_prepared")),
+        "decision_date": doc.get("decision_date"),
+        "action": doc.get("action"),
+        "target_asset": doc.get("target_asset"),
         "order_submission_enabled": False,
     }
