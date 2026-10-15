@@ -16,6 +16,7 @@ from .strategy_lab import get_trader_winner_summary
 from .live_winner_session import plan_next_live_session
 from .live_winner_signal import prepare_live_cash_winner_signal
 from .live_winner_recalibration import recalibrate_live_cash_winner_signal
+from .live_order_execution import execute_recalibrated_live_winner_session, order_submission_opted_in
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
 _POLL_SECONDS = 300.0
@@ -89,6 +90,8 @@ class LiveObservationScheduler:
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
                     elif armed.get("status") == "signal_prepared" and result["market_open"]:
                         recalibrate_live_cash_winner_signal(db, armed["execution_session"])
+                    elif armed.get("status") == "recalibrated_no_orders" and result["market_open"] and order_submission_opted_in():
+                        execute_recalibrated_live_winner_session(db, armed["execution_session"])
                 if result["status"] == "observed":
                     self._last_observed_at = result["recorded_at"]
                 self._last_error = None
