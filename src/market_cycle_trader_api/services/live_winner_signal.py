@@ -25,6 +25,7 @@ from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings, get_system_settings
 from .strategy_lab import get_trader_winner_context, get_trader_winner_model_snapshot
 from .live_winner_session import LIVE_RUNS
+from .live_trader_state import verified_live_state
 
 _ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE})
 
@@ -75,8 +76,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     clock = broker.get_clock()
     if bool(getattr(clock, "is_open", True)):
         raise RuntimeError("Winner preparation requires closed regular market.")
-    if broker.get_all_positions():
-        raise RuntimeError("Live Winner preparation for existing holdings requires separate reconciliation.")
+    state = verified_live_state(db, broker, session=session)
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
     if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
@@ -106,7 +106,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
             raise RuntimeError("Incomplete Alpaca snapshot for Live Winner.")
         decision = build_live_model_decision(
             snapshot.frames, strategy, model_family=model["family"],
-            current_asset="CASH", holding_sessions=0,
+            current_asset=state["managed_symbol"], holding_sessions=state["holding_sessions"],
         )
         decision_date = str(decision.decision_date)[:10]
         if decision_date != cutoff:
@@ -114,6 +114,11 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         target = str(decision.target_asset).upper()
         if not target or (target != "CASH" and target not in strategy.assets):
             raise RuntimeError("Winner signal target is not a permitted asset.")
+        current = state["managed_symbol"]
+        action = ("stay_in_cash" if target == current == "CASH" else
+                  "hold" if target == current else
+                  "buy" if current == "CASH" else
+                  "sell_to_cash" if target == "CASH" else "rotate")
         saved = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": "preparing_signal",
              "winner_configuration_hash": run["winner_configuration_hash"]},
@@ -121,7 +126,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                       "phase": "winner_signal_prepared_execution_disabled",
                       "decision_date": decision_date,
                       "target_asset": target,
-                      "action": "stay_in_cash" if target == "CASH" else "buy",
+                      "action": action,
+                      "current_asset": current,
+                      "current_quantity": state["managed_quantity"],
+                      "live_state_revision": state["revision"],
                       "winner_signal_prepared": True,
                       "snapshot_sha256": snapshot.manifest.get("snapshot_sha256"),
                       "signal_prepared_at": datetime.now(timezone.utc),
