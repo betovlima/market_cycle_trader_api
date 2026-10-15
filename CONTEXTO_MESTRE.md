@@ -1,3 +1,17 @@
+## 2026-10-15 — Pré-validação de execução Live (sem ordens reais)
+
+**Branch:** `feature/live-execution-readiness-v1` a partir de `feature/live-paper-isolated-workspaces-v1`. **Main intocada.**
+
+Criado `GET /api/live-market/execution/readiness` (autenticação administrativa herdada do router) para verificar, em modo de leitura, identidade da conta Alpaca Live, bloqueios informados pela corretora e estado separado do controle Live. Resposta deliberadamente `ready_for_real_orders=false` e `order_submission_enabled=false` enquanto não houver executor segregado, idempotência persistente, limites de risco, validação da decisão oficial e ativação independente. Nenhuma ordem pode ser iniciada por essa rota.
+
+**Railway:** segredos exclusivos do serviço API: `ALPACA_LIVE_API_KEY_ID`, `ALPACA_LIVE_SECRET_KEY` e, recomendado, `ALPACA_LIVE_ACCOUNT_ID`. Nunca colocar segredos no frontend ou Git.
+
+**Testes adicionados:** `tests/test_live_execution_readiness.py` cobre conta saudável e falha de credenciais permanecendo bloqueadas. Testes ainda não executados neste ambiente; validar na CI.
+
+**Próximos passos:** revisar executor Paper como referência sem acoplamento; implementar gateway Live com dry-run obrigatório, ordens idempotentes, plano/sessão congelados, limites de exposição/perdas, parada de emergência, reconciliação corretora/Mongo, travas de horário e ativação administrativa dupla. Somente após testes específicos e autorização de risco ativar envio real de ordens.
+
+---
+
 ## 2026-10-15 — API v10.8.102 — Botões Live operacionais em modo de monitoramento
 
 **Solicitação:** disponibilizar Iniciar/Pausar/Somente saída/Parar na seção Operação do Trader · Live, sem alterar Trader Paper.
