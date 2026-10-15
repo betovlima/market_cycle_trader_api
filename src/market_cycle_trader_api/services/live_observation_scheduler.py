@@ -14,6 +14,7 @@ from .live_control import live_control_status
 from .live_portfolio import live_portfolio_snapshot
 from .strategy_lab import get_trader_winner_summary
 from .live_winner_session import plan_next_live_session
+from .live_winner_signal import prepare_live_cash_winner_signal
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
 _POLL_SECONDS = 300.0
@@ -82,7 +83,9 @@ class LiveObservationScheduler:
                 db = database()
                 result = observe_live_cycle(db)
                 if result["status"] == "observed":
-                    plan_next_live_session(db)
+                    armed = plan_next_live_session(db)
+                    if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
+                        prepare_live_cash_winner_signal(db, armed["execution_session"])
                 if result["status"] == "observed":
                     self._last_observed_at = result["recorded_at"]
                 self._last_error = None
