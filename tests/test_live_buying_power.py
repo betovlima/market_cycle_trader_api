@@ -22,7 +22,8 @@ class LiveBuyingPowerTests(unittest.TestCase):
         broker.get_clock.return_value = SimpleNamespace(
             timestamp=None, is_open=False, next_open=None, next_close=None,
         )
-        result = live_portfolio_snapshot(object())
+        with patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None):
+            result = live_portfolio_snapshot(object())
         self.assertEqual(result["strategy_cash"], 108.25)
         self.assertEqual(result["buying_power"], 80)
         self.assertEqual(result["non_marginable_buying_power"], 75)
@@ -41,7 +42,8 @@ class LiveBuyingPowerTests(unittest.TestCase):
         broker.get_clock.return_value = SimpleNamespace(
             timestamp=None, is_open=False, next_open=None, next_close=None,
         )
-        result = live_portfolio_snapshot(object())
+        with patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None):
+            result = live_portfolio_snapshot(object())
         self.assertIsNone(result["buying_power"])
         self.assertIsNone(result["non_marginable_buying_power"])
         broker.submit_order.assert_not_called()

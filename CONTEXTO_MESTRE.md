@@ -1,3 +1,9 @@
+## 2026-10-15 — API v10.8.104: Candidates presented today no Trader Live
+
+Branch `feature/live-winner-candidates-v10.8.104`: após sinal pós-fechamento e recalibração na abertura, persistir as utilidades reais e metadados da decisão `build_live_model_decision` no documento `live_winner_session_runs` (sem alterar alocação/ordens). O endpoint `GET /api/live-market/portfolio` passa a preencher `audit.latest_decision` e `candidates`, filtrado pelo `live_account_id`, reutilizando exclusivamente o formatador puro do ranking Paper (nunca seu estado). A tela Portfolio → Live → Candidates presented today já renderiza o campo. Ranking é de ativos negociáveis; CASH entra na referência de utilidade, mas não na tabela. Decisões históricas anteriores sem utilidades armazenadas não são reconstruídas/inventadas. Treinamento já iniciado antes do deploy também não terá ranking retroativo. Não alterar autorização de ordens reais.
+
+---
+
 ## 2026-10-15 — API v10.8.103: ciclo Winner Live isolado (não autorizar ordens ainda)
 
 Branch `feature/live-winner-session-scheduler-v1`, PR #54. O botão Iniciar já controla `active` na coleção `live_trader_control`. Scheduler Live separado arma a próxima sessão, verifica conta Alpaca Live, calcula um sinal pós-fechamento com o motor U77/LightGBM da mesma Winner #30 e recalibra após a abertura com dados intraday, mantendo `live_winner_session_runs`, `live_trader_strategy_state` e `live_winner_broker_orders` separadas do Paper. Sessão, alvo, ação, status e data aparecem no endpoint de status. Estado da carteira Live é reconciliado contra o broker antes do cálculo e de qualquer ordem. Executor real foi implementado sob opt-in explícito **DESATIVADO por padrão**, com limite padrão por ordem US$25, exposição máxima 95%, perda diária máxima 5%, validação de mercado, revisão, CAS/ledger determinístico e bloqueio de novas entradas em exit_only.

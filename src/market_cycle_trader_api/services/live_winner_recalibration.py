@@ -22,6 +22,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from ..infrastructure.persistence.mongo_repository import get_paper_trading_settings
 from ..schemas.paper_trading import PaperTradingSettings
 from .live_winner_session import LIVE_RUNS
+from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings
@@ -126,6 +127,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         target = str(decision.target_asset).upper()
         if not target or (target != "CASH" and target not in strategy.assets):
             raise RuntimeError("Winner selected an asset outside the locked universe.")
+        candidate_fields = winner_candidate_fields(decision)
         current = state["managed_symbol"]
         action = ("stay_in_cash" if target == current == "CASH" else
                   "hold" if target == current else
@@ -139,6 +141,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "phase": "ready_for_execution_review",
                 "decision_date": signal_date,
                 "target_asset": target,
+                      **candidate_fields,
                 "action": action,
                 "current_asset": current,
                 "current_quantity": state["managed_quantity"],
