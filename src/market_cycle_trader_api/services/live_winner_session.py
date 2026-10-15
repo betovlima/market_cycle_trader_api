@@ -88,7 +88,9 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
         "next_market_open": expected_open.isoformat(),
         "winner_name": saved.get("winner_name"),
         "phase": saved.get("phase", doc["phase"]),
-        "winner_signal_prepared": False,
+        "winner_signal_prepared": bool(saved.get("winner_signal_prepared")),
+        "target_asset": saved.get("target_asset"),
+        "action": saved.get("action"),
         "order_submission_enabled": False,
     }
 
