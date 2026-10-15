@@ -1,3 +1,9 @@
+## 2026-10-15 — Início da separação operacional Live (observador independente)
+
+Branch `feature/live-execution-readiness-v1`. Novo `live_observation_scheduler.py`, processo de observação independente do Paper, iniciado no lifespan da API e ativado somente se Live estiver em `active` ou `exit_only`. Consulta a carteira Alpaca Live e os metadados da Winner, grava observações na coleção exclusiva `live_trader_session_observations` sem criar planos Paper nem ordens. O status Live informa o scheduler de observação. Testes de isolamento incluídos em `tests/test_live_observation_scheduler.py`, mas **não executados** nesta sessão. O scheduler ainda **não** prepara sinal Winner nem ordens Live, não tem calendário de pós-fechamento/pré-abertura e não equivale à automação Trading Paper. Não depositar dinheiro contando com execução real; os bloqueios reais permanecem ativos. Main intocada.
+
+---
+
 ## 2026-10-15 — Verificações adicionais pré-depósito Live
 
 Na branch `feature/live-execution-readiness-v1`, readiness passa a consultar ordens abertas via Alpaca em modo somente leitura; o dry-run rejeita o placeholder `STRING` e valida a existência/negociabilidade do ativo via get_asset. Testes unitários foram atualizados, **não executados** nesta sessão. Nenhuma ordem real é enviada, e as condições de executor, idempotência persistente, riscos completos, paridade Winner e autorização independente continuam pendentes. Não alterar os checks para true sem validação. `main` intocada.
