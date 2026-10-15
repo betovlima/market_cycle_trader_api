@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from ..services.live_control import live_control_status
 from ..services.live_portfolio import live_portfolio_snapshot
 
@@ -16,6 +17,14 @@ def preview_live_intent(db: Any, *, target: str, max_allocation_fraction: float)
         raise ValueError("Target must be CASH or a simple ticker (up to eight ASCII letters/digits).")
     if not (0 < max_allocation_fraction <= 1):
         raise ValueError("max_allocation_fraction must be within (0, 1].")
+
+    # Swagger placeholder is not a validated instrument.
+    if symbol == "STRING":
+        raise ValueError("STRING is a Swagger placeholder, not a validated trading target.")
+    if symbol != "CASH":
+        asset = create_live_readonly_client().get_asset(symbol)
+        if str(getattr(asset, "symbol", "")).upper() != symbol or not bool(getattr(asset, "tradable", False)):
+            raise ValueError(f"Asset {symbol} is unavailable or not tradable in Alpaca Live.")
 
     state = live_control_status(db)
     snapshot = live_portfolio_snapshot(db)
