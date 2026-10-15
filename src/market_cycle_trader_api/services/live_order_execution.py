@@ -16,7 +16,7 @@ import pandas as pd
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from ..infrastructure.trading.alpaca_live import create_live_readonly_client
+from ..infrastructure.trading.alpaca_live import create_live_execution_client
 from ..infrastructure.trading.alpaca_paper import (
     asset_snapshot, submit_market_buy_notional, submit_market_sell,
     wait_for_order,
@@ -137,7 +137,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     if not bool(run.get("winner_signal_prepared")) or not run.get("target_asset"):
         raise RuntimeError("The current Winner has no verified Live trading signal.")
 
-    broker = create_live_readonly_client()
+    broker = create_live_execution_client()
     account = broker.get_account()
     account_id = str(getattr(account, "id", "") or "")
     if account_id != run["live_account_id"]:
