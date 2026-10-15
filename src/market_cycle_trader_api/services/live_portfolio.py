@@ -168,7 +168,9 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
 def live_robot_status(db: Any) -> dict[str, Any]:
     """Independent Live observation; Winner execution is not connected yet."""
     from .live_observation_scheduler import live_observation_status
+    from .live_winner_session import latest_live_session
     observation = live_observation_status()
+    run = latest_live_session(db)
     return {
         **live_control_status(db),
         "mode": "live_readonly",
@@ -176,8 +178,8 @@ def live_robot_status(db: Any) -> dict[str, Any]:
         "scheduler_alive": observation["scheduler_alive"],
         "last_position_observation_at": observation["last_observed_at"],
         "observation_last_error": observation["last_error"],
-        "next_execution_session": None,
-        "active_run": None,
+        "next_execution_session": run.get("execution_session") if run else None,
+        "active_run": run if run and run.get("status") not in {"completed", "cancelled"} else None,
         "trader_winner": get_trader_winner_summary(db),
     }
 
