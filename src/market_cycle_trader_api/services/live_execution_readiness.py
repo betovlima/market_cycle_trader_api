@@ -7,6 +7,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 from .live_control import live_control_status
+from .live_order_execution import order_submission_opted_in
 
 
 def live_execution_readiness(db: Any) -> dict[str, Any]:
@@ -39,17 +40,20 @@ def live_execution_readiness(db: Any) -> dict[str, Any]:
             f"{len(open_orders)} open broker orders require reconciliation.")
     except Exception:
         add("broker_open_orders", False, "Cannot establish broker open-order status.")
-    # Deliberately hard-block until a reviewed execution engine and order safeguards exist.
-    add("reviewed_live_executor", False, "Real-order executor is not implemented or authorized.")
-    add("order_idempotency", False, "Persistent per-session order idempotency and recovery not implemented.")
-    add("risk_limits", False, "Position, buying-power, daily-loss and emergency-stop checks not implemented.")
-    add("plan_validation", False, "Winner plan parity and current-session signal validation not implemented.")
-    add("operator_activation", False, "Separate real-order activation and second confirmation not implemented.")
+    # The separate operator opt-in must be reported truthfully, even before
+    # the production executor has been certified by an end-to-end dry-run.
+    authorized = order_submission_opted_in()
+    # Deliberately fail closed until end-to-end validation and reconciliation are reviewed.
+    add("reviewed_live_executor", False, "Execution code exists but has not completed a production-like end-to-end review.")
+    add("order_idempotency", False, "Unique order ledger exists; complete broker recovery verification is still pending.")
+    add("risk_limits", False, "Risk checks exist but still require broker-level scenario validation.")
+    add("plan_validation", False, "Winner signals are generated; end-to-end session parity is not yet certified.")
+    add("operator_activation", authorized, "Explicit server opt-in configured." if authorized else "Real-order server opt-in is disabled.")
     return {
         "market": "live",
         "ready_for_real_orders": False,
-        "order_submission_enabled": False,
+        "order_submission_enabled": authorized and status["control_mode"] in {"active", "exit_only"},
         "control_mode": status["control_mode"],
         "checks": checks,
-        "message": "Live real-order execution is disabled. Monitoring controls do not activate trading.",
+        "message": ("WARNING: Live real-money order authorization is set before full certification." if authorized else "Live real-order submission is disabled by default. Winner monitoring and signals are read-only."),
     }
