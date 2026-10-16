@@ -23,6 +23,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from ..infrastructure.persistence.mongo_repository import get_paper_trading_settings
 from ..schemas.paper_trading import PaperTradingSettings
 from .live_winner_session import LIVE_RUNS
+from .live_execution_window import live_execution_window_deadline
 from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
 from .live_order_execution import order_submission_opted_in
@@ -67,13 +68,13 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     if now.tz_convert(EASTERN).date().isoformat() != session:
         raise RuntimeError("Live session is stale.")
     settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
-    latest = expected_open + pd.Timedelta(seconds=settings.market_execution_window_seconds)
+    latest, live_window_seconds = live_execution_window_deadline(expected_open, settings)
     if now > latest and not analysis_only:
         db[LIVE_RUNS].update_one({"_id": run["_id"], "status": "signal_prepared"},
                                 {"$set": {"status": "review_required", "phase": "execution_window_expired",
                                           "window_deadline_at": latest.to_pydatetime(),
                                           "window_expired_at": now.to_pydatetime(),
-                                          "window_seconds": int(settings.market_execution_window_seconds),
+                                          "window_seconds": live_window_seconds,
                                           "order_submission_enabled": False}})
         raise RuntimeError("Live open recalibration window expired.")
     state = verified_live_state(db, broker, session=session)
@@ -113,6 +114,8 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         {"$set": {"status": recalibrating_status,
                   "phase": "late_intraday_analysis" if analysis_only else "market_open_recalibration",
                   "calibration_started_at": recalibration_started_at,
+                  "window_seconds": live_window_seconds,
+                  "window_deadline_at": latest.to_pydatetime(),
                   "order_submission_enabled": False}},
         return_document=ReturnDocument.AFTER,
     )
