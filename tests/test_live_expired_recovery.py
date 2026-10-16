@@ -28,9 +28,8 @@ class ExpiredLiveRecoveryTests(unittest.TestCase):
         )
         self.broker.get_orders.return_value = []
 
-    def _call(self, *, session="2026-10-16", mode="active", enabled=False):
-        with patch("market_cycle_trader_api.services.live_expired_recovery.order_submission_opted_in", return_value=enabled), \
-             patch("market_cycle_trader_api.services.live_expired_recovery.live_control_status", return_value={"control_mode": mode}), \
+    def _call(self, *, session="2026-10-16", mode="active"):
+        with patch("market_cycle_trader_api.services.live_expired_recovery.live_control_status", return_value={"control_mode": mode}), \
              patch("market_cycle_trader_api.services.live_expired_recovery.create_live_readonly_client", return_value=self.broker):
             return queue_expired_live_analysis(
                 self.db, execution_session=session, actor_email="operator@example.com"
@@ -45,9 +44,8 @@ class ExpiredLiveRecoveryTests(unittest.TestCase):
         self.assertFalse(updated["order_submission_enabled"])
         self.broker.submit_order.assert_not_called()
 
-    def test_when_real_money_is_armed_recovery_is_blocked(self):
-        with self.assertRaisesRegex(RuntimeError, "Disable Live"):
-            self._call(enabled=True)
+    def test_live_mode_does_not_make_expired_analysis_executable(self):
+        self.assertEqual(self._call()["status"], "analysis_only_requested")
         self.broker.submit_order.assert_not_called()
 
     def test_no_cross_session_replay(self):
