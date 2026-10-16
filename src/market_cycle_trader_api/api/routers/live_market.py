@@ -79,7 +79,9 @@ def recover_expired_live_analysis(
         return queue_expired_live_analysis(
             database(),
             execution_session=payload.execution_session,
-            actor_email=identity.email,
+            # Password-based admin sessions have no email. Preserve the
+            # authenticated actor's stable subject for the Live audit.
+            actor_email=(identity.email or "").strip() or identity.subject,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
