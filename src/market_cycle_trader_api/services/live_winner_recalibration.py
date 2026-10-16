@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from ..infrastructure.persistence.mongo_repository import get_paper_trading_settings
 from ..schemas.paper_trading import PaperTradingSettings
 from .live_winner_session import LIVE_RUNS
+from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
 from .live_order_execution import order_submission_opted_in
 from .live_trader_state import verified_live_state
@@ -116,6 +118,11 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     )
     if claimed is None:
         raise RuntimeError("Live open recalibration already claimed.")
+    started = monotonic()
+    stage = "download"
+    append_live_event(db, account_id=run["live_account_id"], session=session,
+                      stage="recalibration_started", message="Recalibracao intraday iniciada.",
+                      details={"cutoff": session})
     try:
         cutoff = latest_safe_completed_xnys_session().date().isoformat()
         snapshot = download_u67_operational_snapshot(
@@ -126,13 +133,27 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         )
         if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
             raise RuntimeError("Incomplete Live Winner snapshot.")
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="snapshot_downloaded", message="Snapshot Alpaca concluido.",
+                          details={"assets": len(snapshot.frames), "duration_seconds": round(monotonic() - started, 2)})
+        stage = "intraday_bars"
         augmented, metadata = append_u67_current_session_intraday(
             snapshot.frames, strategy, session=session, now=clock.timestamp,
         )
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="intraday_bars_ready", message="Dados da sessao atual preparados.",
+                          details={"duration_seconds": round(monotonic() - started, 2)})
+        stage = "model_training_and_decision"
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="model_training_started", message="LightGBM: treinamento e decisao iniciados.")
         decision = build_live_model_decision(
             augmented, strategy, model_family=model["family"],
             current_asset=state["managed_symbol"], holding_sessions=state["holding_sessions"],
         )
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="model_decision_computed", message="LightGBM: decisao calculada.",
+                          details={"duration_seconds": round(monotonic() - started, 2)})
+        stage = "decision_validation"
         signal_date = pd.Timestamp(decision.decision_date).date().isoformat()
         if signal_date != session:
             raise RuntimeError("Winner recalibration decision date is not the current session.")
@@ -145,6 +166,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                   "hold" if target == current else
                   "buy" if current == "CASH" else
                   "sell_to_cash" if target == "CASH" else "rotate")
+        stage = "decision_persistence"
         updated = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": recalibrating_status,
              "winner_configuration_hash": run["winner_configuration_hash"]},
@@ -164,15 +186,25 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "current_session_market_data_cutoff_utc": metadata.get("intraday_market_data_cutoff_utc"),
                 "winner_signal_prepared": True,
                 "order_submission_enabled": False,
-            }},
+            }, "$unset": {"last_calibration_error_type": ""}},
             return_document=ReturnDocument.AFTER,
         )
         if updated is None:
             raise RuntimeError("Live recalibration state changed during preparation.")
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="analysis_only_completed" if analysis_only else "recalibration_completed",
+                          message="Analise concluida, sem envio de ordens." if analysis_only else "Decisao pronta para revisao.",
+                          details={"target_asset": target, "action": action,
+                                   "duration_seconds": round(monotonic() - started, 2)})
         return {"status": updated["status"], "execution_session": session,
                 "target_asset": target, "action": updated["action"],
                 "order_submission_enabled": False}
     except Exception as exc:
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="recalibration_failed", level="error",
+                          message="Falha na recalibracao durante a etapa: " + stage,
+                          details={"error_type": type(exc).__name__,
+                                   "duration_seconds": round(monotonic() - started, 2)})
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": recalibrating_status},
             {"$set": {"status": "review_required" if analysis_only else "signal_prepared",

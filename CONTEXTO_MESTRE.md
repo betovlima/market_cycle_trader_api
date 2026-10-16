@@ -1,3 +1,13 @@
+## 2026-10-16 — API v10.8.107: diagnóstico persistente da Winner Live
+
+- Adicionada coleção MongoDB `live_winner_process_events` com eventos limitados por conta Alpaca Live e `execution_session`: início, download de snapshot, preparação intraday, treinamento/decisão LightGBM, persistência, conclusão e falhas com tipo e etapa; falhas de persistência dos logs não interrompem o ciclo Winner.
+- Novas rotas autenticadas de administrador: `GET /api/live-market/winner/events?execution_session=YYYY-MM-DD&level=all|info|warning|error&limit=200` e `GET /api/live-market/winner/events/export.zip?execution_session=YYYY-MM-DD`. O JSON e ZIP não expõem credenciais, exceções completas, dados brutos de corretora ou ordem. A conta é verificada na Alpaca Live.
+- Instrumentação também cobre preparação post-close, recuperação analítica solicitada e exceções de scheduler; preserva fluxo original e condições do executor. Os eventos antigos não podem ser reconstruídos a partir do MongoDB.
+- Frontend correspondente v10.7.28: seção Logs da Winner Live em Portfolio → Live, com consulta a cada 15s, histórico por sessão, filtro de severidade e ZIP.
+- Nenhuma alteração na política Winner #30, habilitação de ordens, limites, modelo ou janelas de mercado. Produção requer deploy da API antes do frontend.
+
+---
+
 ## 2026-10-16 — v10.8.106: correção HTTP 409 no recovery Live
 
 O endpoint `POST /api/live-market/winner/recover-expired-analysis` chegava ao serviço e retornava `409 An authenticated operator is required.` para sessões administrativas válidas criadas por senha: `SessionManager.create_admin_identity()` fornece `email=None`, mas o serviço exigia `actor_email` para trilha de auditoria. Corrigido no router o identificador da trilha: usar e-mail, quando disponível, senão o `subject` autenticado (`trader-admin` no login por senha). Testes cobrem ambos os casos. **Não removemos o requisito de sessão administrativa**, tampouco autorização de corretora, verificação de pregão, janela, estado ou proteção contra ordens. O recovery continua exclusivamente `analysis_only_requested` e termina em `analysis_only_completed`, sem autorizar negociação real.

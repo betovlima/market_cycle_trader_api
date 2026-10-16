@@ -7,6 +7,7 @@ states fail closed instead of silently borrowing Paper state.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from pymongo import ReturnDocument
@@ -25,6 +26,7 @@ from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings, get_system_settings
 from .strategy_lab import get_trader_winner_context, get_trader_winner_model_snapshot
 from .live_winner_session import LIVE_RUNS
+from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
 
@@ -94,6 +96,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if not claimed:
         raise RuntimeError("Live preparation was already claimed.")
 
+    started = monotonic()
+    stage = "download"
+    append_live_event(db, account_id=run["live_account_id"], session=session,
+                      stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
     try:
         cutoff = latest_safe_completed_xnys_session().date().isoformat()
         u77 = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
@@ -105,10 +111,20 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         )
         if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
             raise RuntimeError("Incomplete Alpaca snapshot for Live Winner.")
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_snapshot_downloaded", message="Snapshot do sinal preparado.",
+                          details={"assets": len(snapshot.frames), "duration_seconds": round(monotonic() - started, 2)})
+        stage = "model_training_and_decision"
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_training_started", message="LightGBM: treinamento do sinal iniciado.")
         decision = build_live_model_decision(
             snapshot.frames, strategy, model_family=model["family"],
             current_asset=state["managed_symbol"], holding_sessions=state["holding_sessions"],
         )
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_decision_computed", message="Sinal Winner calculado.",
+                          details={"duration_seconds": round(monotonic() - started, 2)})
+        stage = "decision_validation"
         decision_date = str(decision.decision_date)[:10]
         if decision_date != cutoff:
             raise RuntimeError(f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}")
@@ -121,6 +137,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                   "hold" if target == current else
                   "buy" if current == "CASH" else
                   "sell_to_cash" if target == "CASH" else "rotate")
+        stage = "decision_persistence"
         saved = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": "preparing_signal",
              "winner_configuration_hash": run["winner_configuration_hash"]},
@@ -142,10 +159,19 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         )
         if not saved:
             raise RuntimeError("Live Winner plan changed during preparation.")
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_prepared", message="Sinal Winner registrado.",
+                          details={"target_asset": target, "action": action,
+                                   "duration_seconds": round(monotonic() - started, 2)})
         return {"status": "signal_prepared", "execution_session": session,
                 "decision_date": decision_date, "target_asset": target,
                 "action": saved["action"], "order_submission_enabled": False}
     except Exception as exc:
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_preparation_failed", level="error",
+                          message="Falha no sinal Winner durante: " + stage,
+                          details={"error_type": type(exc).__name__,
+                                   "duration_seconds": round(monotonic() - started, 2)})
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": "preparing_signal"},
             {"$set": {"status": "review_required",

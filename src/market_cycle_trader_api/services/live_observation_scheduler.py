@@ -13,7 +13,8 @@ from ..core.runtime import database
 from .live_control import live_control_status
 from .live_portfolio import live_portfolio_snapshot
 from .strategy_lab import get_trader_winner_summary
-from .live_winner_session import plan_next_live_session
+from .live_winner_session import plan_next_live_session, LIVE_RUNS
+from .live_winner_events import append_live_event
 from .live_winner_signal import prepare_live_cash_winner_signal
 from .live_winner_recalibration import recalibrate_live_cash_winner_signal
 from .live_order_execution import execute_recalibrated_live_winner_session, order_submission_opted_in
@@ -54,6 +55,7 @@ class LiveObservationScheduler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
+        self._last_error_fingerprint: str | None = None
         self._last_observed_at: str | None = None
 
     def start(self) -> None:
@@ -81,25 +83,48 @@ class LiveObservationScheduler:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            db = None
+            armed = None
+            stage = "observation"
             try:
                 db = database()
                 result = observe_live_cycle(db)
                 if result["status"] == "observed":
                     self._last_observed_at = result["recorded_at"]
+                    stage = "session_planning"
                     armed = plan_next_live_session(db)
                     if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
+                        stage = "signal_preparation"
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
                     elif armed.get("status") == "analysis_only_requested" and result["market_open"]:
+                        stage = "late_intraday_analysis"
                         recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                     elif armed.get("status") == "signal_prepared" and result["market_open"]:
+                        stage = "market_open_recalibration"
                         recalibrated = recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                         if recalibrated.get("status") == "recalibrated_no_orders" and order_submission_opted_in():
+                            stage = "order_execution"
                             execute_recalibrated_live_winner_session(db, armed["execution_session"])
                     elif armed.get("status") == "recalibrated_no_orders" and result["market_open"] and order_submission_opted_in():
+                        stage = "order_execution"
                         execute_recalibrated_live_winner_session(db, armed["execution_session"])
                 self._last_error = None
+                self._last_error_fingerprint = None
             except Exception as exc:
+                fingerprint = stage + ":" + type(exc).__name__
+                if db is not None and isinstance(armed, dict) and armed.get("execution_session") and self._last_error_fingerprint != fingerprint:
+                    try:
+                        run = db[LIVE_RUNS].find_one({"execution_session": armed["execution_session"]})
+                        if run and run.get("live_account_id"):
+                            append_live_event(db, account_id=run["live_account_id"],
+                                              session=armed["execution_session"],
+                                              stage="scheduler_failed", level="error",
+                                              message="Falha no scheduler durante: " + stage,
+                                              details={"error_type": type(exc).__name__})
+                    except Exception:
+                        pass  # Scheduler diagnostics must not hide the original failure.
                 self._last_error = type(exc).__name__
+                self._last_error_fingerprint = fingerprint
             self._stop.wait(_POLL_SECONDS)
 
 
