@@ -23,7 +23,9 @@ class LateLiveRecalibrationTests(unittest.TestCase):
             "winner_configuration_hash": "hash",
         }
         db = MagicMock()
-        db["live_winner_session_runs"].find_one.return_value = run
+        collection = MagicMock()
+        db.__getitem__.return_value = collection
+        collection.find_one.return_value = run
         db["live_winner_session_runs"].find_one_and_update.side_effect = [
             {**run, "status": "analysis_only_recalibrating"},
             {**run, "status": "analysis_only_completed", "action": "buy"},
@@ -79,6 +81,7 @@ class LateLiveRecalibrationTests(unittest.TestCase):
 
     def test_analytical_completed_session_is_never_reexecuted(self):
         db = MagicMock()
+        db.__getitem__.return_value = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = {
             "status": "analysis_only_completed", "target_asset": "ADEA"
         }
