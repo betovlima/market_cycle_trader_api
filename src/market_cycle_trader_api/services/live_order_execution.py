@@ -26,6 +26,7 @@ from ..schemas.paper_trading import PaperTradingSettings
 from .live_control import live_control_status
 from .live_trader_state import verified_live_state, confirm_live_fill_state
 from .live_winner_session import LIVE_RUNS
+from .live_execution_window import live_execution_window_deadline
 from .strategy_lab import get_trader_winner_summary
 
 ORDER_LEDGER = "live_winner_broker_orders"
@@ -165,7 +166,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
         raise RuntimeError("Stale Live session.")
     settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
     earliest = expected_open + pd.Timedelta(seconds=settings.market_open_delay_seconds)
-    latest = expected_open + pd.Timedelta(seconds=settings.market_execution_window_seconds)
+    latest, live_window_seconds = live_execution_window_deadline(expected_open, settings)
     if current < earliest:
         return {"status": "waiting_for_open_delay", "order_submission_enabled": False}
     if current > latest:
