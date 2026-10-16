@@ -13,6 +13,7 @@ from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_control import live_control_status
 from .live_order_execution import ORDER_LEDGER, order_submission_opted_in
 from .live_winner_session import LIVE_RUNS
+from .live_winner_events import append_live_event
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -67,6 +68,8 @@ def queue_expired_live_analysis(
     )
     if result.matched_count != 1:
         raise RuntimeError("Live recovery request changed concurrently.")
+    append_live_event(db, account_id=account_id, session=session,
+                      stage="late_analysis_requested", message="Recuperacao somente para analise solicitada.")
     return {
         "status": "analysis_only_requested", "execution_session": session,
         "previous_status": "review_required",
