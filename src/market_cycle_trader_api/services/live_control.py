@@ -1,8 +1,4 @@
-"""Independent Live mode controls; NO brokerage execution in this release.
-
-The modes are *monitoring / future execution policy only*. Any real order
-submission requires a separate reviewed executor and explicit operator opt-in.
-"""
+"""Live Winner operational controls. Start/Pause/Exit only/Stop govern Alpaca Live."""
 from __future__ import annotations
 
 from typing import Any
@@ -44,13 +40,13 @@ def live_control_status(db: Any) -> dict[str, Any]:
     return {
         "control_mode": mode,
         "revision": int(state.get("revision") or 0),
-        "status": "monitoring" if mode in {"active", "exit_only"} else mode,
-        "phase": "live_readonly",
+        "status": mode,
+        "phase": "live_operational" if mode in {"active", "exit_only"} else "live_inactive",
         "enabled": mode in {"active", "exit_only"},
         "monitoring_enabled": mode in {"active", "exit_only"},
-        "execution_enabled": False,
+        "execution_enabled": mode in {"active", "exit_only"},
         "scheduler_alive": False,
-        "order_submission_enabled": False,
+        "order_submission_enabled": mode in {"active", "exit_only"},
         "last_control_update_at": state.get("updated_at"),
         "last_control_updated_by": state.get("updated_by"),
         "last_control_reason": state.get("reason"),
@@ -97,7 +93,7 @@ def set_live_control_mode(
         "new_mode": mode,
         "revision": int(latest["revision"]),
         "reason": reason[:500],
-        "execution_enabled": False,
+        "execution_enabled": mode in {"active", "exit_only"},
         "market": "live",
     })
     return live_control_status(db)
