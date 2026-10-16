@@ -1,3 +1,13 @@
+## 2026-10-16 — API v10.8.105: recuperação não executável de sessão expirada
+
+**Causa verificada no código:** a recalibração de abertura recusa sessões após `expected_market_open + market_execution_window_seconds` e grava `review_required / execution_window_expired`. Nenhuma compra foi submetida na sessão 2026-10-16, e a implantação permaneceu sem opt-in de ordens reais. A duração concreta do treinamento e os ajustes de janela no MongoDB ainda não foram medidos; não afirmar que treinamento demorado foi a causa comprovada.
+
+**Nova branch:** `feature/live-expired-session-safe-recovery-v10.8.105`. Adiciona `POST /api/live-market/winner/recover-expired-analysis` (admin, confirmação literal `LIVE_ANALYSIS_ONLY_NO_ORDERS`) para reiniciar apenas uma análise intraday da sessão corrente que esteja em `review_required/execution_window_expired`. Exige mercado aberto, controle active, conta Live correta, opt-in de ordens reais DESLIGADO, ausência de intents no ledger e de ordens abertas na corretora. A tarefa fica enfileirada em `analysis_only_requested`, processada pelo observador, e termina exclusivamente em `analysis_only_completed / missed_window_analysis_only_no_orders` (ou falha fechada). **Nunca transita para `recalibrated_no_orders` ou `executing`; nunca reenvia a compra ADEA de ontem nem modifica o Paper.** Ranking segue visível na auditoria Live se houver decisão nova.
+
+**Pendências que impedem habilitar compra Live:** validar tempo de recalibração vs janela operacional, teste integrado com broker/ordens parciais e reconciliação de ordens, autorização de operação real e deploy verificado. O endpoint de recuperação NÃO implementa nem autoriza replay tardio de compras. Não ativar `ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM` com o circuito ainda não certificado.
+
+---
+
 ## 2026-10-15 — API v10.8.104: Candidates presented today no Trader Live
 
 Branch `feature/live-winner-candidates-v10.8.104`: após sinal pós-fechamento e recalibração na abertura, persistir as utilidades reais e metadados da decisão `build_live_model_decision` no documento `live_winner_session_runs` (sem alterar alocação/ordens). O endpoint `GET /api/live-market/portfolio` passa a preencher `audit.latest_decision` e `candidates`, filtrado pelo `live_account_id`, reutilizando exclusivamente o formatador puro do ranking Paper (nunca seu estado). A tela Portfolio → Live → Candidates presented today já renderiza o campo. Ranking é de ativos negociáveis; CASH entra na referência de utilidade, mas não na tabela. Decisões históricas anteriores sem utilidades armazenadas não são reconstruídas/inventadas. Treinamento já iniciado antes do deploy também não terá ranking retroativo. Não alterar autorização de ordens reais.
