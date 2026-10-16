@@ -23,7 +23,7 @@ def live_execution_window_seconds(settings: Any) -> int:
         value = int(raw)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("ALPACA_LIVE_EXECUTION_WINDOW_SECONDS must be an integer.") from exc
-    delay = int(settings.market_open_delay_seconds)
+    delay = int(getattr(settings, "market_open_delay_seconds", 0))
     if not _MIN_LIVE_WINDOW_SECONDS <= value <= _MAX_LIVE_WINDOW_SECONDS:
         raise RuntimeError("ALPACA_LIVE_EXECUTION_WINDOW_SECONDS must be 60..7200.")
     if value <= delay:
