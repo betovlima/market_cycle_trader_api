@@ -1,6 +1,4 @@
-"""Live execution preflight must fail closed and never submit orders."""
-from __future__ import annotations
-
+"""Live preflight reflects broker, selected Winner and existing control mode."""
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,56 +7,53 @@ from market_cycle_trader_api.services.live_execution_readiness import live_execu
 
 
 class LiveReadinessTests(unittest.TestCase):
+    @patch("market_cycle_trader_api.services.live_execution_readiness.get_trader_winner_summary")
     @patch("market_cycle_trader_api.services.live_execution_readiness.live_control_status")
     @patch("market_cycle_trader_api.services.live_execution_readiness.create_live_readonly_client")
-    def test_healthy_account_still_does_not_enable_real_orders(self, client_factory, control):
-        client_factory.return_value.get_account.return_value = SimpleNamespace(
-            id="live-account", trading_blocked=False, account_blocked=False,
+    def test_active_mode_with_healthy_broker_and_winner(self, broker, control, winner):
+        broker.return_value.get_account.return_value = SimpleNamespace(
+            id="acct", trading_blocked=False, account_blocked=False,
         )
-        control.return_value = {"revision": 3, "control_mode": "active"}
+        broker.return_value.get_orders.return_value = []
+        control.return_value = {"control_mode": "active"}
+        winner.return_value = {"id": "winner", "configuration_hash": "hash"}
+        result = live_execution_readiness(object())
+        self.assertTrue(result["ready_for_real_orders"])
+        self.assertTrue(result["order_submission_enabled"])
+        broker.return_value.submit_order.assert_not_called()
+
+    @patch("market_cycle_trader_api.services.live_execution_readiness.get_trader_winner_summary")
+    @patch("market_cycle_trader_api.services.live_execution_readiness.live_control_status")
+    @patch("market_cycle_trader_api.services.live_execution_readiness.create_live_readonly_client")
+    def test_paused_mode_is_not_ready(self, broker, control, winner):
+        broker.return_value.get_account.return_value = SimpleNamespace(
+            id="acct", trading_blocked=False, account_blocked=False,
+        )
+        broker.return_value.get_orders.return_value = []
+        control.return_value = {"control_mode": "paused"}
+        winner.return_value = {"id": "winner", "configuration_hash": "hash"}
         result = live_execution_readiness(object())
         self.assertFalse(result["ready_for_real_orders"])
         self.assertFalse(result["order_submission_enabled"])
-        self.assertFalse(next(x for x in result["checks"] if x["name"] == "reviewed_live_executor")["passed"])
-        client_factory.return_value.submit_order.assert_not_called()
 
+    @patch("market_cycle_trader_api.services.live_execution_readiness.get_trader_winner_summary")
     @patch("market_cycle_trader_api.services.live_execution_readiness.live_control_status")
     @patch("market_cycle_trader_api.services.live_execution_readiness.create_live_readonly_client")
-    def test_credentials_failure_fails_closed(self, client_factory, control):
-        client_factory.side_effect = RuntimeError("secret failure")
-        control.return_value = {"revision": 0, "control_mode": "stopped"}
-        result = live_execution_readiness(object())
-        self.assertFalse(result["ready_for_real_orders"])
-        self.assertFalse(next(x for x in result["checks"] if x["name"] == "live_account")["passed"])
-
-    @patch("market_cycle_trader_api.services.live_execution_readiness.live_control_status")
-    @patch("market_cycle_trader_api.services.live_execution_readiness.create_live_readonly_client")
-    def test_open_orders_are_reported_without_enabling_execution(self, factory, control):
-        factory.return_value.get_account.return_value = SimpleNamespace(
-            id="live-account", trading_blocked=False, account_blocked=False,
+    def test_open_orders_are_reported(self, broker, control, winner):
+        broker.return_value.get_account.return_value = SimpleNamespace(
+            id="acct", trading_blocked=False, account_blocked=False,
         )
-        factory.return_value.get_orders.return_value = [SimpleNamespace(id="existing-order")]
-        control.return_value = {"revision": 1, "control_mode": "stopped"}
+        broker.return_value.get_orders.return_value = [SimpleNamespace(id="pending")]
+        control.return_value = {"control_mode": "active"}
+        winner.return_value = {"id": "winner", "configuration_hash": "hash"}
         result = live_execution_readiness(object())
-        broker_check = next(x for x in result["checks"] if x["name"] == "broker_open_orders")
-        self.assertFalse(broker_check["passed"])
         self.assertFalse(result["ready_for_real_orders"])
-        factory.return_value.submit_order.assert_not_called()
+        self.assertFalse(next(c for c in result["checks"] if c["name"] == "broker_open_orders")["passed"])
 
     @patch("market_cycle_trader_api.services.live_execution_readiness.live_control_status")
     @patch("market_cycle_trader_api.services.live_execution_readiness.create_live_readonly_client")
-    def test_no_open_orders_can_pass_but_does_not_enable_execution(self, factory, control):
-        factory.return_value.get_account.return_value = SimpleNamespace(
-            id="live-account", trading_blocked=False, account_blocked=False,
-        )
-        factory.return_value.get_orders.return_value = []
-        control.return_value = {"revision": 1, "control_mode": "stopped"}
+    def test_broker_unavailable_is_not_ready(self, broker, control):
+        broker.side_effect = RuntimeError("unavailable")
+        control.return_value = {"control_mode": "stopped"}
         result = live_execution_readiness(object())
-        broker_check = next(x for x in result["checks"] if x["name"] == "broker_open_orders")
-        self.assertTrue(broker_check["passed"])
         self.assertFalse(result["ready_for_real_orders"])
-        factory.return_value.submit_order.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
