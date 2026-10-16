@@ -1,3 +1,11 @@
+## 2026-10-16 — v10.8.106: correção HTTP 409 no recovery Live
+
+O endpoint `POST /api/live-market/winner/recover-expired-analysis` chegava ao serviço e retornava `409 An authenticated operator is required.` para sessões administrativas válidas criadas por senha: `SessionManager.create_admin_identity()` fornece `email=None`, mas o serviço exigia `actor_email` para trilha de auditoria. Corrigido no router o identificador da trilha: usar e-mail, quando disponível, senão o `subject` autenticado (`trader-admin` no login por senha). Testes cobrem ambos os casos. **Não removemos o requisito de sessão administrativa**, tampouco autorização de corretora, verificação de pregão, janela, estado ou proteção contra ordens. O recovery continua exclusivamente `analysis_only_requested` e termina em `analysis_only_completed`, sem autorizar negociação real.
+
+Branch `fix/live-recovery-admin-identity-v10.8.106`. CI obrigatório antes de merge.
+
+---
+
 ## 2026-10-16 — API v10.8.105: recuperação não executável de sessão expirada
 
 **Causa verificada no código:** a recalibração de abertura recusa sessões após `expected_market_open + market_execution_window_seconds` e grava `review_required / execution_window_expired`. Nenhuma compra foi submetida na sessão 2026-10-16, e a implantação permaneceu sem opt-in de ordens reais. A duração concreta do treinamento e os ajustes de janela no MongoDB ainda não foram medidos; não afirmar que treinamento demorado foi a causa comprovada.
