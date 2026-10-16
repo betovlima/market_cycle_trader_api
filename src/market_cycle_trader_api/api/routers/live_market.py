@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from ...auth.security import SessionIdentity, require_admin_session
@@ -14,6 +14,7 @@ from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_expired_recovery import queue_expired_live_analysis
+from ...services.live_winner_events import list_live_events, export_live_events
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -85,6 +86,38 @@ def recover_expired_live_analysis(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.get("/winner/events")
+def winner_live_events(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+    execution_session: str | None = Query(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$"),
+    level: Literal["all", "info", "warning", "error"] = "all",
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    """Sanitized, account-scoped lifecycle events; never brokers orders."""
+    try:
+        return list_live_events(database(), session=execution_session, level=level, limit=limit)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@router.get("/winner/events/export.zip")
+def export_winner_live_events(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+    execution_session: str | None = Query(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$"),
+) -> Response:
+    """Download sanitized Winner Live diagnostics for the selected session."""
+    try:
+        payload = export_live_events(database(), session=execution_session)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="mct_live_winner_logs_{timestamp}.zip"'},
+    )
 
 
 @router.post("/winner/preflight")
