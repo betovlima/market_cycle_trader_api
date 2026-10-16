@@ -69,6 +69,9 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     if now > latest and not analysis_only:
         db[LIVE_RUNS].update_one({"_id": run["_id"], "status": "signal_prepared"},
                                 {"$set": {"status": "review_required", "phase": "execution_window_expired",
+                                          "window_deadline_at": latest.to_pydatetime(),
+                                          "window_expired_at": now.to_pydatetime(),
+                                          "window_seconds": int(settings.market_execution_window_seconds),
                                           "order_submission_enabled": False}})
         raise RuntimeError("Live open recalibration window expired.")
     state = verified_live_state(db, broker, session=session)
@@ -102,10 +105,12 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         assert_tcc_u67_operational_contract(strategy)
     assert_tcc_u67_model_snapshot(model)
     recalibrating_status = "analysis_only_recalibrating" if analysis_only else "recalibrating"
+    recalibration_started_at = datetime.now(timezone.utc)
     claimed = db[LIVE_RUNS].find_one_and_update(
         {"_id": run["_id"], "status": run["status"]},
         {"$set": {"status": recalibrating_status,
                   "phase": "late_intraday_analysis" if analysis_only else "market_open_recalibration",
+                  "calibration_started_at": recalibration_started_at,
                   "order_submission_enabled": False}},
         return_document=ReturnDocument.AFTER,
     )
@@ -154,6 +159,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "current_quantity": state["managed_quantity"],
                 "live_state_revision": state["revision"],
                 "market_open_calibration_completed_at": datetime.now(timezone.utc),
+                "calibration_duration_seconds": (datetime.now(timezone.utc) - recalibration_started_at).total_seconds(),
                 "current_session_feed": metadata.get("live_feed"),
                 "current_session_market_data_cutoff_utc": metadata.get("intraday_market_data_cutoff_utc"),
                 "winner_signal_prepared": True,
