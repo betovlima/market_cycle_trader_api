@@ -65,7 +65,7 @@ def update_robot_mode(
 
 
 class LiveExpiredAnalysisRequest(BaseModel):
-    execution_session: str = Field(pattern=r"^\\d{4}-\\d{2}-\\d{2}$")
+    execution_session: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     confirm: Literal["LIVE_ANALYSIS_ONLY_NO_ORDERS"]
 
 
