@@ -113,5 +113,10 @@ def latest_live_session(db: Any) -> dict[str, Any] | None:
         "decision_date": doc.get("decision_date"),
         "action": doc.get("action"),
         "target_asset": doc.get("target_asset"),
+        "calibration_duration_seconds": doc.get("calibration_duration_seconds"),
+        "window_seconds": doc.get("window_seconds"),
+        "window_deadline_at": doc["window_deadline_at"].isoformat() if hasattr(doc.get("window_deadline_at"), "isoformat") else None,
+        "window_expired_at": doc["window_expired_at"].isoformat() if hasattr(doc.get("window_expired_at"), "isoformat") else None,
+        "last_calibration_error_type": doc.get("last_calibration_error_type"),
         "order_submission_enabled": False,
     }
