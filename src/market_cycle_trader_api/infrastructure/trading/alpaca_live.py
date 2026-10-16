@@ -1,4 +1,4 @@
-"""Live Alpaca read-only integration. Never exposes order submission.
+"""Dedicated Alpaca Live connection for observations and Winner execution.
 
 Keep trading credentials, broker account and storage independent of Alpaca Paper.
 """
@@ -43,7 +43,5 @@ def create_live_readonly_client() -> Any:
 
 
 def create_live_execution_client() -> Any:
-    """Explicitly authorized real-money client. Default deployments cannot use it."""
-    if str(os.getenv("ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM") or "") != "I_ACKNOWLEDGE_LIVE_REAL_MONEY_ORDERS":
-        raise RuntimeError("Alpaca Live order submission is not explicitly authorized.")
+    """Live Alpaca trading client, isolated from Paper credentials and account."""
     return create_live_readonly_client()
