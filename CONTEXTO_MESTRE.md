@@ -1,3 +1,15 @@
+## 2026-10-16 — v10.8.108: corrigir janela do robô Winner Live e execução manual
+
+- A sessão 2026-10-16 concluiu `analysis_only_completed` e selecionou AVGO, sem ordem na Alpaca Live. Não autorizar reexecução retroativa nem alterar o registro histórico.
+- Causa de falha de prazo: recalibração LightGBM durou ~218 s, enquanto o executor e o recalibrador herdavam a janela `market_execution_window_seconds` dos parâmetros Paper. A janela pode ser menor que o tempo necessário para calcular a decisão.
+- Nova janela **independente e uniforme** para o Live, em `services/live_execution_window.py`, padrão 1.800 s e variável `ALPACA_LIVE_EXECUTION_WINDOW_SECONDS` (60..7200, maior que `market_open_delay_seconds`). O recalibrador e o executor utilizam a mesma função; não modifica o Paper nem os parâmetros da estratégia.
+- Nova rota administrativa `POST /api/live-market/winner/execute-current-plan`: confirma `execution_session`, `expected_target_asset`, `expected_winner_configuration_hash`, `confirm=EXECUTE_WINNER_LIVE_REAL_ORDER`, e chama o **executor Live existente**. Exige status `recalibrated_no_orders` e preserva as validações internas de sessão atual, identidade, corretora, ordens abertas, posições, idempotência, montante e autorização de envio. Não transforma `analysis_only_completed` em plano executável.
+- Front correspondente v10.7.29 exibe botão para execução manual explícita em **Trader operation · Live**. O scheduler Live continua encarregado da execução automática quando o servidor estiver previamente autorizado.
+- A autorização explícita de ordens de dinheiro real (`ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM`) continua desabilitada por padrão e depende da configuração do operador. O código do MCT não envia ordens ao corretor por conta da implantação de uma nova versão.
+- Testes unitários para janela, rejeição de sinal antigo e confirmação de plano, e execução real mockada; não simulam integralmente a corretora de produção. Confirmar deploy do Railway após merge, em ordem API → frontend.
+
+---
+
 ## 2026-10-16 — API v10.8.107: diagnóstico persistente da Winner Live
 
 - Adicionada coleção MongoDB `live_winner_process_events` com eventos limitados por conta Alpaca Live e `execution_session`: início, download de snapshot, preparação intraday, treinamento/decisão LightGBM, persistência, conclusão e falhas com tipo e etapa; falhas de persistência dos logs não interrompem o ciclo Winner.
