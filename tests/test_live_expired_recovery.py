@@ -73,3 +73,42 @@ class ExpiredLiveRecoveryTests(unittest.TestCase):
     def test_paused_mode_recovery_is_blocked(self):
         with self.assertRaisesRegex(RuntimeError, "must be active"):
             self._call(mode="paused")
+
+
+class LiveRecoveryRouteIdentityTests(unittest.TestCase):
+    def test_password_admin_without_email_uses_authenticated_subject(self):
+        from market_cycle_trader_api.api.routers.live_market import (
+            LiveExpiredAnalysisRequest,
+            recover_expired_live_analysis,
+        )
+        identity = SimpleNamespace(email=None, subject="trader-admin")
+        payload = LiveExpiredAnalysisRequest(
+            execution_session="2026-10-16",
+            confirm="LIVE_ANALYSIS_ONLY_NO_ORDERS",
+        )
+        with patch("market_cycle_trader_api.api.routers.live_market.database") as db, \
+             patch("market_cycle_trader_api.api.routers.live_market.queue_expired_live_analysis") as recover:
+            recover.return_value = {"status": "analysis_only_requested"}
+            response = recover_expired_live_analysis(payload, identity)
+            self.assertEqual(response["status"], "analysis_only_requested")
+            recover.assert_called_once_with(
+                db.return_value,
+                execution_session="2026-10-16",
+                actor_email="trader-admin",
+            )
+
+    def test_email_is_used_if_available(self):
+        from market_cycle_trader_api.api.routers.live_market import (
+            LiveExpiredAnalysisRequest,
+            recover_expired_live_analysis,
+        )
+        identity = SimpleNamespace(email="operator@example.com", subject="google:1234")
+        payload = LiveExpiredAnalysisRequest(
+            execution_session="2026-10-16",
+            confirm="LIVE_ANALYSIS_ONLY_NO_ORDERS",
+        )
+        with patch("market_cycle_trader_api.api.routers.live_market.database"), \
+             patch("market_cycle_trader_api.api.routers.live_market.queue_expired_live_analysis") as recover:
+            recover.return_value = {"status": "analysis_only_requested"}
+            recover_expired_live_analysis(payload, identity)
+            self.assertEqual(recover.call_args.kwargs["actor_email"], "operator@example.com")
