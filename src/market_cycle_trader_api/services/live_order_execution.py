@@ -1,7 +1,6 @@
 """Fail-closed Live order executor for independently recalibrated Winner sessions.
 
-All real submission requires an explicit deployment-level opt-in plus active
-Live mode. It cannot use a Paper account or Paper order/state collections.
+Real submissions follow the existing Live Start/Pause/Stop operating mode. It cannot use a Paper account or Paper order/state collections.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from ..infrastructure.trading.alpaca_live import create_live_execution_client
-from ..infrastructure.trading.alpaca_paper import (
+from ..infrastructure.trading.alpaca_live_orders import (
     asset_snapshot, submit_market_buy_notional, submit_market_sell,
     wait_for_order,
 )
@@ -31,14 +30,6 @@ from .strategy_lab import get_trader_winner_summary
 
 ORDER_LEDGER = "live_winner_broker_orders"
 EASTERN = ZoneInfo("America/New_York")
-_ORDER_OPT_IN = "I_ACKNOWLEDGE_LIVE_REAL_MONEY_ORDERS"
-
-
-def order_submission_opted_in() -> bool:
-    """The deployment must explicitly acknowledge use of REAL money."""
-    return str(os.getenv("ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM") or "") == _ORDER_OPT_IN
-
-
 def _number_env(name: str, default: float, *, floor: float, ceiling: float) -> float:
     try:
         value = float(os.getenv(name, str(default)))
@@ -123,8 +114,6 @@ def _execute_leg(
 
 def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str, Any]:
     """Execute once if explicitly enabled and broker state fully reconciled."""
-    if not order_submission_opted_in():
-        return {"status": "order_submission_disabled", "order_submission_enabled": False}
     control = live_control_status(db)
     if control["control_mode"] not in {"active", "exit_only"}:
         return {"status": "blocked_by_live_mode", "order_submission_enabled": False}

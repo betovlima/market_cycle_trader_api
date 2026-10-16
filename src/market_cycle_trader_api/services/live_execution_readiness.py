@@ -1,59 +1,60 @@
-"""Preflight for future Live execution. Never sends broker orders."""
+"""Informational Alpaca Live readiness checks; no additional activation switches."""
 from __future__ import annotations
 
 from typing import Any
 
-from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
+
+from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_control import live_control_status
-from .live_order_execution import order_submission_opted_in
+from .strategy_lab import get_trader_winner_summary
 
 
 def live_execution_readiness(db: Any) -> dict[str, Any]:
-    """Fail-closed report; a passing account check never enables trading."""
+    """Describe actual Live broker/strategy prerequisites, without hardcoded failures."""
     checks: list[dict[str, Any]] = []
+
     def add(name: str, passed: bool, detail: str) -> None:
-        checks.append({"name": name, "passed": passed, "detail": detail})
+        checks.append({"name": name, "passed": bool(passed), "detail": detail})
 
-    client = None
+    broker = None
     try:
-        client = create_live_readonly_client()
-        account = client.get_account()
+        broker = create_live_readonly_client()
+        account = broker.get_account()
         account_id = str(getattr(account, "id", "") or "").strip()
-        add("live_account", bool(account_id), "Dedicated Live credentials and account identity verified." if account_id else "Live account ID missing.")
-        trading_blocked = bool(getattr(account, "trading_blocked", True))
-        account_blocked = bool(getattr(account, "account_blocked", True))
-        add("broker_restrictions", not trading_blocked and not account_blocked, "Account reports restrictions." if trading_blocked or account_blocked else "No account-level trading block reported.")
+        add("live_account", bool(account_id), "Live broker account verified." if account_id else "Account ID unavailable.")
+        blocked = bool(getattr(account, "trading_blocked", True)) or bool(getattr(account, "account_blocked", True))
+        add("broker_restrictions", not blocked, "No trading restriction." if not blocked else "Broker restricted.")
     except Exception as exc:
-        add("live_account", False, f"Read-only Live account check failed: {type(exc).__name__}.")
-        add("broker_restrictions", False, "Cannot verify account trading restrictions.")
+        add("live_account", False, f"Broker connection failed: {type(exc).__name__}.")
+        add("broker_restrictions", False, "Cannot verify broker restrictions.")
 
-    status = live_control_status(db)
-    add("separate_live_control", isinstance(status.get("revision"), int), "Dedicated Live control state found.")
+    control = live_control_status(db)
+    mode = str(control.get("control_mode") or "stopped")
+    add("live_control", mode in {"active", "exit_only"}, f"Operating mode: {mode}.")
+
     try:
-        if client is None:
-            raise RuntimeError("Live account unavailable.")
-        open_orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100))
-        add("broker_open_orders", len(open_orders) == 0,
-            "No open broker orders returned in queried window." if not open_orders else
-            f"{len(open_orders)} open broker orders require reconciliation.")
+        if broker is None:
+            raise RuntimeError("Live broker unavailable.")
+        orders = broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100))
+        add("broker_open_orders", not orders, "No open Live order." if not orders else "Open orders must be reconciled.")
     except Exception:
-        add("broker_open_orders", False, "Cannot establish broker open-order status.")
-    # The separate operator opt-in must be reported truthfully, even before
-    # the production executor has been certified by an end-to-end dry-run.
-    authorized = order_submission_opted_in()
-    # Deliberately fail closed until end-to-end validation and reconciliation are reviewed.
-    add("reviewed_live_executor", False, "Execution code exists but has not completed a production-like end-to-end review.")
-    add("order_idempotency", False, "Unique order ledger exists; complete broker recovery verification is still pending.")
-    add("risk_limits", False, "Risk checks exist but still require broker-level scenario validation.")
-    add("plan_validation", False, "Winner signals are generated; end-to-end session parity is not yet certified.")
-    add("operator_activation", authorized, "Explicit server opt-in configured." if authorized else "Real-order server opt-in is disabled.")
+        add("broker_open_orders", False, "Cannot reconcile broker open orders.")
+
+    try:
+        winner = get_trader_winner_summary(db)
+        selected = isinstance(winner, dict) and bool(winner.get("id")) and bool(winner.get("configuration_hash"))
+        add("winner_selected", selected, "Winner identity available." if selected else "Winner selection unavailable.")
+    except Exception:
+        add("winner_selected", False, "Cannot read Winner selection.")
+
+    ready = all(item["passed"] for item in checks)
     return {
         "market": "live",
-        "ready_for_real_orders": False,
-        "order_submission_enabled": authorized and status["control_mode"] in {"active", "exit_only"},
-        "control_mode": status["control_mode"],
+        "ready_for_real_orders": ready,
+        "order_submission_enabled": mode in {"active", "exit_only"},
+        "control_mode": mode,
         "checks": checks,
-        "message": ("WARNING: Live real-money order authorization is set before full certification." if authorized else "Live real-order submission is disabled by default. Winner monitoring and signals are read-only."),
+        "message": "Live follows the existing operating mode. Each order independently validates session, Winner, broker positions and idempotency.",
     }

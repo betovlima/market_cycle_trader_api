@@ -171,16 +171,14 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
 def live_robot_status(db: Any) -> dict[str, Any]:
     """Independent Live Winner cycle and current real-order authorization."""
     from .live_observation_scheduler import live_observation_status
-    from .live_order_execution import order_submission_opted_in
     observation = live_observation_status()
     run = latest_live_session(db)
     control = live_control_status(db)
-    opted_in = order_submission_opted_in()
-    execution_active = opted_in and control["control_mode"] in {"active", "exit_only"}
+    execution_active = control["control_mode"] in {"active", "exit_only"}
     return {
         **control,
-        "mode": "live_operational" if opted_in else "live_readonly",
-        "real_orders_armed": opted_in,
+        "mode": "live_operational" if execution_active else "live_inactive",
+        "real_orders_armed": execution_active,
         "execution_enabled": execution_active,
         "order_submission_enabled": execution_active,
         "phase": run.get("phase") if run else control.get("phase"),

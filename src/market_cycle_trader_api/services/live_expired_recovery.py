@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_control import live_control_status
-from .live_order_execution import ORDER_LEDGER, order_submission_opted_in
+from .live_order_execution import ORDER_LEDGER
 from .live_winner_session import LIVE_RUNS
 from .live_winner_events import append_live_event
 
@@ -24,8 +24,6 @@ def queue_expired_live_analysis(
     """Queue one *non-executable* recalibration of today's expired Live session."""
     if not actor_email:
         raise RuntimeError("An authenticated operator is required.")
-    if order_submission_opted_in():
-        raise RuntimeError("Disable Live real-order authorization before recovering a missed session.")
     if live_control_status(db)["control_mode"] != "active":
         raise RuntimeError("Live Trader must be active for an analysis-only recovery.")
 

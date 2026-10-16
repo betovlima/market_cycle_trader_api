@@ -26,7 +26,6 @@ from .live_winner_session import LIVE_RUNS
 from .live_execution_window import live_execution_window_deadline
 from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
-from .live_order_execution import order_submission_opted_in
 from .live_trader_state import verified_live_state
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings
@@ -50,8 +49,6 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     analysis_only = run["status"] == "analysis_only_requested"
     if run["status"] not in {"signal_prepared", "analysis_only_requested"}:
         raise RuntimeError("Live signal is not ready for market-open recalibration.")
-    if analysis_only and order_submission_opted_in():
-        raise RuntimeError("Real-order authorization must be off for late analysis.")
     broker = create_live_readonly_client()
     account = broker.get_account()
     if str(getattr(account, "id", "") or "") != run["live_account_id"]:
