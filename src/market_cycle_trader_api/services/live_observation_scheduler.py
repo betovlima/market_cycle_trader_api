@@ -88,6 +88,8 @@ class LiveObservationScheduler:
                     armed = plan_next_live_session(db)
                     if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
+                    elif armed.get("status") == "analysis_only_requested" and result["market_open"]:
+                        recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                     elif armed.get("status") == "signal_prepared" and result["market_open"]:
                         recalibrated = recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                         if recalibrated.get("status") == "recalibrated_no_orders" and order_submission_opted_in():
