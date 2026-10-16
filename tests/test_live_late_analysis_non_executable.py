@@ -45,7 +45,6 @@ class LateLiveRecalibrationTests(unittest.TestCase):
         prefix = "market_cycle_trader_api.services.live_winner_recalibration."
         with ExitStack() as stack:
             patches = {
-                "order_submission_opted_in": False,
                 "create_live_readonly_client": broker,
                 "verified_live_state": {
                     "managed_symbol": "CASH", "managed_quantity": 0.0, "revision": 0,
