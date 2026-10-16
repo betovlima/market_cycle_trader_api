@@ -16,7 +16,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from ..infrastructure.trading.alpaca_live import create_live_execution_client
-from ..infrastructure.trading.alpaca_paper import (
+from ..infrastructure.trading.alpaca_live_orders import (
     asset_snapshot, submit_market_buy_notional, submit_market_sell,
     wait_for_order,
 )
