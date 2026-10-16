@@ -43,7 +43,5 @@ def create_live_readonly_client() -> Any:
 
 
 def create_live_execution_client() -> Any:
-    """Explicitly authorized real-money client. Default deployments cannot use it."""
-    if str(os.getenv("ALPACA_LIVE_ORDER_SUBMISSION_CONFIRM") or "") != "I_ACKNOWLEDGE_LIVE_REAL_MONEY_ORDERS":
-        raise RuntimeError("Alpaca Live order submission is not explicitly authorized.")
+    """Dedicated Live trading client. Operational policy is checked in the executor."""
     return create_live_readonly_client()
