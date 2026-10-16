@@ -55,6 +55,7 @@ class LiveObservationScheduler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
+        self._last_error_fingerprint: str | None = None
         self._last_observed_at: str | None = None
 
     def start(self) -> None:
@@ -103,14 +104,15 @@ class LiveObservationScheduler:
                         recalibrated = recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                         if recalibrated.get("status") == "recalibrated_no_orders" and order_submission_opted_in():
                             stage = "order_execution"
-                            stage = "order_execution"
-                        execute_recalibrated_live_winner_session(db, armed["execution_session"])
+                            execute_recalibrated_live_winner_session(db, armed["execution_session"])
                     elif armed.get("status") == "recalibrated_no_orders" and result["market_open"] and order_submission_opted_in():
+                        stage = "order_execution"
                         execute_recalibrated_live_winner_session(db, armed["execution_session"])
                 self._last_error = None
+                self._last_error_fingerprint = None
             except Exception as exc:
                 fingerprint = stage + ":" + type(exc).__name__
-                if db is not None and isinstance(armed, dict) and armed.get("execution_session") and self._last_error != fingerprint:
+                if db is not None and isinstance(armed, dict) and armed.get("execution_session") and self._last_error_fingerprint != fingerprint:
                     try:
                         run = db[LIVE_RUNS].find_one({"execution_session": armed["execution_session"]})
                         if run and run.get("live_account_id"):
@@ -121,7 +123,8 @@ class LiveObservationScheduler:
                                               details={"error_type": type(exc).__name__})
                     except Exception:
                         pass  # Scheduler diagnostics must not hide the original failure.
-                self._last_error = fingerprint
+                self._last_error = type(exc).__name__
+                self._last_error_fingerprint = fingerprint
             self._stop.wait(_POLL_SECONDS)
 
 
