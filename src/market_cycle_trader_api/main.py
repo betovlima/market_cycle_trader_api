@@ -24,6 +24,7 @@ from .api.routers import (
     health,
     jobs,
     live_market,
+    live_execution,
     model_research,
     model_tuning,
     paper_market,
@@ -148,6 +149,7 @@ def create_app() -> FastAPI:
     application.include_router(asset_discovery.router)
     application.include_router(paper_market.router, dependencies=admin_required)
     application.include_router(live_market.router, dependencies=admin_required)
+    application.include_router(live_execution.router, dependencies=admin_required)
     application.include_router(public_paper_portfolio.router, dependencies=portfolio_required)
     application.include_router(admin_rotations.router, dependencies=admin_required)
     application.include_router(admin_trader.router, dependencies=admin_required)
