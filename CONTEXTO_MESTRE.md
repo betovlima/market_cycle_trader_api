@@ -1,3 +1,17 @@
+## 2026-10-16 — API v10.8.109 / Front v10.7.30 — API exclusiva Alpaca Live
+
+**Objetivo.** Alinhar o controle operacional do Winner Live ao Trader Start / Pause / Exit only / Stop existente, sem um token de autorização adicional exigido pelo deployment e sem enviar ordens via rotas Paper.
+
+**Mudanças.** A API `POST /api/live-execution/winner/execute` identifica a conta Live, verifica o pregão atual e recupera o plano da sessão na coleção `live_winner_session_runs`. Não aceita ticker, quantidade nem valor de ordem do cliente. Reutiliza `execute_recalibrated_live_winner_session`, que verifica a Winner selecionada, conta, posição, ordens abertas, horário, idempotência e limites existentes. O envio à corretora agora usa `infrastructure/trading/alpaca_live_orders.py` em vez de importar os auxiliares do módulo Paper. O scheduler Live usa `control_mode` para decidir se executa automaticamente. O relatório de prontidão deixa de apresentar verificações artificialmente falsas. A tela Trader · Live chama só a API própria, com confirmação explícita do usuário.
+
+**Operação.** `active`: entradas, saídas e rotações conforme Winner; `exit_only`: somente ações permitidas de redução; `paused`/`stopped`: não envia. A operação ainda depende de plano válido da sessão, mercado aberto, corretora reconciliada e limite de risco. A operação histórica de 2026-10-16 (`analysis_only_completed`) permanece não executável. Nenhuma ordem real é enviada pelos testes de CI.
+
+**Compatibilidade.** Não modificar a implementação, as rotas ou os dados Paper. Reutiliza os parâmetros existentes de negociação para o tempo de espera/caixa; a janela Live tem mínimo de 1.800 s, sem nova variável de ambiente. Permanece distinta a identidade da conta e coleção de ordens Live.
+
+**Testes esperados.** Compilação e `python -m unittest discover -s tests -p 'test_*.py' -v` na API; `frontend-build` no frontend. Validar integração/estado do Railway e `GET /api/live-market/robot/status` após os merges. O commit não atesta execução real na Alpaca.
+
+---
+
 ## 2026-10-16 — v10.8.108: corrigir janela do robô Winner Live e execução manual
 
 - A sessão 2026-10-16 concluiu `analysis_only_completed` e selecionou AVGO, sem ordem na Alpaca Live. Não autorizar reexecução retroativa nem alterar o registro histórico.
