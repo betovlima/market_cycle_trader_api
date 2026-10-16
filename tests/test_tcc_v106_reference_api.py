@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -27,7 +28,10 @@ EXPECTED_GIT_BLOBS = {
 
 
 def _git_blob_sha(path: Path) -> str:
-    payload = path.read_bytes()
+    # Git's Windows checkout can convert LF to CRLF without changing the
+    # committed vendored engine. Compare against the canonical LF Git blob;
+    # all other byte changes must still fail this integrity guard.
+    payload = path.read_bytes().replace(b"\r\n", b"\n")
     header = f"blob {len(payload)}\0".encode("ascii")
     return hashlib.sha1(header + payload).hexdigest()
 
@@ -85,3 +89,19 @@ class FrozenVendoredEngineRegressionTests(unittest.TestCase):
     def test_scientific_config_stays_frozen(self) -> None:
         self.assertEqual(tcc_config.EXPERIMENT_VERSION, "1.0.6")
         self.assertEqual(tcc_config.CONFIG.analysis_end_date, "2026-09-17")
+
+    def test_windows_crlf_checkout_preserves_reference_identity(self) -> None:
+        """The same frozen source must hash identically on Windows and Unix."""
+        source = (VENDORED / "__init__.py").read_bytes().replace(b"\r\n", b"\n")
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "__init__.py"
+            checkout.write_bytes(source.replace(b"\n", b"\r\n"))
+            self.assertEqual(_git_blob_sha(checkout), EXPECTED_GIT_BLOBS["__init__.py"])
+
+    def test_mutated_vendored_source_still_fails_integrity_guard(self) -> None:
+        """Only line endings may be normalized, never source modifications."""
+        source = (VENDORED / "__init__.py").read_bytes().replace(b"\r\n", b"\n")
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "__init__.py"
+            checkout.write_bytes(source + b"# unauthorized change\r\n")
+            self.assertNotEqual(_git_blob_sha(checkout), EXPECTED_GIT_BLOBS["__init__.py"])
