@@ -10,6 +10,8 @@ from market_cycle_trader_api.services.live_expired_recovery import queue_expired
 class ExpiredLiveRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
+        collections = {}
+        self.db.__getitem__.side_effect = lambda name: collections.setdefault(name, MagicMock())
         self.db["live_winner_session_runs"].find_one.return_value = {
             "_id": "live-acct:2026-10-16",
             "live_account_id": "live-acct",
