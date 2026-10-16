@@ -11,6 +11,8 @@ from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
 from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
+from ...services.live_order_execution import execute_recalibrated_live_winner_session
+from ...services.live_winner_session import LIVE_RUNS
 from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_expired_recovery import queue_expired_live_analysis
@@ -127,6 +129,40 @@ def winner_preflight() -> dict[str, Any]:
         return capture_live_winner_preflight(database())
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+class LiveExecuteWinnerRequest(BaseModel):
+    execution_session: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    expected_target_asset: str = Field(min_length=1, max_length=8)
+    expected_winner_configuration_hash: str = Field(min_length=64, max_length=64)
+    confirm: Literal["EXECUTE_WINNER_LIVE_REAL_ORDER"]
+
+
+@router.post("/winner/execute-current-plan")
+def execute_live_current_plan(
+    payload: LiveExecuteWinnerRequest,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Operator-triggered execution of an eligible *current-session* Live Winner plan.
+
+    Reuses the same session, identity, position, risk, order idempotency,
+    Live authorization and exchange-window validations as the scheduler.
+    Never converts a completed analysis-only session into an executable one.
+    """
+    db = database()
+    run = db[LIVE_RUNS].find_one({"execution_session": payload.execution_session})
+    if not run or run.get("status") != "recalibrated_no_orders":
+        raise HTTPException(status_code=409, detail="No executable Winner plan for this session.")
+    if (str(run.get("target_asset") or "").upper() != payload.expected_target_asset.upper()
+        or str(run.get("winner_configuration_hash") or "") != payload.expected_winner_configuration_hash):
+        raise HTTPException(status_code=409, detail="Winner plan changed. Refresh and confirm again.")
+    try:
+        result = execute_recalibrated_live_winner_session(db, payload.execution_session)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result.get("status") != "completed":
+        raise HTTPException(status_code=409, detail=f"Live execution not performed: {result.get('status')}")
+    return result
+
 
 @router.get("/execution/readiness")
 def execution_readiness() -> dict[str, Any]:
