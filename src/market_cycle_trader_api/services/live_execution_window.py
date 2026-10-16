@@ -6,7 +6,6 @@ Paper trading or research.
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pandas as pd
@@ -18,16 +17,12 @@ _MAX_LIVE_WINDOW_SECONDS = 7200
 
 def live_execution_window_seconds(settings: Any) -> int:
     """Return one consistent Live window for both the model and executor."""
-    raw = str(os.getenv("ALPACA_LIVE_EXECUTION_WINDOW_SECONDS") or _DEFAULT_LIVE_WINDOW_SECONDS)
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("ALPACA_LIVE_EXECUTION_WINDOW_SECONDS must be an integer.") from exc
+    value = max(_DEFAULT_LIVE_WINDOW_SECONDS, int(getattr(settings, "market_execution_window_seconds", 0)))
     delay = int(getattr(settings, "market_open_delay_seconds", 0))
     if not _MIN_LIVE_WINDOW_SECONDS <= value <= _MAX_LIVE_WINDOW_SECONDS:
-        raise RuntimeError("ALPACA_LIVE_EXECUTION_WINDOW_SECONDS must be 60..7200.")
+        raise RuntimeError("Live execution window outside the supported range.")
     if value <= delay:
-        raise RuntimeError("ALPACA_LIVE_EXECUTION_WINDOW_SECONDS must exceed market_open_delay_seconds.")
+        raise RuntimeError("Live execution window must exceed market_open_delay_seconds.")
     return value
 
 
