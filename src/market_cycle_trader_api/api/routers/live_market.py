@@ -91,7 +91,7 @@ def recover_expired_live_analysis(
 @router.get("/winner/events")
 def winner_live_events(
     identity: Annotated[SessionIdentity, Depends(require_admin_session)],
-    execution_session: str | None = Query(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$"),
+    execution_session: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     level: Literal["all", "info", "warning", "error"] = "all",
     limit: int = Query(default=100, ge=1, le=200),
 ) -> dict[str, Any]:
@@ -105,7 +105,7 @@ def winner_live_events(
 @router.get("/winner/events/export.zip")
 def export_winner_live_events(
     identity: Annotated[SessionIdentity, Depends(require_admin_session)],
-    execution_session: str | None = Query(default=None, pattern=r"^\\d{4}-\\d{2}-\\d{2}$"),
+    execution_session: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ) -> Response:
     """Download sanitized Winner Live diagnostics for the selected session."""
     try:
