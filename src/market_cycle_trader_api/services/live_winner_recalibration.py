@@ -23,6 +23,7 @@ from ..infrastructure.persistence.mongo_repository import get_paper_trading_sett
 from ..schemas.paper_trading import PaperTradingSettings
 from .live_winner_session import LIVE_RUNS
 from .live_winner_candidates import winner_candidate_fields
+from .live_order_execution import order_submission_opted_in
 from .live_trader_state import verified_live_state
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings
@@ -40,11 +41,14 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     run = db[LIVE_RUNS].find_one({"execution_session": session})
     if not run:
         raise RuntimeError("No armed Live session.")
-    if run["status"] == "recalibrated_no_orders":
-        return {"status": "recalibrated_no_orders", "target_asset": run.get("target_asset"),
+    if run["status"] in {"recalibrated_no_orders", "analysis_only_completed"}:
+        return {"status": run["status"], "target_asset": run.get("target_asset"),
                 "order_submission_enabled": False}
-    if run["status"] != "signal_prepared":
+    analysis_only = run["status"] == "analysis_only_requested"
+    if run["status"] not in {"signal_prepared", "analysis_only_requested"}:
         raise RuntimeError("Live signal is not ready for market-open recalibration.")
+    if analysis_only and order_submission_opted_in():
+        raise RuntimeError("Real-order authorization must be off for late analysis.")
     broker = create_live_readonly_client()
     account = broker.get_account()
     if str(getattr(account, "id", "") or "") != run["live_account_id"]:
@@ -62,9 +66,12 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         raise RuntimeError("Live session is stale.")
     settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
     latest = expected_open + pd.Timedelta(seconds=settings.market_execution_window_seconds)
-    if now > latest:
+    if now > latest and not analysis_only:
         db[LIVE_RUNS].update_one({"_id": run["_id"], "status": "signal_prepared"},
                                 {"$set": {"status": "review_required", "phase": "execution_window_expired",
+                                          "window_deadline_at": latest.to_pydatetime(),
+                                          "window_expired_at": now.to_pydatetime(),
+                                          "window_seconds": int(settings.market_execution_window_seconds),
                                           "order_submission_enabled": False}})
         raise RuntimeError("Live open recalibration window expired.")
     state = verified_live_state(db, broker, session=session)
@@ -97,9 +104,14 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     else:
         assert_tcc_u67_operational_contract(strategy)
     assert_tcc_u67_model_snapshot(model)
+    recalibrating_status = "analysis_only_recalibrating" if analysis_only else "recalibrating"
+    recalibration_started_at = datetime.now(timezone.utc)
     claimed = db[LIVE_RUNS].find_one_and_update(
-        {"_id": run["_id"], "status": "signal_prepared"},
-        {"$set": {"status": "recalibrating", "phase": "market_open_recalibration"}},
+        {"_id": run["_id"], "status": run["status"]},
+        {"$set": {"status": recalibrating_status,
+                  "phase": "late_intraday_analysis" if analysis_only else "market_open_recalibration",
+                  "calibration_started_at": recalibration_started_at,
+                  "order_submission_enabled": False}},
         return_document=ReturnDocument.AFTER,
     )
     if claimed is None:
@@ -134,11 +146,11 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                   "buy" if current == "CASH" else
                   "sell_to_cash" if target == "CASH" else "rotate")
         updated = db[LIVE_RUNS].find_one_and_update(
-            {"_id": claimed["_id"], "status": "recalibrating",
+            {"_id": claimed["_id"], "status": recalibrating_status,
              "winner_configuration_hash": run["winner_configuration_hash"]},
             {"$set": {
-                "status": "recalibrated_no_orders",
-                "phase": "ready_for_execution_review",
+                "status": "analysis_only_completed" if analysis_only else "recalibrated_no_orders",
+                "phase": "missed_window_analysis_only_no_orders" if analysis_only else "ready_for_execution_review",
                 "decision_date": signal_date,
                 "target_asset": target,
                       **candidate_fields,
@@ -147,6 +159,7 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "current_quantity": state["managed_quantity"],
                 "live_state_revision": state["revision"],
                 "market_open_calibration_completed_at": datetime.now(timezone.utc),
+                "calibration_duration_seconds": (datetime.now(timezone.utc) - recalibration_started_at).total_seconds(),
                 "current_session_feed": metadata.get("live_feed"),
                 "current_session_market_data_cutoff_utc": metadata.get("intraday_market_data_cutoff_utc"),
                 "winner_signal_prepared": True,
@@ -156,13 +169,14 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         )
         if updated is None:
             raise RuntimeError("Live recalibration state changed during preparation.")
-        return {"status": "recalibrated_no_orders", "execution_session": session,
+        return {"status": updated["status"], "execution_session": session,
                 "target_asset": target, "action": updated["action"],
                 "order_submission_enabled": False}
     except Exception as exc:
         db[LIVE_RUNS].update_one(
-            {"_id": claimed["_id"], "status": "recalibrating"},
-            {"$set": {"status": "signal_prepared", "phase": "market_open_recalibration_retry",
+            {"_id": claimed["_id"], "status": recalibrating_status},
+            {"$set": {"status": "review_required" if analysis_only else "signal_prepared",
+                      "phase": "late_analysis_failed" if analysis_only else "market_open_recalibration_retry",
                       "last_calibration_error_type": type(exc).__name__,
                       "order_submission_enabled": False}},
         )

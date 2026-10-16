@@ -85,17 +85,18 @@ class LiveObservationScheduler:
                 db = database()
                 result = observe_live_cycle(db)
                 if result["status"] == "observed":
+                    self._last_observed_at = result["recorded_at"]
                     armed = plan_next_live_session(db)
                     if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
+                    elif armed.get("status") == "analysis_only_requested" and result["market_open"]:
+                        recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                     elif armed.get("status") == "signal_prepared" and result["market_open"]:
                         recalibrated = recalibrate_live_cash_winner_signal(db, armed["execution_session"])
                         if recalibrated.get("status") == "recalibrated_no_orders" and order_submission_opted_in():
                             execute_recalibrated_live_winner_session(db, armed["execution_session"])
                     elif armed.get("status") == "recalibrated_no_orders" and result["market_open"] and order_submission_opted_in():
                         execute_recalibrated_live_winner_session(db, armed["execution_session"])
-                if result["status"] == "observed":
-                    self._last_observed_at = result["recorded_at"]
                 self._last_error = None
             except Exception as exc:
                 self._last_error = type(exc).__name__

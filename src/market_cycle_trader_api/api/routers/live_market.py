@@ -13,6 +13,7 @@ from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_winner_preflight import capture_live_winner_preflight
+from ...services.live_expired_recovery import queue_expired_live_analysis
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -60,6 +61,27 @@ def update_robot_mode(
             "message": "Live monitoring policy changed; real-order execution remains disabled.",
         }
     except (LiveControlConflict, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+class LiveExpiredAnalysisRequest(BaseModel):
+    execution_session: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    confirm: Literal["LIVE_ANALYSIS_ONLY_NO_ORDERS"]
+
+
+@router.post("/winner/recover-expired-analysis")
+def recover_expired_live_analysis(
+    payload: LiveExpiredAnalysisRequest,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Schedule a new intraday audit decision, NEVER a late broker order."""
+    try:
+        return queue_expired_live_analysis(
+            database(),
+            execution_session=payload.execution_session,
+            actor_email=identity.email,
+        )
+    except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
