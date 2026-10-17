@@ -5,9 +5,8 @@ Real submissions follow the existing Live Start/Pause/Stop operating mode. It ca
 from __future__ import annotations
 
 import hashlib
-import math
-import os
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -30,14 +29,15 @@ from .strategy_lab import get_trader_winner_summary
 
 ORDER_LEDGER = "live_winner_broker_orders"
 EASTERN = ZoneInfo("America/New_York")
-def _number_env(name: str, default: float, *, floor: float, ceiling: float) -> float:
+def _full_live_cash_notional(account: Any) -> float:
+    """Use broker-reported cash to size Winner entries without MCT reserve or caps."""
     try:
-        value = float(os.getenv(name, str(default)))
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid {name}.") from exc
-    if not math.isfinite(value) or not floor <= value <= ceiling:
-        raise RuntimeError(f"{name} outside permitted limits.")
-    return value
+        cash = Decimal(str(getattr(account, "cash", None)))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise RuntimeError("Invalid Alpaca Live cash balance.") from exc
+    if not cash.is_finite() or cash < Decimal("1.00"):
+        raise RuntimeError("Alpaca Live cash cannot fund a notional buy.")
+    return float(cash.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
 
 def _unique_order_id(account: str, session: str, side: str, asset: str) -> str:
@@ -177,15 +177,6 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     if action in {"sell_to_cash", "rotate"} and state["managed_symbol"] == "CASH":
         raise RuntimeError("Winner sell/rotate requires a managed Live position.")
 
-    max_buy = _number_env("ALPACA_LIVE_MAX_ORDER_USD", 25.0, floor=1, ceiling=100000)
-    max_exposure = _number_env("ALPACA_LIVE_MAX_EQUITY_FRACTION", 0.95, floor=0.01, ceiling=1.0)
-    max_daily_loss = _number_env("ALPACA_LIVE_MAX_DAILY_LOSS_FRACTION", 0.05, floor=0.001, ceiling=0.25)
-    baseline = float(run.get("session_equity_baseline") or 0)
-    equity = float(getattr(account, "equity", 0) or 0)
-    if baseline <= 0 or equity <= 0:
-        raise RuntimeError("Live account equity baseline is invalid.")
-    if equity < baseline * (1 - max_daily_loss) and action in {"buy", "rotate"}:
-        raise RuntimeError("Daily-loss threshold blocks new Live exposure; risk-reducing exits remain permitted.")
     if action in {"buy", "rotate"}:
         asset = asset_snapshot(broker, target)
         if (not asset["tradable"] or not asset["fractionable"]
@@ -222,15 +213,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
             if live_control_status(db)["control_mode"] != "active":
                 raise RuntimeError("Live mode no longer permits a buy.")
             account = broker.get_account()
-            equity = float(getattr(account, "equity", 0) or 0)
-            cash = float(getattr(account, "cash", 0) or 0)
-            buying_power = float(getattr(account, "buying_power", 0) or 0)
-            notional = min(max_buy, equity * max_exposure,
-                           max(0, cash - float(settings.cash_reserve_dollars)),
-                           buying_power)
-            notional = math.floor(notional * 100) / 100
-            if notional < 1:
-                raise RuntimeError("Live balance is insufficient for a guarded buy.")
+            notional = _full_live_cash_notional(account)
             fill = _execute_leg(
                 db, broker, account=account_id, session=session,
                 side="buy", symbol=target, quantity=None, notional=notional,
