@@ -1,3 +1,19 @@
+## 2026-10-16 — API v10.8.110 — Winner Live independente do Paper e caixa integral
+
+**Objetivo:** separar o ciclo operacional de Alpaca Live e Paper. Ambos compartilham a Winner selecionada e suas funções de modelo, mas usam suas próprias contas, posições, sessões, decisões, agendadores, coleção de ordens, adaptadores de corretora e rotas HTTP.
+
+**Capital:** remove exclusivamente da execução Live os limites arbitrários `ALPACA_LIVE_MAX_ORDER_USD` (US$ 25 padrão), `ALPACA_LIVE_MAX_EQUITY_FRACTION` e `ALPACA_LIVE_MAX_DAILY_LOSS_FRACTION`, bem como o desconto de `cash_reserve_dollars`. O notional de compra utiliza todo o `account.cash` informado pela Alpaca Live, arredondado para baixo a centavos; não utiliza `buying_power` com margem. Na rotação, solicita a venda da posição integral, confirma o fill, consulta o saldo atualizado e solicita a compra do próximo ativo Winner.
+
+**Autonomia:** `live_order_execution.py` não importa nem lê configuração `PaperTradingSettings`, `get_paper_trading_settings` ou agendador Paper. O executor usa parâmetros operacionais internos de consulta dos fills (300s/2s), sem limite de capital. `live_winner_recalibration.py` não depende de janelas Paper. `live_trader_state.py` consulta calendário via `alpaca_live_orders.py`, nunca via adaptador Paper.
+
+**Agendamento:** o scheduler Live é independente do scheduler Paper. A preparação Live ocorre quando a sessão regular está fechada (após o pregão e/ou pré-abertura se ainda não foi preparada), e a decisão é recalibrada após a abertura com barras atualizadas antes da execução. O status do mercado vem da Alpaca Live; não são enviados trades durante fechamento regular.
+
+**Consistência:** controles operacionais Start/Pause/Exit only/Stop, verificação de Winner/conta/sessão, conferência da posição com estado Live e ledger único de ordens permanecem para impedir ordens divergentes ou duplicadas. Não alterar o motor de estratégia nem a política de rotação da Winner; não modificar código do Paper.
+
+**Verificação:** executar suite completa de testes `python -m unittest discover -s tests -p 'test_*.py' -v`, incluindo `test_live_full_cash_rotation.py`, `test_live_order_execution_safety.py` e `test_live_late_analysis_non_executable.py`. Os testes fazem mock da Alpaca, sem envio real de ordens. Publicação no Railway e execução real não são inferidas de resultado de CI.
+
+---
+
 ## 2026-10-16 — API v10.8.109 / Front v10.7.30 — API exclusiva Alpaca Live
 
 **Objetivo.** Alinhar o controle operacional do Winner Live ao Trader Start / Pause / Exit only / Stop existente, sem um token de autorização adicional exigido pelo deployment e sem enviar ordens via rotas Paper.
