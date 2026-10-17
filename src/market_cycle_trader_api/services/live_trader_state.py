@@ -10,7 +10,7 @@ from typing import Any
 
 from pymongo import ReturnDocument
 
-from ..infrastructure.trading.alpaca_paper import calendar_session_dates
+from ..infrastructure.trading.alpaca_live_orders import calendar_session_dates
 
 LIVE_STATE = "live_trader_strategy_state"
 _QTY_EPS = 1e-6

@@ -50,7 +50,6 @@ class LateLiveRecalibrationTests(unittest.TestCase):
                     "managed_symbol": "CASH", "managed_quantity": 0.0, "revision": 0,
                     "holding_sessions": 0,
                 },
-                "get_paper_trading_settings": {},
                 "get_trader_winner_context": (cfg, {
                     "id": "winner", "revision": 2, "configuration_hash": "hash",
                 }),
@@ -64,8 +63,6 @@ class LateLiveRecalibrationTests(unittest.TestCase):
             }
             for name, value in patches.items():
                 stack.enter_context(patch(prefix + name, return_value=value))
-            stack.enter_context(patch(prefix + "PaperTradingSettings.model_validate",
-                                     return_value=SimpleNamespace(market_execution_window_seconds=1800)))
             stack.enter_context(patch(prefix + "apply_execution_profile", return_value=cfg))
             stack.enter_context(patch(prefix + "apply_training_runtime_settings", return_value=cfg))
             for name in ("assert_tcc_u77_contract", "assert_tcc_u67_model_snapshot"):

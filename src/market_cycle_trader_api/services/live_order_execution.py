@@ -5,9 +5,8 @@ Real submissions follow the existing Live Start/Pause/Stop operating mode. It ca
 from __future__ import annotations
 
 import hashlib
-import math
-import os
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,24 +19,24 @@ from ..infrastructure.trading.alpaca_live_orders import (
     asset_snapshot, submit_market_buy_notional, submit_market_sell,
     wait_for_order,
 )
-from ..infrastructure.persistence.mongo_repository import get_paper_trading_settings
-from ..schemas.paper_trading import PaperTradingSettings
 from .live_control import live_control_status
 from .live_trader_state import verified_live_state, confirm_live_fill_state
 from .live_winner_session import LIVE_RUNS
-from .live_execution_window import live_execution_window_deadline
 from .strategy_lab import get_trader_winner_summary
 
 ORDER_LEDGER = "live_winner_broker_orders"
 EASTERN = ZoneInfo("America/New_York")
-def _number_env(name: str, default: float, *, floor: float, ceiling: float) -> float:
+LIVE_FILL_TIMEOUT_SECONDS = 300
+LIVE_FILL_POLL_SECONDS = 2.0
+def _full_live_cash_notional(account: Any) -> float:
+    """Use broker-reported cash to size Winner entries without MCT reserve or caps."""
     try:
-        value = float(os.getenv(name, str(default)))
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid {name}.") from exc
-    if not math.isfinite(value) or not floor <= value <= ceiling:
-        raise RuntimeError(f"{name} outside permitted limits.")
-    return value
+        cash = Decimal(str(getattr(account, "cash", None)))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise RuntimeError("Invalid Alpaca Live cash balance.") from exc
+    if not cash.is_finite() or cash < Decimal("1.00"):
+        raise RuntimeError("Alpaca Live cash cannot fund a notional buy.")
+    return float(cash.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
 
 def _unique_order_id(account: str, session: str, side: str, asset: str) -> str:
@@ -48,7 +47,7 @@ def _unique_order_id(account: str, session: str, side: str, asset: str) -> str:
 def _execute_leg(
     db: Any, broker: Any, *, account: str, session: str,
     side: str, symbol: str, quantity: float | None, notional: float | None,
-    winner_hash: str, settings: PaperTradingSettings,
+    winner_hash: str,
 ) -> Any:
     client_order_id = _unique_order_id(account, session, side, symbol)
     record = {
@@ -85,8 +84,8 @@ def _execute_leg(
         )
         fill = wait_for_order(
             broker, order_id=order_id,
-            timeout_seconds=settings.order_fill_timeout_seconds,
-            poll_interval_seconds=settings.order_poll_interval_seconds,
+            timeout_seconds=LIVE_FILL_TIMEOUT_SECONDS,
+            poll_interval_seconds=LIVE_FILL_POLL_SECONDS,
         )
         db[ORDER_LEDGER].update_one(
             {"_id": client_order_id},
@@ -148,18 +147,9 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     if not bool(getattr(clock, "is_open", False)):
         return {"status": "market_closed", "order_submission_enabled": False}
     current = pd.Timestamp(clock.timestamp)
-    expected_open = pd.Timestamp(run["expected_market_open"])
     current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
-    expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
     if current.tz_convert(EASTERN).date().isoformat() != session:
         raise RuntimeError("Stale Live session.")
-    settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
-    earliest = expected_open + pd.Timedelta(seconds=settings.market_open_delay_seconds)
-    latest, live_window_seconds = live_execution_window_deadline(expected_open, settings)
-    if current < earliest:
-        return {"status": "waiting_for_open_delay", "order_submission_enabled": False}
-    if current > latest:
-        raise RuntimeError("Live execution window has expired.")
     from alpaca.trading.enums import QueryOrderStatus
     from alpaca.trading.requests import GetOrdersRequest
     if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
@@ -177,15 +167,6 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     if action in {"sell_to_cash", "rotate"} and state["managed_symbol"] == "CASH":
         raise RuntimeError("Winner sell/rotate requires a managed Live position.")
 
-    max_buy = _number_env("ALPACA_LIVE_MAX_ORDER_USD", 25.0, floor=1, ceiling=100000)
-    max_exposure = _number_env("ALPACA_LIVE_MAX_EQUITY_FRACTION", 0.95, floor=0.01, ceiling=1.0)
-    max_daily_loss = _number_env("ALPACA_LIVE_MAX_DAILY_LOSS_FRACTION", 0.05, floor=0.001, ceiling=0.25)
-    baseline = float(run.get("session_equity_baseline") or 0)
-    equity = float(getattr(account, "equity", 0) or 0)
-    if baseline <= 0 or equity <= 0:
-        raise RuntimeError("Live account equity baseline is invalid.")
-    if equity < baseline * (1 - max_daily_loss) and action in {"buy", "rotate"}:
-        raise RuntimeError("Daily-loss threshold blocks new Live exposure; risk-reducing exits remain permitted.")
     if action in {"buy", "rotate"}:
         asset = asset_snapshot(broker, target)
         if (not asset["tradable"] or not asset["fractionable"]
@@ -210,7 +191,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
                 db, broker, account=account_id, session=session,
                 side="sell", symbol=state["managed_symbol"],
                 quantity=state["managed_quantity"], notional=None,
-                winner_hash=run["winner_configuration_hash"], settings=settings,
+                winner_hash=run["winner_configuration_hash"],
             )
             confirm_live_fill_state(
                 db, previous=state, session=session, symbol="CASH",
@@ -222,19 +203,11 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
             if live_control_status(db)["control_mode"] != "active":
                 raise RuntimeError("Live mode no longer permits a buy.")
             account = broker.get_account()
-            equity = float(getattr(account, "equity", 0) or 0)
-            cash = float(getattr(account, "cash", 0) or 0)
-            buying_power = float(getattr(account, "buying_power", 0) or 0)
-            notional = min(max_buy, equity * max_exposure,
-                           max(0, cash - float(settings.cash_reserve_dollars)),
-                           buying_power)
-            notional = math.floor(notional * 100) / 100
-            if notional < 1:
-                raise RuntimeError("Live balance is insufficient for a guarded buy.")
+            notional = _full_live_cash_notional(account)
             fill = _execute_leg(
                 db, broker, account=account_id, session=session,
                 side="buy", symbol=target, quantity=None, notional=notional,
-                winner_hash=run["winner_configuration_hash"], settings=settings,
+                winner_hash=run["winner_configuration_hash"],
             )
             confirm_live_fill_state(
                 db, previous=state, session=session,
