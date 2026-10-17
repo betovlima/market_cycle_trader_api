@@ -103,3 +103,12 @@ def wait_for_order(
         submitted_at=getattr(order, "submitted_at", None),
         filled_at=getattr(order, "filled_at", None),
     )
+
+
+def calendar_session_dates(client: Any, *, start_date: Any, end_date: Any) -> list[str]:
+    """XNYS session dates obtained exclusively through the Alpaca Live client."""
+    from alpaca.trading.requests import GetCalendarRequest
+
+    request = GetCalendarRequest(start=start_date, end=end_date)
+    dates = [str(item.date) for item in client.get_calendar(filters=request) if getattr(item, "date", None)]
+    return sorted(set(dates))
