@@ -1,4 +1,4 @@
-"""Open-session Winner recalibration for a flat Live account, without order execution."""
+"""Open-session independent Winner recalibration for the Alpaca Live account."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -20,10 +20,7 @@ from ..engine.tcc_u67_operational_market_data import (
 from ..engine.tcc_u67_operational_runtime import assert_tcc_u67_model_snapshot, assert_tcc_u67_operational_contract
 from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
-from ..infrastructure.persistence.mongo_repository import get_paper_trading_settings
-from ..schemas.paper_trading import PaperTradingSettings
 from .live_winner_session import LIVE_RUNS
-from .live_execution_window import live_execution_window_deadline
 from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
@@ -64,16 +61,6 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
     if now.tz_convert(EASTERN).date().isoformat() != session:
         raise RuntimeError("Live session is stale.")
-    settings = PaperTradingSettings.model_validate(get_paper_trading_settings(db))
-    latest, live_window_seconds = live_execution_window_deadline(expected_open, settings)
-    if now > latest and not analysis_only:
-        db[LIVE_RUNS].update_one({"_id": run["_id"], "status": "signal_prepared"},
-                                {"$set": {"status": "review_required", "phase": "execution_window_expired",
-                                          "window_deadline_at": latest.to_pydatetime(),
-                                          "window_expired_at": now.to_pydatetime(),
-                                          "window_seconds": live_window_seconds,
-                                          "order_submission_enabled": False}})
-        raise RuntimeError("Live open recalibration window expired.")
     state = verified_live_state(db, broker, session=session)
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
@@ -111,8 +98,6 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         {"$set": {"status": recalibrating_status,
                   "phase": "late_intraday_analysis" if analysis_only else "market_open_recalibration",
                   "calibration_started_at": recalibration_started_at,
-                  "window_seconds": live_window_seconds,
-                  "window_deadline_at": latest.to_pydatetime(),
                   "order_submission_enabled": False}},
         return_document=ReturnDocument.AFTER,
     )
