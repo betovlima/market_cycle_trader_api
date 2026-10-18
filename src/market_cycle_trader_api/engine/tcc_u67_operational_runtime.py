@@ -298,6 +298,7 @@ def run_tcc_u67_operational_backtest(
     trade_callback: Callable[[dict[str, Any]], None] | None = None,
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
+    capture_decision_diagnostics: bool = False,
 ) -> list[Any]:
     """Replay the protected U67 policy on current, already-audited MCT bars."""
     eligible_assets = tuple(
@@ -386,6 +387,10 @@ def run_tcc_u67_operational_backtest(
     )
 
     policies: dict[int, Callable] = {}
+    # Opt-in only for offline audit; normal backtests remain bit-for-bit unchanged.
+    decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] | None = (
+        {} if capture_decision_diagnostics else None
+    )
     fold_count = len(folds)
     candidate_margins = tuple(
         float(value)
@@ -512,6 +517,7 @@ def run_tcc_u67_operational_backtest(
             fold_id=fold_id,
             calibrated_switch_margin=selected_margin,
             utility_cache=decision_cache,
+            decision_diagnostics=decision_diagnostics,
         )
 
     scheduled = _politica_agendada(
@@ -528,6 +534,7 @@ def run_tcc_u67_operational_backtest(
         calcular_taxas_referencia,
         aplicar_deslizamento,
         decision_metadata=decision_metadata,
+        policy_decision_diagnostics=decision_diagnostics,
         trade_callback=trade_callback,
         model_label=(
             "TCC U67+10 Static Challenger v1.4.1"
