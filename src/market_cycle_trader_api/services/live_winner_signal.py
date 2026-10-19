@@ -33,8 +33,6 @@ from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
 
 _ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE})
-_POST_CLOSE_MAX_ATTEMPTS = 256  # automatic retry until next open; no unbounded broker execution
-_POST_CLOSE_RETRY_DELAY_SECONDS = 300
 
 def _utc_datetime(value: Any) -> datetime:
     stamp = value
@@ -58,11 +56,19 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if not calendar.is_session(pd.Timestamp(session)):
         raise RuntimeError("Live execution session is not an XNYS trading day.")
     required_day = calendar.previous_session(pd.Timestamp(session)).date().isoformat()
-    available_day = latest_safe_completed_xnys_session().date().isoformat()
+    # Use the actual Alpaca Live broker timestamp, not Railway's clock or timezone.
+    # No fixed 20-minute post-close delay: actual daily data availability and
+    # the computed decision_date determine when the signal is usable.
+    broker = create_live_readonly_client()
+    clock = broker.get_clock()
+    broker_time = _utc_datetime(clock.timestamp)
+    available_day = latest_safe_completed_xnys_session(
+        now=broker_time, data_delay_minutes=0
+    ).date().isoformat()
     if run.get("status") == "preparing_signal":
         started = run.get("preparation_started_at")
         if started is None or (
-            datetime.now(timezone.utc) - _utc_datetime(started)
+            broker_time - _utc_datetime(started)
         ) <= timedelta(minutes=25):
             return {"status": "post_close_training_in_progress",
                     "execution_session": session, "order_submission_enabled": False}
@@ -116,12 +122,6 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if run.get("status") != "waiting_for_winner_signal":
         raise RuntimeError("Live session is not eligible for Winner preparation.")
     attempts = int(run.get("preparation_attempts") or 0)
-    if attempts >= _POST_CLOSE_MAX_ATTEMPTS:
-        raise RuntimeError("Live post-close signal attempts exhausted; review required.")
-    retry_not_before = run.get("preparation_retry_not_before")
-    if retry_not_before and datetime.now(timezone.utc) < _utc_datetime(retry_not_before):
-        return {"status": "waiting_for_post_close_retry", "execution_session": session,
-                "order_submission_enabled": False}
     if available_day != required_day:
         return {"status": "waiting_for_completed_daily_bar",
                 "execution_session": session, "required_day": required_day,
@@ -151,7 +151,6 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
         assert_tcc_u67_operational_contract(strategy)
     assert_tcc_u67_model_snapshot(model)
 
-    broker = create_live_readonly_client()
     account = broker.get_account()
     if str(getattr(account, "id", "") or "") != run["live_account_id"]:
         raise RuntimeError("Live account identity changed.")
@@ -164,14 +163,11 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
         raise RuntimeError("Outstanding Live orders require reconciliation.")
 
-    now = datetime.now(timezone.utc)
+    now = broker_time
     claimed = db[LIVE_RUNS].find_one_and_update(
         {"_id": f'{run["live_account_id"]}:{session}',
          "status": "waiting_for_winner_signal",
-         "$or": [
-             {"preparation_attempts": {"$exists": False}},
-             {"preparation_attempts": {"$lt": _POST_CLOSE_MAX_ATTEMPTS}},
-         ]},
+        },
         {"$set": {"status": "preparing_signal", "phase": "post_close_winner_training",
                   "preparation_started_at": now, "order_submission_enabled": False},
          "$inc": {"preparation_attempts": 1}},
@@ -185,7 +181,9 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     append_live_event(db, account_id=run["live_account_id"], session=session,
                       stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
     try:
-        cutoff = latest_safe_completed_xnys_session().date().isoformat()
+        cutoff = latest_safe_completed_xnys_session(
+            now=_utc_datetime(broker.get_clock().timestamp), data_delay_minutes=0
+        ).date().isoformat()
         if cutoff != required_day:
             raise RuntimeError("LiveDailyCutoffChanged: safe prior-session date changed.")
         u77 = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
@@ -271,26 +269,17 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           message="Falha no sinal Winner durante: " + stage,
                           details={"error_type": type(exc).__name__,
                                    "duration_seconds": round(monotonic() - started, 2)})
-        failed_attempts = int(claimed.get("preparation_attempts") or (attempts + 1))
-        retry_allowed = (
-            failed_attempts < _POST_CLOSE_MAX_ATTEMPTS
-            and not str(exc).startswith("PostCloseSignalMissedWindow:")
-        )
         updates: dict[str, Any] = {
-            "status": "waiting_for_winner_signal" if retry_allowed else "review_required",
-            "phase": "post_close_signal_retry_wait" if retry_allowed else "post_close_signal_failed",
+            "status": "waiting_for_winner_signal",
+            "phase": "post_close_signal_retry_wait",
             "failure_type": type(exc).__name__,
             "last_preparation_error_type": type(exc).__name__,
             "post_close_signal_ready": False,
             "order_submission_enabled": False,
         }
-        if retry_allowed:
-            updates["preparation_retry_not_before"] = (
-                datetime.now(timezone.utc) + timedelta(seconds=_POST_CLOSE_RETRY_DELAY_SECONDS)
-            )
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": "preparing_signal"},
-            {"$set": updates},
+            {"$set": updates, "$unset": {"preparation_retry_not_before": ""}},
         )
         raise
 

@@ -38,9 +38,6 @@ from .strategy_lab import get_trader_winner_context, get_trader_winner_model_sna
 from .system_settings import apply_training_runtime_settings, get_system_settings
 
 EASTERN = ZoneInfo("America/New_York")
-_OPEN_MIN_BARS_SECONDS = 180
-_OPEN_RETRY_SECONDS = 90
-_OPEN_MAX_ATTEMPTS = 12
 _ELIGIBLE_STATUSES = ("waiting_for_winner_signal", "recalibrated_no_orders", "waiting_for_open_recalibration")
 
 
@@ -120,9 +117,11 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
                       "updated_at": datetime.now(timezone.utc)}},
         )
         return {"status": "execution_window_expired", "order_submission_enabled": False}
-    if stamp < opened + pd.Timedelta(seconds=_OPEN_MIN_BARS_SECONDS):
-        return {"status": "waiting_for_completed_live_minutes", "order_submission_enabled": False}
-    if latest_safe_completed_xnys_session().date().isoformat() != expected_cutoff:
+    # No arbitrary 3-minute delay: the data reader determines when the first
+    # completed regular-session bar is actually available.
+    if latest_safe_completed_xnys_session(
+        now=stamp, data_delay_minutes=0
+    ).date().isoformat() != expected_cutoff:
         return {"status": "waiting_for_correct_prior_daily_bar", "order_submission_enabled": False}
     if (run.get("status") == "recalibrated_no_orders"
         and run.get("market_open_calibration_completed_at")
@@ -132,16 +131,6 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
         return {"status": "recalibrated_no_orders", "order_submission_enabled": False}
     if run.get("status") not in _ELIGIBLE_STATUSES:
         return {"status": "not_eligible_for_live_open_refresh", "order_submission_enabled": False}
-    retry_at = run.get("open_retry_not_before")
-    if retry_at is not None and stamp < _utc(retry_at):
-        return {"status": "waiting_for_open_retry", "order_submission_enabled": False}
-    if int(run.get("open_preparation_attempts") or 0) >= _OPEN_MAX_ATTEMPTS:
-        db[LIVE_RUNS].update_one(
-            {"_id": run["_id"], "status": {"$in": _ELIGIBLE_STATUSES}},
-            {"$set": {"status": "review_required", "phase": "open_recalibration_attempts_exhausted",
-                      "order_submission_enabled": False}},
-        )
-        return {"status": "open_recalibration_attempts_exhausted", "order_submission_enabled": False}
     if not bool(get_system_settings(db)["training"]["enabled"]):
         return {"status": "live_training_disabled", "order_submission_enabled": False}
     config, winner = get_trader_winner_context(db)
@@ -172,13 +161,11 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
         raise RuntimeError("Live broker has open orders; independent reconciliation required.")
     state = verified_live_state(db, broker, session=session)
 
-    started_at = datetime.now(timezone.utc)
+    started_at = stamp.to_pydatetime()
     claimed = db[LIVE_RUNS].find_one_and_update(
         {"_id": run["_id"], "status": {"$in": _ELIGIBLE_STATUSES},
          "winner_configuration_hash": run["winner_configuration_hash"],
-         "market_open_calibration_completed_at": {"$exists": False},
-         "$or": [{"open_preparation_attempts": {"$exists": False}},
-                 {"open_preparation_attempts": {"$lt": _OPEN_MAX_ATTEMPTS}}]},
+         "market_open_calibration_completed_at": {"$exists": False}},
         {"$set": {
             "status": "open_recalibration", "phase": "refreshing_live_intraday_market_data",
             "winner_signal_prepared": False, "post_close_signal_ready": False,
@@ -274,28 +261,23 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 "decision_date": session, "target_asset": target,
                 "action": action, "order_submission_enabled": False}
     except Exception as exc:
-        attempts = int(claimed.get("open_preparation_attempts") or
-                       int(run.get("open_preparation_attempts") or 0) + 1)
-        retry = attempts < _OPEN_MAX_ATTEMPTS and not str(exc).startswith(
-            "LiveOpenRecalibrationMissedWindow:"
-        )
+        # Retry while the US exchange is open. No attempt budget or synthetic
+        # retry cooldown; the scheduler polls independently of server TZ.
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": "open_recalibration"},
             {"$set": {
-                "status": "waiting_for_open_recalibration" if retry else "review_required",
-                "phase": "waiting_for_open_data_retry" if retry else "open_recalibration_failed",
+                "status": "waiting_for_open_recalibration",
+                "phase": "waiting_for_open_data_retry",
                 "order_submission_enabled": False, "winner_signal_prepared": False,
                 "post_close_signal_ready": False, "last_open_calibration_error": str(exc),
-                **({"open_retry_not_before": datetime.now(timezone.utc) +
-                     timedelta(seconds=_OPEN_RETRY_SECONDS)} if retry else {}),
-            }},
+            }, "$unset": {"open_retry_not_before": ""}},
         )
         append_live_event(
             db, account_id=run["live_account_id"], session=session,
             stage="live_open_signal_failed", level="error",
             message="Live reanalise de abertura falhou; aguarda recuperacao automatica.",
             details={"error_type": type(exc).__name__, "stage": stage,
-                     "retry_allowed": retry, "duration_seconds": round(monotonic() - started, 2)},
+                     "retry_allowed": True, "duration_seconds": round(monotonic() - started, 2)},
         )
-        return {"status": "waiting_for_open_retry" if retry else "review_required",
+        return {"status": "waiting_for_open_retry",
                 "error_type": type(exc).__name__, "order_submission_enabled": False}
