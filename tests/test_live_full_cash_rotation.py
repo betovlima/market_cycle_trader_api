@@ -21,7 +21,10 @@ class LiveWinnerRotationTests(TestCase):
             "status": "recalibrated_no_orders", "action": "rotate",
             "target_asset": "ADEA", "current_asset": "NVDA",
             "winner_signal_prepared": True, "post_close_signal_ready": True,
-            "decision_date": "2026-10-16", "snapshot_sha256": "frozen-sha",
+            "decision_date": "2026-10-19", "snapshot_sha256": "frozen-sha",
+            "historical_cutoff": "2026-10-16",
+            "analysis_mode": "live_current_session_intraday",
+            "market_open_calibration_completed_at": datetime(2026, 10, 19, 13, 35, tzinfo=timezone.utc),
             "winner_strategy_id": "winner",
             "winner_configuration_hash": "hash", "winner_revision": 2,
             "live_account_id": "acct", "live_state_revision": 7,
@@ -90,7 +93,10 @@ class LiveWinnerRotationTests(TestCase):
             "winner_strategy_id": "winner", "winner_revision": 2,
             "winner_configuration_hash": "hash",
             "winner_signal_prepared": True, "post_close_signal_ready": True,
-            "snapshot_sha256": "frozen-sha", "decision_date": "2026-10-16",
+            "snapshot_sha256": "frozen-sha", "decision_date": "2026-10-19",
+            "historical_cutoff": "2026-10-16",
+            "analysis_mode": "live_current_session_intraday",
+            "market_open_calibration_completed_at": datetime(2026, 10, 19, 13, 35, tzinfo=timezone.utc),
             "target_asset": "ADEA", "action": "buy", "live_account_id": "acct",
         }
         broker = MagicMock()

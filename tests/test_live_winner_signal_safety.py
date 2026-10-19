@@ -36,5 +36,7 @@ class LiveSignalSafetyTests(unittest.TestCase):
             "status": "waiting_for_winner_signal",
         }
         settings.return_value = {"training": {"enabled": False}}
-        with self.assertRaisesRegex(RuntimeError, "disabled"):
-            prepare_live_cash_winner_signal(db, "2026-10-16")
+        with patch("market_cycle_trader_api.services.live_winner_signal.latest_safe_completed_xnys_session",
+                   return_value=__import__("pandas").Timestamp("2026-10-15")):
+            with self.assertRaisesRegex(RuntimeError, "disabled"):
+                prepare_live_cash_winner_signal(db, "2026-10-16")

@@ -33,7 +33,7 @@ from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
 
 _ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE})
-_POST_CLOSE_MAX_ATTEMPTS = 2  # initial preparation + one retry, never a second calibration
+_POST_CLOSE_MAX_ATTEMPTS = 256  # automatic retry until next open; no unbounded broker execution
 _POST_CLOSE_RETRY_DELAY_SECONDS = 300
 
 def _utc_datetime(value: Any) -> datetime:
@@ -61,7 +61,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     available_day = latest_safe_completed_xnys_session().date().isoformat()
     # Never freeze Friday history as Tuesday's decision. Wait for Monday's
     # completed daily bar and replace any unexecuted stale stored signal.
-    if run.get("status") in {"signal_prepared", "recalibrated_no_orders"}:
+    if run.get("status") == "signal_prepared":
+        return {"status": "signal_prepared", "execution_session": session,
+                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+    if run.get("status") == "recalibrated_no_orders":
         if (run.get("status") == "recalibrated_no_orders"
             and str(run.get("decision_date") or "")[:10] == required_day):
             return {"status": "recalibrated_no_orders", "execution_session": session,
@@ -99,6 +102,8 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if retry_not_before and datetime.now(timezone.utc) < _utc_datetime(retry_not_before):
         return {"status": "waiting_for_post_close_retry", "execution_session": session,
                 "order_submission_enabled": False}
+    if run.get("status") != "waiting_for_winner_signal":
+        raise RuntimeError("Live session is not eligible for Winner preparation.")
     if available_day != required_day:
         return {"status": "waiting_for_completed_daily_bar",
                 "execution_session": session, "required_day": required_day,

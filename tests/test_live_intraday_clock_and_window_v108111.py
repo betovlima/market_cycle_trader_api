@@ -106,7 +106,7 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(updates["snapshot_sha256"], "frozen-snapshot-sha")
         broker.submit_order.assert_not_called()
 
-    def test_one_retry_after_failure_has_cooldown_and_no_order(self):
+    def test_automatic_retry_after_failure_has_cooldown_and_no_order(self):
         db, broker, snapshots, models, result, error = _prepare_test(fail_download=True)
         self.assertIsNotNone(error)
         updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
@@ -117,12 +117,12 @@ class PostCloseSingleCalibrationTests(TestCase):
         models.assert_not_called()
         broker.submit_order.assert_not_called()
 
-    def test_second_failure_exhausts_retry_and_requires_review(self):
+    def test_second_failure_still_retries_before_next_open(self):
         db, broker, snapshots, models, result, error = _prepare_test(fail_download=True, attempts=1)
         self.assertIsNotNone(error)
         updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
-        self.assertEqual(updates["status"], "review_required")
-        self.assertEqual(updates["phase"], "post_close_signal_failed")
+        self.assertEqual(updates["status"], "waiting_for_winner_signal")
+        self.assertEqual(updates["phase"], "post_close_signal_retry_wait")
         self.assertFalse(updates["order_submission_enabled"])
         broker.submit_order.assert_not_called()
 
@@ -137,6 +137,7 @@ class PostCloseSingleCalibrationTests(TestCase):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = {
             "status": "recalibrated_no_orders", "target_asset": "ADEA",
+            "decision_date": "2026-10-16",
         }
         result = signals.prepare_live_cash_winner_signal(db, SESSION)
         self.assertEqual(result["target_asset"], "ADEA")
@@ -153,9 +154,9 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(result["status"], "waiting_for_post_close_retry")
         broker.assert_not_called()
 
-    def test_exhausted_attempts_cannot_start_third_training(self):
+    def test_exhausted_budget_never_trains(self):
         db = MagicMock()
-        db["live_winner_session_runs"].find_one.return_value = _run(attempts=2)
+        db["live_winner_session_runs"].find_one.return_value = _run(attempts=256)
         with patch(PREFIX + "download_u67_operational_snapshot") as download:
             with self.assertRaisesRegex(RuntimeError, "attempts exhausted"):
                 signals.prepare_live_cash_winner_signal(db, SESSION)

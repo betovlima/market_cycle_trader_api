@@ -23,18 +23,18 @@ class LiveWindowTests(unittest.TestCase):
         )
 
     def test_live_window_does_not_expire_before_model_calculates(self):
-        self.assertEqual(live_execution_window_seconds(self.settings), 1800)
+        self.assertEqual(live_execution_window_seconds(self.settings), 5400)
         start = pd.Timestamp(datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc))
         deadline, seconds = live_execution_window_deadline(start, self.settings)
-        self.assertEqual(seconds, 1800)
-        self.assertEqual(deadline, start + pd.Timedelta(minutes=30))
+        self.assertEqual(seconds, 5400)
+        self.assertEqual(deadline, start + pd.Timedelta(minutes=90))
 
     def test_window_respects_existing_larger_operational_setting(self):
-        self.settings.market_execution_window_seconds = 3600
-        self.assertEqual(live_execution_window_seconds(self.settings), 3600)
+        self.settings.market_execution_window_seconds = 7200
+        self.assertEqual(live_execution_window_seconds(self.settings), 7200)
 
     def test_window_must_exceed_open_delay(self):
-        self.settings.market_open_delay_seconds = 1800
+        self.settings.market_open_delay_seconds = 5400
         with self.assertRaisesRegex(RuntimeError, "must exceed"):
             live_execution_window_seconds(self.settings)
 
