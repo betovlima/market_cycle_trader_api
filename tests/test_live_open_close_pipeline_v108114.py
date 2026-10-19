@@ -154,8 +154,6 @@ class LiveOpenPipelineTests(TestCase):
         self.assertEqual(result["status"], "recalibrated_no_orders")
         self.assertEqual(result["decision_date"], SESSION)
         self.assertEqual(result["action"], "hold")
-        self.assertEqual(download.call_args.kwargs["config"].analysis_end_date,
-                         cfg.analysis_end_date) if False else None
         self.assertEqual(live_bars.call_args.kwargs["session"], SESSION)
         self.assertFalse(result["order_submission_enabled"])
         saved_fields = self.db["live_winner_session_runs"].find_one_and_update.call_args_list[-1].args[1]["$set"]

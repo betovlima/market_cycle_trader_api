@@ -93,7 +93,9 @@ class LiveObservationScheduler:
                     self._last_observed_at = result["recorded_at"]
                     stage = "session_planning"
                     armed = plan_next_live_session(db)
-                    if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
+                    if (not result["market_open"] and armed.get("status") in {
+                        "waiting_for_winner_signal", "recalibrated_no_orders",
+                    }):
                         stage = "signal_preparation"
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
                     elif result["market_open"] and armed.get("status") in {

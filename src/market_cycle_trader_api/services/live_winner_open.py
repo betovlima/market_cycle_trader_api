@@ -61,6 +61,38 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
         return {"status": "no_live_session", "order_submission_enabled": False}
     if run.get("status") in {"completed", "executing", "analysis_only_completed"}:
         return {"status": str(run["status"]), "order_submission_enabled": False}
+    if run.get("status") == "open_recalibration":
+        started_at = run.get("open_calibration_started_at")
+        if started_at is None or _utc(datetime.now(timezone.utc)) - _utc(started_at) <= pd.Timedelta(minutes=25):
+            return {"status": "live_open_recalibration_in_progress", "order_submission_enabled": False}
+        # Recover a worker interrupted after claiming the model task. Open
+        # calibration never submits orders; still verify the independent
+        # broker ledger before releasing the stale claim.
+        pending_intent = db["live_winner_broker_orders"].find_one({
+            "broker_account_id": run["live_account_id"],
+            "execution_session": session,
+        })
+        if pending_intent:
+            db[LIVE_RUNS].update_one(
+                {"_id": run["_id"], "status": "open_recalibration"},
+                {"$set": {"status": "review_required",
+                          "phase": "live_open_broker_reconciliation_required",
+                          "order_submission_enabled": False}},
+            )
+            return {"status": "broker_reconciliation_required", "order_submission_enabled": False}
+        recovered = db[LIVE_RUNS].find_one_and_update(
+            {"_id": run["_id"], "status": "open_recalibration",
+             "open_calibration_started_at": started_at},
+            {"$set": {"status": "waiting_for_open_recalibration",
+                      "phase": "recovered_abandoned_live_calibration",
+                      "winner_signal_prepared": False,
+                      "post_close_signal_ready": False,
+                      "order_submission_enabled": False}},
+            return_document=ReturnDocument.AFTER,
+        )
+        return {"status": "recovered_abandoned_live_calibration"
+                if recovered else "live_open_recalibration_in_progress",
+                "order_submission_enabled": False}
     calendar = xcals.get_calendar("XNYS")
     requested = pd.Timestamp(session)
     if not calendar.is_session(requested):
