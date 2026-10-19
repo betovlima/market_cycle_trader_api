@@ -134,6 +134,8 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         )
         if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
             raise RuntimeError("Incomplete Alpaca snapshot for Live Winner.")
+        if not isinstance(snapshot.manifest.get("snapshot_sha256"), str) or not snapshot.manifest["snapshot_sha256"]:
+            raise RuntimeError("Missing immutable post-close Alpaca snapshot SHA-256.")
         append_live_event(db, account_id=run["live_account_id"], session=session,
                           stage="signal_snapshot_downloaded", message="Snapshot do sinal preparado.",
                           details={"assets": len(snapshot.frames), "duration_seconds": round(monotonic() - started, 2)})
@@ -149,8 +151,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           details={"duration_seconds": round(monotonic() - started, 2)})
         stage = "decision_validation"
         decision_date = str(decision.decision_date)[:10]
-        if decision_date != cutoff:
-            raise RuntimeError(f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}")
+        if decision_date != cutoff or decision_date >= session:
+            raise RuntimeError(
+                f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}, next={session}"
+            )
         target = str(decision.target_asset).upper()
         if not target or (target != "CASH" and target not in strategy.assets):
             raise RuntimeError("Winner signal target is not a permitted asset.")
