@@ -1,3 +1,19 @@
+## 2026-10-19 — API v10.8.113 (PR em revisão) — nomenclatura genérica de snapshots e ciclo Live
+
+**Causa.** O pipeline de captura de dados congelados foi criado como U67, mas passou a atender U77; funções e variáveis legadas sugeriam falsamente um limite de 67 ativos. A nomenclatura de funções Live também indicava apenas caixa ou recalibração na abertura, embora o protocolo da API v10.8.111 prepare sinais após o fechamento e aceite estado de posição reconciliado.
+
+**Branch.** `refactor/v10.8.113-generic-market-snapshots`, baseada exclusivamente na `main` da API v10.8.111 (`4963c55dfdbdc64814344efa67d7860fb7a8d21c`). Não efetuar merge/deploy automático. Front permanece v10.7.30; desenvolvimento pendente de API v10.8.112/Front v10.7.31 continua independente.
+
+**Alterações.** A implementação de snapshot agora fica em `engine/operational_market_snapshot.py` com `download_operational_market_snapshot`, `append_current_session_intraday` e `OperationalMarketSnapshot`. `engine/tcc_u67_operational_market_data.py` mantém imports/aliases históricos; a configuração padrão U67 e o universo U77 explícito permanecem. Live, Paper e backtest consomem o nome neutro; o progresso do backtest indica U67 ou U77 corretamente. O Live expõe `prepare_live_winner_signal` e `execute_prepared_live_winner_session`, mantendo aliases para os nomes antigos.
+
+**Invariantes.** Não alterar política de sinais, parâmetros, universo, exclusões estruturais (incluindo CLMT), datas, ajustes, download, credenciais, modelos, ordenação temporal, ordens, scheduler, rotas HTTP, ledger, estados MongoDB, `research_access_path`, hashes de snapshot, tags TCC ou campos persistidos `u67_*`; estes últimos são identificadores legados de compatibilidade e requereriam migração versionada separada. O snapshot U77 solicita 77 símbolos; o universo elegível pode ser menor em decorrência das exclusões. Alpaca Paper e Live têm contas de negociação independentes; o acesso aos dados de mercado permanece na configuração compartilhada e não é alterado neste PR.
+
+**Validação e limites.** Testes atualizados para a API neutra e novo teste de compatibilidade U67/U77. Rodar `python -m unittest discover -s tests -p 'test_*.py' -v` e verificar CI antes de qualquer merge. Não afirmar paridade nem execução em produção sem testes concluídos. Os metadados públicos `u67_*` e a fase do observador Live não foram renomeados para evitar alteração de contratos operacionais; registrar avaliação separada caso sejam revisados no futuro.
+
+**Próximos passos.** Verificar CI, revisar a diff e aprovar apenas após segurança do ciclo Alpaca Live; produção permanece API v10.8.111 / Front v10.7.30 até decisão explícita.
+
+---
+
 ## 2026-10-16 — API v10.8.110 — Winner Live independente do Paper e caixa integral
 
 **Objetivo:** separar o ciclo operacional de Alpaca Live e Paper. Ambos compartilham a Winner selecionada e suas funções de modelo, mas usam suas próprias contas, posições, sessões, decisões, agendadores, coleção de ordens, adaptadores de corretora e rotas HTTP.
