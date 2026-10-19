@@ -1,3 +1,21 @@
+## 2026-10-19 — API v10.8.114 — Live autônomo pós-fechamento + abertura (PR para revisão)
+
+**Motivação.** Em 19/10, um sinal Live CAPR para 20/10 foi preparado com `decision_date=2026-10-16`, antes de o candle de segunda-feira estar seguro. O fluxo Live v10.8.111 executaria esse sinal obsoleto porque só exigia uma data anterior à sessão seguinte.
+
+**Branch.** `fix/v10.8.114-live-independent-open-close-rotation` criada a partir da `main` v10.8.111. Não compartilhar agendador, plano, conta, estado ou executor com Trading/Paper. A alteração não foi publicada na Railway e não faz merge das PRs #64/#65.
+
+**Ciclo Live.** Após fechar XNYS, somente preparar o modelo para a sessão seguinte quando `latest_safe_completed_xnys_session()` identificar **exatamente** o pregão anterior da sessão esperada. Enquanto o candle não estiver seguro, esperar sem consumir uma tentativa; corrigir automaticamente o plano anterior (16/10) sem executar ordens e mantendo o sinal substituído na auditoria. Após abertura XNYS, recarregar o histórico até D-1, baixar e agregar barras 1Min Live da sessão D pelo próprio serviço `live_market_bars.py` usando credenciais Live, treinar/reavaliar o LightGBM e gravar uma decisão de D. Não usar serviços Paper para nada nesse ciclo. A implementação de snapshot diário e as funções matemáticas da Winner permanecem compartilhadas no motor científico, sem importar `paper_trading` ou `paper_market_scheduler`.
+
+**Execução.** `live_order_execution.py` passa a exigir simultaneamente `decision_date=D`, `historical_cutoff=previous_session(D)`, `analysis_mode=live_current_session_intraday` e marcador de recalibração de abertura persistido. Plano pós-fechamento isolado **não libera ordens**, inclusive endpoint manual. Preserva modo Start/Pause/Stop, identidade Winner/conta, reconciliação da posição, consulta de ordens abertas, ledger idempotente, confirmação de fill e CAS para evitar duplicações. A janela Live é 90 minutos contados da abertura, com retentativas automáticas de abertura e recuperação de treinamento interrompido. Se esgotada, mantém a posição e falha sem negociar.
+
+**Trading/Paper.** Nenhum arquivo ou comportamento Trading/Paper é alterado. Após abertura e fechamento, o scheduler Paper conserva seu fluxo atual.
+
+**Validação.** `python -m unittest discover -s tests -p 'test_*.py' -v` e inspeção de GitHub Actions, testes de corte 16/10→19/10, dados intradiários atuais, recuperação, identidade e dupla ordem. Testes usam mocks e não submetem nenhuma ordem real. Não prometer recuperação se a Alpaca, dados ou infraestrutura permanecerem indisponíveis. Antes de liberar produção, revisar PR, versão de API/Front, CI e estado do Live na corretora.
+
+**Produção:** continua API v10.8.111 / Front v10.7.30 até aprovação e deploy. **Atenção:** a execução já preparada para 20/10 não deve usar o plano antigo se o release não for implantado a tempo.
+
+---
+
 ## 2026-10-16 — API v10.8.110 — Winner Live independente do Paper e caixa integral
 
 **Objetivo:** separar o ciclo operacional de Alpaca Live e Paper. Ambos compartilham a Winner selecionada e suas funções de modelo, mas usam suas próprias contas, posições, sessões, decisões, agendadores, coleção de ordens, adaptadores de corretora e rotas HTTP.

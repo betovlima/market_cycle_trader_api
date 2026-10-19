@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
+from market_cycle_trader_api.core.config import TCC_U77_FIXED_CHALLENGER_MODE
 from market_cycle_trader_api.services import live_winner_signal as close_signal
 from market_cycle_trader_api.services import live_winner_open as open_signal
 from market_cycle_trader_api.services import live_market_bars
@@ -111,7 +112,7 @@ class LiveOpenPipelineTests(TestCase):
         self.db["live_winner_session_runs"].find_one.return_value = existing
         self.db["live_winner_session_runs"].find_one_and_update.side_effect = [claimed, saved]
         cfg = MagicMock()
-        cfg.strategy_mode = "tcc_u77_fixed_challenger"
+        cfg.strategy_mode = TCC_U77_FIXED_CHALLENGER_MODE
         cfg.assets = ["MAN", "CAPR"]
         cfg.model_copy.return_value = cfg
         profile = {"id": "winner", "revision": 2, "configuration_hash": "hash"}

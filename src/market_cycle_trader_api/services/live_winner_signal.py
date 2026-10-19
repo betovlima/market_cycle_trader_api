@@ -65,8 +65,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         return {"status": "signal_prepared", "execution_session": session,
                 "target_asset": run.get("target_asset"), "order_submission_enabled": False}
     if run.get("status") == "recalibrated_no_orders":
-        if (run.get("status") == "recalibrated_no_orders"
-            and str(run.get("decision_date") or "")[:10] == required_day):
+        if str(run.get("decision_date") or "")[:10] == required_day:
             return {"status": "recalibrated_no_orders", "execution_session": session,
                     "target_asset": run.get("target_asset"), "order_submission_enabled": False}
         if available_day != required_day:
@@ -102,8 +101,6 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if retry_not_before and datetime.now(timezone.utc) < _utc_datetime(retry_not_before):
         return {"status": "waiting_for_post_close_retry", "execution_session": session,
                 "order_submission_enabled": False}
-    if run.get("status") != "waiting_for_winner_signal":
-        raise RuntimeError("Live session is not eligible for Winner preparation.")
     if available_day != required_day:
         return {"status": "waiting_for_completed_daily_bar",
                 "execution_session": session, "required_day": required_day,
