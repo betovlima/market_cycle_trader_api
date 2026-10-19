@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,12 +16,14 @@ from ..engine.market_data import latest_safe_completed_xnys_session
 from ..engine.tcc_u67_operational_market_data import (
     DATA_DIRECTORY as TCC_U67_DATA_DIRECTORY,
     append_u67_current_session_intraday,
+    SIP_HISTORICAL_DELAY_MINUTES,
     download_u67_operational_snapshot,
 )
 from ..engine.tcc_u67_operational_runtime import assert_tcc_u67_model_snapshot, assert_tcc_u67_operational_contract
 from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_winner_session import LIVE_RUNS
+from .live_execution_window import live_execution_window_deadline
 from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
@@ -29,6 +32,60 @@ from .system_settings import apply_training_runtime_settings
 from .strategy_lab import get_trader_winner_context, get_trader_winner_model_snapshot
 
 EASTERN = ZoneInfo("America/New_York")
+
+# The release must not reveal raw Alpaca errors, URLs or credentials in events.
+_AUDITABLE_INTRADAY_CODES = frozenset({
+    "CurrentSessionIntradayDataMissing",
+    "CurrentSessionIntradayCoverageUnavailable",
+    "CurrentSessionIntradayDelayedSIPNotReady",
+    "CurrentSessionIntradayNotStarted",
+    "CurrentSessionIntradayDateMismatch",
+    "LiveExecutionWindowExpired",
+    "LiveIntradayMarketClockUnavailable",
+})
+
+
+def _utc_time(value: Any) -> pd.Timestamp:
+    stamp = pd.Timestamp(value)
+    if stamp.tzinfo is None:
+        raise RuntimeError("LiveIntradayMarketClockUnavailable: broker timestamp has no timezone.")
+    return stamp.tz_convert("UTC")
+
+
+def _intraday_error_fields(exc: Exception) -> dict[str, str]:
+    """Expose only explicitly recognized fields, never provider response text."""
+    message = str(exc)
+    prefix = message.partition(":")[0]
+    code = prefix if prefix in _AUDITABLE_INTRADAY_CODES else type(exc).__name__
+    result = {"error_code": code}
+    match = re.search(
+        r"\\b([A-Z][A-Z0-9.]{0,9}) has no (IEX|SIP) regular-session bars\\b",
+        message,
+    )
+    if match:
+        result["symbol"] = match.group(1)
+        result["feed"] = match.group(2).lower()
+    return result
+
+
+def _expire_live_window(db: Any, run: dict[str, Any], *, deadline: pd.Timestamp) -> None:
+    """Fail closed for stale model/market sessions; no broker submission."""
+    db[LIVE_RUNS].update_one(
+        {"_id": run["_id"], "status": run["status"]},
+        {"$set": {
+            "status": "review_required",
+            "phase": "execution_window_expired",
+            "window_deadline_at": deadline.to_pydatetime(),
+            "window_expired_at": datetime.now(timezone.utc),
+            "order_submission_enabled": False,
+        }},
+    )
+    append_live_event(
+        db, account_id=run["live_account_id"], session=run["execution_session"],
+        stage="execution_window_expired", level="warning",
+        message="Janela Live encerrada; nenhuma ordem autorizada.",
+        details={"error_code": "LiveExecutionWindowExpired"},
+    )
 
 
 def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
@@ -61,6 +118,21 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
     expected_open = expected_open.tz_localize("UTC") if expected_open.tzinfo is None else expected_open.tz_convert("UTC")
     if now.tz_convert(EASTERN).date().isoformat() != session:
         raise RuntimeError("Live session is stale.")
+
+    # This Live-only 30-minute default never inherits a shorter Paper window.
+    deadline, _ = live_execution_window_deadline(expected_open)
+    if not analysis_only and now >= deadline:
+        _expire_live_window(db, run, deadline=deadline)
+        return {"status": "execution_window_expired", "order_submission_enabled": False}
+    retry_after_raw = run.get("retry_not_before")
+    if not analysis_only and retry_after_raw and now < _utc_time(retry_after_raw):
+        return {"status": "waiting_for_intraday_data", "order_submission_enabled": False,
+                "retry_after": _utc_time(retry_after_raw).isoformat()}
+    # At 09:30:XX no complete one-minute bar exists. Retry next scheduler tick
+    # without downloading all historical assets or entering the order path.
+    if now.floor("min") <= expected_open:
+        return {"status": "waiting_for_intraday_data", "order_submission_enabled": False,
+                "retry_after": (expected_open + pd.Timedelta(minutes=1)).isoformat()}
     state = verified_live_state(db, broker, session=session)
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
@@ -121,9 +193,22 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         append_live_event(db, account_id=run["live_account_id"], session=session,
                           stage="snapshot_downloaded", message="Snapshot Alpaca concluido.",
                           details={"assets": len(snapshot.frames), "duration_seconds": round(monotonic() - started, 2)})
+        # A historical refresh can take minutes: do NOT reuse the clock that
+        # was sampled before the snapshot. All 75 assets share one fresh cutoff.
         stage = "intraday_bars"
+        refreshed_clock = broker.get_clock()
+        if not bool(getattr(refreshed_clock, "is_open", False)):
+            raise RuntimeError("LiveIntradayMarketClockUnavailable: market closed during refresh.")
+        refreshed_now = _utc_time(refreshed_clock.timestamp)
+        if refreshed_now.tz_convert(EASTERN).date().isoformat() != session:
+            raise RuntimeError("LiveIntradayMarketClockUnavailable: market session changed.")
+        if not analysis_only and refreshed_now >= deadline:
+            raise RuntimeError("LiveExecutionWindowExpired: historical refresh exceeded order window.")
+        intraday_cutoff = refreshed_now.floor("min")
+        if intraday_cutoff <= expected_open:
+            raise RuntimeError("CurrentSessionIntradayNotStarted: no complete regular-session minute.")
         augmented, metadata = append_u67_current_session_intraday(
-            snapshot.frames, strategy, session=session, now=clock.timestamp,
+            snapshot.frames, strategy, session=session, now=intraday_cutoff,
         )
         append_live_event(db, account_id=run["live_account_id"], session=session,
                           stage="intraday_bars_ready", message="Dados da sessao atual preparados.",
@@ -152,6 +237,13 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                   "buy" if current == "CASH" else
                   "sell_to_cash" if target == "CASH" else "rotate")
         stage = "decision_persistence"
+        if not analysis_only:
+            completed_clock = broker.get_clock()
+            completed_at = _utc_time(completed_clock.timestamp)
+            if (not bool(getattr(completed_clock, "is_open", False))
+                or completed_at >= deadline
+                or completed_at.tz_convert(EASTERN).date().isoformat() != session):
+                raise RuntimeError("LiveExecutionWindowExpired: model decision completed outside order window.")
         updated = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": recalibrating_status,
              "winner_configuration_hash": run["winner_configuration_hash"]},
@@ -165,13 +257,18 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "current_asset": current,
                 "current_quantity": state["managed_quantity"],
                 "live_state_revision": state["revision"],
+                "window_deadline_at": deadline.to_pydatetime(),
                 "market_open_calibration_completed_at": datetime.now(timezone.utc),
                 "calibration_duration_seconds": (datetime.now(timezone.utc) - recalibration_started_at).total_seconds(),
                 "current_session_feed": metadata.get("live_feed"),
                 "current_session_market_data_cutoff_utc": metadata.get("intraday_market_data_cutoff_utc"),
                 "winner_signal_prepared": True,
                 "order_submission_enabled": False,
-            }, "$unset": {"last_calibration_error_type": ""}},
+            }, "$unset": {"last_calibration_error_type": "",
+                          "last_calibration_error_code": "",
+                          "last_intraday_error_symbol": "",
+                          "last_intraday_error_feed": "",
+                          "retry_not_before": ""}},
             return_document=ReturnDocument.AFTER,
         )
         if updated is None:
@@ -185,16 +282,46 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
                 "target_asset": target, "action": updated["action"],
                 "order_submission_enabled": False}
     except Exception as exc:
+        diagnostic = _intraday_error_fields(exc)
+        expired = diagnostic["error_code"] == "LiveExecutionWindowExpired"
+        details: dict[str, Any] = {
+            "error_type": type(exc).__name__,
+            **diagnostic,
+            "duration_seconds": round(monotonic() - started, 2),
+        }
+        if stage == "intraday_bars" and "intraday_cutoff" in locals():
+            details["cutoff"] = intraday_cutoff.isoformat()
+        retry_at = None
+        if (not analysis_only and not expired
+            and diagnostic["error_code"] == "CurrentSessionIntradayDelayedSIPNotReady"):
+            # SIP may only be queried after the uniform 20-minute delay.
+            retry_at = expected_open + pd.Timedelta(minutes=SIP_HISTORICAL_DELAY_MINUTES + 1)
+            details["retry_after"] = retry_at.isoformat()
         append_live_event(db, account_id=run["live_account_id"], session=session,
                           stage="recalibration_failed", level="error",
                           message="Falha na recalibracao durante a etapa: " + stage,
-                          details={"error_type": type(exc).__name__,
-                                   "duration_seconds": round(monotonic() - started, 2)})
+                          details=details)
+        changes: dict[str, Any] = {
+            "status": "review_required" if analysis_only or expired else "signal_prepared",
+            "phase": ("execution_window_expired" if expired else
+                      "late_analysis_failed" if analysis_only else
+                      "market_open_recalibration_retry"),
+            "last_calibration_error_type": type(exc).__name__,
+            "last_calibration_error_code": diagnostic["error_code"],
+            "last_intraday_error_symbol": diagnostic.get("symbol"),
+            "last_intraday_error_feed": diagnostic.get("feed"),
+            "order_submission_enabled": False,
+        }
+        if expired:
+            changes["window_deadline_at"] = deadline.to_pydatetime()
+            changes["window_expired_at"] = datetime.now(timezone.utc)
+        if retry_at is not None:
+            changes["retry_not_before"] = retry_at.to_pydatetime()
+        update: dict[str, Any] = {"$set": changes}
+        if retry_at is None:
+            update["$unset"] = {"retry_not_before": ""}
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": recalibrating_status},
-            {"$set": {"status": "review_required" if analysis_only else "signal_prepared",
-                      "phase": "late_analysis_failed" if analysis_only else "market_open_recalibration_retry",
-                      "last_calibration_error_type": type(exc).__name__,
-                      "order_submission_enabled": False}},
+            update,
         )
         raise
