@@ -1,4 +1,4 @@
-"""Independent, read-only Winner signal calculation for a CASH-only Live account.
+"""Independent Winner signal calculation for a reconciled Alpaca Live account.
 
 Reuses the exact operational Winner model functions; never reads Paper positions,
 never creates Paper plans and never submits broker orders. Unsupported account
@@ -43,8 +43,8 @@ def _utc_datetime(value: Any) -> datetime:
 
 
 
-def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
-    """Prepare a non-executable Winner signal for a flat Live account.
+def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
+    """Prepare a post-close Winner signal for the verified Live holding state.
 
     This entry point is not a trading or rebalancing function. Any existing
     position or pending order requires a separate reconciled Live executor.
@@ -230,3 +230,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
             {"$set": updates},
         )
         raise
+
+
+# Legacy callable name retained for clients importing the U67-era entry point.
+prepare_live_cash_winner_signal = prepare_live_winner_signal

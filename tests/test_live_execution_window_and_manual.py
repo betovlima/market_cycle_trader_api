@@ -59,7 +59,7 @@ class LiveExecutionRouteTests(unittest.TestCase):
     @patch("market_cycle_trader_api.api.routers.live_execution.database")
     @patch("market_cycle_trader_api.api.routers.live_execution.live_control_status")
     @patch("market_cycle_trader_api.api.routers.live_execution.create_live_readonly_client")
-    @patch("market_cycle_trader_api.api.routers.live_execution.execute_recalibrated_live_winner_session")
+    @patch("market_cycle_trader_api.api.routers.live_execution.execute_prepared_live_winner_session")
     def test_current_winner_plan_uses_only_live_executor(self, executor, client, mode, db):
         db.return_value = self.db
         mode.return_value = {"control_mode": "active"}
@@ -74,7 +74,7 @@ class LiveExecutionRouteTests(unittest.TestCase):
     @patch("market_cycle_trader_api.api.routers.live_execution.database")
     @patch("market_cycle_trader_api.api.routers.live_execution.live_control_status")
     @patch("market_cycle_trader_api.api.routers.live_execution.create_live_readonly_client")
-    @patch("market_cycle_trader_api.api.routers.live_execution.execute_recalibrated_live_winner_session")
+    @patch("market_cycle_trader_api.api.routers.live_execution.execute_prepared_live_winner_session")
     def test_late_analysis_is_not_an_executable_plan(self, executor, client, mode, db):
         db.return_value = self.db
         mode.return_value = {"control_mode": "active"}
