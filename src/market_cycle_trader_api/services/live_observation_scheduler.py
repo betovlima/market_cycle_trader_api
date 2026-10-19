@@ -95,12 +95,13 @@ class LiveObservationScheduler:
                     armed = plan_next_live_session(db)
                     if (not result["market_open"] and armed.get("status") in {
                         "waiting_for_winner_signal", "recalibrated_no_orders",
+                        "preparing_signal",
                     }):
                         stage = "signal_preparation"
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
                     elif result["market_open"] and armed.get("status") in {
                         "waiting_for_winner_signal", "recalibrated_no_orders",
-                        "waiting_for_open_recalibration",
+                        "waiting_for_open_recalibration", "open_recalibration",
                     }:
                         stage = "live_open_recalibration"
                         refreshed = refresh_live_open_winner_signal(db, armed["execution_session"])

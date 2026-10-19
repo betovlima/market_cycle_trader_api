@@ -6,7 +6,7 @@ states fail closed instead of silently borrowing Paper state.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import monotonic
 from typing import Any
 
@@ -59,6 +59,27 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         raise RuntimeError("Live execution session is not an XNYS trading day.")
     required_day = calendar.previous_session(pd.Timestamp(session)).date().isoformat()
     available_day = latest_safe_completed_xnys_session().date().isoformat()
+    if run.get("status") == "preparing_signal":
+        started = run.get("preparation_started_at")
+        if started is None or (
+            datetime.now(timezone.utc) - _utc_datetime(started)
+        ) <= timedelta(minutes=25):
+            return {"status": "post_close_training_in_progress",
+                    "execution_session": session, "order_submission_enabled": False}
+        recovered = db[LIVE_RUNS].find_one_and_update(
+            {"_id": run["_id"], "status": "preparing_signal",
+             "preparation_started_at": started},
+            {"$set": {"status": "waiting_for_winner_signal",
+                      "phase": "recovered_abandoned_post_close_calibration",
+                      "winner_signal_prepared": False,
+                      "post_close_signal_ready": False,
+                      "order_submission_enabled": False}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not recovered:
+            return {"status": "post_close_training_in_progress",
+                    "execution_session": session, "order_submission_enabled": False}
+        run = recovered
     # Never freeze Friday history as Tuesday's decision. Wait for Monday's
     # completed daily bar and replace any unexecuted stale stored signal.
     if run.get("status") == "signal_prepared":
