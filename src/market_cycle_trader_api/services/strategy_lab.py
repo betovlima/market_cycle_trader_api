@@ -612,6 +612,7 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         TCC_U77_FIXED_CHALLENGER_MODE,
     }:
         u77_mode = strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
+        contract_label = "TCC U77" if u77_mode else "TCC U67"
         expected_binding = (
             "tcc_u77_fixed_challenger_backtest"
             if u77_mode
@@ -622,7 +623,7 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "eligible": False,
                 "code": "tcc_u67_engine_binding_mismatch",
                 "reason": (
-                    "TCC U67 requires its protected backtest/live engine "
+                    f"{contract_label} requires its protected backtest/live engine "
                     f"binding {expected_binding!r}."
                 ),
                 "strategy_kind": strategy_kind,
@@ -635,7 +636,7 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "eligible": False,
                 "code": "tcc_u67_model_contract_mismatch",
                 "reason": (
-                    "TCC U67 requires its protected LightGBM snapshot: "
+                    f"{contract_label} requires its protected LightGBM snapshot: "
                     + "; ".join(model_issues[:5])
                 ),
                 "strategy_kind": strategy_kind,
@@ -652,7 +653,7 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "eligible": False,
                 "code": "tcc_u67_contract_mismatch",
                 "reason": (
-                    "TCC U67 configuration differs from its protected "
+                    f"{contract_label} configuration differs from its protected "
                     "operational contract: "
                     + "; ".join(issues[:5])
                 ),

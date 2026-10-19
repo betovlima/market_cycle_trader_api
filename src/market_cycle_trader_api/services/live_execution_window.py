@@ -1,7 +1,7 @@
-"""Independent, explicit Live trading window used by recalibration and execution.
+"""Independent, explicit Live trading window for execution of a previously prepared signal.
 
 Do not inherit Paper's potentially short open window. This window remains
-bounded to protect against stale intraday Winner decisions. It has no effect on
+bounded to protect against stale Winner decisions. It has no effect on
 Paper trading or research.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ _MAX_LIVE_WINDOW_SECONDS = 7200
 
 
 def live_execution_window_seconds(settings: Any = None) -> int:
-    """Return one consistent Live window for both the model and executor."""
+    """Return the bounded Live market-open execution window."""
     value = max(_DEFAULT_LIVE_WINDOW_SECONDS, int(getattr(settings, "market_execution_window_seconds", 0)))
     delay = int(getattr(settings, "market_open_delay_seconds", 0))
     if not _MIN_LIVE_WINDOW_SECONDS <= value <= _MAX_LIVE_WINDOW_SECONDS:
