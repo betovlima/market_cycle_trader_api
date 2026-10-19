@@ -89,8 +89,9 @@ class LiveWinnerRotationTests(TestCase):
             "status": "recalibrated_no_orders",
             "winner_strategy_id": "winner", "winner_revision": 2,
             "winner_configuration_hash": "hash",
-            "winner_signal_prepared": True, "target_asset": "ADEA",
-            "action": "buy", "live_account_id": "acct",
+            "winner_signal_prepared": True, "post_close_signal_ready": True,
+            "snapshot_sha256": "frozen-sha", "decision_date": "2026-10-16",
+            "target_asset": "ADEA", "action": "buy", "live_account_id": "acct",
         }
         broker = MagicMock()
         broker.get_account.return_value = SimpleNamespace(
