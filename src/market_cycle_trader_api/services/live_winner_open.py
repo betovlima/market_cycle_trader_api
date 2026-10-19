@@ -207,8 +207,13 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
         if not snapshot.manifest.get("snapshot_sha256"):
             raise RuntimeError("Live daily history snapshot has no content hash.")
         stage = "current_session_bars"
+        # Downloading 77 daily histories can take several minutes. Obtain a
+        # *fresh* broker time for the current-session as-of cutoff.
+        intraday_clock = broker.get_clock()
+        if not bool(getattr(intraday_clock, "is_open", False)):
+            raise RuntimeError("LiveIntradayCoverageNotReady: session closed during daily download.")
         merged, intraday = load_live_intraday_session(
-            snapshot.frames, strategy, session=session, now=clock.timestamp,
+            snapshot.frames, strategy, session=session, now=intraday_clock.timestamp,
         )
         stage = "lightgbm_decision"
         decision = build_live_model_decision(

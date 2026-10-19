@@ -157,6 +157,8 @@ class LiveOpenPipelineTests(TestCase):
         self.assertEqual(result["decision_date"], SESSION)
         self.assertEqual(result["action"], "hold")
         self.assertEqual(live_bars.call_args.kwargs["session"], SESSION)
+        self.assertEqual(download.call_args.kwargs["credentials_override"],
+                         {"api_key_id": "LIVE_KEY", "secret_key": "LIVE_SECRET"})
         self.assertFalse(result["order_submission_enabled"])
         saved_fields = self.db["live_winner_session_runs"].find_one_and_update.call_args_list[-1].args[1]["$set"]
         self.assertEqual(saved_fields["historical_cutoff"], PREVIOUS)
