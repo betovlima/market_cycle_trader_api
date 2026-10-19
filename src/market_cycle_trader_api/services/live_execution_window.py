@@ -5,6 +5,7 @@ exchange calendar; real order time/open state comes from Alpaca Live's clock.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import exchange_calendars as xcals
@@ -38,7 +39,7 @@ def live_execution_window_deadline(
     # already open. It incorporates provider-known early or exceptional closes.
     if market_clock is not None and bool(getattr(market_clock, "is_open", False)):
         broker_close = getattr(market_clock, "next_close", None)
-        if broker_close is not None:
+        if isinstance(broker_close, (datetime, pd.Timestamp)):
             close = pd.Timestamp(broker_close)
             if close.tzinfo is not None:
                 close = close.tz_convert("UTC")
