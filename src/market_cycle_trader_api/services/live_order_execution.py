@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import exchange_calendars as xcals
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -153,8 +154,14 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
         or not run.get("target_asset")):
         raise RuntimeError("No verified post-close Live Winner signal; real orders blocked.")
     decision_date = str(run.get("decision_date") or "")[:10]
-    if not decision_date or decision_date >= session:
-        raise RuntimeError("Post-close Winner decision date is missing or stale; real orders blocked.")
+    previous_session = xcals.get_calendar("XNYS").previous_session(
+        pd.Timestamp(session)
+    ).date().isoformat()
+    if decision_date != previous_session:
+        raise RuntimeError(
+            "Post-close Winner decision does not match the immediately preceding "
+            "XNYS session; real orders blocked."
+        )
 
     broker = create_live_execution_client()
     account = broker.get_account()
