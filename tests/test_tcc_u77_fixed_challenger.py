@@ -143,7 +143,7 @@ class FixedChallengerTests(unittest.TestCase):
         assert "assert_tcc_u77_contract(" in source
         assert "U77_REQUESTED_ASSETS" in source
         assert "requested_assets=(" in source
-        assert "download_u67_operational_snapshot(" in source
+        assert "download_operational_market_snapshot(" in source
         assert "run_tcc_u67_operational_backtest(" in source
 
 

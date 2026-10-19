@@ -76,9 +76,9 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
         })
         fake("latest_safe_completed_xnys_session", pd.Timestamp("2026-10-16T04:00:00Z"))
         if fail_download:
-            snapshot_call = fake("download_u67_operational_snapshot", side_effect=RuntimeError("provider unavailable"))
+            snapshot_call = fake("download_operational_market_snapshot", side_effect=RuntimeError("provider unavailable"))
         else:
-            snapshot_call = fake("download_u67_operational_snapshot", snapshot)
+            snapshot_call = fake("download_operational_market_snapshot", snapshot)
         model_call = fake("build_live_model_decision", decision)
         fake("winner_candidate_fields", {})
         events = fake("append_live_event")
@@ -156,7 +156,7 @@ class PostCloseSingleCalibrationTests(TestCase):
     def test_exhausted_attempts_cannot_start_third_training(self):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = _run(attempts=2)
-        with patch(PREFIX + "download_u67_operational_snapshot") as download:
+        with patch(PREFIX + "download_operational_market_snapshot") as download:
             with self.assertRaisesRegex(RuntimeError, "attempts exhausted"):
                 signals.prepare_live_cash_winner_signal(db, SESSION)
         download.assert_not_called()

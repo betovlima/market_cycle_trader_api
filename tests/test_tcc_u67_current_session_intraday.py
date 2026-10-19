@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from market_cycle_trader_api.engine import (
-    tcc_u67_operational_market_data as market_data,
+    operational_market_snapshot as market_data,
 )
 
 
@@ -98,7 +98,7 @@ def test_append_current_session_uses_live_feed_and_today_only() -> None:
         ) as download,
     ):
         augmented, metadata = (
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 frames,
                 config,
                 session="2026-10-07",
@@ -148,7 +148,7 @@ def test_append_current_session_fails_closed_without_live_bars() -> None:
         ),
     ):
         try:
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 frames,
                 config,
                 session="2026-10-07",
@@ -184,7 +184,7 @@ def test_missing_iex_ams_retries_entire_universe_on_uniform_sip():
                      return_value={"api_key_id": "key", "secret_key": "secret"}),
         patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
     ):
-        result, metadata = market_data.append_u67_current_session_intraday(
+        result, metadata = market_data.append_current_session_intraday(
             frames, SimpleNamespace(alpaca_live_feed="iex"),
             session="2026-10-07",
             now=pd.Timestamp("2026-10-07T17:00:00Z"),
@@ -222,7 +222,7 @@ def test_missing_iex_sip_unauthorized_fails_without_returning_partial_data():
         patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
     ):
         try:
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 frames, SimpleNamespace(alpaca_live_feed="iex"),
                 session="2026-10-07",
                 now=pd.Timestamp("2026-10-07T17:00:00Z"),
@@ -246,7 +246,7 @@ def test_no_sip_fallback_for_other_iex_data_failures():
                      side_effect=RuntimeError("IEX provider unavailable")) as download,
     ):
         try:
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 {"MAN": _daily_frame("MAN")},
                 SimpleNamespace(alpaca_live_feed="iex"),
                 session="2026-10-07",
@@ -268,7 +268,7 @@ def test_configured_sip_never_uses_iex():
         patch.object(market_data, "download_stock_bars",
                      return_value=_intraday_frame()) as download,
     ):
-        _, metadata = market_data.append_u67_current_session_intraday(
+        _, metadata = market_data.append_current_session_intraday(
             {"MAN": _daily_frame("MAN")},
             SimpleNamespace(alpaca_live_feed="sip"),
             session="2026-10-07",
@@ -303,7 +303,7 @@ def test_recent_sip_subscription_denial_retries_delayed_entire_universe():
                      return_value={"api_key_id": "key", "secret_key": "secret"}),
         patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
     ):
-        result, metadata = market_data.append_u67_current_session_intraday(
+        result, metadata = market_data.append_current_session_intraday(
             frames, SimpleNamespace(alpaca_live_feed="iex"),
             session="2026-10-07",
             now=pd.Timestamp("2026-10-07T17:00:00Z"),
@@ -350,7 +350,7 @@ def test_delayed_sip_still_fails_closed_when_any_asset_has_no_bars():
         patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
     ):
         try:
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 frames, SimpleNamespace(alpaca_live_feed="iex"),
                 session="2026-10-07",
                 now=pd.Timestamp("2026-10-07T17:00:00Z"),
@@ -374,7 +374,7 @@ def test_delayed_sip_not_allowed_before_enough_session_history():
                      )),
     ):
         try:
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 {"MAN": _daily_frame("MAN")},
                 SimpleNamespace(alpaca_live_feed="sip"),
                 session="2026-10-07",
@@ -404,7 +404,7 @@ def test_configured_sip_recent_entitlement_uses_delayed_cutoff():
                      return_value={"api_key_id": "key", "secret_key": "secret"}),
         patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
     ):
-        _, meta = market_data.append_u67_current_session_intraday(
+        _, meta = market_data.append_current_session_intraday(
             {"MAN": _daily_frame("MAN")},
             SimpleNamespace(alpaca_live_feed="sip"),
             session="2026-10-07",
@@ -440,7 +440,7 @@ def test_delayed_sip_does_not_use_any_bar_at_or_after_cutoff():
         patch.object(market_data, "download_stock_bars", side_effect=fake_bars),
     ):
         try:
-            market_data.append_u67_current_session_intraday(
+            market_data.append_current_session_intraday(
                 {"MAN": _daily_frame("MAN")},
                 SimpleNamespace(alpaca_live_feed="sip"),
                 session="2026-10-07",

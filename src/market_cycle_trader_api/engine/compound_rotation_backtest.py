@@ -343,7 +343,7 @@ def run_job(
     if tcc_protected_runtime:
         emit_progress(
             3.0,
-            "TCC U77" if tcc_u77_runtime else "TCC U67",
+            f"TCC {'U77' if tcc_u77_runtime else 'U67'} downloading fresh Alpaca RAW/SIP snapshot",
         )
 
         def operational_snapshot_progress(
