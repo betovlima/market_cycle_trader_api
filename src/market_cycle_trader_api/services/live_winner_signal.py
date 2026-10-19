@@ -204,7 +204,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           details={"error_type": type(exc).__name__,
                                    "duration_seconds": round(monotonic() - started, 2)})
         failed_attempts = int(claimed.get("preparation_attempts") or (attempts + 1))
-        retry_allowed = failed_attempts < _POST_CLOSE_MAX_ATTEMPTS
+        retry_allowed = (
+            failed_attempts < _POST_CLOSE_MAX_ATTEMPTS
+            and not str(exc).startswith("PostCloseSignalMissedWindow:")
+        )
         updates: dict[str, Any] = {
             "status": "waiting_for_winner_signal" if retry_allowed else "review_required",
             "phase": "post_close_signal_retry_wait" if retry_allowed else "post_close_signal_failed",
