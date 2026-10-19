@@ -1026,8 +1026,9 @@ Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
   foi exportado apenas como `RuntimeError`, sem identificar simbolo ou feed.
   Nao afirmar que SIP/AMS falhou na producao.
 - **Alteracoes:** preflight aguarda primeira barra completa; novo horario
-  Alpaca apos baixar historicos; corte de 1 minuto completo e uniforme para
-  Paper e Live; fallback IEX/SIP/delayed SIP preservado; adiamento explicito
+  Alpaca apos baixar historicos; corte de 1 minuto completo e uniforme apenas
+  na chamada Live (coletor compartilhado Paper/Live restaurado igual a main);
+  fallback IEX/SIP/delayed SIP preservado; adiamento explicito
   do fallback ainda indisponivel; codigos de erro e ativo/feed sanitizados;
   janela Live independente de 30 minutos aplicada na recalibracao e nas
   etapas de ordem real; expiracao bloqueia submissao e requer revisao.
