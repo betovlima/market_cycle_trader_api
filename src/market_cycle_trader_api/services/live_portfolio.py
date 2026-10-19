@@ -78,9 +78,11 @@ def _order(order: Any) -> dict[str, Any]:
     }
 
 
-def _store_observation(db: Any, equity: float, cash: float, account_id: str) -> list[dict[str, Any]]:
+def _store_observation(
+    db: Any, equity: float, cash: float, account_id: str, *, recorded_now: datetime
+) -> list[dict[str, Any]]:
     collection = db[LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION]
-    now = datetime.now(timezone.utc)
+    now = recorded_now
     latest = collection.find_one({"account_id": account_id}, sort=[("recorded_at", -1)])
     recorded_at = latest.get("recorded_at") if latest else None
     if recorded_at is None or (
@@ -118,14 +120,17 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     buying_power_raw = getattr(account, "buying_power", None)
     non_marginable_raw = getattr(account, "non_marginable_buying_power", None)
     clock = client.get_clock()
-    history = _store_observation(db, equity, cash, account_id)
+    if getattr(clock, "timestamp", None) is None or clock.timestamp.tzinfo is None:
+        raise RuntimeError("Live broker clock timestamp must include a timezone.")
+    recorded_now = clock.timestamp.astimezone(timezone.utc)
+    history = _store_observation(db, equity, cash, account_id, recorded_now=recorded_now)
     latest_decision = latest_live_winner_decision(db, account_id=account_id)
     unrealized = sum(p["unrealized_pnl"] for p in positions)
 
     return {
         "status": "ready",
         "environment": "live",
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "recorded_at": recorded_now.isoformat(),
         "account_status": _label(getattr(account, "status", None)),
         "trading_blocked": bool(getattr(account, "trading_blocked", False)),
         "initial_capital": None,
