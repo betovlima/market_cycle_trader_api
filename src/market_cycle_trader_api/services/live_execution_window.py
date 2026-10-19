@@ -15,7 +15,7 @@ _MIN_LIVE_WINDOW_SECONDS = 60
 _MAX_LIVE_WINDOW_SECONDS = 7200
 
 
-def live_execution_window_seconds(settings: Any) -> int:
+def live_execution_window_seconds(settings: Any = None) -> int:
     """Return one consistent Live window for both the model and executor."""
     value = max(_DEFAULT_LIVE_WINDOW_SECONDS, int(getattr(settings, "market_execution_window_seconds", 0)))
     delay = int(getattr(settings, "market_open_delay_seconds", 0))
@@ -26,6 +26,6 @@ def live_execution_window_seconds(settings: Any) -> int:
     return value
 
 
-def live_execution_window_deadline(expected_open: pd.Timestamp, settings: Any) -> tuple[pd.Timestamp, int]:
+def live_execution_window_deadline(expected_open: pd.Timestamp, settings: Any = None) -> tuple[pd.Timestamp, int]:
     duration = live_execution_window_seconds(settings)
     return expected_open + pd.Timedelta(seconds=duration), duration
