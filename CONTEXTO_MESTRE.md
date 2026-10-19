@@ -1,3 +1,19 @@
+## 2026-10-19 — API v10.8.116 (branch em revisão): horários US independentes do servidor
+
+**Regra do usuário.** Não introduzir limites arbitrários, sleeps de liberação, orçamentos fixos de tentativas, janelas pós-abertura ou travas novas de processamento sem aprovação explícita. A pipeline Live deve seguir os horários oficiais das bolsas americanas em `America/New_York`, independentemente da zona horária local/UTC do servidor.
+
+**Pesquisa e fontes.** Alpaca Trading API `get_clock()` retorna `timestamp`, `is_open`, `next_open`, `next_close`; `get_calendar()` fornece sessões e fechamentos antecipados. NYSE confirma 09:30-16:00 America/New_York para sessão regular, com feriados e dias de fechamento parcial. Referências: https://alpaca.markets/sdks/python/api_reference/trading/models.html e https://www.nyse.com/trade/trading-information . A API Alpaca Live já possui autenticação separada e é o relógio operacional. Exchange Calendars XNYS mantém cálculo local das sessões e fechamento DST/early close como suporte, sem depender do fuso do host. Evitar provedores gratuitos genéricos de tempo em caminho crítico por risco de divergência e falha.
+
+**Alterações.** Remover espera fixa de três minutos, máximo de 12 tentativas, cooldown de 90 segundos e prazo de 90 minutos na abertura. Recalibração pode iniciar assim que existir a primeira barra concluída; repetir durante a sessão quando os dados não estiverem disponíveis, segundo o polling normal do scheduler. O prazo de execução é o **fechamento real da sessão XNYS** (9:30–16:00 ET ou fechamento antecipado). Preparo pós-fechamento deixa de exigir buffer artificial de 20 minutos: a seleção de D-1 usa o timestamp da Alpaca sem atraso extra e a checagem do `decision_date` confirma que o candle real já foi obtido. Remover orçamento de 256 tentativas e cooldown de 5 minutos de preparação pós-fechamento; preservar logs e contagem de tentativas para observabilidade, sem encerrar a execução por contagem. Hora de eventos de agendamento/observações de carteira usa timestamp da Alpaca.
+
+**Exceções que não são novas travas:** Não é possível executar ordens quando a bolsa/corretora informa mercado fechado, conta suspensa, posição divergente ou transação já em andamento; são estados externos/broker e requisitos de não duplicar ordens, não limites arbitrários para pesquisa ou treinamento. A janela de fallback SIP de 20 minutos decorre de licenciamento do provedor e representa defasagem dos dados consultados, não bloqueio temporal da aplicação.
+
+**Escopo.** Somente Live e timestamps de seu status; Trading/Paper continua parado, com controles, scheduler, credenciais e regras inalterados. Motor científico e exclusões reproduzíveis preservados. Main/produção continuam v10.8.115 até CI e autorização posterior.
+
+**Testes.** Validar em CI versão 10.8.116, abertura normal, fechamentos antecipados, transição EST/EDT, preparo logo após o fechamento, nenhuma espera fixa ou limite de tentativas, seleção de dados intradiários, automação Live e ledger idempotente.
+
+---
+
 ## 2026-10-19 — API v10.8.115 — integração das PRs #64, #65 e #66
 
 **Objetivo.** Integrar em uma única mudança versionada: a correção de corte diário do PR #64, a nomenclatura genérica e retrocompatível de snapshots U67/U77 do PR #65 e a pipeline operacional Live pós-fechamento + abertura da PR #66.
