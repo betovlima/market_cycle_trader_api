@@ -38,8 +38,15 @@ class LiveDailyPreparationTests(TestCase):
     def test_friday_signal_waits_for_monday_daily_data(self):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = _run()
-        with patch.object(close_signal, "latest_safe_completed_xnys_session",
-                          return_value=pd.Timestamp("2026-10-16")):
+        broker = MagicMock()
+        broker.get_clock.return_value = SimpleNamespace(
+            timestamp=datetime(2026, 10, 19, 20, 1, tzinfo=timezone.utc)
+        )
+        with (
+            patch.object(close_signal, "latest_safe_completed_xnys_session",
+                         return_value=pd.Timestamp("2026-10-16")),
+            patch.object(close_signal, "create_live_readonly_client", return_value=broker),
+        ):
             result = close_signal.prepare_live_cash_winner_signal(db, SESSION)
         self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
         self.assertEqual(result["required_day"], PREVIOUS)
@@ -56,7 +63,11 @@ class LiveDailyPreparationTests(TestCase):
                          return_value=pd.Timestamp(PREVIOUS)),
             patch.object(close_signal, "get_system_settings",
                          return_value={"training": {"enabled": False}}),
+            patch.object(close_signal, "create_live_readonly_client") as broker_factory,
         ):
+            broker_factory.return_value.get_clock.return_value = SimpleNamespace(
+                timestamp=datetime(2026, 10, 19, 20, 1, tzinfo=timezone.utc)
+            )
             with self.assertRaisesRegex(RuntimeError, "disabled"):
                 close_signal.prepare_live_cash_winner_signal(db, SESSION)
         update = db["live_winner_session_runs"].find_one_and_update.call_args
@@ -74,8 +85,14 @@ class LiveDailyPreparationTests(TestCase):
         db["live_winner_session_runs"].find_one_and_update.return_value = _run(
             status="waiting_for_winner_signal", preparation_attempts=1,
         )
-        with patch.object(close_signal, "latest_safe_completed_xnys_session",
-                          return_value=pd.Timestamp("2026-10-16")):
+        with (
+            patch.object(close_signal, "latest_safe_completed_xnys_session",
+                         return_value=pd.Timestamp("2026-10-16")),
+            patch.object(close_signal, "create_live_readonly_client") as broker_factory,
+        ):
+            broker_factory.return_value.get_clock.return_value = SimpleNamespace(
+                timestamp=datetime.now(timezone.utc)
+            )
             result = close_signal.prepare_live_cash_winner_signal(db, SESSION)
         self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
         changed = db["live_winner_session_runs"].find_one_and_update.call_args.args[1]["$set"]

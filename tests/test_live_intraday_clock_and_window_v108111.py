@@ -1,4 +1,4 @@
-"""Live post-close-only training, one bounded retry, immutable open-session plan."""
+"""Live post-close preparation, no arbitrary retry budget, intraday execution."""
 from __future__ import annotations
 
 import ast
@@ -44,7 +44,11 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
     db["live_winner_session_runs"].find_one_and_update.side_effect = [claimed, saved]
     broker = MagicMock()
     broker.get_account.return_value = SimpleNamespace(id="acct", equity=1000.0)
-    broker.get_clock.return_value = SimpleNamespace(is_open=market_open)
+    broker.get_clock.return_value = SimpleNamespace(
+        is_open=market_open,
+        timestamp=(datetime(2026, 10, 19, 13, 40, tzinfo=timezone.utc)
+                   if market_open else datetime(2026, 10, 16, 20, 1, tzinfo=timezone.utc)),
+    )
     broker.get_orders.return_value = []
     config = MagicMock()
     config.strategy_mode = TCC_U77_FIXED_CHALLENGER_MODE
@@ -107,13 +111,13 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(updates["snapshot_sha256"], "frozen-snapshot-sha")
         broker.submit_order.assert_not_called()
 
-    def test_automatic_retry_after_failure_has_cooldown_and_no_order(self):
+    def test_provider_failure_retries_without_cooldown_or_order(self):
         db, broker, snapshots, models, result, error = _prepare_test(fail_download=True)
         self.assertIsNotNone(error)
         updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
         self.assertEqual(updates["status"], "waiting_for_winner_signal")
         self.assertEqual(updates["phase"], "post_close_signal_retry_wait")
-        self.assertIsNotNone(updates["preparation_retry_not_before"])
+        self.assertNotIn("preparation_retry_not_before", updates)
         self.assertFalse(updates["post_close_signal_ready"])
         models.assert_not_called()
         broker.submit_order.assert_not_called()
@@ -140,28 +144,44 @@ class PostCloseSingleCalibrationTests(TestCase):
             "status": "recalibrated_no_orders", "target_asset": "ADEA",
             "decision_date": "2026-10-16",
         }
-        result = signals.prepare_live_cash_winner_signal(db, SESSION)
+        broker = MagicMock()
+        broker.get_clock.return_value = SimpleNamespace(
+            timestamp=datetime(2026, 10, 16, 20, 1, tzinfo=timezone.utc),
+        )
+        with patch(PREFIX + "create_live_readonly_client", return_value=broker), patch(
+            PREFIX + "latest_safe_completed_xnys_session",
+            return_value=pd.Timestamp("2026-10-16"),
+        ):
+            result = signals.prepare_live_cash_winner_signal(db, SESSION)
         self.assertEqual(result["target_asset"], "ADEA")
         self.assertFalse(result["order_submission_enabled"])
         db["live_winner_session_runs"].find_one_and_update.assert_not_called()
 
-    def test_pending_retry_does_not_train_during_wait(self):
+    def test_old_future_retry_timestamp_does_not_block_processing(self):
         db = MagicMock()
         run = _run()
         run["preparation_retry_not_before"] = datetime(2099, 10, 19, tzinfo=timezone.utc)
         db["live_winner_session_runs"].find_one.return_value = run
-        with patch(PREFIX + "create_live_readonly_client") as broker:
-            result = signals.prepare_live_cash_winner_signal(db, SESSION)
-        self.assertEqual(result["status"], "waiting_for_post_close_retry")
-        broker.assert_not_called()
-
-    def test_exhausted_budget_never_trains(self):
-        db = MagicMock()
-        db["live_winner_session_runs"].find_one.return_value = _run(attempts=256)
-        with patch(PREFIX + "download_operational_market_snapshot") as download:
-            with self.assertRaisesRegex(RuntimeError, "attempts exhausted"):
+        broker = MagicMock()
+        broker.get_clock.return_value = SimpleNamespace(
+            timestamp=datetime(2026, 10, 16, 20, 1, tzinfo=timezone.utc),
+        )
+        with (
+            patch(PREFIX + "create_live_readonly_client", return_value=broker),
+            patch(PREFIX + "latest_safe_completed_xnys_session",
+                  return_value=pd.Timestamp("2026-10-16")),
+            patch(PREFIX + "get_system_settings",
+                  return_value={"training": {"enabled": False}}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "training is disabled"):
                 signals.prepare_live_cash_winner_signal(db, SESSION)
-        download.assert_not_called()
+
+    def test_256_attempts_do_not_exhaust_live_processing(self):
+        db, broker, snapshots, models, result, error = _prepare_test(attempts=256)
+        self.assertIsNone(error)
+        self.assertEqual(result["status"], "recalibrated_no_orders")
+        models.assert_called_once()
+        broker.submit_order.assert_not_called()
 
     def test_intraday_recalibration_and_expired_reanalysis_retired(self):
         db = MagicMock()

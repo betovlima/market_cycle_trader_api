@@ -36,7 +36,15 @@ class LiveSignalSafetyTests(unittest.TestCase):
             "status": "waiting_for_winner_signal",
         }
         settings.return_value = {"training": {"enabled": False}}
-        with patch("market_cycle_trader_api.services.live_winner_signal.latest_safe_completed_xnys_session",
-                   return_value=__import__("pandas").Timestamp("2026-10-15")):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        with (
+            patch("market_cycle_trader_api.services.live_winner_signal.latest_safe_completed_xnys_session",
+                  return_value=__import__("pandas").Timestamp("2026-10-15")),
+            patch("market_cycle_trader_api.services.live_winner_signal.create_live_readonly_client") as factory,
+        ):
+            factory.return_value.get_clock.return_value = SimpleNamespace(
+                timestamp=datetime(2026, 10, 15, 20, 1, tzinfo=timezone.utc)
+            )
             with self.assertRaisesRegex(RuntimeError, "disabled"):
                 prepare_live_cash_winner_signal(db, "2026-10-16")

@@ -1,4 +1,4 @@
-"""Live execution uses a dedicated route and a bounded current-session deadline."""
+"""Live execution follows full XNYS sessions and Alpaca order-state constraints."""
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -22,21 +22,30 @@ class LiveWindowTests(unittest.TestCase):
             market_open_delay_seconds=60, market_execution_window_seconds=90,
         )
 
-    def test_live_window_does_not_expire_before_model_calculates(self):
-        self.assertEqual(live_execution_window_seconds(self.settings), 5400)
+    def test_full_market_session_replaces_90_minute_limit(self):
+        self.assertEqual(live_execution_window_seconds(self.settings), 23400)
         start = pd.Timestamp(datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc))
         deadline, seconds = live_execution_window_deadline(start, self.settings)
-        self.assertEqual(seconds, 5400)
-        self.assertEqual(deadline, start + pd.Timedelta(minutes=90))
+        self.assertEqual(seconds, 23400)
+        self.assertEqual(deadline, pd.Timestamp("2026-10-19T20:00:00Z"))
 
-    def test_window_respects_existing_larger_operational_setting(self):
-        self.settings.market_execution_window_seconds = 7200
-        self.assertEqual(live_execution_window_seconds(self.settings), 7200)
-
-    def test_window_must_exceed_open_delay(self):
+    def test_open_delay_and_old_custom_settings_do_not_limit_live(self):
+        self.settings.market_execution_window_seconds = 90
         self.settings.market_open_delay_seconds = 5400
-        with self.assertRaisesRegex(RuntimeError, "must exceed"):
-            live_execution_window_seconds(self.settings)
+        self.assertEqual(live_execution_window_seconds(self.settings), 23400)
+
+    def test_nyse_early_close_and_dst_are_included(self):
+        # Black Friday: the official XNYS calendar closes at 13:00 ET.
+        open_at = pd.Timestamp("2026-11-27T14:30:00Z")
+        deadline, duration = live_execution_window_deadline(open_at)
+        self.assertEqual(duration, 12600)
+        self.assertEqual(deadline, pd.Timestamp("2026-11-27T18:00:00Z"))
+
+    def test_nyse_standard_time_is_dynamic(self):
+        # Jan NYSE open: 09:30 EST / 14:30 UTC, closes at 21:00 UTC.
+        deadline, seconds = live_execution_window_deadline(pd.Timestamp("2026-01-05T14:30:00Z"))
+        self.assertEqual(deadline, pd.Timestamp("2026-01-05T21:00:00Z"))
+        self.assertEqual(seconds, 23400)
 
 
 class LiveExecutionRouteTests(unittest.TestCase):
