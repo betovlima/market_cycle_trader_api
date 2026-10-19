@@ -1032,7 +1032,8 @@ Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
   do fallback ainda indisponivel; codigos de erro e ativo/feed sanitizados;
   janela Live independente de 30 minutos aplicada na recalibracao e nas
   etapas de ordem real; expiracao bloqueia submissao e requer revisao.
-- **Sem alteracoes:** LightGBM, pesos, treinamento cientifico, Strategy #30,
+- **Sem alteracoes:** coletor intraday compartilhado e comportamento Paper,
+  LightGBM, pesos, treinamento cientifico, Strategy #30,
   77 solicitados/75 efetivos, TCC, capital, dados congelados, posicoes,
   regras de Broker, identidade do Winner e controle Paper/Live.
 - **Risco mitigado:** nenhuma ordem baseada em barra incompleta, timestamp
