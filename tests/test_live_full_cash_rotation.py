@@ -23,6 +23,7 @@ class LiveWinnerRotationTests(TestCase):
             "winner_signal_prepared": True, "winner_strategy_id": "winner",
             "winner_configuration_hash": "hash", "winner_revision": 2,
             "live_account_id": "acct", "live_state_revision": 7,
+            "expected_market_open": datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc),
         }
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = run
@@ -41,7 +42,7 @@ class LiveWinnerRotationTests(TestCase):
         broker.get_account.side_effect = [first_account, second_account]
         broker.get_clock.return_value = SimpleNamespace(
             is_open=True,
-            timestamp=datetime(2026, 10, 19, 15, 30, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 10, 19, 13, 40, tzinfo=timezone.utc),
         )
         broker.get_orders.return_value = []
         state = {
