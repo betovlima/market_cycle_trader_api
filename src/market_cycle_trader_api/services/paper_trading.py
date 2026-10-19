@@ -18,10 +18,10 @@ from ..core.config import (
 )
 from ..engine.live_model_signal import build_live_model_decision
 from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
-from ..engine.tcc_u67_operational_market_data import (
+from ..engine.operational_market_snapshot import (
     DATA_DIRECTORY as TCC_U67_DATA_DIRECTORY,
-    append_u67_current_session_intraday,
-    download_u67_operational_snapshot,
+    append_current_session_intraday,
+    download_operational_market_snapshot,
 )
 from ..engine.tcc_u67_operational_runtime import (
     assert_tcc_u67_model_snapshot,
@@ -720,7 +720,7 @@ def prepare_next_paper_plan(
         snapshot_config = strategy.model_copy(
             update={"analysis_end_date": target_session}
         )
-        snapshot = download_u67_operational_snapshot(
+        snapshot = download_operational_market_snapshot(
             job_id=live_job_id,
             progress_callback=progress_callback,
             config=snapshot_config,
@@ -763,7 +763,7 @@ def prepare_next_paper_plan(
                 current_session.tz_convert(EASTERN).date().isoformat()
             )
             bars_by_symbol, intraday_metadata = (
-                append_u67_current_session_intraday(
+                append_current_session_intraday(
                     bars_by_symbol,
                     strategy,
                     session=current_session,

@@ -40,9 +40,9 @@ from .tcc_u77_static_challenger import (
     U77_REQUESTED_ASSETS,
     assert_tcc_u77_contract,
 )
-from .tcc_u67_operational_market_data import (
+from .operational_market_snapshot import (
     DATA_DIRECTORY as TCC_U67_DATA_DIRECTORY,
-    download_u67_operational_snapshot,
+    download_operational_market_snapshot,
 )
 from .market_data import validate_and_clean_bars
 from .research_market_data import (
@@ -336,17 +336,17 @@ def run_job(
     bars_by_symbol: dict[str, pd.DataFrame] = {}
     failures: list[dict[str, str]] = []
     structural_exclusions: list[dict[str, Any]] = []
-    u67_snapshot = None
+    operational_snapshot = None
 
     emit_progress(2.0, "Preparing shared-capital rotation")
 
     if tcc_protected_runtime:
         emit_progress(
             3.0,
-            "TCC U67 downloading fresh Alpaca RAW/SIP snapshot",
+            "TCC U77" if tcc_u77_runtime else "TCC U67",
         )
 
-        def u67_snapshot_progress(
+        def operational_snapshot_progress(
             phase: str,
             position: int,
             total: int,
@@ -356,12 +356,12 @@ def run_job(
             emit_progress(
                 3.0 + 12.0 * fraction,
                 (
-                    f"TCC U67 {phase} market data "
+                    f"TCC {'U77' if tcc_u77_runtime else 'U67'} {phase} market data "
                     f"{position}/{total} — {symbol}"
                 ),
             )
 
-        u67_snapshot = download_u67_operational_snapshot(
+        operational_snapshot = download_operational_market_snapshot(
             job_id=job_id,
             config=effective_config,
             requested_assets=(
@@ -369,7 +369,7 @@ def run_job(
                 if tcc_u77_runtime
                 else tuple(config.assets)
             ),
-            progress_callback=u67_snapshot_progress,
+            progress_callback=operational_snapshot_progress,
             data_directory=(
                 TCC_U67_DATA_DIRECTORY.parent.parent
                 / "tcc_u77_fixed_challenger" / "snapshots"
@@ -379,12 +379,12 @@ def run_job(
         )
         bars_by_symbol = {
             symbol: frame.copy()
-            for symbol, frame in u67_snapshot.frames.items()
+            for symbol, frame in operational_snapshot.frames.items()
         }
         structural_exclusions = [
             dict(item)
             for item in (
-                u67_snapshot.manifest.get("structural_exclusions") or []
+                operational_snapshot.manifest.get("structural_exclusions") or []
             )
             if isinstance(item, dict)
         ]
@@ -631,18 +631,18 @@ def run_job(
             "dividend_events_used_by_model": False,
             "split_normalization_direction": "pre_ex_date_history",
             "split_normalization_uses_future_events": True,
-            "u67_fresh_snapshot": bool(u67_snapshot is not None),
+            "u67_fresh_snapshot": bool(operational_snapshot is not None),
             "u67_snapshot_sha256": (
                 str(
-                    u67_snapshot.manifest.get("snapshot_sha256")
+                    operational_snapshot.manifest.get("snapshot_sha256")
                     or ""
                 )
-                if u67_snapshot is not None
+                if operational_snapshot is not None
                 else None
             ),
             "u67_snapshot_directory": (
-                str(u67_snapshot.directory)
-                if u67_snapshot is not None
+                str(operational_snapshot.directory)
+                if operational_snapshot is not None
                 else None
             ),
         }
