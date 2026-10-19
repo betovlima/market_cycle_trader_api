@@ -1,3 +1,19 @@
+## 2026-10-19 — API v10.8.115 — integração das PRs #64, #65 e #66
+
+**Objetivo.** Integrar em uma única mudança versionada: a correção de corte diário do PR #64, a nomenclatura genérica e retrocompatível de snapshots U67/U77 do PR #65 e a pipeline operacional Live pós-fechamento + abertura da PR #66.
+
+**Precedência funcional.** A exigência do PR #64 de corte D-1 **antes de treinar** é mantida. A exigência antiga de executar o sinal pós-fechamento D-1 isoladamente é substituída por uma obrigação mais forte: a execução Live exige `historical_cutoff=D-1` **e** `decision_date=D`, derivada da recalibração intradiária da própria sessão. Não aplicar conjuntamente regras contraditórias do executor antigo. Os testes de #64 são conservados e atualizados para a mensagem/campos novos, além dos testes #66.
+
+**Pipeline independente.** Trading/Paper está parado por decisão do usuário, reservado para avaliações futuras. Esta entrega não o reinicia, não muda controles salvos e não deve criar ordens Paper. Somente a pipeline Live usa credenciais da conta Live para mercado (histórico diário, ações corporativas, barras intradiárias) e execução. O motor científico U67/U77 é compartilhado, mas agendadores, estados, planos e corretora do Paper não são usados pelo Live.
+
+**Recuperação de 20/10.** O sinal CAPR calculado sobre sexta 16/10 não autoriza execução. Na sessão 20/10, apenas uma nova calibração Live com `historical_cutoff=19/10`, barras intradiárias de 20/10 e `decision_date=20/10` pode liberar ordens. Se não houver candles, modelo, reconciliação ou tempo suficiente, permanecer sem operar. Não enviar ordens reais durante testes/deploy.
+
+**Interface.** `engine/operational_market_snapshot.py` abriga download/snapshot e recebe credenciais explícitas quando chamado pelo Live; `engine/tcc_u67_operational_market_data.py` preserva os aliases históricos. Funções Live passam a usar `prepare_live_winner_signal` e `execute_prepared_live_winner_session`, mantendo aliases antigos para terceiros. Preservar manifestos, hashes, exclusões (CLMT), paridade científica, rotas HTTP e estados MongoDB. `API_VERSION` e pacote Python passam juntos a 10.8.115.
+
+**Validação.** CI completo com mocks, teste de 16/10→19/10, teste de execução com data D, isolamento Live/Paper, reinício do treinamento, ledger idempotente, controle de janela e contrato U67/U77. Validar logs Railway e deploy no commit exato. Merge somente após CI verde; não ocultar falhas. Não prometer operações reais nem recuperação garantida se provedores estiverem indisponíveis.
+
+---
+
 ## 2026-10-19 — API v10.8.114 — Live autônomo pós-fechamento + abertura (PR para revisão)
 
 **Motivação.** Em 19/10, um sinal Live CAPR para 20/10 foi preparado com `decision_date=2026-10-16`, antes de o candle de segunda-feira estar seguro. O fluxo Live v10.8.111 executaria esse sinal obsoleto porque só exigia uma data anterior à sessão seguinte.
