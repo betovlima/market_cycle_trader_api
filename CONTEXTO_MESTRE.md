@@ -1015,3 +1015,32 @@ Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
 - O endpoint **não cancela ordens na corretora** e **não reclassifica** o registro de execução de ordens `paper_trade_orders`, pois os casos comprovados como incorretos são planos `prepared`, não ordens preenchidas. Não altera posição, capital, Winner, cotações, agendador, decisão nem regras da estratégia.
 - Sem novas travas de negócio ou manutenção automática que interfira nas escolhas futuras; encerramento é apenas sob chamada do administrador e idempotente para planos já cancelados.
 - CI: dois testes da chamada única e janela temporal foram adicionados em `tests/test_manual_current_session_control.py`; asserção de versão atualizada em `tests/test_tcc_v106_main_integration.py`.
+
+
+## 2026-10-19 — API v10.8.111 — Resiliencia intraday Live e diagnostico
+
+- **Branch:** `fix/v10.8.111-live-intraday-clock-diagnostics` derivada de
+  `main` no commit `11512d23`. Sem merge ou deploy automatico.
+- **Causa:** falha de recalibracao `intraday_bars` no Live em 19/10,
+  apos download de aproximadamente 79 segundos do universo U77. O erro original
+  foi exportado apenas como `RuntimeError`, sem identificar simbolo ou feed.
+  Nao afirmar que SIP/AMS falhou na producao.
+- **Alteracoes:** preflight aguarda primeira barra completa; novo horario
+  Alpaca apos baixar historicos; corte de 1 minuto completo e uniforme para
+  Paper e Live; fallback IEX/SIP/delayed SIP preservado; adiamento explicito
+  do fallback ainda indisponivel; codigos de erro e ativo/feed sanitizados;
+  janela Live independente de 30 minutos aplicada na recalibracao e nas
+  etapas de ordem real; expiracao bloqueia submissao e requer revisao.
+- **Sem alteracoes:** LightGBM, pesos, treinamento cientifico, Strategy #30,
+  77 solicitados/75 efetivos, TCC, capital, dados congelados, posicoes,
+  regras de Broker, identidade do Winner e controle Paper/Live.
+- **Risco mitigado:** nenhuma ordem baseada em barra incompleta, timestamp
+  obsoleto apos download ou decisao que atravessou a janela operacional.
+- **Testes:** `tests/test_live_intraday_clock_and_window_v108111.py`,
+  `tests/test_tcc_u67_current_session_intraday.py`, regressao de rotacao.
+  Status final deve ser verificado no GitHub Actions pelo SHA do ultimo commit.
+- **Proximos passos:** avaliar PR sem merge automatico; homologar com dados
+  intradiarios e auditoria de ordens, sem executar com conta Live durante teste;
+  solicitar nova auditoria de uma sessao futura antes da promocao.
+- **Referencia detalhada:**
+  `docs/changes/v10.8.111-live-intraday-clock-diagnostics.md`.
