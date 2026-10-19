@@ -29,8 +29,10 @@ class LiveSignalSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not eligible"):
             prepare_live_cash_winner_signal(db, "2026-10-16")
 
+    @patch("market_cycle_trader_api.services.live_winner_signal.latest_safe_completed_xnys_session",
+           return_value=__import__("pandas").Timestamp("2026-10-15"))
     @patch("market_cycle_trader_api.services.live_winner_signal.get_system_settings")
-    def test_training_disabled_rejects_before_broker_connect(self, settings):
+    def test_training_disabled_rejects_before_broker_connect(self, settings, _cutoff):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = {
             "status": "waiting_for_winner_signal",
