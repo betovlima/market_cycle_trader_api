@@ -79,7 +79,7 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
         if fail_download:
             snapshot_call = fake("download_operational_market_snapshot", side_effect=RuntimeError("provider unavailable"))
         else:
-            snapshot_call = fake("download_u67_operational_snapshot", snapshot)
+            snapshot_call = fake("download_operational_market_snapshot", snapshot)
         model_call = fake("build_live_model_decision", decision)
         fake("winner_candidate_fields", {})
         events = fake("append_live_event")
@@ -158,7 +158,7 @@ class PostCloseSingleCalibrationTests(TestCase):
     def test_exhausted_budget_never_trains(self):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = _run(attempts=256)
-        with patch(PREFIX + "download_u67_operational_snapshot") as download:
+        with patch(PREFIX + "download_operational_market_snapshot") as download:
             with self.assertRaisesRegex(RuntimeError, "attempts exhausted"):
                 signals.prepare_live_cash_winner_signal(db, SESSION)
         download.assert_not_called()

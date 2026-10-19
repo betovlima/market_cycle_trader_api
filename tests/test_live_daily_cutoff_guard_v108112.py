@@ -27,7 +27,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
             patch(self.prefix + "latest_safe_completed_xnys_session",
                   return_value=pd.Timestamp("2026-10-16")),
             patch(self.prefix + "get_system_settings") as settings,
-            patch(self.prefix + "download_u67_operational_snapshot") as download,
+            patch(self.prefix + "download_operational_market_snapshot") as download,
             patch(self.prefix + "create_live_readonly_client") as broker,
         ):
             result = prepare_live_cash_winner_signal(self.db, "2026-10-20")
@@ -47,7 +47,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
                   return_value=pd.Timestamp("2026-10-16")),
             patch(self.prefix + "get_system_settings",
                   return_value={"training": {"enabled": False}}) as settings,
-            patch(self.prefix + "download_u67_operational_snapshot") as download,
+            patch(self.prefix + "download_operational_market_snapshot") as download,
         ):
             with self.assertRaisesRegex(RuntimeError, "training is disabled"):
                 prepare_live_cash_winner_signal(self.db, "2026-10-19")
@@ -60,7 +60,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
                   return_value=pd.Timestamp("2026-10-19")),
             patch(self.prefix + "get_system_settings",
                   return_value={"training": {"enabled": False}}) as settings,
-            patch(self.prefix + "download_u67_operational_snapshot") as download,
+            patch(self.prefix + "download_operational_market_snapshot") as download,
         ):
             with self.assertRaisesRegex(RuntimeError, "training is disabled"):
                 prepare_live_cash_winner_signal(self.db, "2026-10-20")
