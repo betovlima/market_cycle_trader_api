@@ -1,255 +1,216 @@
-"""Contract tests for Live v10.8.111. All Alpaca/DB operations are mocked."""
+"""Live post-close-only training, one bounded retry, immutable open-session plan."""
 from __future__ import annotations
 
+import ast
 from contextlib import ExitStack
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
-from unittest import TestCase
 
+from market_cycle_trader_api import services
 from market_cycle_trader_api.core.config import TCC_U77_FIXED_CHALLENGER_MODE
 from market_cycle_trader_api.services import (
-    live_winner_recalibration as recalibration,
+    live_winner_signal as signals,
+    live_winner_recalibration as retired,
     live_order_execution as executor,
+    live_expired_recovery,
 )
 
 SESSION = "2026-10-19"
-OPEN = datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc)
-PREFIX = "market_cycle_trader_api.services.live_winner_recalibration."
+PREFIX = "market_cycle_trader_api.services.live_winner_signal."
 
 
-def _clock(minute: int, *, second: int = 0) -> SimpleNamespace:
-    return SimpleNamespace(
-        is_open=True,
-        timestamp=datetime(2026, 10, 19, 13, minute, second, tzinfo=timezone.utc),
-    )
-
-
-def _run() -> dict:
+def _run(attempts=0):
     return {
-        "_id": "acct:2026-10-19",
-        "execution_session": SESSION,
-        "status": "signal_prepared",
-        "expected_market_open": OPEN,
-        "live_account_id": "acct",
-        "winner_strategy_id": "winner",
-        "winner_revision": 2,
-        "winner_configuration_hash": "winner-hash",
+        "_id": "acct:" + SESSION, "execution_session": SESSION,
+        "status": "waiting_for_winner_signal",
+        "live_account_id": "acct", "winner_strategy_id": "winner",
+        "winner_revision": 2, "winner_configuration_hash": "hash",
+        "expected_market_open": datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc),
+        "preparation_attempts": attempts,
     }
 
 
-def _check_test_recalibration_waits_for_a_completed_minute_without_downloading():
-    broker = MagicMock()
-    broker.get_account.return_value.id = "acct"
-    broker.get_clock.return_value = _clock(30, second=46)
+def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
     db = MagicMock()
-    db["live_winner_session_runs"].find_one.return_value = _run()
-    with patch(PREFIX + "create_live_readonly_client", return_value=broker), patch(
-        PREFIX + "download_u67_operational_snapshot"
-    ) as download:
-        result = recalibration.recalibrate_live_cash_winner_signal(db, SESSION)
-    assert result["status"] == "waiting_for_intraday_data"
-    assert result["order_submission_enabled"] is False
-    download.assert_not_called()
-    db["live_winner_session_runs"].find_one_and_update.assert_not_called()
-
-
-def _check_test_expired_live_session_is_never_recalibrated_or_executed():
-    broker = MagicMock()
-    broker.get_account.return_value.id = "acct"
-    broker.get_clock.return_value = SimpleNamespace(
-        is_open=True, timestamp=datetime(2026, 10, 19, 14, 1, tzinfo=timezone.utc)
-    )
-    db = MagicMock()
-    db["live_winner_session_runs"].find_one.return_value = _run()
-    with patch(PREFIX + "create_live_readonly_client", return_value=broker), patch(
-        PREFIX + "download_u67_operational_snapshot"
-    ) as download, patch(PREFIX + "append_live_event"):
-        result = recalibration.recalibrate_live_cash_winner_signal(db, SESSION)
-    assert result["status"] == "execution_window_expired"
-    assert result["order_submission_enabled"] is False
-    download.assert_not_called()
-    assert db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]["phase"] == "execution_window_expired"
-
-
-def _simulate_model_recalibration(final_clock: SimpleNamespace):
-    db = MagicMock()
-    run = _run()
+    run = _run(attempts)
     db["live_winner_session_runs"].find_one.return_value = run
-    db["live_winner_session_runs"].find_one_and_update.side_effect = [
-        run, {"status": "recalibrated_no_orders", "action": "buy"},
-    ]
+    claimed = {**run, "status": "preparing_signal", "preparation_attempts": attempts + 1}
+    saved = {**run, "status": "recalibrated_no_orders", "target_asset": "ADEA", "action": "buy"}
+    db["live_winner_session_runs"].find_one_and_update.side_effect = [claimed, saved]
     broker = MagicMock()
-    broker.get_account.return_value.id = "acct"
+    broker.get_account.return_value = SimpleNamespace(id="acct", equity=1000.0)
+    broker.get_clock.return_value = SimpleNamespace(is_open=market_open)
     broker.get_orders.return_value = []
-    broker.get_clock.side_effect = [
-        _clock(31, second=37),
-        _clock(33, second=12),
-        final_clock,
-    ]
+    config = MagicMock()
+    config.strategy_mode = TCC_U77_FIXED_CHALLENGER_MODE
+    config.assets = ["ADEA"]
+    config.model_copy.return_value = config
+    profile = {"id": "winner", "revision": 2, "configuration_hash": "hash"}
     model = {"family": "lightgbm_utility", "settings_snapshot": {}}
-    profile = {"id": "winner", "revision": 2, "configuration_hash": "winner-hash"}
-    strategy = MagicMock()
-    strategy.strategy_mode = TCC_U77_FIXED_CHALLENGER_MODE
-    strategy.assets = ["ADEA"]
-    strategy.model_copy.return_value = strategy
-
+    snapshot = SimpleNamespace(
+        frames={"ADEA": pd.DataFrame({"close": [1.0]})},
+        manifest={"snapshot_sha256": "frozen-snapshot-sha"},
+    )
+    decision = SimpleNamespace(decision_date=pd.Timestamp("2026-10-16"), target_asset="ADEA")
     with ExitStack() as stack:
-        def fake(method: str, **kwargs):
-            return stack.enter_context(patch(PREFIX + method, **kwargs))
-
-        fake("create_live_readonly_client", return_value=broker)
-        fake("verified_live_state", return_value={
-            "managed_symbol": "CASH", "holding_sessions": 0, "managed_quantity": 0.0,
-            "revision": 1,
-        })
-        fake("get_trader_winner_context", return_value=(strategy, profile))
-        fake("get_trader_winner_model_snapshot", return_value=model)
-        fake("apply_training_runtime_settings", return_value=strategy)
-        fake("apply_execution_profile", return_value=strategy)
+        def fake(name, result=None, side_effect=None):
+            return stack.enter_context(patch(
+                PREFIX + name, return_value=result, side_effect=side_effect,
+            ))
+        fake("get_system_settings", {"training": {"enabled": True}})
+        fake("get_trader_winner_context", (config, profile))
+        fake("get_trader_winner_model_snapshot", model)
+        fake("apply_training_runtime_settings", config)
+        fake("apply_execution_profile", config)
         fake("assert_tcc_u77_contract")
         fake("assert_tcc_u67_model_snapshot")
-        fake("latest_safe_completed_xnys_session", return_value=pd.Timestamp("2026-10-16T04:00:00Z"))
-        fake("download_u67_operational_snapshot", return_value=SimpleNamespace(
-            frames={"ADEA": pd.DataFrame({"close": [1]}, index=[pd.Timestamp("2026-10-16T04:00:00Z")])}
-        ))
-        intraday = fake(
-            "append_u67_current_session_intraday",
-            return_value=({"ADEA": pd.DataFrame({"close": [1]})}, {
-                "live_feed": "iex", "intraday_market_data_cutoff_utc": "2026-10-19T13:33:00+00:00",
-            }),
-        )
-        fake("build_live_model_decision", return_value=SimpleNamespace(
-            decision_date=pd.Timestamp("2026-10-19"), target_asset="ADEA"
-        ))
-        fake("winner_candidate_fields", return_value={})
-        fake("append_live_event")
-        with patch(PREFIX + "download_u67_operational_snapshot") as snapshot_download:
-            snapshot_download.return_value = SimpleNamespace(
-                frames={"ADEA": pd.DataFrame({"close": [1]})}
+        fake("create_live_readonly_client", broker)
+        fake("verified_live_state", {
+            "managed_symbol": "CASH", "managed_quantity": 0,
+            "holding_sessions": 0, "revision": 0,
+        })
+        fake("latest_safe_completed_xnys_session", pd.Timestamp("2026-10-16T04:00:00Z"))
+        if fail_download:
+            snapshot_call = fake("download_u67_operational_snapshot", side_effect=RuntimeError("provider unavailable"))
+        else:
+            snapshot_call = fake("download_u67_operational_snapshot", snapshot)
+        model_call = fake("build_live_model_decision", decision)
+        fake("winner_candidate_fields", {})
+        events = fake("append_live_event")
+        outcome = None
+        error = None
+        try:
+            outcome = signals.prepare_live_cash_winner_signal(db, SESSION)
+        except RuntimeError as exc:
+            error = exc
+    return db, broker, snapshot_call, model_call, outcome, error
+
+
+class PostCloseSingleCalibrationTests(TestCase):
+    def test_success_frozen_once_and_never_retrained(self):
+        db, broker, snapshots, models, result, error = _prepare_test()
+        self.assertIsNone(error)
+        self.assertEqual(result["status"], "recalibrated_no_orders")
+        self.assertFalse(result["order_submission_enabled"])
+        snapshots.assert_called_once()
+        models.assert_called_once()
+        updates = db["live_winner_session_runs"].find_one_and_update.call_args_list[-1].args[1]["$set"]
+        self.assertEqual(updates["phase"], "post_close_signal_ready_for_execution")
+        self.assertTrue(updates["post_close_signal_ready"])
+        self.assertEqual(updates["decision_date"], "2026-10-16")
+        self.assertEqual(updates["snapshot_sha256"], "frozen-snapshot-sha")
+        broker.submit_order.assert_not_called()
+
+    def test_one_retry_after_failure_has_cooldown_and_no_order(self):
+        db, broker, snapshots, models, result, error = _prepare_test(fail_download=True)
+        self.assertIsNotNone(error)
+        updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
+        self.assertEqual(updates["status"], "waiting_for_winner_signal")
+        self.assertEqual(updates["phase"], "post_close_signal_retry_wait")
+        self.assertIsNotNone(updates["preparation_retry_not_before"])
+        self.assertFalse(updates["post_close_signal_ready"])
+        models.assert_not_called()
+        broker.submit_order.assert_not_called()
+
+    def test_second_failure_exhausts_retry_and_requires_review(self):
+        db, broker, snapshots, models, result, error = _prepare_test(fail_download=True, attempts=1)
+        self.assertIsNotNone(error)
+        updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
+        self.assertEqual(updates["status"], "review_required")
+        self.assertEqual(updates["phase"], "post_close_signal_failed")
+        self.assertFalse(updates["order_submission_enabled"])
+        broker.submit_order.assert_not_called()
+
+    def test_no_preparation_when_regular_market_open(self):
+        db, broker, snapshots, models, result, error = _prepare_test(market_open=True)
+        self.assertIn("closed regular market", str(error))
+        snapshots.assert_not_called()
+        models.assert_not_called()
+        broker.submit_order.assert_not_called()
+
+    def test_successful_frozen_plan_is_idempotent(self):
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = {
+            "status": "recalibrated_no_orders", "target_asset": "ADEA",
+        }
+        result = signals.prepare_live_cash_winner_signal(db, SESSION)
+        self.assertEqual(result["target_asset"], "ADEA")
+        self.assertFalse(result["order_submission_enabled"])
+        db["live_winner_session_runs"].find_one_and_update.assert_not_called()
+
+    def test_pending_retry_does_not_train_during_wait(self):
+        db = MagicMock()
+        run = _run()
+        run["preparation_retry_not_before"] = datetime(2099, 10, 19, tzinfo=timezone.utc)
+        db["live_winner_session_runs"].find_one.return_value = run
+        with patch(PREFIX + "create_live_readonly_client") as broker:
+            result = signals.prepare_live_cash_winner_signal(db, SESSION)
+        self.assertEqual(result["status"], "waiting_for_post_close_retry")
+        broker.assert_not_called()
+
+    def test_exhausted_attempts_cannot_start_third_training(self):
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = _run(attempts=2)
+        with patch(PREFIX + "download_u67_operational_snapshot") as download:
+            with self.assertRaisesRegex(RuntimeError, "attempts exhausted"):
+                signals.prepare_live_cash_winner_signal(db, SESSION)
+        download.assert_not_called()
+
+    def test_intraday_recalibration_and_expired_reanalysis_retired(self):
+        db = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "LiveIntradayRecalibrationDisabled"):
+            retired.recalibrate_live_cash_winner_signal(db, SESSION)
+        with self.assertRaisesRegex(RuntimeError, "LiveIntradayReanalysisDisabled"):
+            live_expired_recovery.queue_expired_live_analysis(
+                db, execution_session=SESSION, actor_email="admin@example.com"
             )
-            if final_clock.timestamp.hour == 14:
-                with TestCase().assertRaisesRegex(RuntimeError, "LiveExecutionWindowExpired"):
-                    recalibration.recalibrate_live_cash_winner_signal(db, SESSION)
-                assert db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]["phase"] == "execution_window_expired"
-            else:
-                result = recalibration.recalibrate_live_cash_winner_signal(db, SESSION)
-                assert result["status"] == "recalibrated_no_orders"
-                assert result["order_submission_enabled"] is False
-            snapshot_download.assert_called_once()
-        assert intraday.call_args.kwargs["now"] == pd.Timestamp("2026-10-19T13:33:00Z")
-    broker.submit_order.assert_not_called()
+        db.__getitem__.assert_not_called()
 
+    def test_scheduler_no_longer_imports_or_calls_intraday_model(self):
+        path = Path(services.__file__).parent / "live_observation_scheduler.py"
+        source = path.read_text(encoding="utf-8")
+        parsed = ast.parse(source)
+        self.assertFalse(any(
+            node.module and node.module.endswith("live_winner_recalibration")
+            for node in ast.walk(parsed) if isinstance(node, ast.ImportFrom)
+        ))
+        self.assertNotIn("recalibrate_live_cash_winner_signal(", source)
 
-def _check_test_live_refreshes_clock_after_historical_download():
-    _simulate_model_recalibration(_clock(40))
-
-
-def _check_test_completion_after_deadline_never_creates_executable_plan():
-    _simulate_model_recalibration(SimpleNamespace(
-        is_open=True, timestamp=datetime(2026, 10, 19, 14, 2, tzinfo=timezone.utc)
-    ))
-
-
-def _check_test_intraday_audit_extracts_only_whitelisted_failure_identifiers():
-    exc = RuntimeError(
-        "CurrentSessionIntradayCoverageUnavailable: "
-        "CurrentSessionIntradayDataMissing: AMS has no IEX regular-session bars "
-        "at 2026-10-19. Secret: should not be exported"
-    )
-    result = recalibration._intraday_error_fields(exc)
-    assert result == {
-        "error_code": "CurrentSessionIntradayCoverageUnavailable",
-        "symbol": "AMS", "feed": "iex",
-    }
-    unknown = recalibration._intraday_error_fields(
-        RuntimeError("API KEY sk-test-not-an-error-code")
-    )
-    assert unknown == {"error_code": "RuntimeError"}
-
-
-def _check_test_recovery_waits_until_next_allowed_attempt():
-    run = _run()
-    run["retry_not_before"] = datetime(2026, 10, 19, 13, 51, tzinfo=timezone.utc)
-    db = MagicMock()
-    db["live_winner_session_runs"].find_one.return_value = run
-    broker = MagicMock()
-    broker.get_account.return_value.id = "acct"
-    broker.get_clock.return_value = _clock(40)
-    with patch(PREFIX + "create_live_readonly_client", return_value=broker), patch(
-        PREFIX + "download_u67_operational_snapshot"
-    ) as download:
-        result = recalibration.recalibrate_live_cash_winner_signal(db, SESSION)
-    assert result["status"] == "waiting_for_intraday_data"
-    assert result["retry_after"] == "2026-10-19T13:51:00+00:00"
-    download.assert_not_called()
-
-
-def _check_test_executor_refuses_real_order_after_independent_live_deadline():
-    db = MagicMock()
-    run = _run()
-    run.update({"status": "recalibrated_no_orders", "action": "buy", "target_asset": "ADEA",
-                "winner_signal_prepared": True})
-    db["live_winner_session_runs"].find_one.return_value = run
-    broker = MagicMock()
-    broker.get_account.return_value = SimpleNamespace(
-        id="acct", status="active", account_blocked=False, trading_blocked=False,
-        trade_suspended_by_user=False,
-    )
-    broker.get_clock.return_value = SimpleNamespace(
-        is_open=True, timestamp=datetime(2026, 10, 19, 14, 1, tzinfo=timezone.utc)
-    )
-    prefix = "market_cycle_trader_api.services.live_order_execution."
-    with (
-        patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
-        patch(prefix + "get_trader_winner_summary", return_value={
-            "id": "winner", "revision": 2, "configuration_hash": "winner-hash",
-        }),
-        patch(prefix + "create_live_execution_client", return_value=broker),
-        patch(prefix + "_execute_leg") as leg,
-    ):
-        result = executor.execute_recalibrated_live_winner_session(db, SESSION)
-    assert result["status"] == "execution_window_expired"
-    assert not result["order_submission_enabled"]
-    leg.assert_not_called()
-    broker.submit_order.assert_not_called()
-
-
-def _check_test_each_broker_leg_rechecks_market_deadline():
-    broker = MagicMock()
-    broker.get_clock.return_value = SimpleNamespace(
-        is_open=True, timestamp=datetime(2026, 10, 19, 14, 1, tzinfo=timezone.utc)
-    )
-    with TestCase().assertRaisesRegex(RuntimeError, "LiveExecutionWindowExpired"):
-        executor._assert_live_order_window(
-            broker, SESSION, pd.Timestamp("2026-10-19T14:00:00Z")
+    def test_execution_requires_verified_after_close_frozen_snapshot(self):
+        db = MagicMock()
+        run = {
+            **_run(), "status": "recalibrated_no_orders",
+            "winner_signal_prepared": True, "target_asset": "ADEA",
+            "action": "buy", "current_asset": "CASH",
+            "live_state_revision": 0,
+            "decision_date": "2026-10-16",
+            "snapshot_sha256": "frozen-sha",
+            # post_close_signal_ready deliberately missing.
+        }
+        db["live_winner_session_runs"].find_one.return_value = run
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(
+            id="acct", status="active", account_blocked=False,
+            trading_blocked=False, trade_suspended_by_user=False
         )
-
-
-class LiveIntradayClockAndWindowTests(TestCase):
-    def test_recalibration_waits_for_a_completed_minute_without_downloading(self):
-        _check_test_recalibration_waits_for_a_completed_minute_without_downloading()
-
-    def test_expired_live_session_is_never_recalibrated_or_executed(self):
-        _check_test_expired_live_session_is_never_recalibrated_or_executed()
-
-    def test_live_refreshes_clock_after_historical_download(self):
-        _check_test_live_refreshes_clock_after_historical_download()
-
-    def test_completion_after_deadline_never_creates_executable_plan(self):
-        _check_test_completion_after_deadline_never_creates_executable_plan()
-
-    def test_intraday_audit_extracts_only_whitelisted_failure_identifiers(self):
-        _check_test_intraday_audit_extracts_only_whitelisted_failure_identifiers()
-
-    def test_recovery_waits_until_next_allowed_attempt(self):
-        _check_test_recovery_waits_until_next_allowed_attempt()
-
-    def test_executor_refuses_real_order_after_independent_live_deadline(self):
-        _check_test_executor_refuses_real_order_after_independent_live_deadline()
-
-    def test_each_broker_leg_rechecks_market_deadline(self):
-        _check_test_each_broker_leg_rechecks_market_deadline()
-
+        broker.get_clock.return_value = SimpleNamespace(
+            is_open=True, timestamp=datetime(2026, 10, 19, 13, 40, tzinfo=timezone.utc)
+        )
+        prefix = "market_cycle_trader_api.services.live_order_execution."
+        with (
+            patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
+            patch(prefix + "get_trader_winner_summary", return_value={
+                "id": "winner", "revision": 2, "configuration_hash": "hash",
+            }),
+            patch(prefix + "create_live_execution_client", return_value=broker),
+            patch(prefix + "_execute_leg") as orders,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No verified post-close"):
+                executor.execute_recalibrated_live_winner_session(db, SESSION)
+            orders.assert_not_called()
+            broker.submit_order.assert_not_called()
