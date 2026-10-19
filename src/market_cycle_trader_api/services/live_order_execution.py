@@ -237,7 +237,11 @@ def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any
         if action in {"sell_to_cash", "rotate"}:
             if live_control_status(db)["control_mode"] not in {"active", "exit_only"}:
                 raise RuntimeError("Live mode changed before sell submission.")
-            _assert_live_order_window(broker, session, deadline)
+            refreshed_clock = broker.get_clock()
+            refreshed_deadline, _ = live_execution_window_deadline(
+                expected_open, market_clock=refreshed_clock,
+            )
+            _assert_live_order_window(broker, session, refreshed_deadline)
             fill = _execute_leg(
                 db, broker, account=account_id, session=session,
                 side="sell", symbol=state["managed_symbol"],
@@ -253,7 +257,11 @@ def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any
         if action in {"buy", "rotate"}:
             if live_control_status(db)["control_mode"] != "active":
                 raise RuntimeError("Live mode no longer permits a buy.")
-            _assert_live_order_window(broker, session, deadline)
+            refreshed_clock = broker.get_clock()
+            refreshed_deadline, _ = live_execution_window_deadline(
+                expected_open, market_clock=refreshed_clock,
+            )
+            _assert_live_order_window(broker, session, refreshed_deadline)
             account = broker.get_account()
             notional = _full_live_cash_notional(account)
             fill = _execute_leg(
