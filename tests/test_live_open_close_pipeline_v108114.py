@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -63,6 +63,24 @@ class LiveDailyPreparationTests(TestCase):
         self.assertEqual(update.args[1]["$set"]["status"], "waiting_for_winner_signal")
         self.assertEqual(update.args[1]["$set"]["superseded_decision_date"], "2026-10-16")
         self.assertEqual(update.args[1]["$set"]["superseded_target_asset"], "CAPR")
+
+
+    def test_abandoned_post_close_training_is_rearmed_without_orders(self):
+        db = MagicMock()
+        started = datetime.now(timezone.utc) - timedelta(minutes=30)
+        db["live_winner_session_runs"].find_one.return_value = _run(
+            status="preparing_signal", preparation_started_at=started,
+        )
+        db["live_winner_session_runs"].find_one_and_update.return_value = _run(
+            status="waiting_for_winner_signal", preparation_attempts=1,
+        )
+        with patch.object(close_signal, "latest_safe_completed_xnys_session",
+                          return_value=pd.Timestamp("2026-10-16")):
+            result = close_signal.prepare_live_cash_winner_signal(db, SESSION)
+        self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
+        changed = db["live_winner_session_runs"].find_one_and_update.call_args.args[1]["$set"]
+        self.assertEqual(changed["phase"], "recovered_abandoned_post_close_calibration")
+        self.assertFalse(changed["order_submission_enabled"])
 
 
 class LiveOpenPipelineTests(TestCase):
@@ -165,6 +183,27 @@ class LiveOpenPipelineTests(TestCase):
         self.assertEqual(saved_fields["decision_date"], SESSION)
         self.assertEqual(saved_fields["analysis_mode"], "live_current_session_intraday")
         self.broker.submit_order.assert_not_called()
+
+    def test_abandoned_live_open_claim_recovers_without_orders(self):
+        started = datetime.now(timezone.utc) - timedelta(minutes=30)
+        self.db["live_winner_session_runs"].find_one.return_value = _run(
+            status="open_recalibration", open_calibration_started_at=started,
+        )
+        self.db["live_winner_broker_orders"].find_one.return_value = None
+        self.db["live_winner_session_runs"].find_one_and_update.return_value = _run(
+            status="waiting_for_open_recalibration",
+        )
+        prefix = "market_cycle_trader_api.services.live_winner_open."
+        with (
+            patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
+            patch(prefix + "create_live_readonly_client") as broker_factory,
+        ):
+            result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
+        self.assertEqual(result["status"], "recovered_abandoned_live_calibration")
+        self.assertFalse(result["order_submission_enabled"])
+        broker_factory.assert_not_called()
+        self.broker.submit_order.assert_not_called()
+
 
     def test_completed_session_is_not_retrained(self):
         self.db["live_winner_session_runs"].find_one.return_value = _run(status="completed")
