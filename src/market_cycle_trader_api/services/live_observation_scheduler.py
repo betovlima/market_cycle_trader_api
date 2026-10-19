@@ -16,6 +16,7 @@ from .strategy_lab import get_trader_winner_summary
 from .live_winner_session import plan_next_live_session, LIVE_RUNS
 from .live_winner_events import append_live_event
 from .live_winner_signal import prepare_live_cash_winner_signal
+from .live_winner_open import refresh_live_open_winner_signal
 from .live_order_execution import execute_recalibrated_live_winner_session
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
@@ -95,11 +96,15 @@ class LiveObservationScheduler:
                     if armed.get("status") == "waiting_for_winner_signal" and not result["market_open"]:
                         stage = "signal_preparation"
                         prepare_live_cash_winner_signal(db, armed["execution_session"])
-                    elif armed.get("status") == "recalibrated_no_orders" and result["market_open"]:
-                        # Precomputed, frozen previous-close Winner: execution
-                        # validates broker state but does not train again.
-                        stage = "order_execution"
-                        execute_recalibrated_live_winner_session(db, armed["execution_session"])
+                    elif result["market_open"] and armed.get("status") in {
+                        "waiting_for_winner_signal", "recalibrated_no_orders",
+                        "waiting_for_open_recalibration",
+                    }:
+                        stage = "live_open_recalibration"
+                        refreshed = refresh_live_open_winner_signal(db, armed["execution_session"])
+                        if refreshed.get("status") == "recalibrated_no_orders":
+                            stage = "order_execution"
+                            execute_recalibrated_live_winner_session(db, armed["execution_session"])
                 self._last_error = None
                 self._last_error_fingerprint = None
             except Exception as exc:

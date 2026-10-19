@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from time import monotonic
 from typing import Any
 
+import exchange_calendars as xcals
+import pandas as pd
 from pymongo import ReturnDocument
 
 from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
@@ -52,10 +54,42 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     run = db[LIVE_RUNS].find_one({"execution_session": session})
     if not run:
         raise RuntimeError("No Live session is armed.")
+    calendar = xcals.get_calendar("XNYS")
+    if not calendar.is_session(pd.Timestamp(session)):
+        raise RuntimeError("Live execution session is not an XNYS trading day.")
+    required_day = calendar.previous_session(pd.Timestamp(session)).date().isoformat()
+    available_day = latest_safe_completed_xnys_session().date().isoformat()
+    # Never freeze Friday history as Tuesday's decision. Wait for Monday's
+    # completed daily bar and replace any unexecuted stale stored signal.
     if run.get("status") in {"signal_prepared", "recalibrated_no_orders"}:
-        # Old signal_prepared rows are not executable in the post-close-only protocol.
-        return {"status": run["status"], "execution_session": session,
-                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+        if (run.get("status") == "recalibrated_no_orders"
+            and str(run.get("decision_date") or "")[:10] == required_day):
+            return {"status": "recalibrated_no_orders", "execution_session": session,
+                    "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+        if available_day != required_day:
+            return {"status": "waiting_for_completed_daily_bar",
+                    "execution_session": session, "required_day": required_day,
+                    "available_day": available_day, "order_submission_enabled": False}
+        refreshed = db[LIVE_RUNS].find_one_and_update(
+            {"_id": run["_id"], "status": run["status"],
+             "winner_configuration_hash": run["winner_configuration_hash"]},
+            {"$set": {
+                "status": "waiting_for_winner_signal",
+                "phase": "replacing_stale_post_close_signal",
+                "superseded_decision_date": run.get("decision_date"),
+                "superseded_target_asset": run.get("target_asset"),
+                "superseded_snapshot_sha256": run.get("snapshot_sha256"),
+                "preparation_attempts": 0, "winner_signal_prepared": False,
+                "post_close_signal_ready": False, "order_submission_enabled": False,
+                "decision_date": None, "action": None, "target_asset": None,
+                "snapshot_sha256": None,
+            }, "$unset": {"preparation_retry_not_before": ""}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not refreshed:
+            return {"status": "stale_signal_replacement_claimed_elsewhere",
+                    "order_submission_enabled": False}
+        run = refreshed
     if run.get("status") != "waiting_for_winner_signal":
         raise RuntimeError("Live session is not eligible for Winner preparation.")
     attempts = int(run.get("preparation_attempts") or 0)
@@ -65,6 +99,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if retry_not_before and datetime.now(timezone.utc) < _utc_datetime(retry_not_before):
         return {"status": "waiting_for_post_close_retry", "execution_session": session,
                 "order_submission_enabled": False}
+    if available_day != required_day:
+        return {"status": "waiting_for_completed_daily_bar",
+                "execution_session": session, "required_day": required_day,
+                "available_day": available_day, "order_submission_enabled": False}
     if not bool(get_system_settings(db)["training"]["enabled"]):
         raise RuntimeError("Winner training is disabled in system settings.")
 
@@ -125,6 +163,8 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                       stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
     try:
         cutoff = latest_safe_completed_xnys_session().date().isoformat()
+        if cutoff != required_day:
+            raise RuntimeError("LiveDailyCutoffChanged: safe prior-session date changed.")
         u77 = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
         snapshot = download_u67_operational_snapshot(
             job_id=f"live-{session}-{now.strftime('%Y%m%d%H%M%S%f')}",
@@ -151,7 +191,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           details={"duration_seconds": round(monotonic() - started, 2)})
         stage = "decision_validation"
         decision_date = str(decision.decision_date)[:10]
-        if decision_date != cutoff or decision_date >= session:
+        if decision_date != cutoff or decision_date != required_day:
             raise RuntimeError(
                 f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}, next={session}"
             )
