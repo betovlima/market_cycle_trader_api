@@ -129,7 +129,7 @@ def _execute_leg(
         raise
 
 
-def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str, Any]:
+def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any]:
     """Execute once if explicitly enabled and broker state fully reconciled."""
     control = live_control_status(db)
     if control["control_mode"] not in {"active", "exit_only"}:
@@ -282,3 +282,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
                       "order_submission_enabled": False}},
         )
         raise
+
+
+# Compatibility export for existing callers and previously recorded sessions.
+execute_recalibrated_live_winner_session = execute_prepared_live_winner_session

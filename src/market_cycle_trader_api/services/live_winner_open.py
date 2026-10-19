@@ -17,9 +17,9 @@ from pymongo import ReturnDocument
 from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
 from ..engine.market_data import latest_safe_completed_xnys_session
 from ..engine.live_model_signal import build_live_model_decision
-from ..engine.tcc_u67_operational_market_data import (
+from ..engine.operational_market_snapshot import (
     DATA_DIRECTORY as MARKET_DATA_DIRECTORY,
-    download_u67_operational_snapshot,
+    download_operational_market_snapshot,
 )
 from ..engine.tcc_u67_operational_runtime import (
     assert_tcc_u67_model_snapshot, assert_tcc_u67_operational_contract,
@@ -194,7 +194,7 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
     started = monotonic()
     stage = "daily_history"
     try:
-        snapshot = download_u67_operational_snapshot(
+        snapshot = download_operational_market_snapshot(
             job_id=f"live-open-{session}-{started_at.strftime('%Y%m%d%H%M%S%f')}",
             config=strategy.model_copy(update={"analysis_end_date": expected_cutoff}),
             requested_assets=(U77_REQUESTED_ASSETS if mode == TCC_U77_FIXED_CHALLENGER_MODE

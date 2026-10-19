@@ -77,7 +77,7 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
         })
         fake("latest_safe_completed_xnys_session", pd.Timestamp("2026-10-16T04:00:00Z"))
         if fail_download:
-            snapshot_call = fake("download_u67_operational_snapshot", side_effect=RuntimeError("provider unavailable"))
+            snapshot_call = fake("download_operational_market_snapshot", side_effect=RuntimeError("provider unavailable"))
         else:
             snapshot_call = fake("download_u67_operational_snapshot", snapshot)
         model_call = fake("build_live_model_decision", decision)

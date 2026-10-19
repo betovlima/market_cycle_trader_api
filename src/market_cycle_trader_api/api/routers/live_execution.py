@@ -16,7 +16,7 @@ from ...core.runtime import database
 from ...infrastructure.trading.alpaca_live import create_live_readonly_client
 from ...services.live_control import live_control_status
 from ...services.live_winner_session import LIVE_RUNS
-from ...services.live_order_execution import execute_recalibrated_live_winner_session
+from ...services.live_order_execution import execute_prepared_live_winner_session
 
 router = APIRouter(prefix="/api/live-execution", tags=["alpaca-live-execution"])
 EASTERN = ZoneInfo("America/New_York")
@@ -50,7 +50,7 @@ def execute_current_winner_live(
         run = db[LIVE_RUNS].find_one({"_id": f"{account_id}:{session}"})
         if not run or run.get("status") != "recalibrated_no_orders":
             raise HTTPException(status_code=409, detail="No executable current-session Live Winner plan.")
-        result = execute_recalibrated_live_winner_session(db, session)
+        result = execute_prepared_live_winner_session(db, session)
     except HTTPException:
         raise
     except RuntimeError as exc:

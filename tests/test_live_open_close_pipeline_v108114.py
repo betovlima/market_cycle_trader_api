@@ -116,7 +116,7 @@ class LiveOpenPipelineTests(TestCase):
             patch(prefix + "create_live_readonly_client", return_value=self.broker),
             patch(prefix + "latest_safe_completed_xnys_session",
                   return_value=pd.Timestamp("2026-10-16")),
-            patch(prefix + "download_u67_operational_snapshot") as download,
+            patch(prefix + "download_operational_market_snapshot") as download,
         ):
             result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
         self.assertEqual(result["status"], "waiting_for_correct_prior_daily_bar")
@@ -157,7 +157,7 @@ class LiveOpenPipelineTests(TestCase):
                 "managed_symbol": "MAN", "managed_quantity": 2.668639053,
                 "holding_sessions": 2, "revision": 1,
             })
-            download = fake("download_u67_operational_snapshot", snapshot)
+            download = fake("download_operational_market_snapshot", snapshot)
             live_bars = fake("load_live_intraday_session", (
                 snapshot.frames, {
                     "analysis_mode": "live_current_session_intraday",
