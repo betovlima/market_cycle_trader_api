@@ -11,6 +11,8 @@ from time import monotonic
 from typing import Any
 
 from pymongo import ReturnDocument
+import exchange_calendars as xcals
+import pandas as pd
 
 from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
 from ..engine.live_model_signal import build_live_model_decision
@@ -65,6 +67,22 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if retry_not_before and datetime.now(timezone.utc) < _utc_datetime(retry_not_before):
         return {"status": "waiting_for_post_close_retry", "execution_session": session,
                 "order_submission_enabled": False}
+    # Never consume a retry or train on Friday bars while Monday's regular
+    # close is still inside the 20-minute daily-data availability buffer.
+    # The signal for an execution session MUST use its immediately preceding
+    # XNYS session; a valid earlier historical snapshot is not sufficient.
+    expected_decision_date = xcals.get_calendar("XNYS").previous_session(
+        pd.Timestamp(session)
+    ).date().isoformat()
+    safe_completed_date = latest_safe_completed_xnys_session().date().isoformat()
+    if safe_completed_date != expected_decision_date:
+        return {
+            "status": "waiting_for_completed_daily_bar",
+            "execution_session": session,
+            "expected_decision_date": expected_decision_date,
+            "available_decision_date": safe_completed_date,
+            "order_submission_enabled": False,
+        }
     if not bool(get_system_settings(db)["training"]["enabled"]):
         raise RuntimeError("Winner training is disabled in system settings.")
 
@@ -125,6 +143,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                       stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
     try:
         cutoff = latest_safe_completed_xnys_session().date().isoformat()
+        if cutoff != expected_decision_date:
+            raise RuntimeError(
+                "PostCloseDailyCutoffChanged: safe daily bar changed during preparation."
+            )
         u77 = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
         snapshot = download_u67_operational_snapshot(
             job_id=f"live-{session}-{now.strftime('%Y%m%d%H%M%S%f')}",
@@ -151,7 +173,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           details={"duration_seconds": round(monotonic() - started, 2)})
         stage = "decision_validation"
         decision_date = str(decision.decision_date)[:10]
-        if decision_date != cutoff or decision_date >= session:
+        if decision_date != cutoff or decision_date != expected_decision_date:
             raise RuntimeError(
                 f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}, next={session}"
             )
