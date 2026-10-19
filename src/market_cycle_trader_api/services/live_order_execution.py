@@ -147,8 +147,14 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
         return {"status": "blocked_by_exit_only_mode", "order_submission_enabled": False}
     if action not in {"hold", "stay_in_cash", "buy", "sell_to_cash", "rotate"}:
         raise RuntimeError("Invalid Winner action.")
-    if not bool(run.get("winner_signal_prepared")) or not run.get("target_asset"):
-        raise RuntimeError("The current Winner has no verified Live trading signal.")
+    if (not bool(run.get("winner_signal_prepared"))
+        or not bool(run.get("post_close_signal_ready"))
+        or not run.get("snapshot_sha256")
+        or not run.get("target_asset")):
+        raise RuntimeError("No verified post-close Live Winner signal; real orders blocked.")
+    decision_date = str(run.get("decision_date") or "")[:10]
+    if not decision_date or decision_date >= session:
+        raise RuntimeError("Post-close Winner decision date is missing or stale; real orders blocked.")
 
     broker = create_live_execution_client()
     account = broker.get_account()
