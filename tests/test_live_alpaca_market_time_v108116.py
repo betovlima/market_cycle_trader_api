@@ -101,3 +101,34 @@ class LiveExchangeClockTests(TestCase):
         self.assertEqual(audit["intraday_asset_count"], 1)
         self.assertEqual(audit["live_session"], "2026-10-20")
         self.assertEqual(merged["MAN"].iloc[-1]["close"], 42.5)
+
+    def test_post_close_preparing_claim_is_not_stolen_after_hours(self):
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = {
+            "_id": "acct:2026-10-20", "status": "preparing_signal",
+            "preparation_started_at": datetime(2026, 10, 16, 20, 1, tzinfo=timezone.utc),
+            "execution_session": "2026-10-20",
+        }
+        broker = MagicMock()
+        broker.get_clock.return_value = SimpleNamespace(
+            timestamp=datetime(2026, 10, 19, 20, 2, tzinfo=timezone.utc),
+            is_open=False,
+        )
+        prefix = "market_cycle_trader_api.services.live_winner_signal."
+        with patch(prefix + "create_live_readonly_client", return_value=broker):
+            result = live_winner_signal.prepare_live_winner_signal(db, "2026-10-20")
+        self.assertEqual(result["status"], "post_close_training_in_progress")
+        db["live_winner_session_runs"].find_one_and_update.assert_not_called()
+
+    def test_live_open_claim_is_not_recovered_based_on_elapsed_time(self):
+        from market_cycle_trader_api.services.live_winner_open import refresh_live_open_winner_signal
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = {
+            "_id": "acct:2026-10-20", "status": "open_recalibration",
+            "open_calibration_started_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+        }
+        with patch("market_cycle_trader_api.services.live_winner_open.create_live_readonly_client") as factory:
+            result = refresh_live_open_winner_signal(db, "2026-10-20")
+        self.assertEqual(result["status"], "live_open_recalibration_in_progress")
+        factory.assert_not_called()
+        db["live_winner_session_runs"].find_one_and_update.assert_not_called()
