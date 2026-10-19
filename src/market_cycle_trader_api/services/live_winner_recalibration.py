@@ -59,7 +59,7 @@ def _intraday_error_fields(exc: Exception) -> dict[str, str]:
     code = prefix if prefix in _AUDITABLE_INTRADAY_CODES else type(exc).__name__
     result = {"error_code": code}
     match = re.search(
-        r"\\b([A-Z][A-Z0-9.]{0,9}) has no (IEX|SIP) regular-session bars\\b",
+        r"\b([A-Z][A-Z0-9.]{0,9}) has no (IEX|SIP) regular-session bars\b",
         message,
     )
     if match:
