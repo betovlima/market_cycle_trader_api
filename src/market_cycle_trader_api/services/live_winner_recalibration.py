@@ -125,9 +125,13 @@ def recalibrate_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]
         _expire_live_window(db, run, deadline=deadline)
         return {"status": "execution_window_expired", "order_submission_enabled": False}
     retry_after_raw = run.get("retry_not_before")
-    if not analysis_only and retry_after_raw and now < _utc_time(retry_after_raw):
-        return {"status": "waiting_for_intraday_data", "order_submission_enabled": False,
-                "retry_after": _utc_time(retry_after_raw).isoformat()}
+    if not analysis_only and retry_after_raw:
+        # PyMongo usually decodes UTC datetimes without tzinfo.
+        retry_at = pd.Timestamp(retry_after_raw)
+        retry_at = retry_at.tz_localize("UTC") if retry_at.tzinfo is None else retry_at.tz_convert("UTC")
+        if now < retry_at:
+            return {"status": "waiting_for_intraday_data", "order_submission_enabled": False,
+                    "retry_after": retry_at.isoformat()}
     # At 09:30:XX no complete one-minute bar exists. Retry next scheduler tick
     # without downloading all historical assets or entering the order path.
     if now.floor("min") <= expected_open:
