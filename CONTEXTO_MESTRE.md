@@ -1046,3 +1046,32 @@ Detalhes em `docs/changes/v10.8.92-swagger-endpoint-search.md`.
   solicitar nova auditoria de uma sessao futura antes da promocao.
 - **Referencia detalhada:**
   `docs/changes/v10.8.111-live-intraday-clock-diagnostics.md`.
+
+
+### 2026-10-19 — Revisao decisiva de politica operacional Live (API v10.8.111)
+
+O autor esclareceu que a intencao da duplicacao de calculos era recuperar
+falhas ocasionais, nao adicionar informacao intradiaria para uma segunda
+decisao. **Novo contrato de execucao**: uma unica calibracao apos fechamento
+do pregão, com no maximo uma repeticao depois de cinco minutos se a primeira
+falhar, apenas enquanto XNYS estiver fechado. Sucesso fica persistido como
+sinal congelado da proxima sessao, sem reestimativa na abertura. Depois de
+duas falhas, review_required, sem ordens.
+
+No Live, a abertura apenas valida o plano congelado, identidade Winner,
+snapshot/decision_date, conta, posicao, ordens abertas, janela de 30 minutos
+e ledger de idempotencia; depois executa a decisao, sem chamar barras de um
+minuto ou treinamento. O estado legado `recalibrated_no_orders` e mantido
+como flag de executor por compatibilidade, mas exige marca adicional de
+origem pos-fechamento `post_close_signal_ready=True` e
+`snapshot_sha256`. Sessao legada sem marca nao executa.
+
+Rotas e imports legados de recalibracao intradiaria e recuperacao de sessao
+expirada recusam solicitacoes. Paper e TCC, o fallback IEX/SIP e a pesquisa
+da Strategy #30 permanecem intocados. A variante v10.8.111 continuara
+somente na branch `fix/v10.8.111-live-intraday-clock-diagnostics`, com
+revisao PR #63, ate autorizacao de merge e deploy. Testes e CI no SHA
+final da branch antes de homologacao.
+
+Descricao detalhada em
+`docs/changes/v10.8.111-live-intraday-clock-diagnostics.md`.
