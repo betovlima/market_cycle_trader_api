@@ -124,6 +124,7 @@ class LiveOpenPipelineTests(TestCase):
                 return stack.enter_context(patch(prefix + name, return_value=value))
             fake("live_control_status", {"control_mode": "active"})
             fake("create_live_readonly_client", self.broker)
+            fake("live_credentials", ("LIVE_KEY", "LIVE_SECRET"))
             fake("latest_safe_completed_xnys_session", pd.Timestamp(PREVIOUS))
             fake("get_system_settings", {"training": {"enabled": True}})
             fake("get_trader_winner_context", (cfg, profile))

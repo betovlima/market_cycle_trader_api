@@ -70,6 +70,7 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
         fake("assert_tcc_u77_contract")
         fake("assert_tcc_u67_model_snapshot")
         fake("create_live_readonly_client", broker)
+        fake("live_credentials", ("LIVE_KEY", "LIVE_SECRET"))
         fake("verified_live_state", {
             "managed_symbol": "CASH", "managed_quantity": 0,
             "holding_sessions": 0, "revision": 0,

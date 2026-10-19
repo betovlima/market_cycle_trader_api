@@ -377,6 +377,7 @@ def download_u67_operational_snapshot(
     progress_callback: ProgressCallback | None = None,
     data_directory: Path | None = None,
     per_asset_pause_seconds: float = 0.20,
+    credentials_override: dict[str, str] | None = None,
 ) -> U67OperationalSnapshot:
     """Download all U67 identities fresh from Alpaca for one immutable job."""
     if not str(job_id).strip():
@@ -435,6 +436,8 @@ def download_u67_operational_snapshot(
                 str(fresh_config.start_date),
                 analysis_end,
                 single_request_daily=True,
+                **({"credentials_override": credentials_override}
+                   if credentials_override is not None else {}),
             )
             if raw is None or raw.empty:
                 raise RuntimeError(
@@ -456,6 +459,8 @@ def download_u67_operational_snapshot(
             actions, query_start, query_end = _download_corporate_actions(
                 symbol,
                 fresh_config,
+                **({"credentials_override": credentials_override}
+                   if credentials_override is not None else {}),
             )
             hashes[f"corporate_actions/{symbol}.json"] = _write_bytes(
                 temporary,
