@@ -171,6 +171,10 @@ def append_u67_current_session_intraday(
         if stamp.tzinfo is None
         else stamp.tz_convert("UTC")
     )
+    # Compare only COMPLETED 1-minute bars. Truncate sub-minute time so an
+    # in-progress bar starting in this same minute can never enter the score.
+    # This invariant applies equally to independent Paper and Live pipelines.
+    stamp = stamp.floor("min")
     local_now = stamp.tz_convert(EASTERN)
     if local_now.date() != session_date:
         raise RuntimeError(
