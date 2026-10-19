@@ -79,26 +79,10 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
         now=broker_time, data_delay_minutes=0
     ).date().isoformat()
     if run.get("status") == "preparing_signal":
-        started = run.get("preparation_started_at")
-        if started is None or (
-            broker_time - _utc_datetime(started)
-        ) <= timedelta(minutes=25):
-            return {"status": "post_close_training_in_progress",
-                    "execution_session": session, "order_submission_enabled": False}
-        recovered = db[LIVE_RUNS].find_one_and_update(
-            {"_id": run["_id"], "status": "preparing_signal",
-             "preparation_started_at": started},
-            {"$set": {"status": "waiting_for_winner_signal",
-                      "phase": "recovered_abandoned_post_close_calibration",
-                      "winner_signal_prepared": False,
-                      "post_close_signal_ready": False,
-                      "order_submission_enabled": False}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if not recovered:
-            return {"status": "post_close_training_in_progress",
-                    "execution_session": session, "order_submission_enabled": False}
-        run = recovered
+        # A long-running model is not an abandoned worker. Do not reclaim a
+        # persisted claim based on an arbitrary number of minutes.
+        return {"status": "post_close_training_in_progress",
+                "execution_session": session, "order_submission_enabled": False}
     # Never freeze Friday history as Tuesday's decision. Wait for Monday's
     # completed daily bar and replace any unexecuted stale stored signal.
     if run.get("status") == "signal_prepared":
