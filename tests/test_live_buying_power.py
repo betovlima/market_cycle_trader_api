@@ -1,5 +1,6 @@
 """Read-only Live portfolio displays broker purchasing power without estimating it."""
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ class LiveBuyingPowerTests(unittest.TestCase):
         broker.get_all_positions.return_value = []
         broker.get_orders.return_value = []
         broker.get_clock.return_value = SimpleNamespace(
-            timestamp=None, is_open=False, next_open=None, next_close=None,
+            timestamp=datetime(2026, 10, 19, 20, 10, tzinfo=timezone.utc), is_open=False, next_open=None, next_close=None,
         )
         with patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None):
             result = live_portfolio_snapshot(object())
@@ -40,7 +41,7 @@ class LiveBuyingPowerTests(unittest.TestCase):
         broker.get_all_positions.return_value = []
         broker.get_orders.return_value = []
         broker.get_clock.return_value = SimpleNamespace(
-            timestamp=None, is_open=False, next_open=None, next_close=None,
+            timestamp=datetime(2026, 10, 19, 20, 10, tzinfo=timezone.utc), is_open=False, next_open=None, next_close=None,
         )
         with patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None):
             result = live_portfolio_snapshot(object())

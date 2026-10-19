@@ -56,6 +56,19 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if not calendar.is_session(pd.Timestamp(session)):
         raise RuntimeError("Live execution session is not an XNYS trading day.")
     required_day = calendar.previous_session(pd.Timestamp(session)).date().isoformat()
+    # A completed plan already stamped with its correct decision date needs
+    # no fresh clock lookup. Invalid states must remain non-executable.
+    if run.get("status") == "signal_prepared":
+        return {"status": "signal_prepared", "execution_session": session,
+                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+    if (run.get("status") == "recalibrated_no_orders"
+        and str(run.get("decision_date") or "")[:10] == required_day):
+        return {"status": "recalibrated_no_orders", "execution_session": session,
+                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+    if run.get("status") not in {
+        "waiting_for_winner_signal", "preparing_signal", "recalibrated_no_orders"
+    }:
+        raise RuntimeError("Live session is not eligible for Winner preparation.")
     # Use the actual Alpaca Live broker timestamp, not Railway's clock or timezone.
     # No fixed 20-minute post-close delay: actual daily data availability and
     # the computed decision_date determine when the signal is usable.

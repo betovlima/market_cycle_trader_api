@@ -68,6 +68,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
             patch(self.prefix + "get_system_settings",
                   return_value={"training": {"enabled": False}}) as settings,
             patch(self.prefix + "download_operational_market_snapshot") as download,
+            patch(self.prefix + "create_live_readonly_client", return_value=self.broker),
         ):
             with self.assertRaisesRegex(RuntimeError, "training is disabled"):
                 prepare_live_cash_winner_signal(self.db, "2026-10-20")
@@ -109,4 +110,4 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "LiveOpenCalibrationRequired"):
                 execute_recalibrated_live_winner_session(db, "2026-10-20")
-            broker.assert_called_once()
+            broker.assert_not_called()

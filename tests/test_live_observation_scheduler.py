@@ -1,5 +1,6 @@
 """Live observer isolation and stop semantics."""
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from market_cycle_trader_api.services.live_observation_scheduler import observe_live_cycle
@@ -23,7 +24,9 @@ class LiveObservationTests(unittest.TestCase):
         control.return_value = {"control_mode": "active"}
         portfolio.return_value = {
             "account_status": "active", "portfolio_value": 0.0, "strategy_cash": 0.0,
-            "positions": [], "market_clock": {"is_open": False},
+            "positions": [], "market_clock": {
+                "is_open": False, "timestamp": "2026-10-19T20:10:00+00:00"
+            },
         }
         winner.return_value = {"name": "Winner"}
         db = MagicMock()
