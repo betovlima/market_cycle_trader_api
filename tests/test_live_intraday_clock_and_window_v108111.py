@@ -40,7 +40,7 @@ def _run() -> dict:
     }
 
 
-def test_recalibration_waits_for_a_completed_minute_without_downloading():
+def _check_test_recalibration_waits_for_a_completed_minute_without_downloading():
     broker = MagicMock()
     broker.get_account.return_value.id = "acct"
     broker.get_clock.return_value = _clock(30, second=46)
@@ -56,7 +56,7 @@ def test_recalibration_waits_for_a_completed_minute_without_downloading():
     db["live_winner_session_runs"].find_one_and_update.assert_not_called()
 
 
-def test_expired_live_session_is_never_recalibrated_or_executed():
+def _check_test_expired_live_session_is_never_recalibrated_or_executed():
     broker = MagicMock()
     broker.get_account.return_value.id = "acct"
     broker.get_clock.return_value = SimpleNamespace(
@@ -143,17 +143,17 @@ def _simulate_model_recalibration(final_clock: SimpleNamespace):
     broker.submit_order.assert_not_called()
 
 
-def test_live_refreshes_clock_after_historical_download():
+def _check_test_live_refreshes_clock_after_historical_download():
     _simulate_model_recalibration(_clock(40))
 
 
-def test_completion_after_deadline_never_creates_executable_plan():
+def _check_test_completion_after_deadline_never_creates_executable_plan():
     _simulate_model_recalibration(SimpleNamespace(
         is_open=True, timestamp=datetime(2026, 10, 19, 14, 2, tzinfo=timezone.utc)
     ))
 
 
-def test_intraday_audit_extracts_only_whitelisted_failure_identifiers():
+def _check_test_intraday_audit_extracts_only_whitelisted_failure_identifiers():
     exc = RuntimeError(
         "CurrentSessionIntradayCoverageUnavailable: "
         "CurrentSessionIntradayDataMissing: AMS has no IEX regular-session bars "
@@ -170,7 +170,7 @@ def test_intraday_audit_extracts_only_whitelisted_failure_identifiers():
     assert unknown == {"error_code": "RuntimeError"}
 
 
-def test_recovery_waits_until_next_allowed_attempt():
+def _check_test_recovery_waits_until_next_allowed_attempt():
     run = _run()
     run["retry_not_before"] = datetime(2026, 10, 19, 13, 51, tzinfo=timezone.utc)
     db = MagicMock()
@@ -187,7 +187,7 @@ def test_recovery_waits_until_next_allowed_attempt():
     download.assert_not_called()
 
 
-def test_executor_refuses_real_order_after_independent_live_deadline():
+def _check_test_executor_refuses_real_order_after_independent_live_deadline():
     db = MagicMock()
     run = _run()
     run.update({"status": "recalibrated_no_orders", "action": "buy", "target_asset": "ADEA",
@@ -217,7 +217,7 @@ def test_executor_refuses_real_order_after_independent_live_deadline():
     broker.submit_order.assert_not_called()
 
 
-def test_each_broker_leg_rechecks_market_deadline():
+def _check_test_each_broker_leg_rechecks_market_deadline():
     broker = MagicMock()
     broker.get_clock.return_value = SimpleNamespace(
         is_open=True, timestamp=datetime(2026, 10, 19, 14, 1, tzinfo=timezone.utc)
@@ -226,3 +226,30 @@ def test_each_broker_leg_rechecks_market_deadline():
         executor._assert_live_order_window(
             broker, SESSION, pd.Timestamp("2026-10-19T14:00:00Z")
         )
+
+
+class LiveIntradayClockAndWindowTests(TestCase):
+    def test_recalibration_waits_for_a_completed_minute_without_downloading(self):
+        _check_test_recalibration_waits_for_a_completed_minute_without_downloading()
+
+    def test_expired_live_session_is_never_recalibrated_or_executed(self):
+        _check_test_expired_live_session_is_never_recalibrated_or_executed()
+
+    def test_live_refreshes_clock_after_historical_download(self):
+        _check_test_live_refreshes_clock_after_historical_download()
+
+    def test_completion_after_deadline_never_creates_executable_plan(self):
+        _check_test_completion_after_deadline_never_creates_executable_plan()
+
+    def test_intraday_audit_extracts_only_whitelisted_failure_identifiers(self):
+        _check_test_intraday_audit_extracts_only_whitelisted_failure_identifiers()
+
+    def test_recovery_waits_until_next_allowed_attempt(self):
+        _check_test_recovery_waits_until_next_allowed_attempt()
+
+    def test_executor_refuses_real_order_after_independent_live_deadline(self):
+        _check_test_executor_refuses_real_order_after_independent_live_deadline()
+
+    def test_each_broker_leg_rechecks_market_deadline(self):
+        _check_test_each_broker_leg_rechecks_market_deadline()
+
