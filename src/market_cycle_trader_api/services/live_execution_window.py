@@ -21,7 +21,7 @@ def live_execution_window_seconds(settings: Any = None) -> int:
 
 
 def live_execution_window_deadline(
-    expected_open: pd.Timestamp, settings: Any = None,
+    expected_open: pd.Timestamp, settings: Any = None, *, market_clock: Any = None,
 ) -> tuple[pd.Timestamp, int]:
     """Return the real XNYS session close (including early closes), in UTC."""
     opened = pd.Timestamp(expected_open)
@@ -33,7 +33,19 @@ def live_execution_window_deadline(
     if not calendar.is_session(session):
         raise ValueError("Expected open is not an XNYS trading session.")
     market_open = calendar.session_open(session)
-    market_close = calendar.session_close(session)
-    # Session times are authoritative; do not invent a post-open deadline.
+    market_close = pd.Timestamp(calendar.session_close(session)).tz_convert("UTC")
+    # Prefer Alpaca Live's current-session next_close when the exchange is
+    # already open. It incorporates provider-known early or exceptional closes.
+    if market_clock is not None and bool(getattr(market_clock, "is_open", False)):
+        broker_close = getattr(market_clock, "next_close", None)
+        if broker_close is not None:
+            close = pd.Timestamp(broker_close)
+            if close.tzinfo is not None:
+                close = close.tz_convert("UTC")
+                if (
+                    close > market_open
+                    and close.tz_convert("America/New_York").date() == session.date()
+                ):
+                    market_close = close
     duration = int((market_close - market_open).total_seconds())
-    return pd.Timestamp(market_close).tz_convert("UTC"), duration
+    return market_close, duration

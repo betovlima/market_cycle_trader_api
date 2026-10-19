@@ -107,7 +107,7 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if stamp.tz_convert(EASTERN).date().isoformat() != session:
         raise RuntimeError("Live open-session clock does not match the execution session.")
     opened = _utc(run["expected_market_open"])
-    deadline, _ = live_execution_window_deadline(opened)
+    deadline, _ = live_execution_window_deadline(opened, market_clock=clock)
     if stamp >= deadline:
         db[LIVE_RUNS].update_one(
             {"_id": run["_id"], "status": {"$in": _ELIGIBLE_STATUSES}},

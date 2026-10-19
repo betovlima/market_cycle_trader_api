@@ -41,6 +41,20 @@ class LiveWindowTests(unittest.TestCase):
         self.assertEqual(duration, 12600)
         self.assertEqual(deadline, pd.Timestamp("2026-11-27T18:00:00Z"))
 
+    def test_live_broker_closing_time_overrides_generic_exchange_schedule(self):
+        # For unexpected or provider-known special trading sessions, trust
+        # Alpaca Live instead of a server-local hardcoded closing hour.
+        clock = SimpleNamespace(
+            is_open=True,
+            next_close=datetime(2026, 10, 20, 19, 30, tzinfo=timezone.utc),
+        )
+        deadline, duration = live_execution_window_deadline(
+            pd.Timestamp("2026-10-20T13:30:00Z"),
+            market_clock=clock,
+        )
+        self.assertEqual(deadline, pd.Timestamp("2026-10-20T19:30:00Z"))
+        self.assertEqual(duration, 21600)
+
     def test_nyse_standard_time_is_dynamic(self):
         # Jan NYSE open: 09:30 EST / 14:30 UTC, closes at 21:00 UTC.
         deadline, seconds = live_execution_window_deadline(pd.Timestamp("2026-01-05T14:30:00Z"))
