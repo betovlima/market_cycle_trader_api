@@ -75,3 +75,28 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
         self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
         self.db["live_winner_session_runs"].update_one.assert_not_called()
         self.db["live_winner_session_runs"].find_one_and_update.assert_not_called()
+
+    def test_real_order_rejects_stale_daily_decision(self):
+        from market_cycle_trader_api.services.live_order_execution import (
+            execute_recalibrated_live_winner_session,
+        )
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = {
+            "_id": "acct:2026-10-20", "execution_session": "2026-10-20",
+            "status": "recalibrated_no_orders", "winner_signal_prepared": True,
+            "post_close_signal_ready": True,
+            "snapshot_sha256": "snapshot", "target_asset": "ADEA",
+            "action": "buy", "decision_date": "2026-10-16",
+            "winner_strategy_id": "winner", "winner_revision": 2,
+            "winner_configuration_hash": "hash",
+        }
+        prefix = "market_cycle_trader_api.services.live_order_execution."
+        with (
+            patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
+            patch(prefix + "get_trader_winner_summary",
+                  return_value={"id": "winner", "revision": 2, "configuration_hash": "hash"}),
+            patch(prefix + "create_live_execution_client") as broker,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "immediately preceding XNYS"):
+                execute_recalibrated_live_winner_session(db, "2026-10-20")
+            broker.assert_not_called()
