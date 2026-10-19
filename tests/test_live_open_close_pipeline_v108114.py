@@ -186,11 +186,18 @@ class LiveOpenPipelineTests(TestCase):
 
     def test_abandoned_live_open_claim_recovers_without_orders(self):
         started = datetime.now(timezone.utc) - timedelta(minutes=30)
-        self.db["live_winner_session_runs"].find_one.return_value = _run(
+        # Distinct collections: MagicMock.__getitem__ otherwise returns the
+        # same mock for Live sessions and broker intents.
+        sessions = MagicMock()
+        intents = MagicMock()
+        self.db.__getitem__.side_effect = lambda name: (
+            sessions if name == "live_winner_session_runs" else intents
+        )
+        sessions.find_one.return_value = _run(
             status="open_recalibration", open_calibration_started_at=started,
         )
-        self.db["live_winner_broker_orders"].find_one.return_value = None
-        self.db["live_winner_session_runs"].find_one_and_update.return_value = _run(
+        intents.find_one.return_value = None
+        sessions.find_one_and_update.return_value = _run(
             status="waiting_for_open_recalibration",
         )
         prefix = "market_cycle_trader_api.services.live_winner_open."

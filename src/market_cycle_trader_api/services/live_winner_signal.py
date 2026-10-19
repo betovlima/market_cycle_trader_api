@@ -285,7 +285,6 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
             "order_submission_enabled": False,
         }
         if retry_allowed:
-            from datetime import timedelta
             updates["preparation_retry_not_before"] = (
                 datetime.now(timezone.utc) + timedelta(seconds=_POST_CLOSE_RETRY_DELAY_SECONDS)
             )
