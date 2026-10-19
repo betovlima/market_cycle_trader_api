@@ -498,3 +498,16 @@ def test_no_intraday_query_before_one_completed_regular_minute():
         else:
             raise AssertionError("Current minute is not a completed bar.")
         download.assert_not_called()
+
+
+# The main MCT CI uses unittest discovery; keep these two boundary
+# regressions executable even when pytest is not installed.
+import unittest
+
+
+class CompletedMinuteBoundaryRegressionTests(unittest.TestCase):
+    def test_subminute_clock_excludes_open_bar(self):
+        test_subminute_clock_excludes_still_open_one_minute_bar()
+
+    def test_first_minute_not_completed(self):
+        test_no_intraday_query_before_one_completed_regular_minute()
