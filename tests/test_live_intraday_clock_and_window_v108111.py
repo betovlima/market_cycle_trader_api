@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
+from unittest import TestCase
 
 from market_cycle_trader_api.core.config import TCC_U77_FIXED_CHALLENGER_MODE
 from market_cycle_trader_api.services import (
@@ -59,7 +59,7 @@ def test_recalibration_waits_for_a_completed_minute_without_downloading():
 def test_expired_live_session_is_never_recalibrated_or_executed():
     broker = MagicMock()
     broker.get_account.return_value.id = "acct"
-    broker.get_clock.return_value = _clock(31) if False else SimpleNamespace(
+    broker.get_clock.return_value = SimpleNamespace(
         is_open=True, timestamp=datetime(2026, 10, 19, 14, 1, tzinfo=timezone.utc)
     )
     db = MagicMock()
@@ -131,7 +131,7 @@ def _simulate_model_recalibration(final_clock: SimpleNamespace):
                 frames={"ADEA": pd.DataFrame({"close": [1]})}
             )
             if final_clock.timestamp.hour == 14:
-                with pytest.raises(RuntimeError, match="LiveExecutionWindowExpired"):
+                with TestCase().assertRaisesRegex(RuntimeError, "LiveExecutionWindowExpired"):
                     recalibration.recalibrate_live_cash_winner_signal(db, SESSION)
                 assert db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]["phase"] == "execution_window_expired"
             else:
@@ -222,7 +222,7 @@ def test_each_broker_leg_rechecks_market_deadline():
     broker.get_clock.return_value = SimpleNamespace(
         is_open=True, timestamp=datetime(2026, 10, 19, 14, 1, tzinfo=timezone.utc)
     )
-    with pytest.raises(RuntimeError, match="LiveExecutionWindowExpired"):
+    with TestCase().assertRaisesRegex(RuntimeError, "LiveExecutionWindowExpired"):
         executor._assert_live_order_window(
             broker, SESSION, pd.Timestamp("2026-10-19T14:00:00Z")
         )
