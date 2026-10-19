@@ -1075,3 +1075,20 @@ final da branch antes de homologacao.
 
 Descricao detalhada em
 `docs/changes/v10.8.111-live-intraday-clock-diagnostics.md`.
+
+
+### 2026-10-19 — v10.8.112 guard de corte diario XNYS no Live
+
+A preparacao pos-fechamento da Strategy #30 precisa aguardar o candle diario
+do pregao imediatamente anterior a execucao (XNYS) estar seguro. Ha um buffer
+operacional ja existente de 20 min apos o fechamento; se o scheduler comecar
+as 16:00 ET, o `latest_safe_completed_xnys_session` pode retornar sexta
+ao preparar terça na segunda e criar sinal obsoleto. A v10.8.112, branch
+`fix/v10.8.112-live-safe-daily-cutoff`, sem endpoints novos, impede o treino
+ate que `latest_safe_completed_xnys_session == previous_session(execution_session)`.
+Nao consome tentativas antes da disponibilidade, e o executor Live tambem
+revalida a data anterior de negociacao antes de qualquer ordem. Paper,
+TCC, Winner, 75 ativos e modelos inalterados. Integracao com frontend
+v10.7.31 (botao unico que usa endpoints existentes) documentada em
+`docs/changes/v10.8.112-live-daily-cutoff-guard.md`. Nada de executar
+ordens ou mudar a `main` durante testes.
