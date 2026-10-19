@@ -138,12 +138,24 @@ class FixedChallengerTests(unittest.TestCase):
         assert mock_decision.call_args.kwargs["requested_assets"] == U77_REQUESTED_ASSETS
 
 
+    def test_u77_error_message_identifies_the_actual_strategy(self) -> None:
+        result = _trader_runtime_compatibility({
+            "strategy_kind": "standard",
+            "configuration": {"strategy_mode": TCC_U77_FIXED_CHALLENGER_MODE},
+            "backtest_engine_binding": "invalid-binding",
+            "research_model_snapshot": {"family": "lightgbm_utility"},
+        })
+        assert result["eligible"] is False
+        # Compatibility machine codes are deliberately unchanged.
+        assert result["code"] == "tcc_u67_engine_binding_mismatch"
+        assert result["reason"].startswith("TCC U77 requires")
+
     def test_jobs_have_independent_u77_snapshot_and_replay(self) -> None:
         source = inspect.getsource(compound_rotation_backtest.run_job)
         assert "assert_tcc_u77_contract(" in source
         assert "U77_REQUESTED_ASSETS" in source
         assert "requested_assets=(" in source
-        assert "download_u67_operational_snapshot(" in source
+        assert "download_operational_market_snapshot(" in source
         assert "run_tcc_u67_operational_backtest(" in source
 
 

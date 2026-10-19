@@ -1,7 +1,7 @@
 """Independent next-session arming for the Live Winner.
 
 Records a durable schedule and winner identity. It does NOT train a model,
-calculate a signal or submit an order. The scheduler is strictly read-only.
+calculate a signal or submit an order. The separate Live scheduler can later\nprepare a signal and execute an eligible broker order automatically.
 """
 from __future__ import annotations
 

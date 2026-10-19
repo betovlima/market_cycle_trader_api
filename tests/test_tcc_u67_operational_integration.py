@@ -8,7 +8,7 @@ from market_cycle_trader_api.core.config import (
     RESEARCH_ONLY_SWING_STRATEGY_MODES,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
 )
-from market_cycle_trader_api.engine.tcc_u67_operational_market_data import (
+from market_cycle_trader_api.engine.operational_market_snapshot import (
     _structural_issue,
 )
 from market_cycle_trader_api.engine.tcc_u67_operational_runtime import (
