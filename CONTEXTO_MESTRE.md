@@ -1,3 +1,11 @@
+## 2026-10-19 — API v10.8.117 (revisão sequencial, sem liberação por idade)
+
+Regra: a duração da computação não autoriza outro worker a tomar posse. Enquanto uma tarefa está em `preparing_signal` ou `open_recalibration`, a execução concorrente retorna *in progress* sem reprocessar e sem trocar a posse por tempo transcorrido. Foram removidos os reclaim automáticos baseados em 25 minutos. O deadline da corretora é consultado novamente ao concluir a recalibração e antes das pernas de uma ordem.
+
+**Limitação conhecida que impede merge em produção**: após morte abrupta de um worker, a sessão fica pendente até existir recuperação coordenada com confirmação de término do processo anterior e reconciliação dos efeitos no broker. Não se deve automatizar recuperação apenas por timeout, nem afirmar que esta versão já fornece retomada automática após crash. Exige implementação de protocolo de posse/fencing e testes integrados antes de promoção. Não há mudanças em Paper nem em main.
+
+---
+
 ## 2026-10-19 — API v10.8.116 (branch em revisão): horários US independentes do servidor
 
 **Regra do usuário.** Não introduzir limites arbitrários, sleeps de liberação, orçamentos fixos de tentativas, janelas pós-abertura ou travas novas de processamento sem aprovação explícita. A pipeline Live deve seguir os horários oficiais das bolsas americanas em `America/New_York`, independentemente da zona horária local/UTC do servidor.
