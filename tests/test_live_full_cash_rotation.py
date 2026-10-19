@@ -20,9 +20,12 @@ class LiveWinnerRotationTests(TestCase):
             "_id": "acct:" + session, "execution_session": session,
             "status": "recalibrated_no_orders", "action": "rotate",
             "target_asset": "ADEA", "current_asset": "NVDA",
-            "winner_signal_prepared": True, "winner_strategy_id": "winner",
+            "winner_signal_prepared": True, "post_close_signal_ready": True,
+            "decision_date": "2026-10-16", "snapshot_sha256": "frozen-sha",
+            "winner_strategy_id": "winner",
             "winner_configuration_hash": "hash", "winner_revision": 2,
             "live_account_id": "acct", "live_state_revision": 7,
+            "expected_market_open": datetime(2026, 10, 19, 13, 30, tzinfo=timezone.utc),
         }
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = run
@@ -41,7 +44,7 @@ class LiveWinnerRotationTests(TestCase):
         broker.get_account.side_effect = [first_account, second_account]
         broker.get_clock.return_value = SimpleNamespace(
             is_open=True,
-            timestamp=datetime(2026, 10, 19, 15, 30, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 10, 19, 13, 40, tzinfo=timezone.utc),
         )
         broker.get_orders.return_value = []
         state = {
@@ -86,8 +89,9 @@ class LiveWinnerRotationTests(TestCase):
             "status": "recalibrated_no_orders",
             "winner_strategy_id": "winner", "winner_revision": 2,
             "winner_configuration_hash": "hash",
-            "winner_signal_prepared": True, "target_asset": "ADEA",
-            "action": "buy", "live_account_id": "acct",
+            "winner_signal_prepared": True, "post_close_signal_ready": True,
+            "snapshot_sha256": "frozen-sha", "decision_date": "2026-10-16",
+            "target_asset": "ADEA", "action": "buy", "live_account_id": "acct",
         }
         broker = MagicMock()
         broker.get_account.return_value = SimpleNamespace(

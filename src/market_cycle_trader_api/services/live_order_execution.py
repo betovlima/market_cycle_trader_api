@@ -22,12 +22,29 @@ from ..infrastructure.trading.alpaca_live_orders import (
 from .live_control import live_control_status
 from .live_trader_state import verified_live_state, confirm_live_fill_state
 from .live_winner_session import LIVE_RUNS
+from .live_execution_window import live_execution_window_deadline
 from .strategy_lab import get_trader_winner_summary
 
 ORDER_LEDGER = "live_winner_broker_orders"
 EASTERN = ZoneInfo("America/New_York")
 LIVE_FILL_TIMEOUT_SECONDS = 300
 LIVE_FILL_POLL_SECONDS = 2.0
+
+
+def _assert_live_order_window(broker: Any, session: str, deadline: pd.Timestamp) -> pd.Timestamp:
+    """Recheck market/date/deadline directly at the broker before EACH leg."""
+    clock = broker.get_clock()
+    if not bool(getattr(clock, "is_open", False)):
+        raise RuntimeError("LiveExecutionWindowExpired: broker reports market closed.")
+    now = pd.Timestamp(clock.timestamp)
+    if now.tzinfo is None:
+        raise RuntimeError("LiveExecutionWindowExpired: broker timestamp has no timezone.")
+    now = now.tz_convert("UTC")
+    if now.tz_convert(EASTERN).date().isoformat() != session or now >= deadline:
+        raise RuntimeError("LiveExecutionWindowExpired: real order deadline has passed.")
+    return now
+
+
 def _full_live_cash_notional(account: Any) -> float:
     """Use broker-reported cash to size Winner entries without MCT reserve or caps."""
     try:
@@ -130,8 +147,14 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
         return {"status": "blocked_by_exit_only_mode", "order_submission_enabled": False}
     if action not in {"hold", "stay_in_cash", "buy", "sell_to_cash", "rotate"}:
         raise RuntimeError("Invalid Winner action.")
-    if not bool(run.get("winner_signal_prepared")) or not run.get("target_asset"):
-        raise RuntimeError("The current Winner has no verified Live trading signal.")
+    if (not bool(run.get("winner_signal_prepared"))
+        or not bool(run.get("post_close_signal_ready"))
+        or not run.get("snapshot_sha256")
+        or not run.get("target_asset")):
+        raise RuntimeError("No verified post-close Live Winner signal; real orders blocked.")
+    decision_date = str(run.get("decision_date") or "")[:10]
+    if not decision_date or decision_date >= session:
+        raise RuntimeError("Post-close Winner decision date is missing or stale; real orders blocked.")
 
     broker = create_live_execution_client()
     account = broker.get_account()
@@ -150,6 +173,26 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
     current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
     if current.tz_convert(EASTERN).date().isoformat() != session:
         raise RuntimeError("Stale Live session.")
+    expected_open_raw = run.get("expected_market_open")
+    if expected_open_raw is None:
+        raise RuntimeError("LiveExecutionWindowUnavailable: expected open missing; no real orders.")
+    expected_open = pd.Timestamp(expected_open_raw)
+    if expected_open.tzinfo is None:
+        raise RuntimeError("LiveExecutionWindowUnavailable: expected open must be timezone-aware.")
+    expected_open = expected_open.tz_convert("UTC")
+    deadline, _ = live_execution_window_deadline(expected_open)
+    if current >= deadline:
+        db[LIVE_RUNS].update_one(
+            {"_id": run["_id"], "status": "recalibrated_no_orders"},
+            {"$set": {
+                "status": "review_required",
+                "phase": "execution_window_expired",
+                "window_deadline_at": deadline.to_pydatetime(),
+                "window_expired_at": datetime.now(timezone.utc),
+                "order_submission_enabled": False,
+            }},
+        )
+        return {"status": "execution_window_expired", "order_submission_enabled": False}
     from alpaca.trading.enums import QueryOrderStatus
     from alpaca.trading.requests import GetOrdersRequest
     if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
@@ -187,6 +230,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
         if action in {"sell_to_cash", "rotate"}:
             if live_control_status(db)["control_mode"] not in {"active", "exit_only"}:
                 raise RuntimeError("Live mode changed before sell submission.")
+            _assert_live_order_window(broker, session, deadline)
             fill = _execute_leg(
                 db, broker, account=account_id, session=session,
                 side="sell", symbol=state["managed_symbol"],
@@ -202,6 +246,7 @@ def execute_recalibrated_live_winner_session(db: Any, session: str) -> dict[str,
         if action in {"buy", "rotate"}:
             if live_control_status(db)["control_mode"] != "active":
                 raise RuntimeError("Live mode no longer permits a buy.")
+            _assert_live_order_window(broker, session, deadline)
             account = broker.get_account()
             notional = _full_live_cash_notional(account)
             fill = _execute_leg(

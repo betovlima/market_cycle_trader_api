@@ -64,6 +64,8 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
         "action": None,
         "target_asset": None,
         "winner_signal_prepared": False,
+        "post_close_signal_ready": False,
+        "preparation_attempts": 0,
         "order_submission_enabled": False,
         "updated_at": now,
         **identity,
@@ -89,6 +91,8 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
         "winner_name": saved.get("winner_name"),
         "phase": saved.get("phase", doc["phase"]),
         "winner_signal_prepared": bool(saved.get("winner_signal_prepared")),
+        "post_close_signal_ready": bool(saved.get("post_close_signal_ready")),
+        "preparation_attempts": int(saved.get("preparation_attempts") or 0),
         "target_asset": saved.get("target_asset"),
         "action": saved.get("action"),
         "order_submission_enabled": False,
@@ -110,6 +114,13 @@ def latest_live_session(db: Any) -> dict[str, Any] | None:
         "phase": doc.get("phase"),
         "winner_name": doc.get("winner_name"),
         "winner_signal_prepared": bool(doc.get("winner_signal_prepared")),
+        "post_close_signal_ready": bool(doc.get("post_close_signal_ready")),
+        "preparation_attempts": int(doc.get("preparation_attempts") or 0),
+        "preparation_retry_not_before": (
+            doc["preparation_retry_not_before"].isoformat()
+            if hasattr(doc.get("preparation_retry_not_before"), "isoformat")
+            else None
+        ),
         "decision_date": doc.get("decision_date"),
         "action": doc.get("action"),
         "target_asset": doc.get("target_asset"),
@@ -118,5 +129,13 @@ def latest_live_session(db: Any) -> dict[str, Any] | None:
         "window_deadline_at": doc["window_deadline_at"].isoformat() if hasattr(doc.get("window_deadline_at"), "isoformat") else None,
         "window_expired_at": doc["window_expired_at"].isoformat() if hasattr(doc.get("window_expired_at"), "isoformat") else None,
         "last_calibration_error_type": doc.get("last_calibration_error_type"),
+        "last_calibration_error_code": doc.get("last_calibration_error_code"),
+        "last_intraday_error_symbol": doc.get("last_intraday_error_symbol"),
+        "last_intraday_error_feed": doc.get("last_intraday_error_feed"),
+        "retry_not_before": (
+            doc["retry_not_before"].isoformat()
+            if hasattr(doc.get("retry_not_before"), "isoformat")
+            else None
+        ),
         "order_submission_enabled": False,
     }

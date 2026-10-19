@@ -31,6 +31,16 @@ from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
 
 _ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE})
+_POST_CLOSE_MAX_ATTEMPTS = 2  # initial preparation + one retry, never a second calibration
+_POST_CLOSE_RETRY_DELAY_SECONDS = 300
+
+def _utc_datetime(value: Any) -> datetime:
+    stamp = value
+    if stamp.tzinfo is None:
+        # PyMongo decodes UTC timestamps as naive unless tz_aware was enabled.
+        return stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
 
 
 def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
@@ -42,11 +52,19 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     run = db[LIVE_RUNS].find_one({"execution_session": session})
     if not run:
         raise RuntimeError("No Live session is armed.")
-    if run.get("status") == "signal_prepared":
-        return {"status": "signal_prepared", "execution_session": session,
+    if run.get("status") in {"signal_prepared", "recalibrated_no_orders"}:
+        # Old signal_prepared rows are not executable in the post-close-only protocol.
+        return {"status": run["status"], "execution_session": session,
                 "target_asset": run.get("target_asset"), "order_submission_enabled": False}
     if run.get("status") != "waiting_for_winner_signal":
         raise RuntimeError("Live session is not eligible for Winner preparation.")
+    attempts = int(run.get("preparation_attempts") or 0)
+    if attempts >= _POST_CLOSE_MAX_ATTEMPTS:
+        raise RuntimeError("Live post-close signal attempts exhausted; review required.")
+    retry_not_before = run.get("preparation_retry_not_before")
+    if retry_not_before and datetime.now(timezone.utc) < _utc_datetime(retry_not_before):
+        return {"status": "waiting_for_post_close_retry", "execution_session": session,
+                "order_submission_enabled": False}
     if not bool(get_system_settings(db)["training"]["enabled"]):
         raise RuntimeError("Winner training is disabled in system settings.")
 
@@ -88,9 +106,14 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     claimed = db[LIVE_RUNS].find_one_and_update(
         {"_id": f'{run["live_account_id"]}:{session}',
-         "status": "waiting_for_winner_signal"},
-        {"$set": {"status": "preparing_signal", "phase": "winner_model_training",
-                  "preparation_started_at": now}},
+         "status": "waiting_for_winner_signal",
+         "$or": [
+             {"preparation_attempts": {"$exists": False}},
+             {"preparation_attempts": {"$lt": _POST_CLOSE_MAX_ATTEMPTS}},
+         ]},
+        {"$set": {"status": "preparing_signal", "phase": "post_close_winner_training",
+                  "preparation_started_at": now, "order_submission_enabled": False},
+         "$inc": {"preparation_attempts": 1}},
         return_document=ReturnDocument.AFTER,
     )
     if not claimed:
@@ -111,6 +134,8 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
         )
         if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
             raise RuntimeError("Incomplete Alpaca snapshot for Live Winner.")
+        if not isinstance(snapshot.manifest.get("snapshot_sha256"), str) or not snapshot.manifest["snapshot_sha256"]:
+            raise RuntimeError("Missing immutable post-close Alpaca snapshot SHA-256.")
         append_live_event(db, account_id=run["live_account_id"], session=session,
                           stage="signal_snapshot_downloaded", message="Snapshot do sinal preparado.",
                           details={"assets": len(snapshot.frames), "duration_seconds": round(monotonic() - started, 2)})
@@ -126,8 +151,10 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           details={"duration_seconds": round(monotonic() - started, 2)})
         stage = "decision_validation"
         decision_date = str(decision.decision_date)[:10]
-        if decision_date != cutoff:
-            raise RuntimeError(f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}")
+        if decision_date != cutoff or decision_date >= session:
+            raise RuntimeError(
+                f"Winner cutoff mismatch: decision={decision_date}, expected={cutoff}, next={session}"
+            )
         target = str(decision.target_asset).upper()
         if not target or (target != "CASH" and target not in strategy.assets):
             raise RuntimeError("Winner signal target is not a permitted asset.")
@@ -138,11 +165,17 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                   "buy" if current == "CASH" else
                   "sell_to_cash" if target == "CASH" else "rotate")
         stage = "decision_persistence"
+        # If preparation spilled into the open session, the next-session plan
+        # is no longer an after-close decision. Fail without releasing orders.
+        completed_clock = broker.get_clock()
+        if bool(getattr(completed_clock, "is_open", False)):
+            raise RuntimeError("PostCloseSignalMissedWindow: market opened during preparation.")
         saved = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": "preparing_signal",
              "winner_configuration_hash": run["winner_configuration_hash"]},
-            {"$set": {"status": "signal_prepared",
-                      "phase": "winner_signal_prepared_execution_disabled",
+            {"$set": {"status": "recalibrated_no_orders",
+                      "phase": "post_close_signal_ready_for_execution",
+                      "post_close_signal_ready": True,
                       "decision_date": decision_date,
                       "target_asset": target,
                       **candidate_fields,
@@ -154,7 +187,9 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                       "winner_signal_prepared": True,
                       "snapshot_sha256": snapshot.manifest.get("snapshot_sha256"),
                       "signal_prepared_at": datetime.now(timezone.utc),
-                      "order_submission_enabled": False}},
+                      "order_submission_enabled": False},
+             "$unset": {"preparation_retry_not_before": "",
+                        "last_preparation_error_type": ""}},
             return_document=ReturnDocument.AFTER,
         )
         if not saved:
@@ -163,7 +198,7 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           stage="signal_prepared", message="Sinal Winner registrado.",
                           details={"target_asset": target, "action": action,
                                    "duration_seconds": round(monotonic() - started, 2)})
-        return {"status": "signal_prepared", "execution_session": session,
+        return {"status": "recalibrated_no_orders", "execution_session": session,
                 "decision_date": decision_date, "target_asset": target,
                 "action": saved["action"], "order_submission_enabled": False}
     except Exception as exc:
@@ -172,11 +207,26 @@ def prepare_live_cash_winner_signal(db: Any, session: str) -> dict[str, Any]:
                           message="Falha no sinal Winner durante: " + stage,
                           details={"error_type": type(exc).__name__,
                                    "duration_seconds": round(monotonic() - started, 2)})
+        failed_attempts = int(claimed.get("preparation_attempts") or (attempts + 1))
+        retry_allowed = (
+            failed_attempts < _POST_CLOSE_MAX_ATTEMPTS
+            and not str(exc).startswith("PostCloseSignalMissedWindow:")
+        )
+        updates: dict[str, Any] = {
+            "status": "waiting_for_winner_signal" if retry_allowed else "review_required",
+            "phase": "post_close_signal_retry_wait" if retry_allowed else "post_close_signal_failed",
+            "failure_type": type(exc).__name__,
+            "last_preparation_error_type": type(exc).__name__,
+            "post_close_signal_ready": False,
+            "order_submission_enabled": False,
+        }
+        if retry_allowed:
+            from datetime import timedelta
+            updates["preparation_retry_not_before"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=_POST_CLOSE_RETRY_DELAY_SECONDS)
+            )
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": "preparing_signal"},
-            {"$set": {"status": "review_required",
-                      "phase": "winner_signal_failed",
-                      "failure_type": type(exc).__name__,
-                      "order_submission_enabled": False}},
+            {"$set": updates},
         )
         raise
