@@ -193,8 +193,10 @@ def _action_matches_symbol(item: dict[str, Any], symbol: str) -> bool:
 def _download_corporate_actions(
     symbol: str,
     config: Any,
+    *,
+    credentials_override: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], str, str]:
-    credentials = get_alpaca_credentials()
+    credentials = credentials_override if credentials_override is not None else get_alpaca_credentials()
     query_start = (
         date.fromisoformat(str(config.start_date)) - timedelta(days=366)
     ).isoformat()

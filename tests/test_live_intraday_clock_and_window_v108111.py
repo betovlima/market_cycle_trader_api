@@ -70,15 +70,16 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
         fake("assert_tcc_u77_contract")
         fake("assert_tcc_u67_model_snapshot")
         fake("create_live_readonly_client", broker)
+        fake("live_credentials", ("LIVE_KEY", "LIVE_SECRET"))
         fake("verified_live_state", {
             "managed_symbol": "CASH", "managed_quantity": 0,
             "holding_sessions": 0, "revision": 0,
         })
         fake("latest_safe_completed_xnys_session", pd.Timestamp("2026-10-16T04:00:00Z"))
         if fail_download:
-            snapshot_call = fake("download_u67_operational_snapshot", side_effect=RuntimeError("provider unavailable"))
+            snapshot_call = fake("download_operational_market_snapshot", side_effect=RuntimeError("provider unavailable"))
         else:
-            snapshot_call = fake("download_u67_operational_snapshot", snapshot)
+            snapshot_call = fake("download_operational_market_snapshot", snapshot)
         model_call = fake("build_live_model_decision", decision)
         fake("winner_candidate_fields", {})
         events = fake("append_live_event")
@@ -106,7 +107,7 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(updates["snapshot_sha256"], "frozen-snapshot-sha")
         broker.submit_order.assert_not_called()
 
-    def test_one_retry_after_failure_has_cooldown_and_no_order(self):
+    def test_automatic_retry_after_failure_has_cooldown_and_no_order(self):
         db, broker, snapshots, models, result, error = _prepare_test(fail_download=True)
         self.assertIsNotNone(error)
         updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
@@ -117,12 +118,12 @@ class PostCloseSingleCalibrationTests(TestCase):
         models.assert_not_called()
         broker.submit_order.assert_not_called()
 
-    def test_second_failure_exhausts_retry_and_requires_review(self):
+    def test_second_failure_still_retries_before_next_open(self):
         db, broker, snapshots, models, result, error = _prepare_test(fail_download=True, attempts=1)
         self.assertIsNotNone(error)
         updates = db["live_winner_session_runs"].update_one.call_args.args[1]["$set"]
-        self.assertEqual(updates["status"], "review_required")
-        self.assertEqual(updates["phase"], "post_close_signal_failed")
+        self.assertEqual(updates["status"], "waiting_for_winner_signal")
+        self.assertEqual(updates["phase"], "post_close_signal_retry_wait")
         self.assertFalse(updates["order_submission_enabled"])
         broker.submit_order.assert_not_called()
 
@@ -137,6 +138,7 @@ class PostCloseSingleCalibrationTests(TestCase):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = {
             "status": "recalibrated_no_orders", "target_asset": "ADEA",
+            "decision_date": "2026-10-16",
         }
         result = signals.prepare_live_cash_winner_signal(db, SESSION)
         self.assertEqual(result["target_asset"], "ADEA")
@@ -153,10 +155,10 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(result["status"], "waiting_for_post_close_retry")
         broker.assert_not_called()
 
-    def test_exhausted_attempts_cannot_start_third_training(self):
+    def test_exhausted_budget_never_trains(self):
         db = MagicMock()
-        db["live_winner_session_runs"].find_one.return_value = _run(attempts=2)
-        with patch(PREFIX + "download_u67_operational_snapshot") as download:
+        db["live_winner_session_runs"].find_one.return_value = _run(attempts=256)
+        with patch(PREFIX + "download_operational_market_snapshot") as download:
             with self.assertRaisesRegex(RuntimeError, "attempts exhausted"):
                 signals.prepare_live_cash_winner_signal(db, SESSION)
         download.assert_not_called()

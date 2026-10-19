@@ -882,8 +882,9 @@ def _download_alpaca_bars(
     end_date: str | None,
     *,
     single_request_daily: bool = False,
+    credentials_override: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    credentials = get_alpaca_credentials()
+    credentials = credentials_override if credentials_override is not None else get_alpaca_credentials()
     requested_start = _utc_timestamp(start_date)
     normalized_end = normalize_end_date(end_date)
     if normalized_end is None:
