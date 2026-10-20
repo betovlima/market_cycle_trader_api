@@ -158,7 +158,6 @@ class LiveOpenPipelineTests(TestCase):
                 return stack.enter_context(patch(prefix + name, return_value=value))
             fake("live_control_status", {"control_mode": "active"})
             fake("create_live_readonly_client", self.broker)
-            fake("live_credentials", ("LIVE_KEY", "LIVE_SECRET"))
             fake("latest_safe_completed_xnys_session", pd.Timestamp(PREVIOUS))
             fake("get_system_settings", {"training": {"enabled": True}})
             fake("get_trader_winner_context", (cfg, profile))
@@ -191,8 +190,8 @@ class LiveOpenPipelineTests(TestCase):
         self.assertEqual(result["decision_date"], SESSION)
         self.assertEqual(result["action"], "hold")
         self.assertEqual(live_bars.call_args.kwargs["session"], SESSION)
-        self.assertEqual(download.call_args.kwargs["credentials_override"],
-                         {"api_key_id": "LIVE_KEY", "secret_key": "LIVE_SECRET"})
+        # The Trading market-data key is now resolved by the shared snapshot.
+        self.assertNotIn("credentials_override", download.call_args.kwargs)
         self.assertFalse(result["order_submission_enabled"])
         saved_fields = self.db["live_winner_session_runs"].find_one_and_update.call_args_list[-1].args[1]["$set"]
         self.assertEqual(saved_fields["historical_cutoff"], PREVIOUS)
@@ -242,7 +241,7 @@ class LiveOpenPipelineTests(TestCase):
 
 
 class LiveCurrentSessionBarsTests(TestCase):
-    def test_uses_live_credentials_and_aggregates_completed_minutes(self):
+    def test_uses_trading_data_credentials_and_aggregates_completed_minutes(self):
         daily = pd.DataFrame([{"open": 100, "high": 101, "low": 99,
                               "close": 100, "volume": 1000}],
                              index=pd.DatetimeIndex([pd.Timestamp("2026-10-19T04:00:00Z")]))
@@ -256,10 +255,10 @@ class LiveCurrentSessionBarsTests(TestCase):
             pd.Timestamp("2026-10-20T13:36:00Z"),
         ]))
         with (
-            patch.object(live_market_bars, "live_credentials",
-                         return_value=("LIVE_KEY", "LIVE_SECRET")),
-            patch.object(live_market_bars, "download_stock_bars",
-                         return_value=minutes) as provider,
+            patch("market_cycle_trader_api.engine.operational_market_snapshot.get_alpaca_credentials",
+                  return_value={"api_key_id": "DATA_KEY", "secret_key": "DATA_SECRET"}),
+            patch("market_cycle_trader_api.engine.operational_market_snapshot.download_stock_bars",
+                  return_value=minutes) as provider,
         ):
             bars, info = live_market_bars.load_live_intraday_session(
                 {"MAN": daily}, SimpleNamespace(alpaca_live_feed="iex"),
@@ -268,7 +267,7 @@ class LiveCurrentSessionBarsTests(TestCase):
         self.assertEqual(info["intraday_asset_count"], 1)
         self.assertEqual(info["live_feed"], "iex")
         self.assertEqual(info["live_session"], SESSION)
-        self.assertEqual(provider.call_args.kwargs["api_key_id"], "LIVE_KEY")
+        self.assertEqual(provider.call_args.kwargs["api_key_id"], "DATA_KEY")
         current = bars["MAN"].iloc[-1]
         self.assertEqual(float(current["close"]), 103)
         self.assertEqual(float(current["volume"]), 30)

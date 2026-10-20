@@ -88,9 +88,9 @@ class LiveExchangeClockTests(TestCase):
             {"open": 40, "high": 42, "low": 39, "close": 41, "volume": 30}
         ], index=pd.DatetimeIndex([pd.Timestamp("2026-10-19T04:00:00Z")]))
         with (
-            patch("market_cycle_trader_api.services.live_market_bars.live_credentials",
-                  return_value=("LIVE", "SECRET")),
-            patch("market_cycle_trader_api.services.live_market_bars.download_stock_bars",
+            patch("market_cycle_trader_api.engine.operational_market_snapshot.get_alpaca_credentials",
+                  return_value={"api_key_id": "DATA", "secret_key": "SECRET"}),
+            patch("market_cycle_trader_api.engine.operational_market_snapshot.download_stock_bars",
                   return_value=bars),
         ):
             merged, audit = load_live_intraday_session(

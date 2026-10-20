@@ -25,7 +25,7 @@ from ..engine.tcc_u67_operational_runtime import (
     assert_tcc_u67_model_snapshot, assert_tcc_u67_operational_contract,
 )
 from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
-from ..infrastructure.trading.alpaca_live import create_live_readonly_client, live_credentials
+from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_control import live_control_status
 from .live_execution_window import live_execution_window_deadline
 from .live_market_bars import load_live_intraday_session
@@ -185,7 +185,6 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
             requested_assets=(U77_REQUESTED_ASSETS if mode == TCC_U77_FIXED_CHALLENGER_MODE
                               else tuple(strategy.assets)),
             data_directory=MARKET_DATA_DIRECTORY.parent.parent / "live_winner" / "snapshots",
-            credentials_override=dict(zip(("api_key_id", "secret_key"), live_credentials())),
         )
         if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
             raise RuntimeError("Live daily history snapshot is incomplete.")

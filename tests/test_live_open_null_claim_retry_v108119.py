@@ -77,7 +77,6 @@ class LiveOpenNullClaimRecoveryTests(TestCase):
                 "managed_symbol": "CASH", "managed_quantity": 0,
                 "holding_sessions": 0, "revision": 1,
             })
-            fake("live_credentials", ("KEY", "SECRET"))
             download = fake(
                 "download_operational_market_snapshot",
                 side_effect=RuntimeError("Live daily history snapshot is incomplete."),

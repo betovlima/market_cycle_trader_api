@@ -23,7 +23,7 @@ from ..engine.operational_market_snapshot import (
 )
 from ..engine.tcc_u67_operational_runtime import assert_tcc_u67_model_snapshot, assert_tcc_u67_operational_contract
 from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
-from ..infrastructure.trading.alpaca_live import create_live_readonly_client, live_credentials
+from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .model_research import apply_execution_profile
 from .system_settings import apply_training_runtime_settings, get_system_settings
 from .strategy_lab import get_trader_winner_context, get_trader_winner_model_snapshot
@@ -193,7 +193,6 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
             config=strategy.model_copy(update={"analysis_end_date": cutoff}),
             requested_assets=(U77_REQUESTED_ASSETS if u77 else tuple(strategy.assets)),
             data_directory=TCC_U67_DATA_DIRECTORY.parent.parent / "live_winner" / "snapshots",
-            credentials_override=dict(zip(("api_key_id", "secret_key"), live_credentials())),
         )
         if not snapshot.frames or any(frame.empty for frame in snapshot.frames.values()):
             raise RuntimeError("Incomplete Alpaca snapshot for Live Winner.")
