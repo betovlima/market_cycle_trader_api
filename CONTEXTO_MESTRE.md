@@ -1,3 +1,19 @@
+## 2026-10-20 — API v10.8.122 | paridade do Trading na coleta e idade das posições do Live
+
+**Motivação.** Trading (Paper) tem comportamento estável com os mesmos ativos, enquanto Live registrou tentativas `LiveIntradayCoverageNotReady` na sessão de 20/10. As duas rotinas de barras `1Min` eram independentes, com regras e credenciais diferentes. Após conciliação manual MAN -> CAPR (API v10.8.121), preservar a posição CAPR; nenhuma ordem será reenviada por esta mudança.
+
+**Paridade implementada.** Live delega a preparação de barras ao mesmo `append_current_session_intraday()` de Trading (U67/U77), preservando políticas IEX -> SIP -> SIP atrasado 20 min, conjunto completo de ativos, cutoff e agregação OHLCV, sem importar portfólio, cliente de ordens ou estados Paper. A `analysis_mode` permanece `live_current_session_intraday`, exigida pelo contrato financeiro Live, mas as barras e metadados de origem são idênticos. O snapshot de histórico Live usa agora as mesmas credenciais de **dados de mercado** do Trading; o cliente de negociação permanece Alpaca Live, sem misturar contas nem ordens.
+
+**Regra de holding explicitamente preservada.** O Trading não acrescenta o pregão ainda em andamento à idade de uma posição: entrada conta como sessão 1; apenas sessões concluídas depois da entrada somam mais uma. O Live passa a aplicar o mesmo `latest_safe_completed_xnys_session` com buffer do Trading, calendário XNYS e relógio da Alpaca Live. Quantidades fracionárias são comparadas com a mesma tolerância absoluta/relativa de Trading; divergências de símbolo/quantidade acima da tolerância continuam bloqueando.
+
+**Escopo e segurança.** Nenhum uso de executor, contas, posições, filas ou coleções Paper no Live; nenhuma alteração de Winner, universo, modelos ou parâmetros; nenhuma nova ordem, retry financeiro ou execução retroativa da sessão 20/10. Não alegar correção do `RuntimeError` financeiro de 15:11 UTC sem evidência do guard específico; os diagnósticos v10.8.120 continuam em vigor.
+
+**Validação.** `tests/test_live_trading_parity_v108122.py` compara barras e metadados Paper/Live nas mesmas entradas IEX, fallback SIP e SIP atrasado; verifica sessão atual incompleta, permanência a partir da entrada e tolerância de posição; CI regressivo obrigatório antes do merge/deploy.
+
+**Branch.** `fix/v10.8.122-live-trading-pipeline-parity`.
+
+---
+
 ## 2026-10-20 — API v10.8.121 (reconciliacao manual Live sem ordens)
 
 Problema: posicao Alpaca foi alterada manualmente de MAN para CAPR apos a decisao Winner CAPR/rotate em 20/10, sem passar pelo executor MCT. A carteira Live le a Alpaca, mas live_trader_strategy_state e o plano antigo mantinham MAN.
