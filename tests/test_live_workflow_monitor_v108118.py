@@ -18,6 +18,13 @@ PREFIX = "market_cycle_trader_api.services.live_workflow_monitor."
 class LiveWorkflowMonitorTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
+        # Different collections must have independent mock cursors.
+        self.collections = {
+            name: MagicMock() for name in (
+                LIVE_RUNS, LIVE_ATTEMPTS, LIVE_EVENTS, ORDER_LEDGER
+            )
+        }
+        self.db.__getitem__.side_effect = self.collections.__getitem__
         self.db[LIVE_RUNS].find_one.return_value = {
             "_id": "acct:2026-10-20",
             "live_account_id": "acct",
