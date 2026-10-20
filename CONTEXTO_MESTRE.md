@@ -1,3 +1,19 @@
+## 2026-10-20 — API v10.8.119 (Live open: recuperação travada após erro tratado)
+
+**Evidência:** o ZIP de eventos `mct_live_winner_logs_20261020T141400Z.zip` da sessão `2026-10-20` contém duas preparações pós-fechamento concluídas com `target_asset=CAPR` e `action=rotate`, e uma falha `live_open_signal_failed` às 13:31:43 (horário gravado sem timezone) após 97,05 s. A mensagem e o traceback originais NÃO estão no ZIP, logo a causa inicial do `RuntimeError` permanece não identificada; o ZIP também não prova a execução ou ausência de ordens em broker. Logs Railway consultados no intervalo disponível continham respostas HTTP 200 às consultas, sem traceback de erro.
+
+**Defeito confirmado no código:** `refresh_live_open_winner_signal()` atualiza a sessão com `status=waiting_for_open_recalibration` e `market_open_calibration_completed_at=None` ao capturar a exceção. O próximo `find_one_and_update` só aceitava `market_open_calibration_completed_at: {$exists: false}`, o que NÃO combina com campo BSON presente e `null`. Após a primeira falha tratada a sessão ficava sem possibilidade de claim para nova tentativa, embora o scheduler tentasse novamente.
+
+**Correção:** filtro do claim passa a usar igualdade `market_open_calibration_completed_at: None`, que em MongoDB corresponde aos campos ausentes OU nulos, mas não a um timestamp de sucesso. A guarda de estado e a identidade do Winner continuam sendo exigidas. Não recupera um claim `open_recalibration` em andamento apenas pelo tempo transcorrido. Nenhuma política de retry de ordens foi adicionada; somente recomputação dos dados/modelo quando a sessão está elegível.
+
+**Diagnóstico seguro:** o evento de falha passa a exportar `stage`, `retry_allowed` e `error_code` de uma lista curada, sem mensagem bruta de exceção nem payload de Alpaca. Eventos já gravados não são enriquecidos retroativamente.
+
+**Testes:** `tests/test_live_open_null_claim_retry_v108119.py` valida duas falhas consecutivas seguidas de dois claims (sem ordens), preservação da idempotência de sessão concluída e redigibilidade do error code. Conferir no CI antes de merge/deploy. O erro original de barras intradiárias pode persistir independentemente do destravamento de retries: `live_market_bars.py` exige barras completas dos ativos em cada observação.
+
+**Escopo:** somente API MCT operacional. Não modifica os scripts nem o universo científico TCC. Não promover à produção antes da revisão e confirmação da situação financeira do pregão.
+
+---
+
 ## 2026-10-19 — API v10.8.118 (Live workflow monitor / transitions + Tenacity)
 
 **Objetivo.** Tornar observáveis as tentativas do cálculo Live e disponibilizar consulta administrativa por `GET /api/live-market/winner/monitor?execution_session=AAAA-MM-DD` na interface Swagger `/docs`, sem alterar a identidade das estratégias e sem acionar operações por um endpoint de leitura.
