@@ -1,3 +1,11 @@
+## 2026-10-19 — API v10.8.117 (ajuste de recuperação sequencial na PR #69)
+
+O foco é a recuperação do *fluxo operacional*, não a recuperação da infraestrutura Railway. Na preparação pós-fechamento, o registro inicial de auditoria agora faz parte da operação protegida por tratamento de exceção; uma falha nesse evento deixa a sessão em `waiting_for_winner_signal`, sem janela, cooldown ou limite de tentativas. Em erros de preparação e recalibração de abertura, primeiro se persiste o estado recuperável no MongoDB e depois tenta-se registrar o evento; a falha do evento não substitui o resultado operacional. Acrescentado teste de falha de auditoria.
+
+Continuam as garantias de não duplicar ordens e de validar com a Alpaca antes de cada etapa. Permanecem fora do escopo desta PR as recuperações automáticas de processos terminados abruptamente pela infraestrutura. Uma tarefa em andamento não é tomada por outra por duração transcorrida. A recuperação entre etapas já tratadas por exceção é permitida pela transição explícita ao estado de espera. Manter PR Draft até testes de integração e CI.
+
+---
+
 ## 2026-10-19 — API v10.8.117 (revisão sequencial, sem liberação por idade)
 
 Regra: a duração da computação não autoriza outro worker a tomar posse. Enquanto uma tarefa está em `preparing_signal` ou `open_recalibration`, a execução concorrente retorna *in progress* sem reprocessar e sem trocar a posse por tempo transcorrido. Foram removidos os reclaim automáticos baseados em 25 minutos. O deadline da corretora é consultado novamente ao concluir a recalibração e antes das pernas de uma ordem.
