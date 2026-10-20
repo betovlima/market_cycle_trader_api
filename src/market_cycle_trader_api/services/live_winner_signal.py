@@ -166,7 +166,10 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
          "status": "waiting_for_winner_signal",
         },
         {"$set": {"status": "preparing_signal", "phase": "post_close_winner_training",
-                  "preparation_started_at": now, "order_submission_enabled": False},
+                  "preparation_started_at": now, "order_submission_enabled": False,
+                  "winner_signal_prepared": False, "post_close_signal_ready": False,
+                  "decision_date": None, "target_asset": None, "action": None,
+                  "snapshot_sha256": None},
          "$inc": {"preparation_attempts": 1}},
         return_document=ReturnDocument.AFTER,
     )
@@ -270,6 +273,9 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
             "failure_type": type(exc).__name__,
             "last_preparation_error_type": type(exc).__name__,
             "post_close_signal_ready": False,
+            "winner_signal_prepared": False,
+            "decision_date": None, "target_asset": None, "action": None,
+            "snapshot_sha256": None,
             "order_submission_enabled": False,
         }
         db[LIVE_RUNS].update_one(
