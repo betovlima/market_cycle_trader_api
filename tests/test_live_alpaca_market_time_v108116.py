@@ -127,7 +127,11 @@ class LiveExchangeClockTests(TestCase):
             "_id": "acct:2026-10-20", "status": "open_recalibration",
             "open_calibration_started_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
         }
-        with patch("market_cycle_trader_api.services.live_winner_open.create_live_readonly_client") as factory:
+        with (
+            patch("market_cycle_trader_api.services.live_winner_open.live_control_status",
+                  return_value={"control_mode": "active"}),
+            patch("market_cycle_trader_api.services.live_winner_open.create_live_readonly_client") as factory,
+        ):
             result = refresh_live_open_winner_signal(db, "2026-10-20")
         self.assertEqual(result["status"], "live_open_recalibration_in_progress")
         factory.assert_not_called()
