@@ -1,3 +1,19 @@
+## 2026-10-20 — API v10.8.123 | falha financeira Live: BSON UTC tz-naive
+
+**Evidência do incidente real.** Exportação do usuário `mct_live_winner_logs_20261020T173808Z.zip` (65 eventos para 2026-10-20) mostra 9 `live_open_signal_failed` (8 `LiveIntradayCoverageNotReady`, current_session_bars, entre 14:39 e 15:01 UTC); recalibração `live_open_signal_prepared` em 15:11:35 UTC, action=rotate, target=CAPR; a partir de 15:45:42 até 16:26:09 UTC foram registrados 41 eventos `broker_execution_failed` com **error_code=invalid_execution_window** e **error_location=live_order_execution.py:188**, além de `scheduler_failed: RuntimeError`. Não há prova de erro na estratégia/LightGBM; o executor falhou antes de qualquer claim e ordem no guard de horário.
+
+**Causa raiz demonstrada.** `plan_next_live_session` grava `expected_market_open` como datetime UTC-aware, mas PyMongo por padrão decodifica BSON UTC como datetime sem tzinfo. O executor v10.8.122 interpretava a ausência de tzinfo como erro (`LiveExecutionWindowUnavailable: expected open must be timezone-aware.`). Nenhuma ordem era enviada, apesar de o instante ser a abertura legítima. Múltiplas tentativas não resolviam o contrato de leitura de BSON.
+
+**Correção da v10.8.123.** Normalizar o timestamp BSON sem tzinfo explicitamente para UTC, como Trading (Paper); UTC-aware segue com tz_convert('UTC'). Somente autorizar continuar se o instante normalizado for **exatamente** `exchange_calendars.XNYS.session_open(execution_session)` (rejeita horário local tratado como UTC, dia errado, 9:30 UTC, horário não oficial). Depois continuam `live_execution_window_deadline`, relógio Alpaca real, horário comercial, Winner, estado/posição/quantidades, open orders, revisão CAS e ledger de idempotência antes de qualquer submissão. Datas ausentes ou não parseáveis continuam bloqueadas, com código público seguro `invalid_execution_window`.
+
+**Teste.** `tests/test_live_bson_market_open_v108123.py`: utiliza `bson.BSON.encode(...).decode()` real para reproduzir PyMongo tz-naive, verifica passagem ao preflight do broker sem submissão, DST/early close, recusa horários inválidos, tarde demais, idempotência de sessão manual_reconciled. Suíte `engine-parity-tests` necessária antes de merge.
+
+**Escopo / não objetivos.** Não altera estratégia, preço, modelo, universo, conta, relógio real da Alpaca ou janela autorizada. Não executa novamente a rotação 20/10: a sessão anteriormente conciliada está `manual_reconciled` e permanece inelegível. O erro de cobertura de dados é separado e foi abordado pelo alinhamento Trading → Live v10.8.122; avaliação em produção ainda requer logs novos após deploy.
+
+**Branch:** fix/v10.8.123-live-utc-bson-market-open.
+
+---
+
 ## 2026-10-20 — API v10.8.122 | paridade do Trading na coleta e idade das posições do Live
 
 **Motivação.** Trading (Paper) tem comportamento estável com os mesmos ativos, enquanto Live registrou tentativas `LiveIntradayCoverageNotReady` na sessão de 20/10. As duas rotinas de barras `1Min` eram independentes, com regras e credenciais diferentes. Após conciliação manual MAN -> CAPR (API v10.8.121), preservar a posição CAPR; nenhuma ordem será reenviada por esta mudança.
