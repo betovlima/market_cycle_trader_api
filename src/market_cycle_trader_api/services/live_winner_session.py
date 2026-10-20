@@ -46,7 +46,7 @@ def plan_next_live_session(db: Any) -> dict[str, Any]:
     else:
         session = next_open.astimezone(EASTERN).date().isoformat()
         expected_open = next_open
-    now = datetime.now(timezone.utc)
+    now = timestamp.astimezone(timezone.utc)
     identity = {
         "live_account_id": account_id,
         "winner_strategy_id": str(winner["id"]),

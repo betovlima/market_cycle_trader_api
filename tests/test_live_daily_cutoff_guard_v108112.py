@@ -19,6 +19,12 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
             "preparation_attempts": 0,
         }
         self.prefix = "market_cycle_trader_api.services.live_winner_signal."
+        self.broker = MagicMock()
+        self.broker.get_clock.return_value = type("LiveClock", (), {
+            "timestamp": datetime(2026, 10, 19, 20, 1, tzinfo=timezone.utc),
+            "is_open": False,
+        })()
+
 
     def test_waits_after_close_until_daily_bar_is_safe(self):
         # Monday 2026-10-19 is complete but the 20-min buffer is not.
@@ -28,7 +34,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
                   return_value=pd.Timestamp("2026-10-16")),
             patch(self.prefix + "get_system_settings") as settings,
             patch(self.prefix + "download_operational_market_snapshot") as download,
-            patch(self.prefix + "create_live_readonly_client") as broker,
+            patch(self.prefix + "create_live_readonly_client", return_value=self.broker) as broker,
         ):
             result = prepare_live_cash_winner_signal(self.db, "2026-10-20")
         self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
@@ -37,7 +43,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
         self.assertFalse(result["order_submission_enabled"])
         settings.assert_not_called()
         download.assert_not_called()
-        broker.assert_not_called()
+        broker.assert_called_once()
         self.db["live_winner_session_runs"].find_one_and_update.assert_not_called()
 
     def test_accepts_previous_trading_day_across_weekend(self):
@@ -48,6 +54,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
             patch(self.prefix + "get_system_settings",
                   return_value={"training": {"enabled": False}}) as settings,
             patch(self.prefix + "download_operational_market_snapshot") as download,
+            patch(self.prefix + "create_live_readonly_client", return_value=self.broker),
         ):
             with self.assertRaisesRegex(RuntimeError, "training is disabled"):
                 prepare_live_cash_winner_signal(self.db, "2026-10-19")
@@ -61,6 +68,7 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
             patch(self.prefix + "get_system_settings",
                   return_value={"training": {"enabled": False}}) as settings,
             patch(self.prefix + "download_operational_market_snapshot") as download,
+            patch(self.prefix + "create_live_readonly_client", return_value=self.broker),
         ):
             with self.assertRaisesRegex(RuntimeError, "training is disabled"):
                 prepare_live_cash_winner_signal(self.db, "2026-10-20")
@@ -69,8 +77,11 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
 
     def test_waiting_never_consumes_retry_budget(self):
         self.db["live_winner_session_runs"].find_one.return_value["preparation_attempts"] = 1
-        with patch(self.prefix + "latest_safe_completed_xnys_session",
-                   return_value=pd.Timestamp("2026-10-16")):
+        with (
+            patch(self.prefix + "latest_safe_completed_xnys_session",
+                  return_value=pd.Timestamp("2026-10-16")),
+            patch(self.prefix + "create_live_readonly_client", return_value=self.broker),
+        ):
             result = prepare_live_cash_winner_signal(self.db, "2026-10-20")
         self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
         self.db["live_winner_session_runs"].update_one.assert_not_called()

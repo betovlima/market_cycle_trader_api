@@ -30,7 +30,13 @@ def observe_live_cycle(db: Any) -> dict[str, Any]:
         return {"status": "skipped", "reason": "live_control_not_active"}
     snapshot = live_portfolio_snapshot(db)
     winner = get_trader_winner_summary(db)
-    now = datetime.now(timezone.utc)
+    broker_stamp = snapshot["market_clock"].get("timestamp")
+    if not broker_stamp:
+        raise RuntimeError("Live broker timestamp missing from portfolio snapshot.")
+    now = datetime.fromisoformat(str(broker_stamp))
+    if now.tzinfo is None:
+        raise RuntimeError("Live broker timestamp must include timezone.")
+    now = now.astimezone(timezone.utc)
     # Winner metadata is informational: the Paper decision is not silently reused.
     document = {
         "recorded_at": now,

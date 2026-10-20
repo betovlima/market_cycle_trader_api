@@ -187,7 +187,7 @@ def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any
     if expected_open.tzinfo is None:
         raise RuntimeError("LiveExecutionWindowUnavailable: expected open must be timezone-aware.")
     expected_open = expected_open.tz_convert("UTC")
-    deadline, _ = live_execution_window_deadline(expected_open)
+    deadline, _ = live_execution_window_deadline(expected_open, market_clock=clock)
     if current >= deadline:
         db[LIVE_RUNS].update_one(
             {"_id": run["_id"], "status": "recalibrated_no_orders"},
