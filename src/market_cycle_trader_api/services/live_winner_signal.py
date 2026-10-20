@@ -79,26 +79,10 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
         now=broker_time, data_delay_minutes=0
     ).date().isoformat()
     if run.get("status") == "preparing_signal":
-        started = run.get("preparation_started_at")
-        if started is None or (
-            broker_time - _utc_datetime(started)
-        ) <= timedelta(minutes=25):
-            return {"status": "post_close_training_in_progress",
-                    "execution_session": session, "order_submission_enabled": False}
-        recovered = db[LIVE_RUNS].find_one_and_update(
-            {"_id": run["_id"], "status": "preparing_signal",
-             "preparation_started_at": started},
-            {"$set": {"status": "waiting_for_winner_signal",
-                      "phase": "recovered_abandoned_post_close_calibration",
-                      "winner_signal_prepared": False,
-                      "post_close_signal_ready": False,
-                      "order_submission_enabled": False}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if not recovered:
-            return {"status": "post_close_training_in_progress",
-                    "execution_session": session, "order_submission_enabled": False}
-        run = recovered
+        # A long-running model is not an abandoned worker. Do not reclaim a
+        # persisted claim based on an arbitrary number of minutes.
+        return {"status": "post_close_training_in_progress",
+                "execution_session": session, "order_submission_enabled": False}
     # Never freeze Friday history as Tuesday's decision. Wait for Monday's
     # completed daily bar and replace any unexecuted stale stored signal.
     if run.get("status") == "signal_prepared":
@@ -182,7 +166,10 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
          "status": "waiting_for_winner_signal",
         },
         {"$set": {"status": "preparing_signal", "phase": "post_close_winner_training",
-                  "preparation_started_at": now, "order_submission_enabled": False},
+                  "preparation_started_at": now, "order_submission_enabled": False,
+                  "winner_signal_prepared": False, "post_close_signal_ready": False,
+                  "decision_date": None, "target_asset": None, "action": None,
+                  "snapshot_sha256": None},
          "$inc": {"preparation_attempts": 1}},
         return_document=ReturnDocument.AFTER,
     )
@@ -190,10 +177,11 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
         raise RuntimeError("Live preparation was already claimed.")
 
     started = monotonic()
-    stage = "download"
-    append_live_event(db, account_id=run["live_account_id"], session=session,
-                      stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
+    stage = "initial_event"
     try:
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
+        stage = "download"
         cutoff = latest_safe_completed_xnys_session(
             now=_utc_datetime(broker.get_clock().timestamp), data_delay_minutes=0
         ).date().isoformat()
@@ -277,23 +265,32 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 "decision_date": decision_date, "target_asset": target,
                 "action": saved["action"], "order_submission_enabled": False}
     except Exception as exc:
-        append_live_event(db, account_id=run["live_account_id"], session=session,
-                          stage="signal_preparation_failed", level="error",
-                          message="Falha no sinal Winner durante: " + stage,
-                          details={"error_type": type(exc).__name__,
-                                   "duration_seconds": round(monotonic() - started, 2)})
+        # Persist the recoverable state before emitting secondary audit events.
+        # A logging failure must not strand a claimed job in preparing_signal.
         updates: dict[str, Any] = {
             "status": "waiting_for_winner_signal",
             "phase": "post_close_signal_retry_wait",
             "failure_type": type(exc).__name__,
             "last_preparation_error_type": type(exc).__name__,
             "post_close_signal_ready": False,
+            "winner_signal_prepared": False,
+            "decision_date": None, "target_asset": None, "action": None,
+            "snapshot_sha256": None,
             "order_submission_enabled": False,
         }
         db[LIVE_RUNS].update_one(
             {"_id": claimed["_id"], "status": "preparing_signal"},
             {"$set": updates, "$unset": {"preparation_retry_not_before": ""}},
         )
+        try:
+            append_live_event(db, account_id=run["live_account_id"], session=session,
+                              stage="signal_preparation_failed", level="error",
+                              message="Falha no sinal Winner durante: " + stage,
+                              details={"error_type": type(exc).__name__,
+                                       "duration_seconds": round(monotonic() - started, 2)})
+        except Exception:
+            # Recovery state is authoritative; preserve the original failure.
+            pass
         raise
 
 

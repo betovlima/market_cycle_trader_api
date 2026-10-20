@@ -1,3 +1,29 @@
+## 2026-10-19 — API v10.8.117 — regra all-in para recomputação, Alpaca separada
+
+A cada falha tratada de dados, treinamento, previsão ou validação, a tentativa é descartada integralmente e o fluxo de cálculo recomeça na etapa inicial: baixar dados, recompor snapshot, treinar, gerar decisão e validar. A sessão persiste um estado de espera recuperável e limpa os campos de decisão/snapshot que não foram confirmados. Não reutilizar decisão parcial. Uma tarefa ativa permanece exclusiva e não é recuperada por um prazo arbitrário.
+
+**Exceção financeira:** o envio e acompanhamento de ordens Alpaca nunca entra no retry all-in. A corretora e o ledger persistido são a fonte de verdade. Em erro de envio, retorno incerto, preenchimento parcial ou ausência de confirmação, reconciliar usando client_order_id, estado real da posição e fills antes de qualquer outra ordem. Não reexecutar compra/venda por simples retry.
+
+Escopo desta alteração: ajustes em catches/claims de preparação e recalibração existentes e asserções nos testes. Não é uma garantia de recuperação universal (ex. erro antes do claim, falha fatal do processo, erro persistente Mongo), nem de que o processamento continuará fora da sessão atual. CI e integração ainda pendentes. PR #69 Draft, sem deploy.
+
+---
+
+## 2026-10-19 — API v10.8.117 (ajuste de recuperação sequencial na PR #69)
+
+O foco é a recuperação do *fluxo operacional*, não a recuperação da infraestrutura Railway. Na preparação pós-fechamento, o registro inicial de auditoria agora faz parte da operação protegida por tratamento de exceção; uma falha nesse evento deixa a sessão em `waiting_for_winner_signal`, sem janela, cooldown ou limite de tentativas. Em erros de preparação e recalibração de abertura, primeiro se persiste o estado recuperável no MongoDB e depois tenta-se registrar o evento; a falha do evento não substitui o resultado operacional. Acrescentado teste de falha de auditoria.
+
+Continuam as garantias de não duplicar ordens e de validar com a Alpaca antes de cada etapa. Permanecem fora do escopo desta PR as recuperações automáticas de processos terminados abruptamente pela infraestrutura. Uma tarefa em andamento não é tomada por outra por duração transcorrida. A recuperação entre etapas já tratadas por exceção é permitida pela transição explícita ao estado de espera. Manter PR Draft até testes de integração e CI.
+
+---
+
+## 2026-10-19 — API v10.8.117 (revisão sequencial, sem liberação por idade)
+
+Regra: a duração da computação não autoriza outro worker a tomar posse. Enquanto uma tarefa está em `preparing_signal` ou `open_recalibration`, a execução concorrente retorna *in progress* sem reprocessar e sem trocar a posse por tempo transcorrido. Foram removidos os reclaim automáticos baseados em 25 minutos. O deadline da corretora é consultado novamente ao concluir a recalibração e antes das pernas de uma ordem.
+
+**Limitação conhecida que impede merge em produção**: após morte abrupta de um worker, a sessão fica pendente até existir recuperação coordenada com confirmação de término do processo anterior e reconciliação dos efeitos no broker. Não se deve automatizar recuperação apenas por timeout, nem afirmar que esta versão já fornece retomada automática após crash. Exige implementação de protocolo de posse/fencing e testes integrados antes de promoção. Não há mudanças em Paper nem em main.
+
+---
+
 ## 2026-10-19 — API v10.8.116 (branch em revisão): horários US independentes do servidor
 
 **Regra do usuário.** Não introduzir limites arbitrários, sleeps de liberação, orçamentos fixos de tentativas, janelas pós-abertura ou travas novas de processamento sem aprovação explícita. A pipeline Live deve seguir os horários oficiais das bolsas americanas em `America/New_York`, independentemente da zona horária local/UTC do servidor.

@@ -59,36 +59,9 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if run.get("status") in {"completed", "executing", "analysis_only_completed"}:
         return {"status": str(run["status"]), "order_submission_enabled": False}
     if run.get("status") == "open_recalibration":
-        started_at = run.get("open_calibration_started_at")
-        if started_at is None or _utc(datetime.now(timezone.utc)) - _utc(started_at) <= pd.Timedelta(minutes=25):
-            return {"status": "live_open_recalibration_in_progress", "order_submission_enabled": False}
-        # Recover a worker interrupted after claiming the model task. Open
-        # calibration never submits orders; still verify the independent
-        # broker ledger before releasing the stale claim.
-        pending_intent = db["live_winner_broker_orders"].find_one({
-            "broker_account_id": run["live_account_id"],
-            "execution_session": session,
-        })
-        if pending_intent:
-            db[LIVE_RUNS].update_one(
-                {"_id": run["_id"], "status": "open_recalibration"},
-                {"$set": {"status": "review_required",
-                          "phase": "live_open_broker_reconciliation_required",
-                          "order_submission_enabled": False}},
-            )
-            return {"status": "broker_reconciliation_required", "order_submission_enabled": False}
-        recovered = db[LIVE_RUNS].find_one_and_update(
-            {"_id": run["_id"], "status": "open_recalibration",
-             "open_calibration_started_at": started_at},
-            {"$set": {"status": "waiting_for_open_recalibration",
-                      "phase": "recovered_abandoned_live_calibration",
-                      "winner_signal_prepared": False,
-                      "post_close_signal_ready": False,
-                      "order_submission_enabled": False}},
-            return_document=ReturnDocument.AFTER,
-        )
-        return {"status": "recovered_abandoned_live_calibration"
-                if recovered else "live_open_recalibration_in_progress",
+        # Never infer worker death from elapsed wall-clock time. Keep the
+        # claim sequential; failed executions release it explicitly below.
+        return {"status": "live_open_recalibration_in_progress",
                 "order_submission_enabled": False}
     calendar = xcals.get_calendar("XNYS")
     requested = pd.Timestamp(session)
@@ -224,9 +197,12 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
         # result for another session or after the broker execution deadline.
         finished_clock = broker.get_clock()
         finished_time = _utc(finished_clock.timestamp)
+        latest_deadline, _ = live_execution_window_deadline(
+            opened, market_clock=finished_clock,
+        )
         if (not getattr(finished_clock, "is_open", False)
             or finished_time.tz_convert(EASTERN).date().isoformat() != session
-            or finished_time >= deadline):
+            or finished_time >= latest_deadline):
             raise RuntimeError("LiveOpenRecalibrationMissedWindow: no orders allowed.")
         saved = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": "open_recalibration",
@@ -270,14 +246,22 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 "phase": "waiting_for_open_data_retry",
                 "order_submission_enabled": False, "winner_signal_prepared": False,
                 "post_close_signal_ready": False, "last_open_calibration_error": str(exc),
+                "market_open_calibration_completed_at": None,
+                "analysis_mode": None, "historical_cutoff": None,
+                "decision_date": None, "target_asset": None, "action": None,
+                "snapshot_sha256": None,
             }, "$unset": {"open_retry_not_before": ""}},
         )
-        append_live_event(
-            db, account_id=run["live_account_id"], session=session,
-            stage="live_open_signal_failed", level="error",
-            message="Live reanalise de abertura falhou; aguarda recuperacao automatica.",
-            details={"error_type": type(exc).__name__, "stage": stage,
-                     "retry_allowed": True, "duration_seconds": round(monotonic() - started, 2)},
-        )
+        try:
+            append_live_event(
+                db, account_id=run["live_account_id"], session=session,
+                stage="live_open_signal_failed", level="error",
+                message="Live reanalise de abertura falhou; aguarda recuperacao automatica.",
+                details={"error_type": type(exc).__name__, "stage": stage,
+                         "retry_allowed": True, "duration_seconds": round(monotonic() - started, 2)},
+            )
+        except Exception:
+            # The already-persisted waiting state controls the next attempt.
+            pass
         return {"status": "waiting_for_open_retry",
                 "error_type": type(exc).__name__, "order_submission_enabled": False}

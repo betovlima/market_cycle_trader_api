@@ -35,7 +35,7 @@ def _run(attempts=0):
     }
 
 
-def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
+def _prepare_test(*, fail_download=False, attempts=0, market_open=False, fail_event=False):
     db = MagicMock()
     run = _run(attempts)
     db["live_winner_session_runs"].find_one.return_value = run
@@ -86,7 +86,7 @@ def _prepare_test(*, fail_download=False, attempts=0, market_open=False):
             snapshot_call = fake("download_operational_market_snapshot", snapshot)
         model_call = fake("build_live_model_decision", decision)
         fake("winner_candidate_fields", {})
-        events = fake("append_live_event")
+        events = fake("append_live_event", side_effect=RuntimeError("audit unavailable") if fail_event else None)
         outcome = None
         error = None
         try:
@@ -119,7 +119,21 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(updates["phase"], "post_close_signal_retry_wait")
         self.assertNotIn("preparation_retry_not_before", updates)
         self.assertFalse(updates["post_close_signal_ready"])
+        self.assertFalse(updates["winner_signal_prepared"])
+        self.assertIsNone(updates["decision_date"])
+        self.assertIsNone(updates["target_asset"])
+        self.assertIsNone(updates["snapshot_sha256"])
         models.assert_not_called()
+        broker.submit_order.assert_not_called()
+
+    def test_audit_failure_persists_recoverable_state_before_retry(self):
+        db, broker, snapshots, models, result, error = _prepare_test(fail_event=True)
+        self.assertIsNotNone(error)
+        self.assertIn("audit unavailable", str(error))
+        update = db["live_winner_session_runs"].update_one.call_args.args[1]
+        self.assertEqual(update["$set"]["status"], "waiting_for_winner_signal")
+        self.assertFalse(update["$set"]["order_submission_enabled"])
+        snapshots.assert_not_called()
         broker.submit_order.assert_not_called()
 
     def test_second_failure_still_retries_before_next_open(self):
