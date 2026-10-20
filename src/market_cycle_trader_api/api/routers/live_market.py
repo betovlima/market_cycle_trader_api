@@ -15,6 +15,7 @@ from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_expired_recovery import queue_expired_live_analysis
 from ...services.live_winner_events import list_live_events, export_live_events
+from ...services.live_workflow_monitor import live_workflow_monitor
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -85,6 +86,23 @@ def recover_expired_live_analysis(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.get("/winner/monitor")
+def winner_workflow_monitor(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+    execution_session: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Read-only Live workflow and recovery status for the current Alpaca account."""
+    try:
+        return live_workflow_monitor(
+            database(), session=execution_session, limit=limit,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),
+        ) from exc
 
 
 @router.get("/winner/events")

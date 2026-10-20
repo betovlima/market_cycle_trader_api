@@ -76,7 +76,7 @@ class LiveDailyPreparationTests(TestCase):
         self.assertEqual(update.args[1]["$set"]["superseded_target_asset"], "CAPR")
 
 
-    def test_abandoned_post_close_training_is_rearmed_without_orders(self):
+    def test_long_running_post_close_training_not_reclaimed_by_elapsed_time(self):
         db = MagicMock()
         started = datetime.now(timezone.utc) - timedelta(minutes=30)
         db["live_winner_session_runs"].find_one.return_value = _run(
@@ -94,10 +94,9 @@ class LiveDailyPreparationTests(TestCase):
                 timestamp=datetime.now(timezone.utc)
             )
             result = close_signal.prepare_live_cash_winner_signal(db, SESSION)
-        self.assertEqual(result["status"], "waiting_for_completed_daily_bar")
-        changed = db["live_winner_session_runs"].find_one_and_update.call_args.args[1]["$set"]
-        self.assertEqual(changed["phase"], "recovered_abandoned_post_close_calibration")
-        self.assertFalse(changed["order_submission_enabled"])
+        self.assertEqual(result["status"], "post_close_training_in_progress")
+        db["live_winner_session_runs"].find_one_and_update.assert_not_called()
+        self.assertFalse(result["order_submission_enabled"])
 
 
 class LiveOpenPipelineTests(TestCase):
@@ -201,7 +200,7 @@ class LiveOpenPipelineTests(TestCase):
         self.assertEqual(saved_fields["analysis_mode"], "live_current_session_intraday")
         self.broker.submit_order.assert_not_called()
 
-    def test_abandoned_live_open_claim_recovers_without_orders(self):
+    def test_long_running_live_open_claim_is_not_reclaimed_by_elapsed_time(self):
         started = datetime.now(timezone.utc) - timedelta(minutes=30)
         # Distinct collections: MagicMock.__getitem__ otherwise returns the
         # same mock for Live sessions and broker intents.
@@ -223,8 +222,9 @@ class LiveOpenPipelineTests(TestCase):
             patch(prefix + "create_live_readonly_client") as broker_factory,
         ):
             result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
-        self.assertEqual(result["status"], "recovered_abandoned_live_calibration")
+        self.assertEqual(result["status"], "live_open_recalibration_in_progress")
         self.assertFalse(result["order_submission_enabled"])
+        sessions.find_one_and_update.assert_not_called()
         broker_factory.assert_not_called()
         self.broker.submit_order.assert_not_called()
 
