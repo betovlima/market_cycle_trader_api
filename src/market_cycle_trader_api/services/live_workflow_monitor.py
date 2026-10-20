@@ -8,6 +8,8 @@ attempt budget. Never apply Tenacity to Alpaca order submissions.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
+from traceback import extract_tb
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -16,10 +18,69 @@ from transitions import Machine
 
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_winner_session import LIVE_RUNS
-from .live_winner_events import LIVE_EVENTS
+from .live_winner_events import LIVE_EVENTS, append_live_event
 
 LIVE_ATTEMPTS = "live_cycle_attempts"
 ORDER_LEDGER = "live_winner_broker_orders"
+
+# Exact, application-authored validation messages. Never expose messages,
+# stack frames, host paths or provider data in public monitoring records.
+_BROKER_GUARD_CODES = {
+    "Winner changed since Live recalibration; real orders blocked.": "winner_identity_mismatch",
+    "Invalid Winner action.": "invalid_winner_action",
+    "No verified post-close Live Winner signal; real orders blocked.": "winner_signal_missing",
+    "LiveOpenCalibrationRequired: a current-session Winner signal is required before real orders.": "open_calibration_missing",
+    "Live account mismatch; refusing to trade.": "live_account_mismatch",
+    "Live broker account is not permitted to trade.": "broker_account_blocked",
+    "Stale Live session.": "stale_execution_session",
+    "LiveExecutionWindowUnavailable: expected open missing; no real orders.": "missing_execution_window",
+    "LiveExecutionWindowUnavailable: expected open must be timezone-aware.": "invalid_execution_window",
+    "Existing Live broker orders require reconciliation.": "broker_open_orders",
+    "Live position changed since Winner model calibration.": "broker_position_changed",
+    "Winner HOLD action does not match broker position.": "hold_position_mismatch",
+    "Winner buy requires a flat Live account.": "buy_requires_cash",
+    "Winner sell/rotate requires a managed Live position.": "sell_requires_position",
+    "Winner target cannot be traded fractionally in Alpaca Live.": "target_not_fractionable",
+    "Live session already claimed or changed.": "session_claim_changed",
+    "Live broker positions differ from the independently recorded Trader state.": "broker_state_mismatch",
+    "Unmanaged Live position exists. A controlled adoption/reconciliation is required.": "unmanaged_live_position",
+    "Live holding has no auditable entry session.": "holding_entry_missing",
+    "Live short positions require manual review.": "live_short_position",
+    "Live Winner supports only one managed asset; multiple positions require review.": "multiple_live_positions",
+    "Live position quantity or symbol is invalid.": "invalid_live_position",
+    "Cannot verify Live account identity.": "broker_account_identity_unavailable",
+    "Live state was modified concurrently; broker reconciliation is required.": "live_state_revision_changed",
+    "Live order intent already exists; reconcile it before continuing.": "duplicate_order_intent",
+    "Live order did not fully fill; reconciliation required.": "order_fill_incomplete",
+    "Live sell quantity is incomplete; reconciliation required.": "sell_fill_incomplete",
+    "Alpaca returned no order ID; reconciliation required.": "broker_order_id_missing",
+    "LiveExecutionWindowExpired: broker reports market closed.": "execution_market_closed",
+    "LiveExecutionWindowExpired: broker timestamp has no timezone.": "execution_clock_invalid",
+    "LiveExecutionWindowExpired: real order deadline has passed.": "execution_deadline_passed",
+    "Invalid Alpaca Live cash balance.": "invalid_live_cash",
+    "Alpaca Live cash cannot fund a notional buy.": "insufficient_live_cash",
+}
+_BROKER_DIAGNOSTIC_FILES = frozenset({
+    "live_order_execution.py", "live_trader_state.py",
+    "alpaca_live_orders.py", "live_execution_window.py",
+    "strategy_lab.py", "live_winner_session.py",
+})
+
+
+def _safe_broker_failure(exc: Exception) -> dict[str, str]:
+    """Identify the application guard without exporting raw exception text."""
+    code = _BROKER_GUARD_CODES.get(str(exc), "broker_execution_unclassified")
+    internal = [
+        frame for frame in extract_tb(exc.__traceback__)
+        if Path(frame.filename).name in _BROKER_DIAGNOSTIC_FILES
+    ]
+    location = "unclassified"
+    if internal:
+        frame = internal[-1]
+        location = f"{Path(frame.filename).name}:{frame.lineno}"
+    return {"error_code": code, "error_location": location}
+
+
 
 # These are *observation* states, not a second source of trading authority.
 STATES = (
@@ -152,10 +213,22 @@ def execute_monitored_live_stage(
         else:
             flow.retry_from_start()
         if account_id:
+            details = _safe_broker_failure(exc) if brokerage else {}
             _persist_best_effort(db, key, {
                 "status": flow.state, "finished_at": datetime.now(timezone.utc),
-                "error_type": type(exc).__name__,
+                "error_type": type(exc).__name__, **details,
             })
+            if brokerage:
+                # Best-effort diagnostics never retry, submit or change orders.
+                try:
+                    append_live_event(
+                        db, account_id=account_id, session=session,
+                        stage="broker_execution_failed", level="error",
+                        message="Execucao Live bloqueada; verifique a validacao e reconcilie com a corretora.",
+                        details={"error_type": type(exc).__name__, **details},
+                    )
+                except Exception:
+                    pass
         raise
 
 
@@ -197,6 +270,8 @@ def live_workflow_monitor(
             "started_at": _timestamp(attempt.get("started_at")),
             "finished_at": _timestamp(attempt.get("finished_at")),
             "error_type": attempt.get("error_type"),
+            "error_code": attempt.get("error_code"),
+            "error_location": attempt.get("error_location"),
             "result_status": attempt.get("result_status"),
         })
     event_cursor = db[LIVE_EVENTS].find(
