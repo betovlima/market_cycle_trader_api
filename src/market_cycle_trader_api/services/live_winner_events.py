@@ -19,7 +19,7 @@ from .live_winner_session import LIVE_RUNS
 LIVE_EVENTS = "live_winner_process_events"
 _LOGGER = logging.getLogger(__name__)
 _LEVELS = frozenset({"info", "warning", "error"})
-_DETAILS = frozenset({"assets", "cutoff", "target_asset", "action", "error_type", "error_code", "symbol", "feed", "duration_seconds", "retry_after"})
+_DETAILS = frozenset({"assets", "cutoff", "target_asset", "action", "error_type", "error_code", "stage", "retry_allowed", "symbol", "feed", "duration_seconds", "retry_after"})
 
 
 def append_live_event(
