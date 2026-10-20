@@ -174,10 +174,11 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
         raise RuntimeError("Live preparation was already claimed.")
 
     started = monotonic()
-    stage = "download"
-    append_live_event(db, account_id=run["live_account_id"], session=session,
-                      stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
+    stage = "initial_event"
     try:
+        append_live_event(db, account_id=run["live_account_id"], session=session,
+                          stage="signal_preparation_started", message="Preparacao do sinal Winner iniciada.")
+        stage = "download"
         cutoff = latest_safe_completed_xnys_session(
             now=_utc_datetime(broker.get_clock().timestamp), data_delay_minutes=0
         ).date().isoformat()
@@ -261,11 +262,8 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 "decision_date": decision_date, "target_asset": target,
                 "action": saved["action"], "order_submission_enabled": False}
     except Exception as exc:
-        append_live_event(db, account_id=run["live_account_id"], session=session,
-                          stage="signal_preparation_failed", level="error",
-                          message="Falha no sinal Winner durante: " + stage,
-                          details={"error_type": type(exc).__name__,
-                                   "duration_seconds": round(monotonic() - started, 2)})
+        # Persist the recoverable state before emitting secondary audit events.
+        # A logging failure must not strand a claimed job in preparing_signal.
         updates: dict[str, Any] = {
             "status": "waiting_for_winner_signal",
             "phase": "post_close_signal_retry_wait",
@@ -278,6 +276,15 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
             {"_id": claimed["_id"], "status": "preparing_signal"},
             {"$set": updates, "$unset": {"preparation_retry_not_before": ""}},
         )
+        try:
+            append_live_event(db, account_id=run["live_account_id"], session=session,
+                              stage="signal_preparation_failed", level="error",
+                              message="Falha no sinal Winner durante: " + stage,
+                              details={"error_type": type(exc).__name__,
+                                       "duration_seconds": round(monotonic() - started, 2)})
+        except Exception:
+            # Recovery state is authoritative; preserve the original failure.
+            pass
         raise
 
 
