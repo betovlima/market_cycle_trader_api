@@ -119,6 +119,10 @@ class PostCloseSingleCalibrationTests(TestCase):
         self.assertEqual(updates["phase"], "post_close_signal_retry_wait")
         self.assertNotIn("preparation_retry_not_before", updates)
         self.assertFalse(updates["post_close_signal_ready"])
+        self.assertFalse(updates["winner_signal_prepared"])
+        self.assertIsNone(updates["decision_date"])
+        self.assertIsNone(updates["target_asset"])
+        self.assertIsNone(updates["snapshot_sha256"])
         models.assert_not_called()
         broker.submit_order.assert_not_called()
 
