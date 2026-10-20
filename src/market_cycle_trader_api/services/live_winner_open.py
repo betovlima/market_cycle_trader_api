@@ -246,6 +246,10 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 "phase": "waiting_for_open_data_retry",
                 "order_submission_enabled": False, "winner_signal_prepared": False,
                 "post_close_signal_ready": False, "last_open_calibration_error": str(exc),
+                "market_open_calibration_completed_at": None,
+                "analysis_mode": None, "historical_cutoff": None,
+                "decision_date": None, "target_asset": None, "action": None,
+                "snapshot_sha256": None,
             }, "$unset": {"open_retry_not_before": ""}},
         )
         try:
