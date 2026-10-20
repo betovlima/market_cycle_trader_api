@@ -36,6 +36,7 @@ class ManualReconciliationTests(unittest.TestCase):
             "action": "rotate", "target_asset": "CAPR", "current_asset": "MAN",
             "current_quantity": 2.668639053,
             "decision_date": SESSION,
+            "analysis_mode": "live_current_session_intraday",
             "market_open_calibration_completed_at": PREPARED,
             "winner_strategy_id": "winner", "winner_revision": 2,
             "winner_configuration_hash": "hash",
