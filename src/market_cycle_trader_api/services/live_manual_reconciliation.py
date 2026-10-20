@@ -142,8 +142,18 @@ def _inspect(db: Any, *, execution_session: str | None = None) -> dict[str, Any]
         raise ManualReconciliationBlocked("Nenhuma sessao Winner Live da conta foi encontrada.")
     session = str(run.get("execution_session") or "")
     if run.get("status") == "manual_reconciled":
+        state = db[LIVE_STATE].find_one({"_id": account_id})
+        confirmation = run.get("manual_reconciliation") or {}
+        positions = list(broker.get_all_positions())
+        if (not state or len(positions) != 1
+            or str(getattr(positions[0], "symbol", "") or "").upper() != confirmation.get("target_symbol")
+            or str(state.get("managed_symbol") or "").upper() != confirmation.get("target_symbol")
+            or abs(float(state.get("managed_quantity") or 0) - _quantity(getattr(positions[0], "qty", None))) > _TOLERANCE):
+            raise ManualReconciliationBlocked("Sessao ja conciliada, mas a posicao atual divergiu. Revisao necessaria.")
+        if broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)):
+            raise ManualReconciliationBlocked("Existem ordens abertas na Alpaca; revisar sessao.")
         return {"status": "already_reconciled", "execution_session": session,
-                "control_mode": mode, "message": "Sessao manual ja conciliada."}
+                "control_mode": mode, "message": "Sessao e posicao manual ja conciliadas."}
     if run.get("status") not in _PLAN_STATUSES:
         raise ManualReconciliationBlocked("Plano Live em estado inelegivel para conciliacao manual.")
     if run.get("action") != "rotate":
@@ -271,12 +281,14 @@ def reconcile_manual_live_rotation(db: Any, *, execution_session: str,
             "order_ids": [o["id"] for o in fresh_evidence["orders"]],
             "created_at": datetime.now(timezone.utc),
         }
-        db[LIVE_RUNS].update_one(
+        completion = db[LIVE_RUNS].update_one(
             {"_id": run["_id"], "status": "manual_reconciliation_in_progress"},
             {"$set": {"status": "manual_reconciled", "phase": "manual_alpaca_fills_reconciled",
                       "order_submission_enabled": False, "execution_origin": "manual_alpaca_fills",
                       "manual_reconciliation": audit, "completed_at": datetime.now(timezone.utc)}},
         )
+        if completion.matched_count != 1:
+            raise ManualReconciliationBlocked("Falha ao arquivar o plano antigo; requer revisao.")
         # An immutable receipt in the run above is the authoritative audit;
         # a separate collection improves discoverability without blocking.
         try:
