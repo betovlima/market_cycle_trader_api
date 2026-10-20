@@ -183,10 +183,31 @@ def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any
     expected_open_raw = run.get("expected_market_open")
     if expected_open_raw is None:
         raise RuntimeError("LiveExecutionWindowUnavailable: expected open missing; no real orders.")
-    expected_open = pd.Timestamp(expected_open_raw)
-    if expected_open.tzinfo is None:
-        raise RuntimeError("LiveExecutionWindowUnavailable: expected open must be timezone-aware.")
-    expected_open = expected_open.tz_convert("UTC")
+    # PyMongo decodes BSON UTC datetimes without tzinfo by default.
+    # This is the SAME UTC normalization used by Trading (Paper), not a
+    # conversion from local exchange time or the Railway machine timezone.
+    try:
+        expected_open = pd.Timestamp(expected_open_raw)
+        if pd.isna(expected_open):
+            raise ValueError("missing timestamp")
+        expected_open = (
+            expected_open.tz_localize("UTC")
+            if expected_open.tzinfo is None
+            else expected_open.tz_convert("UTC")
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "LiveExecutionWindowUnavailable: expected open has an invalid UTC timestamp."
+        ) from exc
+    # A BSON timestamp can be valid UTC but refer to the wrong session or
+    # clock time. Accept ONLY the official opening instant for this XNYS day.
+    calendar = xcals.get_calendar("XNYS")
+    target_session = pd.Timestamp(session)
+    if (not calendar.is_session(target_session)
+        or expected_open != calendar.session_open(target_session)):
+        raise RuntimeError(
+            "LiveExecutionWindowUnavailable: expected open differs from the official XNYS session open."
+        )
     deadline, _ = live_execution_window_deadline(expected_open, market_clock=clock)
     if current >= deadline:
         db[LIVE_RUNS].update_one(
