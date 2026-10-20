@@ -8,7 +8,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
 from pymongo import ReturnDocument
+
+from ..engine.market_data import latest_safe_completed_xnys_session
 
 from ..infrastructure.trading.alpaca_live_orders import calendar_session_dates
 
@@ -44,8 +47,10 @@ def verified_live_state(db: Any, broker: Any, *, session: str) -> dict[str, Any]
             }}, upsert=True,
         )
         state = db[LIVE_STATE].find_one({"_id": account_id})
+    # Match Trading's relative/absolute tolerance for fractional holdings.
+    tolerance = max(_QTY_EPS, abs(float(state.get("managed_quantity") or 0)) * 1e-6)
     if (str(state.get("managed_symbol") or "").upper() != broker_symbol
-        or abs(float(state.get("managed_quantity") or 0) - broker_quantity) > _QTY_EPS):
+        or abs(float(state.get("managed_quantity") or 0) - broker_quantity) > tolerance):
         raise RuntimeError("Live broker positions differ from the independently recorded Trader state.")
     entry = str(state.get("entry_session") or "")
     if broker_symbol == "CASH":
@@ -53,10 +58,30 @@ def verified_live_state(db: Any, broker: Any, *, session: str) -> dict[str, Any]
     else:
         if not entry:
             raise RuntimeError("Live holding has no auditable entry session.")
-        sessions = calendar_session_dates(
-            broker, start_date=entry, end_date=session,
-        )
-        sessions_held = max(1, len([day for day in sessions if entry <= day <= session]))
+        # Trading counts entry as session 1, then only COMPLETED XNYS
+        # sessions after entry. An unfinished Live session does not count.
+        clock = broker.get_clock()
+        timestamp = getattr(clock, "timestamp", None)
+        if timestamp is None:
+            raise RuntimeError("Live broker clock is missing for holding-age verification.")
+        now = pd.Timestamp(timestamp)
+        if now.tzinfo is None:
+            raise RuntimeError("Live broker clock must be timezone-aware for holding age.")
+        completed_cutoff = latest_safe_completed_xnys_session(
+            now=now, data_delay_minutes=0,
+        ).date().isoformat()
+        if completed_cutoff < entry:
+            sessions_held = 1
+        else:
+            completed_cutoff = min(completed_cutoff, session)
+            sessions = calendar_session_dates(
+                broker, start_date=entry, end_date=completed_cutoff,
+            )
+            if entry not in sessions:
+                raise RuntimeError("Live holding entry session is absent from broker calendar.")
+            sessions_held = 1 + len([
+                day for day in sessions if entry < day <= completed_cutoff
+            ])
     return {
         "account_id": account_id,
         "managed_symbol": broker_symbol,
