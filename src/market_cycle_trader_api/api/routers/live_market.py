@@ -16,6 +16,10 @@ from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_expired_recovery import queue_expired_live_analysis
 from ...services.live_winner_events import list_live_events, export_live_events
 from ...services.live_workflow_monitor import live_workflow_monitor
+from ...services.live_manual_reconciliation import (
+    ManualReconciliationBlocked, manual_reconciliation_preview,
+    reconcile_manual_live_rotation,
+)
 from ...services.live_portfolio import (
     build_live_portfolio_export,
     live_portfolio_snapshot,
@@ -135,6 +139,38 @@ def export_winner_live_events(
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="mct_live_winner_logs_{timestamp}.zip"'},
     )
+
+
+
+@router.get("/winner/manual-reconciliation/preview")
+def preview_manual_live_rotation(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+    execution_session: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> dict[str, Any]:
+    """Read-only validation against account, broker fills and internal state."""
+    return manual_reconciliation_preview(database(), execution_session=execution_session)
+
+
+class ManualLiveReconciliationRequest(BaseModel):
+    execution_session: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    confirmation_token: str = Field(pattern=r"^[a-f0-9]{64}$")
+    confirm: Literal["RECONCILE_MANUAL_FILLS_NO_ORDERS"]
+
+
+@router.post("/winner/manual-reconciliation/apply")
+def apply_manual_live_rotation(
+    payload: ManualLiveReconciliationRequest,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Adopt only fully proved manual Alpaca fills while paused; no orders."""
+    try:
+        return reconcile_manual_live_rotation(
+            database(), execution_session=payload.execution_session,
+            confirmation_token=payload.confirmation_token,
+            actor=(identity.email or "").strip() or identity.subject,
+        )
+    except ManualReconciliationBlocked as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post("/winner/preflight")

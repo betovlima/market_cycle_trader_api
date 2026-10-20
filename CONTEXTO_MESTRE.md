@@ -1,3 +1,21 @@
+## 2026-10-20 — API v10.8.121 (reconciliacao manual Live sem ordens)
+
+Problema: posicao Alpaca foi alterada manualmente de MAN para CAPR apos a decisao Winner CAPR/rotate em 20/10, sem passar pelo executor MCT. A carteira Live le a Alpaca, mas live_trader_strategy_state e o plano antigo mantinham MAN.
+
+Nova funcionalidade: GET /api/live-market/winner/manual-reconciliation/preview faz a conferencia somente leitura; POST /api/live-market/winner/manual-reconciliation/apply exige sessao, token de evidencia validado e confirmacao literal; ambos autenticados como admin.
+
+Guardas: Trader Live paused/stopped; identidade da conta e Winner inalteradas; plano intradiario rotate MAN->CAPR elegivel; estado interno igual a origem; compra/venda integralmente filled na Alpaca na sessao; todas as vendas MAN somadas igual ao estoque anterior; todas as compras CAPR iguais a posicao atual; nenhuma outra operacao do dia, ordem aberta ou intent persistido no ledger Live; reconsulta antes da gravacao; limite de 100 ordens ate implementar paginacao.
+
+Persistencia: first claim da sessao como manual_reconciliation_in_progress (nao executavel), CAS por revisao de live_trader_strategy_state para CAPR, entry_session e last_execution_session na data dos fills, incremento da revisao, encerramento do plano manual_reconciled e recibo auditavel com IDs das ordens, origem manual_alpaca_fills. Falha entre etapas permanece bloqueada em review_required, nunca reabilita plano velho.
+
+Escopo: nao enviar, alterar nem cancelar ordens; nao editar Winner, Paper ou pesquisas do TCC. Condicoes nao verificaveis ficam bloqueadas. Aplicacao da conciliacao demanda clique e confirmacao explicita do administrador; nenhum ajuste retroativo foi executado nesta branch.
+
+Teste: tests/test_live_manual_reconciliation_v108121.py; CI necessario antes de producao.
+
+Branch: fix/v10.8.121-live-manual-reconcile. Front associado: feature/v10.7.32-live-reconcile-button.
+
+---
+
 ## 2026-10-20 — API v10.8.120 (diagnostico da execucao financeira Live)
 
 **Evidencia:** mct_live_winner_logs_20261020T151651Z.zip registra a recuperacao do sinal CAPR/rotate as 15:11:35 UTC, seguida de scheduler_failed RuntimeError em order_execution. A auditoria mct_live_transaction_audit_20261020T152551Z.zip, feita as 15:25 UTC, ainda mostra MAN e nenhuma ordem de 20/10. Os dados sugerem falha antes da reivindicacao da sessao financeira, mas nao identificam a guarda original; ordens precisam ser sempre reconciliadas na Alpaca.
