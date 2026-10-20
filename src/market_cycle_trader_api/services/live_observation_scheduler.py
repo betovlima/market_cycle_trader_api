@@ -18,6 +18,7 @@ from .live_winner_events import append_live_event
 from .live_winner_signal import prepare_live_winner_signal
 from .live_winner_open import refresh_live_open_winner_signal
 from .live_order_execution import execute_prepared_live_winner_session
+from .live_workflow_monitor import execute_monitored_live_stage
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
 _POLL_SECONDS = 60.0
@@ -104,16 +105,35 @@ class LiveObservationScheduler:
                         "preparing_signal",
                     }):
                         stage = "signal_preparation"
-                        prepare_live_winner_signal(db, armed["execution_session"])
+                        execute_monitored_live_stage(
+                            db, session=armed["execution_session"],
+                            stage="post_close_calculation",
+                            operation=lambda: prepare_live_winner_signal(
+                                db, armed["execution_session"]
+                            ),
+                        )
                     elif result["market_open"] and armed.get("status") in {
                         "waiting_for_winner_signal", "recalibrated_no_orders",
                         "waiting_for_open_recalibration", "open_recalibration",
                     }:
                         stage = "live_open_recalibration"
-                        refreshed = refresh_live_open_winner_signal(db, armed["execution_session"])
+                        refreshed = execute_monitored_live_stage(
+                            db, session=armed["execution_session"],
+                            stage="open_calculation",
+                            operation=lambda: refresh_live_open_winner_signal(
+                                db, armed["execution_session"]
+                            ),
+                        )
                         if refreshed.get("status") == "recalibrated_no_orders":
                             stage = "order_execution"
-                            execute_prepared_live_winner_session(db, armed["execution_session"])
+                            execute_monitored_live_stage(
+                                db, session=armed["execution_session"],
+                                stage="broker_execution",
+                                operation=lambda: execute_prepared_live_winner_session(
+                                    db, armed["execution_session"]
+                                ),
+                                brokerage=True,
+                            )
                 self._last_error = None
                 self._last_error_fingerprint = None
             except Exception as exc:
