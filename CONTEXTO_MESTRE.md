@@ -1,3 +1,17 @@
+## 2026-10-19 — API v10.8.118 (Live workflow monitor / transitions + Tenacity)
+
+**Objetivo.** Tornar observáveis as tentativas do cálculo Live e disponibilizar consulta administrativa por `GET /api/live-market/winner/monitor?execution_session=AAAA-MM-DD` na interface Swagger `/docs`, sem alterar a identidade das estratégias e sem acionar operações por um endpoint de leitura.
+
+**Estrutura.** Nova coleção `live_cycle_attempts`, escopada pela conta Live da Alpaca e por pregão. O scheduler existente observa o relógio Alpaca e invoca `execute_monitored_live_stage` para os estágios `post_close_calculation`, `open_calculation` e `broker_execution`. A máquina `transitions` descreve estados de *observação* (`pending`, `running`, `waiting`, `retry_pending`, `completed`, `reconciliation_required`) sem substituir `live_winner_session_runs` e o ledger de corretora. A resposta de monitor inclui estado persistido da sessão, contadores, últimas tentativas, eventos de ciclo e número de ordens pendentes de reconciliação; todas as consultas são somente leitura, exigem autenticação de administrador e filtram pela conta Live atual.
+
+**Sem retry arbitrário.** Tenacity executa **somente uma invocação de cálculo por observação do scheduler**, sem tentar novamente em loop fechado. O scheduler reapresenta o fluxo completo nas próximas observações elegíveis, com **nenhum limite cumulativo de tentativas**. O polling de 60 segundos já existente é uma frequência de monitoramento, não limite do cálculo e não deadline para tarefas. O cálculo reinicia da obtenção dos dados quando os serviços Live retornam ao estado de espera após falha tratada.
+
+**Operações financeiras.** O executor `execute_prepared_live_winner_session` permanece fora de qualquer política de retry Tenacity. O monitor apenas registra resultados; erros na corretora exigem reconciliação e idempotência do ledger. Instrumentação é best-effort e não deve introduzir novas ordens, posições nem decisões.
+
+**Limitações.** A funcionalidade inicialmente disponível é consulta JSON pelo Swagger `/docs`; a tela gráfica do frontend MCT não é criada nesta PR. Testar dependências (`transitions`, `tenacity`), status de sessão, classificação de falhas, isolamento de conta e execução sem duplicações em CI antes de merge ou deploy. Recuperação automática após término abrupto de um processo em andamento permanece fora deste escopo.
+
+---
+
 ## 2026-10-19 — API v10.8.117 — regra all-in para recomputação, Alpaca separada
 
 A cada falha tratada de dados, treinamento, previsão ou validação, a tentativa é descartada integralmente e o fluxo de cálculo recomeça na etapa inicial: baixar dados, recompor snapshot, treinar, gerar decisão e validar. A sessão persiste um estado de espera recuperável e limpa os campos de decisão/snapshot que não foram confirmados. Não reutilizar decisão parcial. Uma tarefa ativa permanece exclusiva e não é recuperada por um prazo arbitrário.
