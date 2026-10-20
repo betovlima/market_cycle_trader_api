@@ -59,14 +59,10 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if run.get("status") in {"completed", "executing", "analysis_only_completed"}:
         return {"status": str(run["status"]), "order_submission_enabled": False}
     if run.get("status") == "open_recalibration":
-        started_at = run.get("open_calibration_started_at")
-        # Never infer worker death from elapsed wall-clock time. An unfinished
-        # claim stays owned until its executor completes or an independently
-        # coordinated recovery confirms that no prior executor remains active.
+        # Never infer worker death from elapsed wall-clock time. Keep the
+        # claim sequential; failed executions release it explicitly below.
         return {"status": "live_open_recalibration_in_progress",
                 "order_submission_enabled": False}
-        # Legacy time-based reclamation deliberately disabled. A resumed worker
-        # must reconcile its prior claim before taking ownership.
     calendar = xcals.get_calendar("XNYS")
     requested = pd.Timestamp(session)
     if not calendar.is_session(requested):
@@ -252,12 +248,16 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 "post_close_signal_ready": False, "last_open_calibration_error": str(exc),
             }, "$unset": {"open_retry_not_before": ""}},
         )
-        append_live_event(
-            db, account_id=run["live_account_id"], session=session,
-            stage="live_open_signal_failed", level="error",
-            message="Live reanalise de abertura falhou; aguarda recuperacao automatica.",
-            details={"error_type": type(exc).__name__, "stage": stage,
-                     "retry_allowed": True, "duration_seconds": round(monotonic() - started, 2)},
-        )
+        try:
+            append_live_event(
+                db, account_id=run["live_account_id"], session=session,
+                stage="live_open_signal_failed", level="error",
+                message="Live reanalise de abertura falhou; aguarda recuperacao automatica.",
+                details={"error_type": type(exc).__name__, "stage": stage,
+                         "retry_allowed": True, "duration_seconds": round(monotonic() - started, 2)},
+            )
+        except Exception:
+            # The already-persisted waiting state controls the next attempt.
+            pass
         return {"status": "waiting_for_open_retry",
                 "error_type": type(exc).__name__, "order_submission_enabled": False}
