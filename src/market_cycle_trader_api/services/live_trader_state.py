@@ -67,9 +67,16 @@ def verified_live_state(db: Any, broker: Any, *, session: str) -> dict[str, Any]
         now = pd.Timestamp(timestamp)
         if now.tzinfo is None:
             raise RuntimeError("Live broker clock must be timezone-aware for holding age.")
+        # Match Trading's safe daily-bar cutoff (including its buffer).
+        # An open session never counts as completed, even if a provider
+        # reports a timestamp that would otherwise advance the cutoff.
         completed_cutoff = latest_safe_completed_xnys_session(
-            now=now, data_delay_minutes=0,
+            now=now,
         ).date().isoformat()
+        if bool(getattr(clock, "is_open", False)):
+            current_day = now.tz_convert("America/New_York").date().isoformat()
+            if completed_cutoff >= current_day:
+                completed_cutoff = (pd.Timestamp(current_day) - pd.Timedelta(days=1)).date().isoformat()
         if completed_cutoff < entry:
             sessions_held = 1
         else:
