@@ -1,3 +1,17 @@
+## 2026-10-20 — API v10.8.124 | restringir scheduler intradiario Live ao pregão regular XNYS
+
+**Solicitacao:** impedir tentativas de recalibracao intradiaria e etapas de execucao Alpaca quando a NYSE estiver fora do pregao regular, mantendo preparacao de sinal para o proximo dia apos o fechamento.
+
+**Implementacao:** live_observation_scheduler.py valida simultaneamente market_clock.is_open, timestamp UTC com timezone, data de sessao em America/New_York e abertura/fechamento oficiais exchange_calendars.XNYS. O timestamp precisa ser >= session_open e < session_close; o next_close Alpaca apenas pode reduzir (nunca ampliar) a janela. Se o processamento LightGBM cruzar o fechamento, uma segunda leitura read-only do relogio Alpaca impede o inicio de broker_execution e evita o registro de tentativas financeiras artificiais fora da janela. Fora do horario, continuam disponiveis monitoramento e preparacao pos-fechamento (post_close_calculation) sem ordens. Controles Active/Exit Only, Paper, Winner, broker idempotence, timing checks dentro de executor e cash/position safeguards nao mudam.
+
+**Interpretacao historica:** eventos em 20/10/2026 as 16:13 local Paraguay sao 15:13 America/New_York; as 41 falhas invalid_execution_window aconteceram com mercado aberto e foram tratadas separadamente em API v10.8.123 (normalizacao UTC de datetime BSON). Esta restricao nova nao e o reparo da falha original nem valida o envio de ordens.
+
+**Testes:** tests/test_live_regular_hours_scheduler_v108124.py confere 09:30/16:00 NY, fechamento antecipado de 27/11/2026, fim de semana, feriado, fuso ausente, sessao diferente, relogio da corretora adiantando fechamento, retreinamento que ultrapassa 16:00 NY, preparacao pos-fechamento e nao repeticao de operacao ja conciliada. Pipeline de CI completo obrigatorio.
+
+**Branch:** fix/v10.8.124-live-regular-hours-scheduler-guard. Nenhuma ordem real disparada por este trabalho.
+
+---
+
 ## 2026-10-20 — API v10.8.123 | falha financeira Live: BSON UTC tz-naive
 
 **Evidência do incidente real.** Exportação do usuário `mct_live_winner_logs_20261020T173808Z.zip` (65 eventos para 2026-10-20) mostra 9 `live_open_signal_failed` (8 `LiveIntradayCoverageNotReady`, current_session_bars, entre 14:39 e 15:01 UTC); recalibração `live_open_signal_prepared` em 15:11:35 UTC, action=rotate, target=CAPR; a partir de 15:45:42 até 16:26:09 UTC foram registrados 41 eventos `broker_execution_failed` com **error_code=invalid_execution_window** e **error_location=live_order_execution.py:188**, além de `scheduler_failed: RuntimeError`. Não há prova de erro na estratégia/LightGBM; o executor falhou antes de qualquer claim e ordem no guard de horário.
