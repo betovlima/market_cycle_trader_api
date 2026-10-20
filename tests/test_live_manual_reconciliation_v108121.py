@@ -118,9 +118,7 @@ class ManualReconciliationTests(unittest.TestCase):
         self.broker.cancel_order_by_id.assert_not_called()
 
     def test_recheck_blocks_changes_to_broker_after_claim(self):
-        original = self.broker.get_all_positions.side_effect
         self.broker.get_all_positions.side_effect = [
-            [SimpleNamespace(symbol="CAPR", qty="16.890370370")],
             [SimpleNamespace(symbol="CAPR", qty="16.890370370")],
             [SimpleNamespace(symbol="CAPR", qty="16.890370370")],
             [SimpleNamespace(symbol="CAPR", qty="16.5")],
