@@ -38,6 +38,28 @@ from .strategy_lab import get_trader_winner_context, get_trader_winner_model_sna
 from .system_settings import apply_training_runtime_settings, get_system_settings
 
 EASTERN = ZoneInfo("America/New_York")
+
+# Public diagnostic codes never include provider payloads, URLs, credentials,
+# account balances or arbitrary exception messages.
+_SAFE_FAILURE_CODES = (
+    "LiveIntradayCoverageNotReady",
+    "LiveIntradaySessionMismatch",
+    "LiveIntradayFeedInvalid",
+    "LiveOpenRecalibrationMissedWindow",
+)
+
+
+def _safe_open_failure_code(exc: Exception, stage: str) -> str:
+    message = str(exc)
+    for code in _SAFE_FAILURE_CODES:
+        if message.startswith(code + ":"):
+            return code
+    return {
+        "daily_history": "daily_history_failed",
+        "current_session_bars": "current_session_bars_failed",
+        "lightgbm_decision": "lightgbm_decision_failed",
+    }.get(stage, "live_open_calculation_failed")
+
 _ELIGIBLE_STATUSES = ("waiting_for_winner_signal", "recalibrated_no_orders", "waiting_for_open_recalibration")
 
 
@@ -138,7 +160,10 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
     claimed = db[LIVE_RUNS].find_one_and_update(
         {"_id": run["_id"], "status": {"$in": _ELIGIBLE_STATUSES},
          "winner_configuration_hash": run["winner_configuration_hash"],
-         "market_open_calibration_completed_at": {"$exists": False}},
+         # MongoDB equality to None matches both a missing field and explicit
+         # null (the value persisted after a handled failure). A non-null
+         # successful completion remains ineligible.
+         "market_open_calibration_completed_at": None},
         {"$set": {
             "status": "open_recalibration", "phase": "refreshing_live_intraday_market_data",
             "winner_signal_prepared": False, "post_close_signal_ready": False,
@@ -257,8 +282,10 @@ def refresh_live_open_winner_signal(db: Any, session: str) -> dict[str, Any]:
                 db, account_id=run["live_account_id"], session=session,
                 stage="live_open_signal_failed", level="error",
                 message="Live reanalise de abertura falhou; aguarda recuperacao automatica.",
-                details={"error_type": type(exc).__name__, "stage": stage,
-                         "retry_allowed": True, "duration_seconds": round(monotonic() - started, 2)},
+                details={"error_type": type(exc).__name__,
+                         "error_code": _safe_open_failure_code(exc, stage),
+                         "stage": stage, "retry_allowed": True,
+                         "duration_seconds": round(monotonic() - started, 2)},
             )
         except Exception:
             # The already-persisted waiting state controls the next attempt.
