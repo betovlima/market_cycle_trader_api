@@ -1,3 +1,13 @@
+## 2026-10-19 — API v10.8.117 — regra all-in para recomputação, Alpaca separada
+
+A cada falha tratada de dados, treinamento, previsão ou validação, a tentativa é descartada integralmente e o fluxo de cálculo recomeça na etapa inicial: baixar dados, recompor snapshot, treinar, gerar decisão e validar. A sessão persiste um estado de espera recuperável e limpa os campos de decisão/snapshot que não foram confirmados. Não reutilizar decisão parcial. Uma tarefa ativa permanece exclusiva e não é recuperada por um prazo arbitrário.
+
+**Exceção financeira:** o envio e acompanhamento de ordens Alpaca nunca entra no retry all-in. A corretora e o ledger persistido são a fonte de verdade. Em erro de envio, retorno incerto, preenchimento parcial ou ausência de confirmação, reconciliar usando client_order_id, estado real da posição e fills antes de qualquer outra ordem. Não reexecutar compra/venda por simples retry.
+
+Escopo desta alteração: ajustes em catches/claims de preparação e recalibração existentes e asserções nos testes. Não é uma garantia de recuperação universal (ex. erro antes do claim, falha fatal do processo, erro persistente Mongo), nem de que o processamento continuará fora da sessão atual. CI e integração ainda pendentes. PR #69 Draft, sem deploy.
+
+---
+
 ## 2026-10-19 — API v10.8.117 (ajuste de recuperação sequencial na PR #69)
 
 O foco é a recuperação do *fluxo operacional*, não a recuperação da infraestrutura Railway. Na preparação pós-fechamento, o registro inicial de auditoria agora faz parte da operação protegida por tratamento de exceção; uma falha nesse evento deixa a sessão em `waiting_for_winner_signal`, sem janela, cooldown ou limite de tentativas. Em erros de preparação e recalibração de abertura, primeiro se persiste o estado recuperável no MongoDB e depois tenta-se registrar o evento; a falha do evento não substitui o resultado operacional. Acrescentado teste de falha de auditoria.
