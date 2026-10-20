@@ -9,7 +9,11 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
+import exchange_calendars as xcals
+import pandas as pd
+
 from ..core.runtime import database
+from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_control import live_control_status
 from .live_portfolio import live_portfolio_snapshot
 from .strategy_lab import get_trader_winner_summary
@@ -22,6 +26,58 @@ from .live_workflow_monitor import execute_monitored_live_stage
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
 _POLL_SECONDS = 60.0
+
+
+def _regular_xnys_session_open(
+    *, session: str, broker_timestamp: Any, broker_is_open: bool,
+    broker_next_close: Any = None,
+) -> bool:
+    """Fail-closed regular-session gate; no after-hours Live calculation/orders.
+
+    Use the Alpaca clock *and* the XNYS calendar, never host local time.
+    Early closes come from XNYS; an earlier valid broker next_close can only
+    shorten (never extend) the approved execution window.
+    """
+    if not broker_is_open or not broker_timestamp:
+        return False
+    try:
+        now = pd.Timestamp(broker_timestamp)
+        if pd.isna(now) or now.tzinfo is None:
+            return False
+        now = now.tz_convert("UTC")
+        requested = pd.Timestamp(session)
+        if requested.tzinfo is not None:
+            return False
+        calendar = xcals.get_calendar("XNYS")
+        if not calendar.is_session(requested):
+            return False
+        if now.tz_convert("America/New_York").date() != requested.date():
+            return False
+        opened = calendar.session_open(requested)
+        closed = calendar.session_close(requested)
+        if broker_next_close is not None:
+            close = pd.Timestamp(broker_next_close)
+            if (close.tzinfo is not None
+                and close.tz_convert("America/New_York").date() == requested.date()
+                and close.tz_convert("UTC") > opened):
+                closed = min(closed, close.tz_convert("UTC"))
+        return bool(opened <= now < closed)
+    except (TypeError, ValueError, OverflowError):
+        # Incomplete/unparseable provider timestamps must never arm real orders.
+        return False
+
+
+def _fresh_regular_live_execution_window(session: str) -> bool:
+    """Fresh read-only Alpaca clock after lengthy LightGBM computation."""
+    broker = create_live_readonly_client()
+    clock = broker.get_clock()
+    return _regular_xnys_session_open(
+        session=session,
+        broker_timestamp=getattr(clock, "timestamp", None),
+        broker_is_open=bool(getattr(clock, "is_open", False)),
+        broker_next_close=getattr(clock, "next_close", None),
+    )
+
 
 
 def observe_live_cycle(db: Any) -> dict[str, Any]:
@@ -112,10 +168,14 @@ class LiveObservationScheduler:
                                 db, armed["execution_session"]
                             ),
                         )
-                    elif result["market_open"] and armed.get("status") in {
+                    elif (armed.get("status") in {
                         "waiting_for_winner_signal", "recalibrated_no_orders",
                         "waiting_for_open_recalibration", "open_recalibration",
-                    }:
+                    } and _regular_xnys_session_open(
+                        session=armed["execution_session"],
+                        broker_timestamp=result["recorded_at"],
+                        broker_is_open=result["market_open"],
+                    )):
                         stage = "live_open_recalibration"
                         refreshed = execute_monitored_live_stage(
                             db, session=armed["execution_session"],
@@ -124,7 +184,13 @@ class LiveObservationScheduler:
                                 db, armed["execution_session"]
                             ),
                         )
-                        if refreshed.get("status") == "recalibrated_no_orders":
+                        # The calculation may take several minutes and cross
+                        # the closing bell. Re-read Alpaca's clock before even
+                        # creating a monitored financial execution attempt.
+                        if (refreshed.get("status") == "recalibrated_no_orders"
+                            and _fresh_regular_live_execution_window(
+                                armed["execution_session"]
+                            )):
                             stage = "order_execution"
                             execute_monitored_live_stage(
                                 db, session=armed["execution_session"],
