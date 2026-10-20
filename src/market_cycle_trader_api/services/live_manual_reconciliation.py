@@ -73,6 +73,8 @@ def _broker_evidence(broker: Any, account_id: str, *, session: str,
         raise ManualReconciliationBlocked("A conta deve ter exatamente uma posicao Live.")
     position = positions[0]
     symbol = str(getattr(position, "symbol", "") or "").upper()
+    if _value(getattr(position, "side", "long")) != "long":
+        raise ManualReconciliationBlocked("Posicao vendida a descoberto nao pode ser adotada.")
     amount = _quantity(getattr(position, "qty", None))
     if symbol != target_symbol:
         raise ManualReconciliationBlocked("A posicao Alpaca nao corresponde ao alvo aprovado.")
@@ -80,6 +82,8 @@ def _broker_evidence(broker: Any, account_id: str, *, session: str,
     if open_orders:
         raise ManualReconciliationBlocked("Existem ordens abertas na Alpaca; reconciliar primeiro.")
     all_orders = list(broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, limit=100)))
+    if len(all_orders) >= 100:
+        raise ManualReconciliationBlocked("Historico Alpaca excede 100 ordens; revisao completa necessaria.")
     current_orders = []
     for order in all_orders:
         date = getattr(order, "filled_at", None)
@@ -105,6 +109,7 @@ def _broker_evidence(broker: Any, account_id: str, *, session: str,
         if (side, asset) not in {("sell", source_symbol), ("buy", target_symbol)}:
             raise ManualReconciliationBlocked("Ha outra negociacao Live no mesmo pregao.")
         current_orders.append({
+            "filled_at": _session_of(date) + " " + str(date),
             "id": order_id, "client_order_id": client_id,
             "side": side, "symbol": asset,
             "quantity": _quantity(getattr(order, "filled_qty", None)),
@@ -121,6 +126,8 @@ def _broker_evidence(broker: Any, account_id: str, *, session: str,
         raise ManualReconciliationBlocked("Vendas manuais nao zeraram a posicao registrada.")
     if abs(bought - amount) > _TOLERANCE:
         raise ManualReconciliationBlocked("Compras manuais nao conferem com a posicao Alpaca.")
+    if max(o["filled_at"] for o in sales) > min(o["filled_at"] for o in buys):
+        raise ManualReconciliationBlocked("Compra antecedeu o encerramento das vendas manuais.")
     current_orders.sort(key=lambda order: order["id"])
     return {
         "symbol": symbol, "quantity": amount, "sold_quantity": sold,
@@ -162,7 +169,9 @@ def _inspect(db: Any, *, execution_session: str | None = None) -> dict[str, Any]
     target = str(run.get("target_asset") or "").upper()
     if not source or not target or source == "CASH" or source == target:
         raise ManualReconciliationBlocked("Plano de rotacao incompleto.")
-    if str(run.get("decision_date") or "")[:10] != session or not run.get("market_open_calibration_completed_at"):
+    if (str(run.get("decision_date") or "")[:10] != session
+        or str(run.get("analysis_mode") or "") != "live_current_session_intraday"
+        or not run.get("market_open_calibration_completed_at")):
         raise ManualReconciliationBlocked("O plano nao foi recalibrado para a sessao.")
     winner = get_trader_winner_summary(db)
     if (not isinstance(winner, dict)
