@@ -233,6 +233,14 @@ def live_workflow_monitor(
         recovery = "eligible_for_full_recalculation"
     else:
         recovery = "not_required"
+    open_error_type = next(
+        (
+            event.get("details", {}).get("error_type")
+            for event in reversed(events)
+            if event.get("stage") == "live_open_signal_failed"
+        ),
+        None,
+    )
     return {
         "execution_session": session,
         "status": status,
@@ -242,7 +250,7 @@ def live_workflow_monitor(
         "open_preparation_attempts": int(run.get("open_preparation_attempts") or 0),
         "last_preparation_error_type": run.get("last_preparation_error_type"),
         "last_open_calibration_error_type": (
-            "RuntimeError" if run.get("last_open_calibration_error") else None
+            open_error_type or ("recorded_error" if run.get("last_open_calibration_error") else None)
         ),
         "orders_requiring_reconciliation": unresolved,
         "attempts": attempts,
