@@ -108,8 +108,9 @@ def _broker_evidence(broker: Any, account_id: str, *, session: str,
         asset = str(getattr(order, "symbol", "") or "").upper()
         if (side, asset) not in {("sell", source_symbol), ("buy", target_symbol)}:
             raise ManualReconciliationBlocked("Ha outra negociacao Live no mesmo pregao.")
+        completed = datetime.fromisoformat(str(date).replace("Z", "+00:00")) if isinstance(date, str) else date
         current_orders.append({
-            "filled_at": _session_of(date) + " " + str(date),
+            "filled_at": completed.astimezone(timezone.utc).isoformat(),
             "id": order_id, "client_order_id": client_id,
             "side": side, "symbol": asset,
             "quantity": _quantity(getattr(order, "filled_qty", None)),
