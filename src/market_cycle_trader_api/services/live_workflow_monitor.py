@@ -16,6 +16,7 @@ from transitions import Machine
 
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_winner_session import LIVE_RUNS
+from .live_winner_events import LIVE_EVENTS
 
 LIVE_ATTEMPTS = "live_cycle_attempts"
 ORDER_LEDGER = "live_winner_broker_orders"
@@ -61,6 +62,12 @@ def _outcome_state(result: Any, *, brokerage: bool) -> str:
     if brokerage:
         if status == "completed":
             return "completed"
+        if status in {
+            "market_closed", "blocked_by_live_mode",
+            "blocked_by_exit_only_mode", "no_recalibrated_live_plan",
+            "execution_window_expired",
+        }:
+            return "waiting"
         return "reconciliation_required"
     if status in {"waiting_for_open_retry", "waiting_for_post_close_retry"}:
         return "retry_pending"
@@ -192,6 +199,21 @@ def live_workflow_monitor(
             "error_type": attempt.get("error_type"),
             "result_status": attempt.get("result_status"),
         })
+    event_cursor = db[LIVE_EVENTS].find(
+        {"account_id": account_id, "execution_session": session},
+        {"_id": 0, "account_id": 0},
+    ).sort("recorded_at", -1).limit(max_items)
+    events = [
+        {
+            "recorded_at": _timestamp(event.get("recorded_at")),
+            "stage": event.get("stage"),
+            "level": event.get("level"),
+            "message": event.get("message"),
+            "details": event.get("details") or {},
+        }
+        for event in event_cursor
+    ]
+    events.reverse()
     unresolved = db[ORDER_LEDGER].count_documents({
         "broker_account_id": account_id,
         "execution_session": session,
@@ -224,5 +246,6 @@ def live_workflow_monitor(
         ),
         "orders_requiring_reconciliation": unresolved,
         "attempts": attempts,
+        "events": events,
         "limit": max_items,
     }
