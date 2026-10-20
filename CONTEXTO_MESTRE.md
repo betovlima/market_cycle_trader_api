@@ -1,3 +1,19 @@
+## 2026-10-20 — API v10.8.120 (diagnostico da execucao financeira Live)
+
+**Evidencia:** mct_live_winner_logs_20261020T151651Z.zip registra a recuperacao do sinal CAPR/rotate as 15:11:35 UTC, seguida de scheduler_failed RuntimeError em order_execution. A auditoria mct_live_transaction_audit_20261020T152551Z.zip, feita as 15:25 UTC, ainda mostra MAN e nenhuma ordem de 20/10. Os dados sugerem falha antes da reivindicacao da sessao financeira, mas nao identificam a guarda original; ordens precisam ser sempre reconciliadas na Alpaca.
+
+**Mudanca:** classificacao segura de mensagens exatas do aplicativo em error_code e localizacao interna limitada a modulo revisado mais linha em error_location. Esses metadados passam a ser exportados no monitor Live e no evento broker_execution_failed. Nao exportar mensagens brutas, host paths, traces, corretora, dados de conta ou credenciais. Erros desconhecidos recebem broker_execution_unclassified.
+
+**Seguranca:** modifica apenas instrumentacao de falhas na supervisao de broker. Nenhuma alteracao ao executor financeiro, regras de decisao, estado do Mongo, ordens da corretora, retry ou janela do pregao. Nenhuma tentativa de operacao gerada por leitura de logs. Novas informacoes nao preenchem retroativamente eventos antigos.
+
+**Limitacao:** esta versao corrige a ausencia de diagnostico especifico, mas ainda nao prova nem resolve a causa original do RuntimeError. Nova rodada de logs deve permitir diagnosticar o motivo real antes de alterar uma guarda. Nao forcar MAN -> CAPR sem reconciliacao.
+
+**Testes:** testes/test_live_broker_failure_diagnostics_v108120.py exercita classificacao, serializacao segura, monitor de leitura e ausencia de ordens; regressao do restante do motor por CI.
+
+**Branch:** fix/v10.8.120-live-broker-preflight-diagnostics.
+
+---
+
 ## 2026-10-20 — API v10.8.119 (Live open: recuperação travada após erro tratado)
 
 **Evidência:** o ZIP de eventos `mct_live_winner_logs_20261020T141400Z.zip` da sessão `2026-10-20` contém duas preparações pós-fechamento concluídas com `target_asset=CAPR` e `action=rotate`, e uma falha `live_open_signal_failed` às 13:31:43 (horário gravado sem timezone) após 97,05 s. A mensagem e o traceback originais NÃO estão no ZIP, logo a causa inicial do `RuntimeError` permanece não identificada; o ZIP também não prova a execução ou ausência de ordens em broker. Logs Railway consultados no intervalo disponível continham respostas HTTP 200 às consultas, sem traceback de erro.
