@@ -35,6 +35,8 @@ _BROKER_GUARD_CODES = {
     "Stale Live session.": "stale_execution_session",
     "LiveExecutionWindowUnavailable: expected open missing; no real orders.": "missing_execution_window",
     "LiveExecutionWindowUnavailable: expected open must be timezone-aware.": "invalid_execution_window",
+    "LiveExecutionWindowUnavailable: expected open has an invalid UTC timestamp.": "invalid_execution_window",
+    "LiveExecutionWindowUnavailable: expected open differs from the official XNYS session open.": "invalid_execution_window",
     "Existing Live broker orders require reconciliation.": "broker_open_orders",
     "Live position changed since Winner model calibration.": "broker_position_changed",
     "Winner HOLD action does not match broker position.": "hold_position_mismatch",
