@@ -108,6 +108,6 @@ class LiveDailyCutoffGuardTests(unittest.TestCase):
                   return_value={"id": "winner", "revision": 2, "configuration_hash": "hash"}),
             patch(prefix + "create_live_execution_client") as broker,
         ):
-            with self.assertRaisesRegex(RuntimeError, "LiveOpenCalibrationRequired"):
+            with self.assertRaisesRegex(RuntimeError, "LivePriorDailySignalRequired"):
                 execute_recalibrated_live_winner_session(db, "2026-10-20")
             broker.assert_not_called()

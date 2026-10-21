@@ -126,7 +126,7 @@ class PriorDailyContractTests(TestCase):
         self.assertEqual(result["decision_date"], PRIOR)
         self.assertEqual(result["action"], "hold")
         self.assertEqual(daily.call_count, 1)
-        self.assertEqual(daily.call_args.kwargs["config"].analysis_end_date, PRIOR)
+        self.assertEqual(config.model_copy.call_args_list[-1].kwargs["update"]["analysis_end_date"], PRIOR)
         fields = db["live_winner_session_runs"].find_one_and_update.call_args_list[-1].args[1]["$set"]
         self.assertEqual(fields["analysis_mode"], "previous_completed_session_daily")
         self.assertEqual(fields["historical_cutoff"], PRIOR)
@@ -139,19 +139,34 @@ class PriorDailyContractTests(TestCase):
             status="waiting_for_winner_signal", decision_date=None,
         )
         broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(id="acct")
         broker.get_clock.return_value = SimpleNamespace(
-            is_open=True,
-            timestamp=datetime(2026, 10, 21, 13, 40, tzinfo=timezone.utc),
+            is_open=True, timestamp=datetime(2026, 10, 21, 13, 40, tzinfo=timezone.utc)
         )
-        with patch(PREFIX + "create_live_readonly_client", return_value=broker), patch(
-            PREFIX + "latest_safe_completed_xnys_session",
-            return_value=pd.Timestamp(PRIOR),
-        ), patch(PREFIX + "get_system_settings", return_value={"training": {"enabled": True}}), patch(
-            PREFIX + "get_trader_winner_context", return_value=(MagicMock(), {})
-        ):
-            # Default after-close path does not acquire an open recovery claim.
-            with self.assertRaises(RuntimeError):
+        broker.get_orders.return_value = []
+        cfg = MagicMock()
+        cfg.strategy_mode = TCC_U77_FIXED_CHALLENGER_MODE
+        cfg.model_copy.return_value = cfg
+        with ExitStack() as stack:
+            def fake(name, value=None):
+                return stack.enter_context(patch(PREFIX + name, return_value=value))
+            fake("create_live_readonly_client", broker)
+            fake("latest_safe_completed_xnys_session", pd.Timestamp(PRIOR))
+            fake("get_system_settings", {"training": {"enabled": True}})
+            fake("get_trader_winner_context", (
+                cfg, {"id": "winner", "revision": 2, "configuration_hash": "hash"}
+            ))
+            fake("get_trader_winner_model_snapshot", {
+                "family": "lightgbm_utility", "settings_snapshot": {}
+            })
+            fake("apply_training_runtime_settings", cfg)
+            fake("apply_execution_profile", cfg)
+            fake("assert_tcc_u77_contract")
+            fake("assert_tcc_u67_model_snapshot")
+            download = fake("download_operational_market_snapshot")
+            with self.assertRaisesRegex(RuntimeError, "requires closed regular market"):
                 signal.prepare_live_winner_signal(db, SESSION)
+        download.assert_not_called()
         db["live_winner_session_runs"].find_one_and_update.assert_not_called()
 
     def test_missing_data_fails_closed_without_training_or_orders(self):

@@ -12,14 +12,14 @@ class LiveSignalSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "No Live session"):
             prepare_live_cash_winner_signal(db, "2026-10-16")
 
-    def test_prepared_signal_is_idempotently_read_only(self):
+    def test_legacy_signal_without_cutoff_is_not_trusted(self):
         db = MagicMock()
         db["live_winner_session_runs"].find_one.return_value = {
             "status": "signal_prepared", "target_asset": "NVDA",
         }
-        result = prepare_live_cash_winner_signal(db, "2026-10-16")
-        self.assertEqual(result["target_asset"], "NVDA")
-        self.assertFalse(result["order_submission_enabled"])
+        with self.assertRaisesRegex(RuntimeError, "requires explicit review"):
+            prepare_live_cash_winner_signal(db, "2026-10-16")
+        db["live_winner_session_runs"].find_one_and_update.assert_not_called()
 
     def test_review_required_is_not_retried_automatically(self):
         db = MagicMock()
