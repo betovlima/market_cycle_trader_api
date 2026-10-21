@@ -188,6 +188,9 @@ class LiveObservationScheduler:
                             and bool(run.get("post_close_signal_ready"))
                             and bool(run.get("snapshot_sha256"))
                             and bool(run.get("target_asset"))
+                            and run.get("action") in (
+                                "hold", "stay_in_cash", "buy", "sell_to_cash", "rotate",
+                            )
                             and str(run.get("decision_date") or "")[:10] == previous
                             and run.get("historical_cutoff") in (None, previous)
                             and run.get("analysis_mode") in (
