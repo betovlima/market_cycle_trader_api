@@ -1,4 +1,4 @@
-"""Fail-closed Live order executor for independently recalibrated Winner sessions.
+"""Fail-closed Live order executor for verified prior-day Winner signals.
 
 Real submissions follow the existing Live Start/Pause/Stop operating mode. It cannot use a Paper account or Paper order/state collections.
 """
@@ -157,11 +157,17 @@ def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any
     expected_cutoff = xcals.get_calendar("XNYS").previous_session(
         pd.Timestamp(session)
     ).date().isoformat()
-    if (decision_date != session
-        or str(run.get("historical_cutoff") or "") != expected_cutoff
-        or str(run.get("analysis_mode") or "") != "live_current_session_intraday"
-        or not run.get("market_open_calibration_completed_at")):
-        raise RuntimeError("LiveOpenCalibrationRequired: a current-session Winner signal is required before real orders.")
+    # Live executes the immutable D-1 decision. API v10.8.124 post-close
+    # records had no explicit historical_cutoff/analysis_mode; those legacy
+    # fields are accepted ONLY with a verified prior-session decision date.
+    # In contrast, an old intraday recalibration is never an executable plan.
+    if (decision_date != expected_cutoff
+        or run.get("historical_cutoff") not in (None, expected_cutoff)
+        or run.get("analysis_mode") not in (None, "previous_completed_session_daily")):
+        raise RuntimeError(
+            "LivePriorDailySignalRequired: Winner decision must use the "
+            "immediately preceding completed XNYS session."
+        )
 
     broker = create_live_execution_client()
     account = broker.get_account()

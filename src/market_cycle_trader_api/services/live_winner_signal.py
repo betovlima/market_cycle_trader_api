@@ -43,11 +43,16 @@ def _utc_datetime(value: Any) -> datetime:
 
 
 
-def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
+def prepare_live_winner_signal(
+    db: Any, session: str, *, allow_open_recovery: bool = False,
+) -> dict[str, Any]:
     """Prepare a non-executable Winner signal for a flat Live account.
 
-    This entry point is not a trading or rebalancing function. Any existing
-    position or pending order requires a separate reconciled Live executor.
+    Normal preparation occurs after close using the last completed daily bar.
+    When allow_open_recovery is true, a missing daily signal may be computed
+    after the next regular open using only the SAME prior-session daily bars.
+    Neither route downloads or merges current-session minute bars.
+    This function never submits real broker orders.
     """
     run = db[LIVE_RUNS].find_one({"execution_session": session})
     if not run:
@@ -56,19 +61,27 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if not calendar.is_session(pd.Timestamp(session)):
         raise RuntimeError("Live execution session is not an XNYS trading day.")
     required_day = calendar.previous_session(pd.Timestamp(session)).date().isoformat()
-    # A completed plan already stamped with its correct decision date needs
-    # no fresh clock lookup. Invalid states must remain non-executable.
-    if run.get("status") == "signal_prepared":
-        return {"status": "signal_prepared", "execution_session": session,
-                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
-    if (run.get("status") == "recalibrated_no_orders"
-        and str(run.get("decision_date") or "")[:10] == required_day):
+    already_valid = (
+        run.get("status") == "recalibrated_no_orders"
+        and str(run.get("decision_date") or "")[:10] == required_day
+        and bool(run.get("winner_signal_prepared"))
+        and bool(run.get("post_close_signal_ready"))
+        and bool(run.get("snapshot_sha256"))
+        and bool(run.get("target_asset"))
+        and run.get("analysis_mode") in (None, "previous_completed_session_daily")
+    )
+    if already_valid:
         return {"status": "recalibrated_no_orders", "execution_session": session,
                 "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+    if run.get("status") == "signal_prepared":
+        raise RuntimeError("Legacy Live signal_prepared state requires explicit review.")
     if run.get("status") not in {
-        "waiting_for_winner_signal", "preparing_signal", "recalibrated_no_orders"
+        "waiting_for_winner_signal", "preparing_signal", "recalibrated_no_orders",
+        "waiting_for_open_recalibration",
     }:
         raise RuntimeError("Live session is not eligible for Winner preparation.")
+    if run.get("status") == "waiting_for_open_recalibration" and not allow_open_recovery:
+        raise RuntimeError("Open recovery is permitted only for a missing daily signal.")
     # Use the actual Alpaca Live broker timestamp, not Railway's clock or timezone.
     # No fixed 20-minute post-close delay: actual daily data availability and
     # the computed decision_date determine when the signal is usable.
@@ -78,20 +91,24 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     available_day = latest_safe_completed_xnys_session(
         now=broker_time, data_delay_minutes=0
     ).date().isoformat()
+    if allow_open_recovery:
+        if (not bool(getattr(clock, "is_open", False))
+            or broker_time.date().isoformat() != session
+            or not (
+                calendar.session_open(pd.Timestamp(session))
+                <= pd.Timestamp(broker_time)
+                < calendar.session_close(pd.Timestamp(session))
+            )):
+            return {"status": "waiting_for_regular_live_open",
+                    "order_submission_enabled": False}
     if run.get("status") == "preparing_signal":
         # A long-running model is not an abandoned worker. Do not reclaim a
         # persisted claim based on an arbitrary number of minutes.
         return {"status": "post_close_training_in_progress",
                 "execution_session": session, "order_submission_enabled": False}
-    # Never freeze Friday history as Tuesday's decision. Wait for Monday's
-    # completed daily bar and replace any unexecuted stale stored signal.
-    if run.get("status") == "signal_prepared":
-        return {"status": "signal_prepared", "execution_session": session,
-                "target_asset": run.get("target_asset"), "order_submission_enabled": False}
+    # Only missing or stale prior-day preparation may be recovered at the open.
+    # Never replace a valid persisted signal or a still-running preparation.
     if run.get("status") == "recalibrated_no_orders":
-        if str(run.get("decision_date") or "")[:10] == required_day:
-            return {"status": "recalibrated_no_orders", "execution_session": session,
-                    "target_asset": run.get("target_asset"), "order_submission_enabled": False}
         if available_day != required_day:
             return {"status": "waiting_for_completed_daily_bar",
                     "execution_session": session, "required_day": required_day,
@@ -116,6 +133,22 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
             return {"status": "stale_signal_replacement_claimed_elsewhere",
                     "order_submission_enabled": False}
         run = refreshed
+    if run.get("status") == "waiting_for_open_recalibration":
+        # Migration from the prior intraday retry state. Atomically convert
+        # only an incomplete run into daily-only recovery.
+        recovered = db[LIVE_RUNS].find_one_and_update(
+            {"_id": run["_id"], "status": "waiting_for_open_recalibration"},
+            {"$set": {"status": "waiting_for_winner_signal",
+                      "phase": "missing_prior_daily_signal_recovery",
+                      "winner_signal_prepared": False,
+                      "post_close_signal_ready": False,
+                      "order_submission_enabled": False}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not recovered:
+            return {"status": "daily_recovery_claimed_elsewhere",
+                    "order_submission_enabled": False}
+        run = recovered
     if run.get("status") != "waiting_for_winner_signal":
         raise RuntimeError("Live session is not eligible for Winner preparation.")
     attempts = int(run.get("preparation_attempts") or 0)
@@ -152,8 +185,11 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
     if str(getattr(account, "id", "") or "") != run["live_account_id"]:
         raise RuntimeError("Live account identity changed.")
     clock = broker.get_clock()
-    if bool(getattr(clock, "is_open", True)):
+    if bool(getattr(clock, "is_open", True)) and not allow_open_recovery:
         raise RuntimeError("Winner preparation requires closed regular market.")
+    if allow_open_recovery and not bool(getattr(clock, "is_open", False)):
+        return {"status": "waiting_for_regular_live_open",
+                "order_submission_enabled": False}
     state = verified_live_state(db, broker, session=session)
     from alpaca.trading.requests import GetOrdersRequest
     from alpaca.trading.enums import QueryOrderStatus
@@ -230,13 +266,25 @@ def prepare_live_winner_signal(db: Any, session: str) -> dict[str, Any]:
         # If preparation spilled into the open session, the next-session plan
         # is no longer an after-close decision. Fail without releasing orders.
         completed_clock = broker.get_clock()
-        if bool(getattr(completed_clock, "is_open", False)):
+        if allow_open_recovery:
+            completed_stamp = pd.Timestamp(_utc_datetime(completed_clock.timestamp))
+            if (not bool(getattr(completed_clock, "is_open", False))
+                or not (
+                    calendar.session_open(pd.Timestamp(session))
+                    <= completed_stamp
+                    < calendar.session_close(pd.Timestamp(session))
+                )):
+                raise RuntimeError("DailyRecoveryMissedRegularSession: no orders allowed.")
+        elif bool(getattr(completed_clock, "is_open", False)):
             raise RuntimeError("PostCloseSignalMissedWindow: market opened during preparation.")
         saved = db[LIVE_RUNS].find_one_and_update(
             {"_id": claimed["_id"], "status": "preparing_signal",
              "winner_configuration_hash": run["winner_configuration_hash"]},
             {"$set": {"status": "recalibrated_no_orders",
-                      "phase": "post_close_signal_ready_for_execution",
+                      "phase": ("daily_signal_recovered_at_open" if allow_open_recovery
+                                else "post_close_signal_ready_for_execution"),
+                      "analysis_mode": "previous_completed_session_daily",
+                      "historical_cutoff": cutoff,
                       "post_close_signal_ready": True,
                       "decision_date": decision_date,
                       "target_asset": target,
