@@ -1,3 +1,17 @@
+## 2026-10-21 — API v10.8.125 | Winner Live: somente último pregão fechado
+
+**Correção da regra operacional:** no fechamento de D−1, o Winner prepara e persiste o sinal com candles **diários completos**, incluindo SHA do snapshot, data de decisão, identidade do Winner e estado da posição. Na abertura de D, se o sinal já está válido, o scheduler **não baixa histórico, não solicita barras 1Min e não refaz LightGBM**: valida as proteções de conta, mercado XNYS, posição, ordens pendentes, revisão/identidade, idempotência e utiliza a decisão persistida. Não transferir o dado intradiário de Paper para Live.
+
+**Recuperação excepcional:** somente se o sinal D−1 estiver ausente, incompleto ou tiver falhado, o scheduler usa `prepare_live_winner_signal(..., allow_open_recovery=True)` com o **corte diário D−1** e as mesmas validações e SHA. Nunca incluir candle do pregão corrente. A recuperação não envia ordens e exige que a execução, se elegível, permaneça dentro da sessão regular XNYS. Uma preparação ainda em andamento não é retomada arbitrariamente por tempo decorrido. Os estados legados de falha `waiting_for_open_recalibration` podem ser migrados, apenas com CAS, para o processo diário.
+
+**Compatibilidade:** a API v10.8.124 não gravava `historical_cutoff` nem `analysis_mode` no sinal normal pós-fechamento. Aceitar essa ausência **somente** quando `decision_date` for exatamente o último pregão concluído e os marcadores, SHA, alvo e estado estiverem válidos. Rejeitar explicitamente planos marcados como `live_current_session_intraday` e planos com data incorreta. Os novos sinais recebem `analysis_mode=previous_completed_session_daily` e `historical_cutoff=D-1`. O nome interno do status persistido `recalibrated_no_orders` foi mantido por compatibilidade de Mongo; não significa recalibração na abertura.
+
+**Causa da correção:** em 21/10/2026 o snapshot e sinal de 20/10 (CAPR/hold) estavam preparados, mas o componente `live_winner_open.py` tentava 77 séries intradiárias e falhava em `current_session_bars` (`LiveIntradayCoverageNotReady`). Este código foi aposentado e a importação removida do scheduler. Nenhuma ordem real realizada durante a alteração.
+
+**Verificação:** testes unitários e CI `python -m unittest discover -s tests -p "test_*.py" -v`. Branch `fix/v10.8.125-live-prior-day-signal-only`. Requer revisão e aprovação de implantação separadas; **não fundir nem ativar ordens reais automaticamente**. O front v10.7.36 é independente.
+
+---
+
 ## 2026-10-20 — API v10.8.124 | restringir scheduler intradiario Live ao pregão regular XNYS
 
 **Solicitacao:** impedir tentativas de recalibracao intradiaria e etapas de execucao Alpaca quando a NYSE estiver fora do pregao regular, mantendo preparacao de sinal para o proximo dia apos o fechamento.
