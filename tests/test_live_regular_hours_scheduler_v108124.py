@@ -82,6 +82,7 @@ class SchedulerStagesTests(unittest.TestCase):
             "winner_signal_prepared": ready, "post_close_signal_ready": ready,
             "snapshot_sha256": "snapshot-daily" if ready else None,
             "target_asset": "CAPR" if ready else None,
+            "action": "hold" if ready else None,
             "decision_date": "2026-10-19" if ready else None,
         }
         calls = []
