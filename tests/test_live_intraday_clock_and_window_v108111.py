@@ -156,7 +156,7 @@ class PostCloseSingleCalibrationTests(TestCase):
         db["live_winner_session_runs"].find_one.return_value = {
             "status": "recalibrated_no_orders", "target_asset": "ADEA",
             "decision_date": "2026-10-16",
-            "winner_signal_prepared": True,
+            "winner_signal_prepared": True, "action": "buy",
             "post_close_signal_ready": True, "snapshot_sha256": "valid-sha",
         }
         broker = MagicMock()
