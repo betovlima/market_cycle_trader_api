@@ -68,6 +68,8 @@ def prepare_live_winner_signal(
         and bool(run.get("post_close_signal_ready"))
         and bool(run.get("snapshot_sha256"))
         and bool(run.get("target_asset"))
+        and run.get("action") in ("hold", "stay_in_cash", "buy", "sell_to_cash", "rotate")
+        and run.get("historical_cutoff") in (None, required_day)
         and run.get("analysis_mode") in (None, "previous_completed_session_daily")
     )
     if already_valid:
