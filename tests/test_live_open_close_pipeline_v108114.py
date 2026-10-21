@@ -100,18 +100,17 @@ class LiveDailyPreparationTests(TestCase):
 
 
 class LiveOpenPipelineTests(TestCase):
-    def setUp(self):
-        self.db = MagicMock()
-        self.broker = MagicMock()
-        self.broker.get_account.return_value = SimpleNamespace(id="acct", equity=110.70)
-        self.broker.get_clock.return_value = SimpleNamespace(
-            is_open=True, timestamp=datetime(2026, 10, 20, 13, 40, tzinfo=timezone.utc),
-        )
-        self.broker.get_orders.return_value = []
+    """The previous intraday recalibration entry point is retired."""
 
-    def test_old_capr_plan_is_not_automatically_executed(self):
-        run = _run()
-        self.db["live_winner_session_runs"].find_one.return_value = run
+    def test_legacy_open_recalibration_is_disabled_without_broker_access(self):
+        db = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "LiveIntradayRecalibrationDisabled"):
+            open_signal.refresh_live_open_winner_signal(db, SESSION)
+        db.__getitem__.assert_not_called()
+
+    def test_stale_friday_plan_requires_correct_monday_daily_bar(self):
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = _run()
         prefix = "market_cycle_trader_api.services.live_order_execution."
         with (
             patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
@@ -120,124 +119,27 @@ class LiveOpenPipelineTests(TestCase):
             }),
             patch(prefix + "create_live_execution_client") as broker_factory,
         ):
-            with self.assertRaisesRegex(RuntimeError, "LiveOpenCalibrationRequired"):
-                executor.execute_recalibrated_live_winner_session(self.db, SESSION)
+            with self.assertRaisesRegex(RuntimeError, "LivePriorDailySignalRequired"):
+                executor.execute_prepared_live_winner_session(db, SESSION)
             broker_factory.assert_not_called()
 
-    def test_open_waits_if_monday_cutoff_not_current(self):
-        self.db["live_winner_session_runs"].find_one.return_value = _run()
-        prefix = "market_cycle_trader_api.services.live_winner_open."
+    def test_obsolete_current_session_decision_is_not_executable(self):
+        db = MagicMock()
+        db["live_winner_session_runs"].find_one.return_value = _run(
+            decision_date=PREVIOUS, historical_cutoff=PREVIOUS,
+            analysis_mode="live_current_session_intraday",
+        )
+        prefix = "market_cycle_trader_api.services.live_order_execution."
         with (
             patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
-            patch(prefix + "create_live_readonly_client", return_value=self.broker),
-            patch(prefix + "latest_safe_completed_xnys_session",
-                  return_value=pd.Timestamp("2026-10-16")),
-            patch(prefix + "download_operational_market_snapshot") as download,
+            patch(prefix + "get_trader_winner_summary", return_value={
+                "id": "winner", "revision": 2, "configuration_hash": "hash",
+            }),
+            patch(prefix + "create_live_execution_client") as broker_factory,
         ):
-            result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
-        self.assertEqual(result["status"], "waiting_for_correct_prior_daily_bar")
-        download.assert_not_called()
-
-    def test_open_recalibrates_monday_history_and_tuesday_minutes(self):
-        existing = _run()
-        claimed = _run(status="open_recalibration", open_preparation_attempts=1)
-        saved = _run(status="recalibrated_no_orders", decision_date=SESSION,
-                     target_asset="MAN", action="hold")
-        self.db["live_winner_session_runs"].find_one.return_value = existing
-        self.db["live_winner_session_runs"].find_one_and_update.side_effect = [claimed, saved]
-        cfg = MagicMock()
-        cfg.strategy_mode = TCC_U77_FIXED_CHALLENGER_MODE
-        cfg.assets = ["MAN", "CAPR"]
-        cfg.model_copy.return_value = cfg
-        profile = {"id": "winner", "revision": 2, "configuration_hash": "hash"}
-        snapshot = SimpleNamespace(frames={"MAN": pd.DataFrame({"close": [1]})},
-                                   manifest={"snapshot_sha256": "monday-hash"})
-        prefix = "market_cycle_trader_api.services.live_winner_open."
-        with ExitStack() as stack:
-            def fake(name, value=None):
-                return stack.enter_context(patch(prefix + name, return_value=value))
-            fake("live_control_status", {"control_mode": "active"})
-            fake("create_live_readonly_client", self.broker)
-            fake("latest_safe_completed_xnys_session", pd.Timestamp(PREVIOUS))
-            fake("get_system_settings", {"training": {"enabled": True}})
-            fake("get_trader_winner_context", (cfg, profile))
-            fake("get_trader_winner_model_snapshot", {
-                "family": "lightgbm_utility", "settings_snapshot": {},
-            })
-            fake("apply_training_runtime_settings", cfg)
-            fake("apply_execution_profile", cfg)
-            fake("assert_tcc_u77_contract")
-            fake("assert_tcc_u67_model_snapshot")
-            fake("verified_live_state", {
-                "managed_symbol": "MAN", "managed_quantity": 2.668639053,
-                "holding_sessions": 2, "revision": 1,
-            })
-            download = fake("download_operational_market_snapshot", snapshot)
-            live_bars = fake("load_live_intraday_session", (
-                snapshot.frames, {
-                    "analysis_mode": "live_current_session_intraday",
-                    "live_session": SESSION,
-                    "intraday_market_data_cutoff_utc": "2026-10-20T13:40:00+00:00",
-                },
-            ))
-            fake("build_live_model_decision", SimpleNamespace(
-                decision_date=pd.Timestamp(SESSION), target_asset="MAN"
-            ))
-            fake("winner_candidate_fields", {})
-            fake("append_live_event")
-            result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
-        self.assertEqual(result["status"], "recalibrated_no_orders")
-        self.assertEqual(result["decision_date"], SESSION)
-        self.assertEqual(result["action"], "hold")
-        self.assertEqual(live_bars.call_args.kwargs["session"], SESSION)
-        # The Trading market-data key is now resolved by the shared snapshot.
-        self.assertNotIn("credentials_override", download.call_args.kwargs)
-        self.assertFalse(result["order_submission_enabled"])
-        saved_fields = self.db["live_winner_session_runs"].find_one_and_update.call_args_list[-1].args[1]["$set"]
-        self.assertEqual(saved_fields["historical_cutoff"], PREVIOUS)
-        self.assertEqual(saved_fields["decision_date"], SESSION)
-        self.assertEqual(saved_fields["analysis_mode"], "live_current_session_intraday")
-        self.broker.submit_order.assert_not_called()
-
-    def test_long_running_live_open_claim_is_not_reclaimed_by_elapsed_time(self):
-        started = datetime.now(timezone.utc) - timedelta(minutes=30)
-        # Distinct collections: MagicMock.__getitem__ otherwise returns the
-        # same mock for Live sessions and broker intents.
-        sessions = MagicMock()
-        intents = MagicMock()
-        self.db.__getitem__.side_effect = lambda name: (
-            sessions if name == "live_winner_session_runs" else intents
-        )
-        sessions.find_one.return_value = _run(
-            status="open_recalibration", open_calibration_started_at=started,
-        )
-        intents.find_one.return_value = None
-        sessions.find_one_and_update.return_value = _run(
-            status="waiting_for_open_recalibration",
-        )
-        prefix = "market_cycle_trader_api.services.live_winner_open."
-        with (
-            patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
-            patch(prefix + "create_live_readonly_client") as broker_factory,
-        ):
-            result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
-        self.assertEqual(result["status"], "live_open_recalibration_in_progress")
-        self.assertFalse(result["order_submission_enabled"])
-        sessions.find_one_and_update.assert_not_called()
-        broker_factory.assert_not_called()
-        self.broker.submit_order.assert_not_called()
-
-
-    def test_completed_session_is_not_retrained(self):
-        self.db["live_winner_session_runs"].find_one.return_value = _run(status="completed")
-        prefix = "market_cycle_trader_api.services.live_winner_open."
-        with (
-            patch(prefix + "live_control_status", return_value={"control_mode": "active"}),
-            patch(prefix + "create_live_readonly_client") as broker_factory,
-        ):
-            result = open_signal.refresh_live_open_winner_signal(self.db, SESSION)
-        self.assertEqual(result["status"], "completed")
-        broker_factory.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "LivePriorDailySignalRequired"):
+                executor.execute_prepared_live_winner_session(db, SESSION)
+            broker_factory.assert_not_called()
 
 
 class LiveCurrentSessionBarsTests(TestCase):

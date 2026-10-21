@@ -76,6 +76,15 @@ class SchedulerStagesTests(unittest.TestCase):
         broker.get_clock.return_value = fresh_clock
         result = {"status": "observed", "recorded_at": recorded_at, "market_open": market_open}
         armed = {"status": plan_status, "execution_session": SESSION}
+        ready = plan_status == "recalibrated_no_orders"
+        db["live_winner_session_runs"].find_one.return_value = {
+            "status": plan_status,
+            "winner_signal_prepared": ready, "post_close_signal_ready": ready,
+            "snapshot_sha256": "snapshot-daily" if ready else None,
+            "target_asset": "CAPR" if ready else None,
+            "action": "hold" if ready else None,
+            "decision_date": "2026-10-19" if ready else None,
+        }
         calls = []
 
         def run_stage(_db, *, session, stage, operation, brokerage=False):
@@ -136,7 +145,7 @@ class SchedulerStagesTests(unittest.TestCase):
             market_open=True, plan_status="recalibrated_no_orders",
             fresh_clock=closed_clock,
         )
-        self.assertEqual(calls, [("open_calculation", False)])
+        self.assertEqual(calls, [])
         broker.get_clock.assert_called_once()
 
     def test_ready_signal_must_recheck_clock_before_broker(self):
@@ -144,7 +153,7 @@ class SchedulerStagesTests(unittest.TestCase):
             recorded_at="2026-10-20T19:20:00Z",
             market_open=True, plan_status="recalibrated_no_orders",
         )
-        self.assertEqual(calls, [("open_calculation", False), ("broker_execution", True)])
+        self.assertEqual(calls, [("broker_execution", True)])
         broker.get_clock.assert_called_once()
 
     def test_no_exec_when_calculation_needs_retry(self):
@@ -153,8 +162,16 @@ class SchedulerStagesTests(unittest.TestCase):
             market_open=True, plan_status="waiting_for_open_recalibration",
             calculation_status="waiting_for_open_retry",
         )
-        self.assertEqual(calls, [("open_calculation", False)])
+        self.assertEqual(calls, [("open_daily_recovery", False)])
         client.assert_not_called()
+
+    def test_recovery_only_when_daily_signal_missing(self):
+        calls, _, _ = self._once(
+            recorded_at="2026-10-20T19:20:00Z",
+            market_open=True, plan_status="waiting_for_winner_signal",
+            calculation_status="recalibrated_no_orders",
+        )
+        self.assertEqual(calls, [("open_daily_recovery", False), ("broker_execution", True)])
 
     def test_manual_reconciled_session_is_not_replayed(self):
         calls, client, _ = self._once(

@@ -20,7 +20,6 @@ from .strategy_lab import get_trader_winner_summary
 from .live_winner_session import plan_next_live_session, LIVE_RUNS
 from .live_winner_events import append_live_event
 from .live_winner_signal import prepare_live_winner_signal
-from .live_winner_open import refresh_live_open_winner_signal
 from .live_order_execution import execute_prepared_live_winner_session
 from .live_workflow_monitor import execute_monitored_live_stage
 
@@ -170,33 +169,53 @@ class LiveObservationScheduler:
                         )
                     elif (armed.get("status") in {
                         "waiting_for_winner_signal", "recalibrated_no_orders",
-                        "waiting_for_open_recalibration", "open_recalibration",
+                        "waiting_for_open_recalibration",
                     } and _regular_xnys_session_open(
                         session=armed["execution_session"],
                         broker_timestamp=result["recorded_at"],
                         broker_is_open=result["market_open"],
                     )):
-                        stage = "live_open_recalibration"
-                        refreshed = execute_monitored_live_stage(
-                            db, session=armed["execution_session"],
-                            stage="open_calculation",
-                            operation=lambda: refresh_live_open_winner_signal(
-                                db, armed["execution_session"]
-                            ),
+                        session = armed["execution_session"]
+                        run = db[LIVE_RUNS].find_one(
+                            {"execution_session": session}
+                        ) or {}
+                        previous = xcals.get_calendar("XNYS").previous_session(
+                            pd.Timestamp(session)
+                        ).date().isoformat()
+                        prepared = (
+                            run.get("status") == "recalibrated_no_orders"
+                            and bool(run.get("winner_signal_prepared"))
+                            and bool(run.get("post_close_signal_ready"))
+                            and bool(run.get("snapshot_sha256"))
+                            and bool(run.get("target_asset"))
+                            and run.get("action") in (
+                                "hold", "stay_in_cash", "buy", "sell_to_cash", "rotate",
+                            )
+                            and str(run.get("decision_date") or "")[:10] == previous
+                            and run.get("historical_cutoff") in (None, previous)
+                            and run.get("analysis_mode") in (
+                                None, "previous_completed_session_daily",
+                            )
                         )
-                        # The calculation may take several minutes and cross
-                        # the closing bell. Re-read Alpaca's clock before even
-                        # creating a monitored financial execution attempt.
-                        if (refreshed.get("status") == "recalibrated_no_orders"
-                            and _fresh_regular_live_execution_window(
-                                armed["execution_session"]
-                            )):
+                        # Only missing/stale D-1 preparation is retried.
+                        # A ready D-1 signal NEVER triggers market data
+                        # downloads, intraday bars or LightGBM recalibration.
+                        if not prepared:
+                            stage = "missing_daily_signal_recovery"
+                            recovery = execute_monitored_live_stage(
+                                db, session=session, stage="open_daily_recovery",
+                                operation=lambda: prepare_live_winner_signal(
+                                    db, session, allow_open_recovery=True,
+                                ),
+                            )
+                            prepared = recovery.get("status") == "recalibrated_no_orders"
+                        if prepared and _fresh_regular_live_execution_window(session):
                             stage = "order_execution"
                             execute_monitored_live_stage(
-                                db, session=armed["execution_session"],
+                                db, session=session,
                                 stage="broker_execution",
                                 operation=lambda: execute_prepared_live_winner_session(
-                                    db, armed["execution_session"]
+                                    db, session,
                                 ),
                                 brokerage=True,
                             )

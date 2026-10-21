@@ -43,9 +43,9 @@ class LiveExpectedOpenUTCRegression(unittest.TestCase):
             "post_close_signal_ready": True,
             "snapshot_sha256": "frozen-daily-sha",
             "market_open_calibration_completed_at": datetime(2026, 10, 20, 15, 11, tzinfo=timezone.utc),
-            "decision_date": "2026-10-20",
+            "decision_date": "2026-10-19",
             "historical_cutoff": "2026-10-19",
-            "analysis_mode": "live_current_session_intraday",
+            "analysis_mode": "previous_completed_session_daily",
             "action": "rotate",
             "current_asset": "MAN",
             "target_asset": "CAPR",
@@ -151,7 +151,7 @@ class LiveExpectedOpenUTCRegression(unittest.TestCase):
         official = calendar.session_open(pd.Timestamp(session))
         self.run["execution_session"] = session
         self.run["_id"] = ACCOUNT_ID + ":" + session
-        self.run["decision_date"] = session
+        self.run["decision_date"] = "2026-11-25"
         self.run["historical_cutoff"] = "2026-11-25"
         self.run["expected_market_open"] = _date_from_bson(official.to_pydatetime())
         self.broker.get_clock.return_value = SimpleNamespace(

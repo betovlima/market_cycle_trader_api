@@ -120,19 +120,9 @@ class LiveExchangeClockTests(TestCase):
         self.assertEqual(result["status"], "post_close_training_in_progress")
         db["live_winner_session_runs"].find_one_and_update.assert_not_called()
 
-    def test_live_open_claim_is_not_recovered_based_on_elapsed_time(self):
+    def test_legacy_open_entrypoint_always_blocks_and_never_reads_broker(self):
         from market_cycle_trader_api.services.live_winner_open import refresh_live_open_winner_signal
         db = MagicMock()
-        db["live_winner_session_runs"].find_one.return_value = {
-            "_id": "acct:2026-10-20", "status": "open_recalibration",
-            "open_calibration_started_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
-        }
-        with (
-            patch("market_cycle_trader_api.services.live_winner_open.live_control_status",
-                  return_value={"control_mode": "active"}),
-            patch("market_cycle_trader_api.services.live_winner_open.create_live_readonly_client") as factory,
-        ):
-            result = refresh_live_open_winner_signal(db, "2026-10-20")
-        self.assertEqual(result["status"], "live_open_recalibration_in_progress")
-        factory.assert_not_called()
-        db["live_winner_session_runs"].find_one_and_update.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "LiveIntradayRecalibrationDisabled"):
+            refresh_live_open_winner_signal(db, "2026-10-20")
+        db.__getitem__.assert_not_called()
