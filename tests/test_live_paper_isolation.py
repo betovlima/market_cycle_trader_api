@@ -39,7 +39,7 @@ class LivePaperIsolationTests(unittest.TestCase):
         self.assertEqual(result["filled_value"], 19.5)
         self.assertIsNone(result["decision_audit"])
         self.assertIsNone(result["realized_pnl"])
-        self.assertEqual(result["execution_origin"], "live_broker_history")
+        self.assertEqual(result["execution_origin"], "live_broker_unclassified")
 
     def test_live_robot_is_explicitly_readonly(self):
         with (

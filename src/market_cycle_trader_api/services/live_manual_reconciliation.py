@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcals
+import pandas as pd
+
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
 from pymongo import ReturnDocument
@@ -170,10 +173,24 @@ def _inspect(db: Any, *, execution_session: str | None = None) -> dict[str, Any]
     target = str(run.get("target_asset") or "").upper()
     if not source or not target or source == "CASH" or source == target:
         raise ManualReconciliationBlocked("Plano de rotacao incompleto.")
-    if (str(run.get("decision_date") or "")[:10] != session
-        or str(run.get("analysis_mode") or "") != "live_current_session_intraday"
-        or not run.get("market_open_calibration_completed_at")):
-        raise ManualReconciliationBlocked("O plano nao foi recalibrado para a sessao.")
+    # API v10.8.125 removed the intraday recalibration requirement.
+    # Manual adoption must validate exactly the same immutable D-1 daily
+    # decision contract as the real-order executor, not today's 1Min bars.
+    calendar = xcals.get_calendar("XNYS")
+    requested_session = pd.Timestamp(session)
+    if not calendar.is_session(requested_session):
+        raise ManualReconciliationBlocked("Sessao de conciliacao fora do calendario XNYS.")
+    required_day = calendar.previous_session(requested_session).date().isoformat()
+    if (str(run.get("decision_date") or "")[:10] != required_day
+        or run.get("analysis_mode") not in (None, "previous_completed_session_daily")
+        or run.get("historical_cutoff") not in (None, required_day)
+        or not bool(run.get("winner_signal_prepared"))
+        or not bool(run.get("post_close_signal_ready"))
+        or not run.get("snapshot_sha256")):
+        raise ManualReconciliationBlocked(
+            "Conciliacao manual exige sinal Winner diario D-1 verificado; "
+            "recalibracao intradiaria legada nao e valida para novos pedidos."
+        )
     winner = get_trader_winner_summary(db)
     if (not isinstance(winner, dict)
         or str(winner.get("id")) != str(run.get("winner_strategy_id"))
@@ -200,7 +217,9 @@ def _inspect(db: Any, *, execution_session: str | None = None) -> dict[str, Any]
         "run_status": run["status"], "winner_hash": run["winner_configuration_hash"],
         "revision": int(state.get("revision") or 0),
         "source": source, "source_quantity": registered_quantity,
-        "target": target, "evidence": evidence,
+        "target": target, "decision_date": required_day,
+        "signal_contract": "previous_completed_session_daily",
+        "evidence": evidence,
     }
     token = hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {
@@ -209,6 +228,8 @@ def _inspect(db: Any, *, execution_session: str | None = None) -> dict[str, Any]
         "source": source, "target": target,
         "registered_quantity": registered_quantity,
         "broker_quantity": evidence["quantity"],
+        "decision_date": required_day,
+        "signal_contract": "previous_completed_session_daily",
         "sell_order_count": sum(1 for o in evidence["orders"] if o["side"] == "sell"),
         "buy_order_count": sum(1 for o in evidence["orders"] if o["side"] == "buy"),
         "order_ids": [o["id"] for o in evidence["orders"]],
@@ -284,6 +305,8 @@ def reconcile_manual_live_rotation(db: Any, *, execution_session: str,
         audit = {
             "broker_account_id": account_id, "execution_session": session,
             "origin": "manual_alpaca_fills", "actor": actor,
+            "decision_date": info["decision_date"],
+            "signal_contract": info["signal_contract"],
             "winner_configuration_hash": run["winner_configuration_hash"],
             "source_symbol": info["source"], "target_symbol": info["target"],
             "source_quantity": info["registered_quantity"],

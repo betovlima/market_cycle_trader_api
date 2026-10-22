@@ -13,7 +13,8 @@ from alpaca.trading.requests import GetOrdersRequest
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .strategy_lab import get_trader_winner_summary
 from .live_control import live_control_status
-from .live_winner_session import latest_live_session
+from .live_winner_session import LIVE_RUNS, latest_live_session
+from .live_order_execution import ORDER_LEDGER
 from .live_winner_candidates import latest_live_winner_decision
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
@@ -55,7 +56,7 @@ def _position(p: Any) -> dict[str, Any]:
     }
 
 
-def _order(order: Any) -> dict[str, Any]:
+def _order(order: Any, *, execution_origin: str = "live_broker_unclassified") -> dict[str, Any]:
     quantity = _float(getattr(order, "qty", 0))
     filled = _float(getattr(order, "filled_qty", 0))
     avg = getattr(order, "filled_avg_price", None)
@@ -72,10 +73,52 @@ def _order(order: Any) -> dict[str, Any]:
         "created_at": _timestamp(getattr(order, "created_at", None)),
         "filled_at": _timestamp(getattr(order, "filled_at", None)),
         "economic_fill": filled > 0,
-        "execution_origin": "live_broker_history",
+        "execution_origin": execution_origin,
         "realized_pnl": None,  # Not derivable from a single fill.
-        "decision_audit": None,  # No Live model decisions have been executed.
+        "decision_audit": None,  # Cannot infer a model decision from one broker fill.
     }
+
+
+def _verified_order_origins(db: Any, account_id: str, broker_orders: list[Any]) -> dict[str, str]:
+    """Attribute orders only with a persisted Live receipt or internal ledger.
+
+    Never infer 'manual' solely from an unfamiliar Alpaca client_order_id.
+    Historical orders without an exact receipt stay unclassified.
+    """
+    broker_ids = [str(getattr(o, "id", "") or "") for o in broker_orders]
+    client_ids = [str(getattr(o, "client_order_id", "") or "") for o in broker_orders]
+    broker_ids = [value for value in broker_ids if value]
+    client_ids = [value for value in client_ids if value.startswith("mct-live-")]
+    origin: dict[str, str] = {}
+    if broker_ids:
+        receipts = db[LIVE_RUNS].find(
+            {"live_account_id": account_id, "status": "manual_reconciled",
+             "manual_reconciliation.origin": "manual_alpaca_fills",
+             "manual_reconciliation.order_ids": {"$in": broker_ids}},
+            {"manual_reconciliation.order_ids": 1},
+        )
+        for receipt in receipts:
+            for order_id in (receipt.get("manual_reconciliation") or {}).get("order_ids") or []:
+                key = str(order_id)
+                if key in broker_ids:
+                    origin[key] = "manual_alpaca_fills"
+    if client_ids:
+        records = db[ORDER_LEDGER].find(
+            {"broker_account_id": account_id, "_id": {"$in": client_ids}},
+            {"_id": 1},
+        )
+        verified_client_ids = {str(record.get("_id") or "") for record in records}
+        for order in broker_orders:
+            client_id = str(getattr(order, "client_order_id", "") or "")
+            broker_id = str(getattr(order, "id", "") or "")
+            if broker_id and client_id in verified_client_ids:
+                if broker_id in origin:
+                    # Conflicting manual receipt and robot ledger: do not
+                    # claim either provenance without human review.
+                    origin[broker_id] = "live_broker_unclassified"
+                else:
+                    origin[broker_id] = "live_automated_verified"
+    return origin
 
 
 def _store_observation(
@@ -112,9 +155,18 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     if not account_id:
         raise RuntimeError('Live broker account has no verifiable account id.')
     positions = [_position(p) for p in client.get_all_positions()]
-    orders = [_order(o) for o in client.get_orders(filter=GetOrdersRequest(
+    broker_orders = list(client.get_orders(filter=GetOrdersRequest(
         status=QueryOrderStatus.ALL, limit=100,
-    ))]
+    )))
+    # Match exact persisted manual reconciliation receipts or MCT intents.
+    # If the evidence is absent, do not guess who submitted a broker order.
+    order_origins = _verified_order_origins(db, account_id, broker_orders)
+    orders = [
+        _order(order, execution_origin=order_origins.get(
+            str(getattr(order, "id", "") or ""), "live_broker_unclassified",
+        ))
+        for order in broker_orders
+    ]
     cash = _float(getattr(account, "cash", 0))
     equity = _float(getattr(account, "equity", 0))
     buying_power_raw = getattr(account, "buying_power", None)

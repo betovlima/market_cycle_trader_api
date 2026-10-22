@@ -1,3 +1,15 @@
+## 2026-10-22 — API v10.8.126 | conciliação manual D−1 e origem verificável de operações Live
+
+**Problema:** a API v10.8.125 removeu a recalibração intradiária obrigatória e passou a executar planos diários D−1, mas `live_manual_reconciliation.py` ainda exigia um plano `live_current_session_intraday` com `decision_date == execution_session`. Novas rotações manuais de emergência seriam bloqueadas mesmo com prova de fills na Alpaca. A operação MAN→CAPR de 20/10/2026 foi realizada manualmente; não se deve reclassificá-la como ordem automática nem refazer negociações.
+
+**Alterações:** a adoção manual passa a exigir o mesmo sinal validado D−1 do executor: sessão XNYS, decisão do último pregão, tipo de análise diária (ou campo omitido de registro pós-fechamento legado), corte histórico coerente, sinal pronto e SHA. Mantêm-se validações de Winner, posição e quantidade, controle pausado/parado, inexistência de ordens pendentes e ledger, recibos Alpaca, idempotência e CAS. O novo recibo inclui `signal_contract` e `decision_date`; registros já conciliados mantêm o caminho `already_reconciled` sem alteração.
+
+**Auditabilidade:** `live_portfolio_snapshot` atribui origem de uma ordem SOMENTE quando seu ID consta de um recibo de conciliação manual ou seu client ID está no ledger do MCT. Sem prova, usa `live_broker_unclassified`; prefixos desconhecidos não são tratados como manuais por inferência. Decisão `completed` de `hold`/`stay_in_cash` é `live_no_orders`, e não `live_broker`. O histórico permanece ancorado na conta Live.
+
+**Segurança:** nenhum submit/cancel/correção manual automática, sem mudança de decisão Winner, quantidade, banco histórico, TCC ou Paper. Testes em mocks e CI antes de integrar. Branch `fix/v10.8.126-live-daily-manual-reconciliation`.
+
+---
+
 ## 2026-10-21 — API v10.8.125 | Winner Live: somente último pregão fechado
 
 **Correção da regra operacional:** no fechamento de D−1, o Winner prepara e persiste o sinal com candles **diários completos**, incluindo SHA do snapshot, data de decisão, identidade do Winner e estado da posição. Na abertura de D, se o sinal já está válido, o scheduler **não baixa histórico, não solicita barras 1Min e não refaz LightGBM**: valida as proteções de conta, mercado XNYS, posição, ordens pendentes, revisão/identidade, idempotência e utiliza a decisão persistida. Não transferir o dado intradiário de Paper para Live.
