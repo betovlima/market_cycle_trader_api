@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import zipfile
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from alpaca.trading.enums import QueryOrderStatus
@@ -16,6 +18,7 @@ from .live_control import live_control_status
 from .live_winner_session import LIVE_RUNS, latest_live_session
 from .live_order_execution import ORDER_LEDGER
 from .live_winner_candidates import latest_live_winner_decision
+from .live_trader_state import LIVE_STATE
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
 
@@ -148,6 +151,62 @@ def _store_observation(
     } for item in documents]
 
 
+
+def _last_verified_live_execution(
+    db: Any, *, account_id: str, positions: list[dict[str, Any]],
+    recorded_now: datetime,
+) -> dict[str, str | None]:
+    """Read-only position-change metadata; never infer a trade from HOLD.
+
+    Show the date only when the persisted Live state still matches the
+    independently read broker position. A manual source also requires the
+    reconciliation origin and session to match this last execution.
+    """
+    unavailable = {"session": None, "origin": None}
+    state = db[LIVE_STATE].find_one(
+        {"_id": account_id},
+        {"managed_symbol": 1, "managed_quantity": 1,
+         "last_execution_session": 1, "last_reconciliation_origin": 1,
+         "last_reconciliation_session": 1},
+    )
+    if not isinstance(state, dict):
+        return unavailable
+    raw_session = state.get("last_execution_session")
+    if not isinstance(raw_session, str):
+        return unavailable
+    try:
+        session = date.fromisoformat(raw_session)
+        if session.isoformat() != raw_session:
+            return unavailable
+        # The broker clock is the same trusted clock used for the snapshot.
+        if session > recorded_now.astimezone(ZoneInfo("America/New_York")).date():
+            return unavailable
+    except (TypeError, ValueError):
+        return unavailable
+
+    if len(positions) > 1:
+        return unavailable
+    broker_symbol = str(positions[0]["symbol"] or "").upper() if positions else "CASH"
+    broker_quantity = float(positions[0]["quantity"]) if positions else 0.0
+    try:
+        recorded_quantity = float(state.get("managed_quantity"))
+    except (TypeError, ValueError):
+        return unavailable
+    if not math.isfinite(recorded_quantity) or not math.isfinite(broker_quantity):
+        return unavailable
+    if (str(state.get("managed_symbol") or "").upper() != broker_symbol
+        or abs(recorded_quantity - broker_quantity) >
+            max(1e-6, abs(broker_quantity) * 1e-6)):
+        return unavailable
+
+    origin = None
+    if (state.get("last_reconciliation_session") == raw_session
+        and state.get("last_reconciliation_origin") == "manual_alpaca_fills"):
+        origin = "manual_alpaca_fills"
+    # An automated origin is never guessed from a stale manual receipt.
+    return {"session": raw_session, "origin": origin}
+
+
 def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     client = create_live_readonly_client()
     account = client.get_account()
@@ -177,6 +236,9 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     recorded_now = clock.timestamp.astimezone(timezone.utc)
     history = _store_observation(db, equity, cash, account_id, recorded_now=recorded_now)
     latest_decision = latest_live_winner_decision(db, account_id=account_id)
+    last_execution = _last_verified_live_execution(
+        db, account_id=account_id, positions=positions, recorded_now=recorded_now,
+    )
     unrealized = sum(p["unrealized_pnl"] for p in positions)
 
     return {
@@ -198,7 +260,8 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
         "position": positions[0] if len(positions) == 1 else None,
         "positions": positions,
         "last_decision_date": latest_decision.get("decision_date") if latest_decision else None,
-        "last_execution_session": None,
+        "last_execution_session": last_execution["session"],
+        "last_execution_origin": last_execution["origin"],
         "market_clock": {
             "timestamp": _timestamp(getattr(clock, "timestamp", None)),
             "is_open": bool(getattr(clock, "is_open", False)),
