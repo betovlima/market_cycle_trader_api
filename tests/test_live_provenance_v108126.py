@@ -3,12 +3,14 @@
 All tests use mocks; no Alpaca orders, Mongo writes, or requests.
 """
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from market_cycle_trader_api.services.live_portfolio import (
-    _order, _verified_order_origins, LIVE_RUNS, ORDER_LEDGER,
+    _order, _verified_order_origins, _last_verified_live_execution, LIVE_RUNS, ORDER_LEDGER,
 )
+from market_cycle_trader_api.services.live_trader_state import LIVE_STATE
 from market_cycle_trader_api.services.live_winner_candidates import (
     latest_live_winner_decision,
 )
@@ -110,6 +112,71 @@ class LiveDecisionOriginTests(unittest.TestCase):
         self.assertEqual(
             self.decision("completed", "buy")["execution_origin"], "live_broker",
         )
+
+
+
+class LastVerifiedLiveExecutionTests(unittest.TestCase):
+    """Pure mocked Mongo snapshot checks: no broker requests or financial writes."""
+
+    def setUp(self):
+        self.db = MagicMock()
+        self.broker_time = datetime(2026, 10, 22, 16, 40, tzinfo=timezone.utc)
+        self.position = [{"symbol": "CAPR", "quantity": 16.89037037}]
+        self.state = {
+            "managed_symbol": "CAPR", "managed_quantity": 16.89037037,
+            "last_execution_session": "2026-10-20",
+            "last_reconciliation_origin": "manual_alpaca_fills",
+            "last_reconciliation_session": "2026-10-20",
+        }
+        self.db[LIVE_STATE].find_one.return_value = self.state
+
+    def read(self, positions=None):
+        return _last_verified_live_execution(
+            self.db, account_id="acct-1", positions=self.position if positions is None else positions,
+            recorded_now=self.broker_time,
+        )
+
+    def test_verified_manual_adoption_has_date_and_manual_source(self):
+        self.assertEqual(self.read(), {
+            "session": "2026-10-20", "origin": "manual_alpaca_fills",
+        })
+        self.db[LIVE_STATE].find_one.assert_called_once()
+        self.assertEqual(self.db[LIVE_STATE].find_one.call_args.args[0], {"_id": "acct-1"})
+        self.db[LIVE_STATE].update_one.assert_not_called()
+
+    def test_position_divergence_never_shows_stale_execution(self):
+        self.assertEqual(
+            self.read([{"symbol": "MAN", "quantity": 2.668639053}]),
+            {"session": None, "origin": None},
+        )
+
+    def test_broker_quantity_divergence_never_shows_stale_execution(self):
+        self.state["managed_quantity"] = 14.0
+        self.assertEqual(self.read(), {"session": None, "origin": None})
+
+    def test_later_automatic_trade_does_not_inherit_manual_origin(self):
+        self.state["last_execution_session"] = "2026-10-21"
+        self.assertEqual(self.read(), {
+            "session": "2026-10-21", "origin": None,
+        })
+
+    def test_missing_state_or_invalid_session_has_no_inferred_trade(self):
+        self.db[LIVE_STATE].find_one.return_value = None
+        self.assertEqual(self.read(), {"session": None, "origin": None})
+        self.db[LIVE_STATE].find_one.return_value = self.state
+        self.state["last_execution_session"] = "2026-10-23"
+        self.assertEqual(self.read(), {"session": None, "origin": None})
+        self.state["last_execution_session"] = "2026-10-20junk"
+        self.assertEqual(self.read(), {"session": None, "origin": None})
+
+    def test_cash_state_can_preserve_last_sale_without_manual_inference(self):
+        self.state.update({
+            "managed_symbol": "CASH", "managed_quantity": 0.0,
+            "last_execution_session": "2026-10-21",
+        })
+        self.assertEqual(self.read([]), {
+            "session": "2026-10-21", "origin": None,
+        })
 
 
 if __name__ == "__main__":
