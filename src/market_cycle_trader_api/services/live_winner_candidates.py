@@ -71,10 +71,22 @@ def latest_live_winner_decision(db: Any, *, account_id: str) -> dict[str, Any] |
             "status", "phase", "candidate_count",
         )
     }
+    status = str(run.get("status") or "")
+    action = str(run.get("action") or "")
+    if status == "manual_reconciled" and (run.get("manual_reconciliation") or {}).get("origin") == "manual_alpaca_fills":
+        execution_origin = "manual_alpaca_fills"
+    elif status == "completed" and action in {"hold", "stay_in_cash"}:
+        # A completed HOLD/CASH session means broker reconciliation succeeded,
+        # NOT that the executor submitted an order.
+        execution_origin = "live_no_orders"
+    elif status == "completed":
+        execution_origin = "live_broker"
+    else:
+        execution_origin = "live_not_executed"
     return {
         **{key: value for key, value in document.items() if value is not None},
         "plan_id": str(run.get("_id") or ""),
         "decision_origin": "live_winner_model",
-        "execution_origin": "live_not_executed" if run.get("status") != "completed" else "live_broker",
+        "execution_origin": execution_origin,
         "candidates": decision_candidates(document),
     }

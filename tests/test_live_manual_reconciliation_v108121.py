@@ -14,6 +14,7 @@ from market_cycle_trader_api.services.live_manual_reconciliation import (
 )
 
 SESSION = "2026-10-20"
+PRIOR = "2026-10-19"
 PREPARED = datetime(2026, 10, 20, 15, 11, tzinfo=timezone.utc)
 
 
@@ -35,9 +36,12 @@ class ManualReconciliationTests(unittest.TestCase):
             "execution_session": SESSION, "status": "recalibrated_no_orders",
             "action": "rotate", "target_asset": "CAPR", "current_asset": "MAN",
             "current_quantity": 2.668639053,
-            "decision_date": SESSION,
-            "analysis_mode": "live_current_session_intraday",
-            "market_open_calibration_completed_at": PREPARED,
+            "decision_date": PRIOR,
+            "historical_cutoff": PRIOR,
+            "analysis_mode": "previous_completed_session_daily",
+            "post_close_signal_ready": True,
+            "winner_signal_prepared": True,
+            "snapshot_sha256": "verified-daily-snapshot",
             "winner_strategy_id": "winner", "winner_revision": 2,
             "winner_configuration_hash": "hash",
         }
@@ -91,6 +95,8 @@ class ManualReconciliationTests(unittest.TestCase):
         self.assertEqual(result["buy_order_count"], 1)
         self.assertAlmostEqual(result["broker_quantity"], 16.890370370)
         self.assertEqual(len(result["confirmation_token"]), 64)
+        self.assertEqual(result["decision_date"], PRIOR)
+        self.assertEqual(result["signal_contract"], "previous_completed_session_daily")
         self.tables[LIVE_STATE].find_one_and_update.assert_not_called()
         self.tables[LIVE_RUNS].find_one_and_update.assert_not_called()
         self.broker.submit_order.assert_not_called()
@@ -115,6 +121,8 @@ class ManualReconciliationTests(unittest.TestCase):
         self.assertEqual(finished["execution_origin"], "manual_alpaca_fills")
         self.assertFalse(finished["order_submission_enabled"])
         self.assertEqual(len(finished["manual_reconciliation"]["order_ids"]), 4)
+        self.assertEqual(finished["manual_reconciliation"]["decision_date"], PRIOR)
+        self.assertEqual(finished["manual_reconciliation"]["signal_contract"], "previous_completed_session_daily")
         self.broker.submit_order.assert_not_called()
         self.broker.cancel_order_by_id.assert_not_called()
 
@@ -136,6 +144,39 @@ class ManualReconciliationTests(unittest.TestCase):
             "review_required",
         )
         self.broker.submit_order.assert_not_called()
+
+    def test_daily_signal_without_explicit_cutoff_compatibility(self):
+        # v10.8.124 post-close records did not carry analysis_mode/cutoff.
+        self.run.pop("historical_cutoff")
+        self.run.pop("analysis_mode")
+        self.assertEqual(
+            manual_reconciliation_preview(self.db, execution_session=SESSION)["status"],
+            "ready",
+        )
+
+    def test_old_intraday_plan_cannot_be_adopted_as_new_manual_reconciliation(self):
+        self.run["decision_date"] = SESSION
+        self.run["analysis_mode"] = "live_current_session_intraday"
+        self.run["market_open_calibration_completed_at"] = PREPARED
+        self.assertEqual(
+            manual_reconciliation_preview(self.db, execution_session=SESSION)["status"],
+            "blocked",
+        )
+        self.tables[LIVE_RUNS].find_one_and_update.assert_not_called()
+
+    def test_stale_daily_cutoff_blocks_reconciliation(self):
+        self.run["historical_cutoff"] = "2026-10-16"
+        self.assertEqual(
+            manual_reconciliation_preview(self.db, execution_session=SESSION)["status"],
+            "blocked",
+        )
+
+    def test_missing_provenance_sha_blocks_reconciliation(self):
+        self.run["snapshot_sha256"] = None
+        self.assertEqual(
+            manual_reconciliation_preview(self.db, execution_session=SESSION)["status"],
+            "blocked",
+        )
 
     def test_wrong_token_never_claims_session(self):
         with self.assertRaisesRegex(ManualReconciliationBlocked, "evidencia mudou"):
