@@ -1,3 +1,15 @@
+## 2026-10-22 — API v10.8.127 | última execução Live verificada e auditoria CAPR manual
+
+**Causa:** CAPR (16,89037037 ações, 20/10/2026) foi adquirido manualmente na Alpaca e devidamente classificado como `manual_alpaca_fills`; entretanto o endpoint de carteira Live retornava `last_execution_session=None` mesmo após conciliação. O snapshot da Alpaca está correto, mas a data não era exposta.
+
+**Alteração:** leitura somente informativa de `live_trader_strategy_state.last_execution_session` por conta, com data ISO não futura, comparação independente de símbolo e quantidade da posição Alpaca e origem manual somente se a última reconciliação corresponder à mesma sessão. Em divergência, devolve campos vazios, sem inferir origem automática. Preservados sinais Winner, executor e regras financeiras. Testes de mocks em `test_live_provenance_v108126.py` e ajuste do isolamento de `test_live_buying_power.py`.
+
+**Escopo:** sem submissões/cancelamentos à Alpaca, sem escrita de estado Live, sem alteração de estratégia, cálculos de lucro ou TCC/Paper. O retorno total permanece indefinido ante depósitos/saques. Auditoria inicial: `docs/audits/v10.8.127-live-winner-operational-initial.md`. Branch: `audit/v10.8.127-live-winner-operational`; PR #79; front relacionado: v10.7.39 PR #26.
+
+**Teste e implantação:** merge somente depois de CI verde e revisão; merge GitHub não comprova deploy no Railway. Verificar status da implantação separadamente.
+
+---
+
 ## 2026-10-22 — API v10.8.126 | conciliação manual D−1 e origem verificável de operações Live
 
 **Problema:** a API v10.8.125 removeu a recalibração intradiária obrigatória e passou a executar planos diários D−1, mas `live_manual_reconciliation.py` ainda exigia um plano `live_current_session_intraday` com `decision_date == execution_session`. Novas rotações manuais de emergência seriam bloqueadas mesmo com prova de fills na Alpaca. A operação MAN→CAPR de 20/10/2026 foi realizada manualmente; não se deve reclassificá-la como ordem automática nem refazer negociações.
