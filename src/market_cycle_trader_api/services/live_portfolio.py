@@ -111,8 +111,13 @@ def _verified_order_origins(db: Any, account_id: str, broker_orders: list[Any]) 
         for order in broker_orders:
             client_id = str(getattr(order, "client_order_id", "") or "")
             broker_id = str(getattr(order, "id", "") or "")
-            if client_id in verified_client_ids and broker_id not in origin:
-                origin[broker_id] = "live_automated_verified"
+            if client_id in verified_client_ids:
+                if broker_id in origin:
+                    # Conflicting manual receipt and robot ledger: do not
+                    # claim either provenance without human review.
+                    origin[broker_id] = "live_broker_unclassified"
+                else:
+                    origin[broker_id] = "live_automated_verified"
     return origin
 
 
