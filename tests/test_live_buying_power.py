@@ -23,7 +23,9 @@ class LiveBuyingPowerTests(unittest.TestCase):
         broker.get_clock.return_value = SimpleNamespace(
             timestamp=datetime(2026, 10, 19, 20, 10, tzinfo=timezone.utc), is_open=False, next_open=None, next_close=None,
         )
-        with patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None):
+        with (patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None),
+              patch("market_cycle_trader_api.services.live_portfolio._last_verified_live_execution",
+                    return_value={"session": None, "origin": None})):
             result = live_portfolio_snapshot(object())
         self.assertEqual(result["strategy_cash"], 108.25)
         self.assertEqual(result["buying_power"], 80)
@@ -43,7 +45,9 @@ class LiveBuyingPowerTests(unittest.TestCase):
         broker.get_clock.return_value = SimpleNamespace(
             timestamp=datetime(2026, 10, 19, 20, 10, tzinfo=timezone.utc), is_open=False, next_open=None, next_close=None,
         )
-        with patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None):
+        with (patch("market_cycle_trader_api.services.live_portfolio.latest_live_winner_decision", return_value=None),
+              patch("market_cycle_trader_api.services.live_portfolio._last_verified_live_execution",
+                    return_value={"session": None, "origin": None})):
             result = live_portfolio_snapshot(object())
         self.assertIsNone(result["buying_power"])
         self.assertIsNone(result["non_marginable_buying_power"])
