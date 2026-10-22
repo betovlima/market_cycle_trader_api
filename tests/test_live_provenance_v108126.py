@@ -25,6 +25,8 @@ def broker_order(order_id, client_id):
 class LiveOrderProvenanceTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
+        self.tables = {name: MagicMock() for name in (LIVE_RUNS, ORDER_LEDGER)}
+        self.db.__getitem__.side_effect = self.tables.__getitem__
         self.orders = [
             broker_order("manual-b1", "manual-123"),
             broker_order("auto-b1", "mct-live-buy-123"),
@@ -60,7 +62,7 @@ class LiveOrderProvenanceTests(unittest.TestCase):
         )
         self.db[LIVE_RUNS].update_one.assert_not_called()
 
-    def test_same_order_in_two_origins_prefers_manual_receipt_for_audit(self):
+    def test_contradictory_manual_and_automated_receipts_are_unclassified(self):
         self.db[LIVE_RUNS].find.return_value = [{
             "manual_reconciliation": {"order_ids": ["auto-b1"]},
         }]
