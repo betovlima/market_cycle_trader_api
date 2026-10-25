@@ -20,3 +20,8 @@ def replay_guest_request_allowed(method: str, path: str) -> bool:
     return path in {"/api/auth/session", "/api/analytics/backtests"} or bool(
         _BACKTEST_DETAIL.fullmatch(path)
     )
+
+
+def replay_guest_denied(role: str | None, method: str, path: str) -> bool:
+    """Leave all existing roles unchanged and deny guests outside replay."""
+    return role == "replay_guest" and not replay_guest_request_allowed(method, path)
