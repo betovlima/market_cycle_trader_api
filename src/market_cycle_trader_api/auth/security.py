@@ -65,6 +65,7 @@ class SessionManager:
         role = str(session.get("role") or "viewer")
         scope_by_role = {
             "viewer": "trader:read",
+            "replay_guest": "trader:read",
             "reviewer": "trader:read",
             "trader": "trader:read portfolio:read",
             "admin": "trader:read portfolio:read admin:manage",
@@ -120,7 +121,7 @@ class SessionManager:
 
         role = str(payload.get("role") or "")
         scope = str(payload.get("scope") or "")
-        if role not in {"admin", "viewer", "reviewer", "trader"} or "trader:read" not in scope.split():
+        if role not in {"admin", "viewer", "reviewer", "trader", "replay_guest"} or "trader:read" not in scope.split():
             raise HTTPException(status_code=401, detail="Invalid session.")
         identity = SessionIdentity(
             subject=str(payload.get("subject") or ""),
