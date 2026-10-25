@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 CAPABILITY_NAMES = (
+    "annual_replay.view",
     "dashboard.view",
     "dashboard.strategy_intelligence.view",
     "backtest.view",
@@ -35,9 +36,13 @@ CAPABILITY_NAMES = (
 )
 
 _ROLE_CAPABILITIES = {
+    "replay_guest": {
+        "annual_replay.view",
+    },
     "viewer": {
         "dashboard.view",
         "backtest.view",
+        "annual_replay.view",
         "tuning.view",
         "research_models.view",
         "temporal_intelligence.view",
@@ -48,6 +53,7 @@ _ROLE_CAPABILITIES = {
         "dashboard.view",
         "dashboard.strategy_intelligence.view",
         "backtest.view",
+        "annual_replay.view",
         "backtest.export",
         "research_models.view",
         "temporal_intelligence.view",
@@ -60,6 +66,7 @@ _ROLE_CAPABILITIES = {
         "dashboard.view",
         "dashboard.strategy_intelligence.view",
         "backtest.view",
+        "annual_replay.view",
         "backtest.start",
         "tuning.view",
         "research_models.view",
