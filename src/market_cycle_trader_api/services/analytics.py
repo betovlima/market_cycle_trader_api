@@ -372,6 +372,71 @@ def _equity_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
     return output
 
 
+
+def _decision_score_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
+    """Replay the model's persisted, pre-execution scores without recomputation.
+
+    Older jobs may contain top-1..3 only; never fabricate ranks four and five.
+    Scores are read from the selected PORTFOLIO prediction series, not from
+    realized returns or the broker's current market data.
+    """
+    projection = {
+        "_id": 0, "timestamp": 1, "decision_date": 1,
+        "current_asset": 1, "current_score": 1,
+        "best_asset": 1, "best_score": 1,
+        "finite_score_count": 1, "decision_reason": 1,
+        "final_action_asset": 1, "holding_days_at_decision": 1,
+        "effective_switch_margin": 1, "best_vs_current_gap": 1,
+        "min_hold_guard_applied": 1, "switch_margin_guard_applied": 1,
+        "cash_threshold_guard_applied": 1,
+        "minimum_expected_edge_guard_applied": 1,
+    }
+    for rank in range(1, 6):
+        projection[f"top_{rank}_asset"] = 1
+        projection[f"top_{rank}_score"] = 1
+
+    records = db[PREDICTIONS_COLLECTION].find(
+        {"job_id": job_id, "symbol": "PORTFOLIO", "backend": backend},
+        projection,
+    )
+    output: list[dict[str, Any]] = []
+    for raw in _sorted_rows(records, "timestamp"):
+        execution_date = _as_utc(raw.get("timestamp"))
+        if execution_date is None:
+            continue
+        top_scores: list[dict[str, Any]] = []
+        for rank in range(1, 6):
+            symbol = str(raw.get(f"top_{rank}_asset") or "").strip().upper()
+            utility = _as_float(raw.get(f"top_{rank}_score"))
+            if symbol and utility is not None:
+                top_scores.append({"asset": symbol, "score": utility})
+        current_score = _as_float(raw.get("current_score"))
+        best_score = _as_float(raw.get("best_score"))
+        if not top_scores and current_score is None and best_score is None:
+            continue  # This historical job never persisted comparable utilities.
+        count = _as_float(raw.get("finite_score_count"))
+        output.append({
+            "execution_date": iso_value(execution_date),
+            "decision_date": iso_value(raw.get("decision_date")),
+            "current_asset": raw.get("current_asset"),
+            "current_score": current_score,
+            "best_asset": raw.get("best_asset"),
+            "best_score": best_score,
+            "finite_score_count": int(count) if count is not None and count > 0 and count.is_integer() else None,
+            "decision_reason": raw.get("decision_reason"),
+            "final_action_asset": raw.get("final_action_asset"),
+            "holding_days_at_decision": raw.get("holding_days_at_decision"),
+            "effective_switch_margin": _as_float(raw.get("effective_switch_margin")),
+            "best_vs_current_gap": _as_float(raw.get("best_vs_current_gap")),
+            "min_hold_guard_applied": bool(raw.get("min_hold_guard_applied")),
+            "switch_margin_guard_applied": bool(raw.get("switch_margin_guard_applied")),
+            "cash_threshold_guard_applied": bool(raw.get("cash_threshold_guard_applied")),
+            "minimum_expected_edge_guard_applied": bool(raw.get("minimum_expected_edge_guard_applied")),
+            "top_scores": top_scores,
+        })
+    return output
+
+
 def _trade_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
     rows = db[TRADES_COLLECTION].find(
         {"job_id": job_id, "symbol": "PORTFOLIO", "backend": backend},
@@ -681,9 +746,11 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
             "holding_buckets": [],
             "trade_dependency": _trade_dependency([]),
             "rotations": [],
+            "decision_scores": [],
         }
 
     equity = _equity_rows(db, job_id, backend)
+    decision_scores = _decision_score_rows(db, job_id, backend)
     trades = _trade_rows(db, job_id, backend)
     sells = _completed_sells(trades)
     rotation_payload = admin_job_rotations(db, job_id)
@@ -704,6 +771,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
         "holding_buckets": _holding_buckets(sells),
         "trade_dependency": _trade_dependency(sells),
         "rotations": rotations,
+        "decision_scores": decision_scores,
     }
     _assert_strategy_neutral(payload)
     return payload
