@@ -54,6 +54,58 @@ U56_COUNT = 56
 U67_COUNT = 67
 
 
+def _replay_ranked_policy(
+    policy: Callable[[pd.Timestamp, int, int], tuple[int, float]],
+    *,
+    diagnostics: dict[pd.Timestamp, dict[str, Any]],
+    utility_cache: dict[pd.Timestamp, np.ndarray],
+    symbols: list[str],
+) -> Callable[[pd.Timestamp, int, int], tuple[int, float]]:
+    """Record ranks 4/5 from existing fold predictions, without changing policy.
+
+    The frozen scientific policy already computes the top three. Reuse its
+    recorded diagnostics, then append the remaining genuine cached utilities.
+    No model is refitted, no prediction is repeated, and no decision is changed.
+    """
+    def traced(
+        timestamp: pd.Timestamp,
+        current_position: int,
+        holding_days: int,
+    ) -> tuple[int, float]:
+        action = policy(timestamp, current_position, holding_days)
+        date = pd.Timestamp(timestamp)
+        row = diagnostics.get(date)
+        scores = utility_cache.get(date)
+        if row is None or scores is None or len(scores) != len(symbols) + 1:
+            return action
+
+        ranked = sorted(
+            (
+                (symbol, float(scores[position]))
+                for position, symbol in enumerate(symbols, start=1)
+                if np.isfinite(scores[position])
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        # Protect against a mismatch between cached values and the frozen
+        # model: never attach fourth/fifth ranks to an inconsistent top three.
+        for rank, (asset, score) in enumerate(ranked[:3], start=1):
+            existing = row.get(f"top_{rank}_score")
+            if (
+                row.get(f"top_{rank}_asset") != asset
+                or existing is None
+                or not np.isclose(float(existing), score, rtol=0.0, atol=1e-12)
+            ):
+                return action
+
+        for rank, (asset, score) in enumerate(ranked[3:5], start=4):
+            row[f"top_{rank}_asset"] = asset
+            row[f"top_{rank}_score"] = score
+        return action
+
+    return traced
+
+
 def _value(config: Any, name: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(name, default)
@@ -386,6 +438,7 @@ def run_tcc_u67_operational_backtest(
     )
 
     policies: dict[int, Callable] = {}
+    replay_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
     fold_count = len(folds)
     candidate_margins = tuple(
         float(value)
@@ -503,15 +556,21 @@ def run_tcc_u67_operational_backtest(
             decision_dates,
             config_u67,
         )
-        policies[fold_id] = _politica_utilidade(
-            final_models,
-            frames,
-            symbols,
-            config_u67,
-            effective_margin,
-            fold_id=fold_id,
-            calibrated_switch_margin=selected_margin,
+        policies[fold_id] = _replay_ranked_policy(
+            _politica_utilidade(
+                final_models,
+                frames,
+                symbols,
+                config_u67,
+                effective_margin,
+                decision_diagnostics=replay_decision_diagnostics,
+                fold_id=fold_id,
+                calibrated_switch_margin=selected_margin,
+                utility_cache=decision_cache,
+            ),
+            diagnostics=replay_decision_diagnostics,
             utility_cache=decision_cache,
+            symbols=symbols,
         )
 
     scheduled = _politica_agendada(
@@ -528,6 +587,7 @@ def run_tcc_u67_operational_backtest(
         calcular_taxas_referencia,
         aplicar_deslizamento,
         decision_metadata=decision_metadata,
+        policy_decision_diagnostics=replay_decision_diagnostics,
         trade_callback=trade_callback,
         model_label=(
             "TCC U67+10 Static Challenger v1.4.1"
