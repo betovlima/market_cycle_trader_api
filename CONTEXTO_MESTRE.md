@@ -1,6 +1,6 @@
 ## 2026-10-25 — API v10.8.128 | diagnóstico diário de utilidades no replay
 
-O endpoint autenticado de analytics do Backtest expõe `decision_scores[]` a partir das previsões persistidas, alinhado por data de execução, com utilidades, margem e ranking top-3 legado/top-5 novo. O motor geral registra top-5 e o U67 recebe wrapper de diagnóstico sobre cache sem modificar a referência científica vendorizada ou seus SOURCE_BLOBS. Segurança, isolamento Live/Paper, operações, modelo e regras de decisão permanecem intactos. Branch `feature/v10.8.128-backtest-replay-utility-scores`; ver `docs/changes/v10.8.128-replay-decision-scores.md`. CI + PR antes de merge.
+O endpoint autenticado de analytics do Backtest expõe `decision_scores[]` a partir das previsões persistidas, alinhado por data de execução, com utilidades, margem e ranking top-3 legado/top-5 novo. O motor genérico de rotação passa a registrar até cinco candidatos, independentemente de nomes de métodos legados ou tamanho do universo. O universo atual informado é de 75 ativos; a leitura é parametrizada pelos registros de cada backtest. Nenhum motor ou referência científica legada foi modificado. Segurança, isolamento Live/Paper, operações, modelo e regras de decisão permanecem intactos. Branch `feature/v10.8.128-backtest-replay-utility-scores`; ver `docs/changes/v10.8.128-replay-decision-scores.md`. CI + PR antes de merge.
 
 ---
 
