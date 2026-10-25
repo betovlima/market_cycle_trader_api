@@ -2446,7 +2446,7 @@ def _iqn_policy(
             ),
             "raw_action_asset": labels[raw_action],
         }
-        for rank in range(3):
+        for rank in range(5):
             asset, score = ranked[rank] if rank < len(ranked) else (None, None)
             decision_diagnostics[pd.Timestamp(timestamp)][f"top_{rank + 1}_asset"] = asset
             decision_diagnostics[pd.Timestamp(timestamp)][f"top_{rank + 1}_score"] = score
