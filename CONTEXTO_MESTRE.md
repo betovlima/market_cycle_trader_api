@@ -1,3 +1,9 @@
+## 2026-10-25 — API v10.8.128 | diagnóstico diário de utilidades no replay
+
+O endpoint autenticado de analytics do Backtest expõe `decision_scores[]` a partir das previsões persistidas, alinhado por data de execução, com utilidades, margem e ranking top-3 legado/top-5 novo. O motor geral registra top-5 e o U67 recebe wrapper de diagnóstico sobre cache sem modificar a referência científica vendorizada ou seus SOURCE_BLOBS. Segurança, isolamento Live/Paper, operações, modelo e regras de decisão permanecem intactos. Branch `feature/v10.8.128-backtest-replay-utility-scores`; ver `docs/changes/v10.8.128-replay-decision-scores.md`. CI + PR antes de merge.
+
+---
+
 ## 2026-10-22 — API v10.8.127 | última execução Live verificada e auditoria CAPR manual
 
 **Causa:** CAPR (16,89037037 ações, 20/10/2026) foi adquirido manualmente na Alpaca e devidamente classificado como `manual_alpaca_fills`; entretanto o endpoint de carteira Live retornava `last_execution_session=None` mesmo após conciliação. O snapshot da Alpaca está correto, mas a data não era exposta.
