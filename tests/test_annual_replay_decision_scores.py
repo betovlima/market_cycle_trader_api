@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import unittest
+
+import numpy as np
+import pandas as pd
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from market_cycle_trader_api.services.analytics import _decision_score_rows
+from market_cycle_trader_api.engine.tcc_u67_operational_runtime import _observe_five_cached_utilities
 
 
 def ts(day: int) -> datetime:
@@ -63,6 +67,26 @@ class ReplayDecisionScoresTests(unittest.TestCase):
         output = _decision_score_rows(db, "job-3", "model-3")
         self.assertEqual(len(output), 1)
         self.assertEqual(output[0]["top_scores"], [{"asset": "AAPL", "score": 0.0}])
+
+    def test_protected_u67_instrumentation_does_not_change_policy_output(self):
+        decision_at = pd.Timestamp(ts(2))
+        diagnostics = {}
+
+        def scientific_policy(timestamp, holding, days):
+            diagnostics[pd.Timestamp(timestamp)] = {
+                "decision_reason": "HOLD_CURRENT_BEST",
+                "top_1_asset": "AVGO",
+                "top_1_score": 0.5,
+            }
+            return 1, 0.5
+
+        symbols = ["AVGO", "LLY", "TSLA", "NVDA", "AAPL", "MSFT"]
+        cache = {decision_at: np.asarray([0.0, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05])}
+        observed = _observe_five_cached_utilities(scientific_policy, cache, symbols, diagnostics)
+        self.assertEqual(observed(decision_at, 1, 3), (1, 0.5))
+        self.assertEqual(diagnostics[decision_at]["top_4_asset"], "NVDA")
+        self.assertEqual(diagnostics[decision_at]["top_5_score"], 0.1)
+
 
 
 if __name__ == "__main__":
