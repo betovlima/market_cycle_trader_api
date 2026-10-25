@@ -1,3 +1,9 @@
+## 2026-10-25 — API v10.8.130 | Acesso do professor e navegação
+
+Professor Annual Replay-only: novo papel `replay_guest` para convite com Google autorizado, único capability `annual_replay.view`, bloqueio HTTP no servidor para todos os caminhos exceto sessão/logout/listagem e analytics do replay. Sem alteração da política, das previsões, de backtests ou de dados Live/Paper. Requer frontend v10.7.44. Testes adicionados em `tests/test_replay_guest_access_v108130.py`. Documentação `docs/changes/v10.8.130-professor-annual-replay-only.md`.
+
+---
+
 ## 2026-10-25 — API v10.8.129 | correção de pontuações U67/U77 no Backtest Replay
 
 **Causa:** o adaptador do motor científico congelado U67/U77 não passava os diagnósticos de utilidade da política para a simulação. **Correção:** conectar os diagnósticos no adaptador e anexar top-4/top-5 usando somente o cache já calculado do mesmo fold, após conferir top-3 com o motor original. Sem alterações nas decisões, nos arquivos científicos, no Live/Paper ou no frontend v10.7.43. Execuções antigas sem pontuações precisam ser refeitas como novos jobs, sem sobrescrever o histórico. Branch `feature/v10.8.129-backtest-u67-u77-replay-scores`; documentação em `docs/changes/v10.8.129-backtest-u67-u77-replay-scores.md`. Validar CI e novo job antes de afirmar funcionamento em produção.
