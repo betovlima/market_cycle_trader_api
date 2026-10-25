@@ -1,3 +1,9 @@
+## 2026-10-25 — API v10.8.129 | correção de pontuações U67/U77 no Backtest Replay
+
+**Causa:** o adaptador do motor científico congelado U67/U77 não passava os diagnósticos de utilidade da política para a simulação. **Correção:** conectar os diagnósticos no adaptador e anexar top-4/top-5 usando somente o cache já calculado do mesmo fold, após conferir top-3 com o motor original. Sem alterações nas decisões, nos arquivos científicos, no Live/Paper ou no frontend v10.7.43. Execuções antigas sem pontuações precisam ser refeitas como novos jobs, sem sobrescrever o histórico. Branch `feature/v10.8.129-backtest-u67-u77-replay-scores`; documentação em `docs/changes/v10.8.129-backtest-u67-u77-replay-scores.md`. Validar CI e novo job antes de afirmar funcionamento em produção.
+
+---
+
 ## 2026-10-25 — API v10.8.128 | diagnóstico diário de utilidades no replay
 
 O endpoint autenticado de analytics do Backtest expõe `decision_scores[]` a partir das previsões persistidas, alinhado por data de execução, com utilidades, margem e ranking top-3 legado/top-5 novo. O motor genérico de rotação passa a registrar até cinco candidatos, independentemente de nomes de métodos legados ou tamanho do universo. O universo atual informado é de 75 ativos; a leitura é parametrizada pelos registros de cada backtest. Nenhum motor ou referência científica legada foi modificado. Segurança, isolamento Live/Paper, operações, modelo e regras de decisão permanecem intactos. Branch `feature/v10.8.128-backtest-replay-utility-scores`; ver `docs/changes/v10.8.128-replay-decision-scores.md`. CI + PR antes de merge.
