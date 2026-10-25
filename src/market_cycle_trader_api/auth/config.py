@@ -56,6 +56,7 @@ class AuthSettings:
     def session_max_age_for_role(self, role: str) -> int:
         return {
             "viewer": self.viewer_session_max_age_seconds,
+            "replay_guest": self.viewer_session_max_age_seconds,
             "reviewer": self.viewer_session_max_age_seconds,
             "trader": self.trader_session_max_age_seconds,
             "admin": self.admin_session_max_age_seconds,
@@ -64,6 +65,7 @@ class AuthSettings:
     def session_idle_for_role(self, role: str) -> int:
         return {
             "viewer": self.viewer_session_idle_seconds,
+            "replay_guest": self.viewer_session_idle_seconds,
             "reviewer": self.viewer_session_idle_seconds,
             "trader": self.trader_session_idle_seconds,
             "admin": self.admin_session_idle_seconds,
