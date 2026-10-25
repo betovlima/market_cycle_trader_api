@@ -536,7 +536,7 @@ class AccessService:
                 detail="This Google account does not have active access to Market Cycle Trader.",
             )
 
-        role_priority = {"viewer": 1, "trader": 2, "admin": 3}
+        role_priority = {"replay_guest": 0, "viewer": 1, "trader": 2, "admin": 3}
         return max(
             active,
             key=lambda item: (
@@ -556,7 +556,7 @@ class AccessService:
         if invitation_expires_at is None or invitation_expires_at <= now:
             raise HTTPException(status_code=401, detail="Access expired or revoked.")
         role = str(document.get("role") or "viewer")
-        if role not in {"viewer", "trader", "admin"}:
+        if role not in {"viewer", "trader", "admin", "replay_guest"}:
             raise HTTPException(status_code=401, detail="Invalid access role.")
         absolute_lifetime = self.settings.session_max_age_for_role(role)
         idle_lifetime = self.settings.session_idle_for_role(role)
