@@ -289,39 +289,6 @@ def _scientific_config(
     return config.copiar_modelo(update=updates) if updates else config
 
 
-def _observe_five_cached_utilities(
-    policy: Callable,
-    utility_cache: dict[pd.Timestamp, np.ndarray],
-    symbols: list[str],
-    diagnostics: dict[pd.Timestamp, dict[str, Any]],
-) -> Callable:
-    """Add top-4/5 to persisted diagnostics without modifying the pinned TCC engine.
-
-    Cached decision-date utilities were computed in the normal backtest. This
-    wrapper makes no new model predictions, no changes to target weights or
-    rotation thresholds, and does not modify the frozen TCC source blobs.
-    """
-    def observed(timestamp: pd.Timestamp, current_position: int, holding_days: int):
-        result = policy(timestamp, current_position, holding_days)
-        key = pd.Timestamp(timestamp)
-        diagnostic = diagnostics.get(key)
-        cached = utility_cache.get(key)
-        if diagnostic is not None and cached is not None:
-            utilities = np.asarray(cached, dtype=np.float64)
-            eligible = sorted(
-                (index for index in range(1, min(len(utilities), len(symbols) + 1))
-                 if np.isfinite(utilities[index])),
-                key=lambda index: (-float(utilities[index]), symbols[index - 1]),
-            )
-            for rank in (4, 5):
-                if len(eligible) >= rank:
-                    position = eligible[rank - 1]
-                    diagnostic[f"top_{rank}_asset"] = symbols[position - 1]
-                    diagnostic[f"top_{rank}_score"] = float(utilities[position])
-        return result
-    return observed
-
-
 def run_tcc_u67_operational_backtest(
     bars_by_symbol: dict[str, pd.DataFrame],
     base_config: Any,
@@ -419,7 +386,6 @@ def run_tcc_u67_operational_backtest(
     )
 
     policies: dict[int, Callable] = {}
-    replay_decision_diagnostics: dict[pd.Timestamp, dict[str, Any]] = {}
     fold_count = len(folds)
     candidate_margins = tuple(
         float(value)
@@ -537,7 +503,7 @@ def run_tcc_u67_operational_backtest(
             decision_dates,
             config_u67,
         )
-        base_policy = _politica_utilidade(
+        policies[fold_id] = _politica_utilidade(
             final_models,
             frames,
             symbols,
@@ -546,10 +512,6 @@ def run_tcc_u67_operational_backtest(
             fold_id=fold_id,
             calibrated_switch_margin=selected_margin,
             utility_cache=decision_cache,
-            decision_diagnostics=replay_decision_diagnostics,
-        )
-        policies[fold_id] = _observe_five_cached_utilities(
-            base_policy, decision_cache, symbols, replay_decision_diagnostics,
         )
 
     scheduled = _politica_agendada(
@@ -566,7 +528,6 @@ def run_tcc_u67_operational_backtest(
         calcular_taxas_referencia,
         aplicar_deslizamento,
         decision_metadata=decision_metadata,
-        policy_decision_diagnostics=replay_decision_diagnostics,
         trade_callback=trade_callback,
         model_label=(
             "TCC U67+10 Static Challenger v1.4.1"
