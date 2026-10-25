@@ -47,7 +47,7 @@ from .milp_decision.router import router as milp_decision_router
 from .decision_science.router import router as decision_science_router
 from .roc_decision_policy.router import router as roc_decision_policy_router
 from .auth.config import get_auth_settings
-from .auth.replay_guest import replay_guest_request_allowed
+from .auth.replay_guest import replay_guest_denied
 from .auth.security import SESSION_COOKIE_NAME, get_session_manager, require_admin_session, require_backtest_access, require_capability, require_portfolio_session, require_trader_access, require_trader_session
 from .auth.access_service import get_access_service
 from .auth.reviewer_access_service import get_reviewer_access_service
@@ -123,8 +123,8 @@ def create_app() -> FastAPI:
             except HTTPException:
                 # Normal authentication dependencies handle expired/invalid tokens.
                 identity = None
-            if identity is not None and identity.role == "replay_guest":
-                if not replay_guest_request_allowed(request.method, request.url.path):
+            if identity is not None:
+                if replay_guest_denied(identity.role, request.method, request.url.path):
                     return JSONResponse(
                         status_code=403,
                         content={"detail": "Only Annual Replay is available for this account."},
