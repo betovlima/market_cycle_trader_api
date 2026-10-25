@@ -11,7 +11,7 @@ class InvitationCreateRequest(BaseModel):
 
     guest_name: str = Field(min_length=1, max_length=120)
     authorized_email: EmailStr
-    role: Literal["viewer", "trader", "admin"] = "viewer"
+    role: Literal["viewer", "trader", "admin", "replay_guest"] = "viewer"
     duration_seconds: int = Field(ge=300, le=31_536_000)
     max_active_sessions: int | None = Field(default=None, ge=1, le=5)
 
