@@ -862,7 +862,7 @@ def _utility_policy(
             expected_edge_guard: bool = False,
         ) -> tuple[int, float]:
             if decision_diagnostics is not None:
-                top = ranked_positions[:3]
+                top = ranked_positions[:5]
                 final_cash_edge = (
                     float(cash_edges[target_position])
                     if target_position > 0 and np.isfinite(cash_edges[target_position])
@@ -982,7 +982,7 @@ def _utility_policy(
                     'q_gap_best_vs_second': best_vs_second_gap,
                     'raw_action_asset': position_asset(best),
                 }
-                for rank in range(3):
+                for rank in range(5):
                     position = top[rank] if rank < len(top) else 0
                     asset = symbols[position - 1] if position > 0 else None
                     score = float(utilities[position]) if position > 0 else None
@@ -1333,7 +1333,7 @@ def _optimized_policy(
                 if np.isfinite(utilities[position])
             ]
             finite_scores.sort(key=lambda item: (-item[1], item[0]))
-            top = finite_scores[:3]
+            top = finite_scores[:5]
             target_weights = {symbol: float(decision.weights.get(symbol, 0.0)) for symbol in symbols}
             diagnostic = {
                 "decision_diagnostics_schema_version": 10 if concentrated_allocation_enabled(config) else 9,
@@ -1382,6 +1382,10 @@ def _optimized_policy(
                 "top_2_score": top[1][1] if len(top) > 1 else None,
                 "top_3_asset": top[2][0] if len(top) > 2 else None,
                 "top_3_score": top[2][1] if len(top) > 2 else None,
+                "top_4_asset": top[3][0] if len(top) > 3 else None,
+                "top_4_score": top[3][1] if len(top) > 3 else None,
+                "top_5_asset": top[4][0] if len(top) > 4 else None,
+                "top_5_score": top[4][1] if len(top) > 4 else None,
             }
             decision_diagnostics[pd.Timestamp(timestamp)] = diagnostic
         return decision
@@ -2141,6 +2145,10 @@ def _simulate_exact(backend: str, policy: Callable[[pd.Timestamp, int, int], tup
                 'top_2_score',
                 'top_3_asset',
                 'top_3_score',
+                'top_4_asset',
+                'top_4_score',
+                'top_5_asset',
+                'top_5_score',
                 'current_asset_rank',
                 'universe_score_mean',
                 'universe_score_std',
