@@ -350,6 +350,7 @@ def _equity_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
             "timestamp": 1,
             "strategy_equity": 1,
             "buy_hold_equity": 1,
+            "selected_asset": 1,
         },
     )
     output: list[dict[str, Any]] = []
@@ -366,6 +367,13 @@ def _equity_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
                 "timestamp": iso_value(row.get("timestamp")),
                 "simulation_equity": strategy,
                 "reference_equity": reference,
+                # The engine records the actual asset held at this session close;
+                # unlike a signal decided at close(t), it cannot be shifted to t+1.
+                # Historical rows lacking the field remain unknown (not CASH).
+                "selected_asset": (
+                    str(row["selected_asset"]).strip().upper()
+                    if str(row.get("selected_asset") or "").strip() else None
+                ),
                 "drawdown": drawdown,
             }
         )
