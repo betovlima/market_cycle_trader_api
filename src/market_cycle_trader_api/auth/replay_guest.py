@@ -9,8 +9,8 @@ import re
 _BACKTEST_DETAIL = re.compile(r"^/api/analytics/backtests/[^/]+$")
 _REPLAY_FILES = re.compile(
     r"^/api/analytics/backtests/[^/]+/files(?:/"
-    r"(?:equity_history\\.csv|rotations\\.csv|decision_scores\\.csv|"
-    r"metrics\\.json|analytics\\.json|manifest\\.json|package\\.zip))?$"
+    r"(?:equity_history\.csv|rotations\.csv|decision_scores\.csv|"
+    r"metrics\.json|analytics\.json|manifest\.json|package\.zip))?$"
 )
 
 
