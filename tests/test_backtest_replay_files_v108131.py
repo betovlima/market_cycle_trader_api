@@ -7,6 +7,10 @@ from io import BytesIO, StringIO
 import json
 import unittest
 from zipfile import ZipFile
+from unittest.mock import patch
+
+from fastapi import HTTPException
+from market_cycle_trader_api.api.routers import analytics as analytics_router
 
 from market_cycle_trader_api.services.backtest_replay_files import (
     PUBLIC_FILES, available_backtest_files, backtest_file,
@@ -84,6 +88,45 @@ class ReplayFilesTests(unittest.TestCase):
         with ZipFile(BytesIO(backtest_file(data, "package.zip")[0])) as archive:
             self.assertNotIn("decision_scores.csv", archive.namelist())
             self.assertNotIn("rotations.csv", archive.namelist())
+
+    def test_historical_completed_backtest_exports_without_new_execution(self):
+        # Simulate an old completed job with persisted equity but no decision scores.
+        # Neither route has a dependency on when the backtest was run.
+        old = sample("historic-2020")
+        old["created_at"] = "2020-01-01T00:00:00Z"
+        old["decision_scores"] = []
+        self.assertIn(
+            "/api/analytics/backtests/{job_id}/files",
+            {route.path for route in analytics_router.router.routes},
+        )
+        self.assertIn(
+            "/api/analytics/backtests/{job_id}/files/{filename}",
+            {route.path for route in analytics_router.router.routes},
+        )
+        with patch.object(analytics_router, "database", return_value=object()), patch.object(
+            analytics_router, "backtest_analytics", return_value=old,
+        ) as analytics:
+            listing = analytics_router.list_backtest_replay_files("historic-2020", object())
+            self.assertEqual(listing["job_id"], "historic-2020")
+            names = {item["name"] for item in listing["files"]}
+            self.assertIn("equity_history.csv", names)
+            self.assertIn("package.zip", names)
+            self.assertNotIn("decision_scores.csv", names)
+            response = analytics_router.download_backtest_replay_file(
+                "historic-2020", "package.zip", object()
+            )
+            with ZipFile(BytesIO(response.body)) as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+                self.assertEqual(manifest["job_id"], "historic-2020")
+                self.assertEqual(manifest["created_at"], "2020-01-01T00:00:00Z")
+                self.assertIn("equity_history.csv", archive.namelist())
+                self.assertNotIn("decision_scores.csv", archive.namelist())
+            self.assertEqual(analytics.call_count, 2)
+            with self.assertRaises(HTTPException) as error:
+                analytics_router.download_backtest_replay_file(
+                    "historic-2020", "unknown.csv", object()
+                )
+            self.assertEqual(error.exception.status_code, 404)
 
     def test_whitelist_and_formula_safety(self):
         data = sample("../../bad")
