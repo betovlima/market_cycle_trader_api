@@ -31,11 +31,22 @@ class ProfessorReplayAccessTests(unittest.TestCase):
         self.assertTrue(replay_guest_request_allowed("POST", "/api/auth/logout"))
         self.assertTrue(replay_guest_request_allowed("GET", "/api/analytics/backtests"))
         self.assertTrue(replay_guest_request_allowed("GET", "/api/analytics/backtests/job-123"))
+        self.assertTrue(replay_guest_request_allowed("GET", "/api/analytics/backtests/job-123/files"))
+        for filename in ("equity_history.csv", "rotations.csv", "decision_scores.csv",
+                         "metrics.json", "analytics.json", "manifest.json", "package.zip"):
+            self.assertTrue(replay_guest_request_allowed(
+                "GET", "/api/analytics/backtests/job-123/files/" + filename
+            ))
         for method, path in (
             ("GET", "/api/dashboard/summary"),
             ("GET", "/api/jobs"),
             ("POST", "/api/jobs"),
             ("GET", "/api/analytics/backtests/job-123/rotation-period"),
+            ("GET", "/api/analytics/backtests/job-123/files/secret.txt"),
+            ("GET", "/api/analytics/backtests/job-123/files/../../secrets"),
+            ("GET", "/api/analytics/backtests/job-123/files/package.zip/extra"),
+            ("POST", "/api/analytics/backtests/job-123/files"),
+            ("DELETE", "/api/analytics/backtests/job-123/files/rotations.csv"),
             ("GET", "/api/analytics/portfolio"),
             ("GET", "/api/analytics/processings"),
             ("GET", "/api/admin/invitations"),
