@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 
 from ...auth.security import SessionIdentity, require_portfolio_session, require_trader_session
 from ...core.runtime import database
+from ...services.backtest_replay_files import available_backtest_files, backtest_file
 from ...services.analytics import (
     backtest_analytics,
     completed_backtests,
@@ -57,6 +59,31 @@ def list_completed_backtests(
 @router.get("/backtests/{job_id}")
 def get_backtest_analytics(job_id: str, _: AuthenticatedSession) -> dict[str, Any]:
     return backtest_analytics(database(), job_id)
+
+
+@router.get("/backtests/{job_id}/files")
+def list_backtest_replay_files(job_id: str, _: AuthenticatedSession) -> dict[str, Any]:
+    """Metadata for downloads belonging to this completed backtest only."""
+    return available_backtest_files(backtest_analytics(database(), job_id))
+
+
+@router.get("/backtests/{job_id}/files/{filename}")
+def download_backtest_replay_file(job_id: str, filename: str, _: AuthenticatedSession) -> Response:
+    """Allowlisted historical records only; no arbitrary disk paths."""
+    analytics = backtest_analytics(database(), job_id)
+    try:
+        content, media_type, download_name = backtest_file(analytics, filename)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="File unavailable for selected backtest.") from None
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/backtests/{job_id}/rotation-period")
