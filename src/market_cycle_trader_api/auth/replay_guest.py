@@ -7,6 +7,11 @@ from __future__ import annotations
 import re
 
 _BACKTEST_DETAIL = re.compile(r"^/api/analytics/backtests/[^/]+$")
+_REPLAY_FILES = re.compile(
+    r"^/api/analytics/backtests/[^/]+/files(?:/"
+    r"(?:equity_history\\.csv|rotations\\.csv|decision_scores\\.csv|"
+    r"metrics\\.json|analytics\\.json|manifest\\.json|package\\.zip))?$"
+)
 
 
 def replay_guest_request_allowed(method: str, path: str) -> bool:
@@ -18,7 +23,7 @@ def replay_guest_request_allowed(method: str, path: str) -> bool:
     if operation != "GET":
         return False
     return path in {"/api/auth/session", "/api/analytics/backtests"} or bool(
-        _BACKTEST_DETAIL.fullmatch(path)
+        _BACKTEST_DETAIL.fullmatch(path) or _REPLAY_FILES.fullmatch(path)
     )
 
 
