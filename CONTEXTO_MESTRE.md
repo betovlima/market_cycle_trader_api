@@ -1,3 +1,9 @@
+## 2026-10-30 — API v10.8.132 | Winner Live: janela pós-fechamento SIP
+
+**Correção:** o scheduler agora só inicia a preparação normal de dados RAW/SIP, treinamento e decisão de rotação depois de XNYS fechar + 20 minutos e antes da abertura da próxima sessão, conforme relógio da Alpaca e calendário oficial (inclui feriados e fechamentos antecipados). Antes da janela, registra no máximo um evento informativo `signal_waiting_for_daily_bar` por sessão/processo, sem gerar tentativas de download ou erros repetidos. A abertura mantém execução do sinal diário D−1 persistido; a recuperação excepcional de sinal ausente não foi modificada.
+
+**Origem:** exportação da sessão de 30/10/2026, com 19 falhas previsíveis `RuntimeError` no download antes de 20:20 UTC de 29/10, seguidas por preparação válida. Sem alteração de estratégia, resultado financeiro, ordem, broker, papel ou frontend. Testes em `tests/test_live_post_close_sip_window_v108132.py` e `tests/test_live_regular_hours_scheduler_v108124.py`. Detalhes em `docs/changes/v10.8.132-live-post-close-sip-window.md`.
+
 ## 2026-10-25 — API v10.8.130 | Acesso do professor e navegação
 
 Professor Annual Replay-only: novo papel `replay_guest` para convite com Google autorizado, único capability `annual_replay.view`, bloqueio HTTP no servidor para todos os caminhos exceto sessão/logout/listagem e analytics do replay. Sem alteração da política, das previsões, de backtests ou de dados Live/Paper. Requer frontend v10.7.44. Testes adicionados em `tests/test_replay_guest_access_v108130.py`. Documentação `docs/changes/v10.8.130-professor-annual-replay-only.md`.

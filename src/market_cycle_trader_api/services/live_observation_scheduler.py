@@ -13,6 +13,7 @@ import exchange_calendars as xcals
 import pandas as pd
 
 from ..core.runtime import database
+from ..engine.market_data import SAFE_DAILY_BAR_DELAY_MINUTES
 from ..infrastructure.trading.alpaca_live import create_live_readonly_client
 from .live_control import live_control_status
 from .live_portfolio import live_portfolio_snapshot
@@ -64,6 +65,43 @@ def _regular_xnys_session_open(
     except (TypeError, ValueError, OverflowError):
         # Incomplete/unparseable provider timestamps must never arm real orders.
         return False
+
+
+def _post_close_daily_preparation_window(
+    *, session: str, broker_timestamp: Any,
+) -> tuple[str, str | None, str | None]:
+    """Return readiness for prior-session SIP data before the next XNYS open.
+
+    Uses the Alpaca broker observation timestamp, official XNYS schedule,
+    and the SAME 20-minute data guard as the daily historical downloader.
+    A missing or invalid clock fails closed; no trading operation is involved.
+    """
+    try:
+        now = pd.Timestamp(broker_timestamp)
+        target = pd.Timestamp(session)
+        if pd.isna(now) or now.tzinfo is None or target.tzinfo is not None:
+            return "outside_window", None, None
+        now = now.tz_convert("UTC")
+        calendar = xcals.get_calendar("XNYS")
+        if not calendar.is_session(target):
+            return "outside_window", None, None
+        previous = calendar.previous_session(target)
+        previous_close = calendar.session_close(previous).tz_convert("UTC")
+        next_open = calendar.session_open(target).tz_convert("UTC")
+        ready_at = previous_close + pd.Timedelta(
+            minutes=SAFE_DAILY_BAR_DELAY_MINUTES,
+        )
+        if now < previous_close or now >= next_open:
+            return "outside_window", None, None
+        if now < ready_at:
+            return (
+                "waiting_for_daily_bar",
+                previous.date().isoformat(),
+                ready_at.isoformat(),
+            )
+        return "ready", previous.date().isoformat(), ready_at.isoformat()
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return "outside_window", None, None
 
 
 def _fresh_regular_live_execution_window(session: str) -> bool:
@@ -119,6 +157,7 @@ class LiveObservationScheduler:
         self._last_error: str | None = None
         self._last_error_fingerprint: str | None = None
         self._last_observed_at: str | None = None
+        self._last_daily_wait_session: str | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -159,14 +198,40 @@ class LiveObservationScheduler:
                         "waiting_for_winner_signal", "recalibrated_no_orders",
                         "preparing_signal",
                     }):
-                        stage = "signal_preparation"
-                        execute_monitored_live_stage(
-                            db, session=armed["execution_session"],
-                            stage="post_close_calculation",
-                            operation=lambda: prepare_live_winner_signal(
-                                db, armed["execution_session"]
-                            ),
+                        # Post-close D-1 signal is built only after a completed
+                        # SIP daily bar is safe, and strictly before D's open.
+                        readiness, cutoff, ready_at = _post_close_daily_preparation_window(
+                            session=armed["execution_session"],
+                            broker_timestamp=result["recorded_at"],
                         )
+                        if readiness == "waiting_for_daily_bar":
+                            # This is normal provider availability, not an error
+                            # or a preparation attempt. Emit at most one notice
+                            # per session in this observer process.
+                            session = armed["execution_session"]
+                            if (armed.get("status") == "waiting_for_winner_signal"
+                                and self._last_daily_wait_session != session):
+                                run = db[LIVE_RUNS].find_one(
+                                    {"execution_session": session}
+                                ) or {}
+                                if run.get("live_account_id"):
+                                    append_live_event(
+                                        db, account_id=run["live_account_id"],
+                                        session=session,
+                                        stage="signal_waiting_for_daily_bar",
+                                        message="Aguardando a janela segura do candle diario SIP.",
+                                        details={"cutoff": cutoff, "retry_after": ready_at},
+                                    )
+                                self._last_daily_wait_session = session
+                        elif readiness == "ready":
+                            stage = "signal_preparation"
+                            execute_monitored_live_stage(
+                                db, session=armed["execution_session"],
+                                stage="post_close_calculation",
+                                operation=lambda: prepare_live_winner_signal(
+                                    db, armed["execution_session"]
+                                ),
+                            )
                     elif (armed.get("status") in {
                         "waiting_for_winner_signal", "recalibrated_no_orders",
                         "waiting_for_open_recalibration",

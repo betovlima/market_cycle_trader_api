@@ -63,7 +63,8 @@ class RegularXnysGateTests(unittest.TestCase):
 
 class SchedulerStagesTests(unittest.TestCase):
     def _once(self, *, recorded_at, market_open, plan_status,
-              calculation_status="recalibrated_no_orders", fresh_clock=None):
+              calculation_status="recalibrated_no_orders", fresh_clock=None,
+              execution_session=SESSION):
         worker = scheduler.LiveObservationScheduler()
         db = MagicMock()
         if fresh_clock is None:
@@ -75,7 +76,7 @@ class SchedulerStagesTests(unittest.TestCase):
         broker = MagicMock()
         broker.get_clock.return_value = fresh_clock
         result = {"status": "observed", "recorded_at": recorded_at, "market_open": market_open}
-        armed = {"status": plan_status, "execution_session": SESSION}
+        armed = {"status": plan_status, "execution_session": execution_session}
         ready = plan_status == "recalibrated_no_orders"
         db["live_winner_session_runs"].find_one.return_value = {
             "status": plan_status,
@@ -128,10 +129,20 @@ class SchedulerStagesTests(unittest.TestCase):
 
     def test_post_close_next_session_preparation_remains_possible(self):
         calls, client, _ = self._once(
-            recorded_at="2026-10-20T20:01:00Z",
+            recorded_at="2026-10-20T20:20:01Z",
             market_open=False, plan_status="waiting_for_winner_signal",
+            execution_session="2026-10-21",
         )
         self.assertEqual(calls, [("post_close_calculation", False)])
+        client.assert_not_called()
+
+    def test_closed_market_waits_before_daily_bar_is_safe(self):
+        calls, client, _ = self._once(
+            recorded_at="2026-10-20T20:01:00Z",
+            market_open=False, plan_status="waiting_for_winner_signal",
+            execution_session="2026-10-21",
+        )
+        self.assertEqual(calls, [])
         client.assert_not_called()
 
     def test_calculation_completes_after_close_skips_broker(self):
