@@ -1,3 +1,33 @@
+## 2026-10-31 — API v10.8.134 (branch isolada) | Reprodução anual: posições efetivas
+
+No Backtest U75 `20261031T204408-402222ac` (US$ 76.710.842,01;
+1.578 sessões; duas sessões CASH, 17/06/2022 e 19/04/2024), o
+motor exportou corretamente `selected_asset` por pregão, mas
+`services/analytics.py::_equity_rows` descartava os campos de posição
+ao montar a resposta da Reprodução anual. O frontend
+`feature/v10.7.50-cash-period-audit` lê `equity[].selected_asset`
+e por isso mostrava **Indisponível** mesmo com CSV completo.
+
+Na branch `fix/v10.8.134-replay-effective-positions` a API lê
+`selected_asset`, `previous_asset`, `trade_action`, CASH e
+indicadores U75 da mesma previsão financeira persistida.
+Adiciona `position_coverage` auditável e
+`positions_history.csv` para downloads do Backtest. Históricos sem
+posição salva continuam explicitamente incompletos; sem imputação
+por rotações ou pontuação. Nenhum efeito na estratégia, backteste,
+Winner, Paper ou ordens.
+
+O banco **deve** conter esses campos quando foi usado
+`replace_run_result`, mas o ZIP sozinho não comprova o estado atual
+do MongoDB. Validar sem recomputar via
+`GET /api/analytics/backtests/20261031T204408-402222ac`:
+se `recorded_sessions=1578` e `cash_sessions=2`, basta a atualização
+da API. Se for zero, investigar persistência antes de qualquer
+recuperação explícita e auditada do ZIP. Mais detalhes em
+`docs/changes/v10.8.134-annual-replay-effective-positions.md`.
+
+---
+
 ## 2026-10-31 — API v10.8.133 (branch de integração, não implantada) | U75 proteção coletiva diária em uma chamada
 
 **Objetivo:** adicionar uma Strategy experimental U75 à API sem misturar pesquisa, Winner e execução de ordens. Endpoint administrativo único: `POST /api/admin/strategies/u75-protection/install-and-backtest`. Registra/reutiliza perfil, seleciona apenas para Backtest, enfileira execução com histórico Alpaca RAW/SIP novo e mantém job/resultados/arquivos nos caminhos atuais da Reprodução anual (`/api/analytics/backtests/{job_id}` e `/files`); a API devolve o identificador do job, não finge backtest instantâneo.
