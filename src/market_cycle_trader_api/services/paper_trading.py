@@ -758,7 +758,9 @@ def prepare_next_paper_plan(
             )
 
         intraday_metadata: dict[str, Any] = {}
-        if allow_open_market:
+        # U75 is defined only on COMPLETED daily sessions. Never append
+        # a partial current-session bar to its market-wide decision panel.
+        if allow_open_market and str(strategy.strategy_mode) != TCC_U75_DAILY_PROTECTION_MODE:
             current_session = pd.Timestamp(clock["timestamp"])
             current_session = (
                 current_session.tz_localize("UTC")
