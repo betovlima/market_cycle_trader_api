@@ -200,11 +200,43 @@ def test_one_call_reuses_existing_job_without_installing_or_promoting():
     queue.assert_not_called()
 
 
+def test_one_call_installs_selects_enqueues_and_does_not_promote():
+    db = MagicMock()
+    db.__getitem__.return_value.find_one.return_value = None
+    # A completed request is queued by the standard job scheduler.
+    db.__getitem__.return_value.find_one.side_effect = [
+        None, {"id": "new-u75-job", "status": "queued"},
+    ]
+    installed = {"created": True, "strategy": {"id": "new-strategy"}}
+    with (
+        patch.object(u75_protection, "database", return_value=db),
+        patch.object(u75_protection, "install_u75_protection_strategy", return_value=installed) as installer,
+        patch.object(u75_protection, "queue_backtest_job", return_value={"id": "new-u75-job"}) as queue,
+        patch.object(u75_protection, "run_job") as runner,
+        patch.object(u75_protection.threading, "Thread") as thread,
+    ):
+        result = u75_protection.install_and_backtest(SimpleNamespace(email="admin@example.org"))
+    assert result["created"]
+    assert result["job_id"] == "new-u75-job"
+    assert result["annual_replay_path"].endswith("/new-u75-job")
+    assert result["annual_replay_files_path"].endswith("/new-u75-job/files")
+    assert result["winner_changed"] is False
+    installer.assert_called_once_with(db, actor_email="admin@example.org")
+    queue.assert_called_once_with(start_thread=False, certify_strategy=True)
+    runner.assert_not_called()  # executing in a dedicated worker only
+    thread.assert_called_once()
+    thread.return_value.start.assert_called_once()
+    db.__getitem__.return_value.update_one.assert_called_once()
+
+
 # CI uses unittest discovery; execute the same tests under its runner.
 import unittest
 
 
 class U75OneCallIntegrationTests(unittest.TestCase):
+    def test_one_call_installs_selects_enqueues_and_does_not_promote(self):
+        test_one_call_installs_selects_enqueues_and_does_not_promote()
+
     def test_whole_universe_decline_and_no_technical_candidate(self):
         test_whole_universe_decline_and_no_technical_candidate()
 
