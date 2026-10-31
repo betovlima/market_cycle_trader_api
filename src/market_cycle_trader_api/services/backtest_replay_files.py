@@ -14,7 +14,15 @@ from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-EQUITY_COLUMNS = ("timestamp", "simulation_equity", "reference_equity", "drawdown")
+EQUITY_COLUMNS = (
+    "timestamp", "simulation_equity", "reference_equity", "drawdown",
+    "selected_asset", "is_cash",
+)
+POSITION_COLUMNS = (
+    "timestamp", "selected_asset", "previous_asset", "trade_action",
+    "decision_date", "is_cash", "u75_market_stress", "u75_cash_override",
+    "u75_technical_candidates", "u75_effective_coverage",
+)
 ROTATION_COLUMNS = (
     "executed_at", "from_asset", "to_asset", "realized_pnl",
     "transaction_fees", "buy_reason", "sell_reason",
@@ -30,6 +38,7 @@ SCORE_COLUMNS = (
 )
 PUBLIC_FILES = (
     "equity_history.csv",
+    "positions_history.csv",
     "rotations.csv",
     "decision_scores.csv",
     "metrics.json",
@@ -38,7 +47,8 @@ PUBLIC_FILES = (
     "package.zip",
 )
 _DESCRIPTIONS = {
-    "equity_history.csv": "Historical capital and drawdown per recorded session",
+    "equity_history.csv": "Historical capital, recorded positions and drawdown per session",
+    "positions_history.csv": "Only actually recorded effective holdings and CASH flags",
     "rotations.csv": "Recorded transitions and transaction values",
     "decision_scores.csv": "Only utility scores actually saved at execution time",
     "metrics.json": "Stored metrics and summary diagnostics",
@@ -92,6 +102,15 @@ def _files_and_manifest(analytics: dict[str, Any]) -> tuple[dict[str, bytes], di
     if equity:
         result["equity_history.csv"] = _csv_bytes(equity, EQUITY_COLUMNS)
         rows["equity_history.csv"] = len(equity)
+        recorded_positions = [
+            row for row in equity if isinstance(row.get("selected_asset"), str)
+            and bool(row["selected_asset"].strip())
+        ]
+        if recorded_positions:
+            result["positions_history.csv"] = _csv_bytes(
+                recorded_positions, POSITION_COLUMNS
+            )
+            rows["positions_history.csv"] = len(recorded_positions)
     if rotations:
         result["rotations.csv"] = _csv_bytes(rotations, ROTATION_COLUMNS)
         rows["rotations.csv"] = len(rotations)

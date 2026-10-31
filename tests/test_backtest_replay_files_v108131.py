@@ -47,7 +47,7 @@ class ReplayFilesTests(unittest.TestCase):
         second = sample("two")
         listing = available_backtest_files(first)
         self.assertEqual(listing["job_id"], "one")
-        self.assertEqual({f["name"] for f in listing["files"]}, set(PUBLIC_FILES))
+        self.assertEqual({f["name"] for f in listing["files"]}, set(PUBLIC_FILES) - {"positions_history.csv"})
         left, _, left_name = backtest_file(first, "analytics.json")
         right, _, right_name = backtest_file(second, "analytics.json")
         self.assertEqual(json.loads(left)["job_id"], "one")
@@ -60,7 +60,7 @@ class ReplayFilesTests(unittest.TestCase):
         archive_bytes, media_type, _ = backtest_file(sample(), "package.zip")
         self.assertEqual(media_type, "application/zip")
         with ZipFile(BytesIO(archive_bytes)) as archive:
-            self.assertEqual(set(archive.namelist()), set(PUBLIC_FILES) - {"package.zip"})
+            self.assertEqual(set(archive.namelist()), set(PUBLIC_FILES) - {"package.zip", "positions_history.csv"})
             manifest = json.loads(archive.read("manifest.json"))
             self.assertEqual(manifest["source"], "persisted_backtest_analytics")
             self.assertIn("not original", manifest["limitations"])

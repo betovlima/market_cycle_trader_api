@@ -343,13 +343,15 @@ def _sorted_rows(rows: Iterable[dict[str, Any]], key: str) -> list[dict[str, Any
 
 
 def _equity_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
+    """Equity AND true daily holdings from the same persisted prediction."""
     rows = db[PREDICTIONS_COLLECTION].find(
         {"job_id": job_id, "symbol": "PORTFOLIO", "backend": backend},
         {
-            "_id": 0,
-            "timestamp": 1,
-            "strategy_equity": 1,
-            "buy_hold_equity": 1,
+            "_id": 0, "timestamp": 1, "strategy_equity": 1,
+            "buy_hold_equity": 1, "selected_asset": 1,
+            "previous_asset": 1, "trade_action": 1, "decision_date": 1,
+            "u75_market_stress": 1, "u75_cash_override": 1,
+            "u75_technical_candidates": 1, "u75_effective_coverage": 1,
         },
     )
     output: list[dict[str, Any]] = []
@@ -361,16 +363,75 @@ def _equity_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
             continue
         peak = strategy if peak is None else max(peak, strategy)
         drawdown = strategy / peak - 1.0 if peak else 0.0
-        output.append(
-            {
-                "timestamp": iso_value(row.get("timestamp")),
-                "simulation_equity": strategy,
-                "reference_equity": reference,
-                "drawdown": drawdown,
-            }
-        )
+        item: dict[str, Any] = {
+            "timestamp": iso_value(row.get("timestamp")),
+            "simulation_equity": strategy,
+            "reference_equity": reference,
+            "drawdown": drawdown,
+        }
+        # Never reconstruct missing historical positions from trades or rankings.
+        asset = row.get("selected_asset")
+        if isinstance(asset, str) and asset.strip():
+            item["selected_asset"] = asset.strip().upper()
+            item["is_cash"] = item["selected_asset"] == "CASH"
+            item["position_source"] = "persisted_execution_prediction"
+            previous = row.get("previous_asset")
+            if isinstance(previous, str) and previous.strip():
+                item["previous_asset"] = previous.strip().upper()
+            action = row.get("trade_action")
+            if isinstance(action, str) and action.strip():
+                item["trade_action"] = action.strip().upper()
+            if row.get("decision_date") is not None:
+                item["decision_date"] = iso_value(row["decision_date"])
+            for key in (
+                "u75_market_stress", "u75_cash_override",
+                "u75_technical_candidates", "u75_effective_coverage",
+            ):
+                if row.get(key) is not None:
+                    item[key] = row[key]
+        output.append(item)
     return output
 
+
+def _equity_position_summary(equity: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize recorded positions, with unknown legacy periods kept unknown."""
+    positions = [
+        row for row in equity
+        if isinstance(row.get("selected_asset"), str) and row["selected_asset"]
+    ]
+    complete = bool(equity) and len(positions) == len(equity)
+    episodes: list[dict[str, Any]] = []
+    active: dict[str, Any] | None = None
+    for row in equity:
+        if row.get("selected_asset") != "CASH":
+            if active:
+                episodes.append(active)
+                active = None
+            continue
+        if active is None:
+            active = {
+                "start_at": row["timestamp"],
+                "last_recorded_at": row["timestamp"],
+                "sessions": 0,
+            }
+        active["last_recorded_at"] = row["timestamp"]
+        active["sessions"] += 1
+    if active:
+        episodes.append(active)
+    return {
+        "total_sessions": len(equity),
+        "recorded_sessions": len(positions),
+        "missing_sessions": len(equity) - len(positions),
+        "complete": complete,
+        "cash_sessions": (
+            sum(row["selected_asset"] == "CASH" for row in positions)
+            if complete else None
+        ),
+        "cash_episodes": episodes,
+        "position_source": (
+            "persisted_execution_prediction" if positions else None
+        ),
+    }
 
 
 def _decision_score_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
@@ -738,6 +799,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
             "metrics": metrics,
             "rotation_summary": {},
             "equity": [],
+            "position_coverage": _equity_position_summary([]),
             "monthly_returns": [],
             "consistency": _consistency([]),
             "drawdown_episodes": [],
@@ -750,6 +812,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
         }
 
     equity = _equity_rows(db, job_id, backend)
+    position_coverage = _equity_position_summary(equity)
     decision_scores = _decision_score_rows(db, job_id, backend)
     trades = _trade_rows(db, job_id, backend)
     sells = _completed_sells(trades)
@@ -763,6 +826,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
         "metrics": metrics,
         "rotation_summary": rotation_payload.get("summary", {}),
         "equity": equity,
+        "position_coverage": position_coverage,
         "monthly_returns": monthly,
         "consistency": _consistency(monthly),
         "drawdown_episodes": _drawdown_episodes(equity),
