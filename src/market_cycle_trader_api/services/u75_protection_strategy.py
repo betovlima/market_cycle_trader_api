@@ -43,7 +43,13 @@ def install_u75_protection_strategy(db: Any, *, actor_email: str | None) -> dict
             selected = control
         return {"created": False, "strategy": get_strategy(db, sid), "control": selected}
 
+    # Validate the complete target contract BEFORE mutating the catalog.
+    # A failed request must not create a half-configured Strategy profile.
     source, current = get_research_strategy_context(db)
+    baseline = _mct_configuration_for_u67(source)
+    configuration = BacktestRequest.model_validate({
+        **baseline.model_dump(mode="python"), **u75_strategy_updates(),
+    })
     created = create_strategy(
         db, name="U75 Daily Market Protection v1.0.1",
         description=(
@@ -60,10 +66,6 @@ def install_u75_protection_strategy(db: Any, *, actor_email: str | None) -> dict
         note="Frozen LightGBM Control settings; market protection is separate",
         expected_strategy_revision=int(created["revision"]), actor_email=actor,
     )
-    baseline = _mct_configuration_for_u67(source)
-    configuration = BacktestRequest.model_validate({
-        **baseline.model_dump(mode="python"), **u75_strategy_updates(),
-    })
     updated = update_strategy(
         db, sid, configuration=configuration,
         name=str(created.get("name") or ""),

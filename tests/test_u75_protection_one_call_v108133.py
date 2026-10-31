@@ -229,11 +229,65 @@ def test_one_call_installs_selects_enqueues_and_does_not_promote():
     db.__getitem__.return_value.update_one.assert_called_once()
 
 
+def test_u75_mode_is_valid_in_both_backtest_request_schemas():
+    from typing import get_args
+    from pydantic import TypeAdapter, ValidationError
+    from market_cycle_trader_api.schemas.requests import (
+        BacktestRequest, BacktestExecutionRequest,
+    )
+    from market_cycle_trader_api.engine.u75_market_protection import u75_strategy_updates
+
+    mode = u75_strategy_updates()["strategy_mode"]
+    for request_type in (BacktestRequest, BacktestExecutionRequest):
+        annotated = request_type.model_fields["strategy_mode"].annotation
+        assert mode in get_args(annotated)
+        assert TypeAdapter(annotated).validate_python(mode) == mode
+        try:
+            TypeAdapter(annotated).validate_python("UNREGISTERED_U75_MODE")
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("Unexpected unknown strategy mode accepted")
+
+
+def test_u75_validation_happens_before_any_catalog_mutation():
+    from market_cycle_trader_api.services import u75_protection_strategy as service
+    db = MagicMock()
+    db.__getitem__.return_value.find_one.return_value = None
+    source = SimpleNamespace(model_dump=lambda mode: {"strategy_mode": "old"})
+    with (
+        patch.object(service, "get_research_strategy_context",
+                     return_value=(source, {"id": "existing"})),
+        patch.object(service, "_mct_configuration_for_u67", return_value=source),
+        patch.object(service.BacktestRequest, "model_validate",
+                     side_effect=ValueError("invalid request")) as validator,
+        patch.object(service, "create_strategy") as create,
+        patch.object(service, "update_strategy_model") as update_model,
+        patch.object(service, "update_strategy") as update_config,
+    ):
+        try:
+            service.install_u75_protection_strategy(db, actor_email="admin@example.org")
+        except ValueError as exc:
+            assert str(exc) == "invalid request"
+        else:
+            raise AssertionError("Expected validation failure")
+        validator.assert_called_once()
+        create.assert_not_called()
+        update_model.assert_not_called()
+        update_config.assert_not_called()
+
+
 # CI uses unittest discovery; execute the same tests under its runner.
 import unittest
 
 
 class U75OneCallIntegrationTests(unittest.TestCase):
+    def test_u75_mode_is_valid_in_both_backtest_request_schemas(self):
+        test_u75_mode_is_valid_in_both_backtest_request_schemas()
+
+    def test_u75_validation_happens_before_any_catalog_mutation(self):
+        test_u75_validation_happens_before_any_catalog_mutation()
+
     def test_one_call_installs_selects_enqueues_and_does_not_promote(self):
         test_one_call_installs_selects_enqueues_and_does_not_promote()
 
