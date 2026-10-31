@@ -417,7 +417,7 @@ class StrategyLabConflict(StrategyLabError):
     pass
 
 
-class UnsupportedBacktestStrategyMode(StrategyLabError):
+class UnsupportedBacktestStrategyMode(StrategyLabConflict):
     """A stored, non-executable research strategy was selected."""
 
 
