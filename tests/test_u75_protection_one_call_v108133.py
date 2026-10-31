@@ -190,3 +190,39 @@ def test_one_call_reuses_existing_job_without_installing_or_promoting():
     assert not result["winner_changed"]
     install.assert_not_called()
     queue.assert_not_called()
+
+
+# CI uses unittest discovery; execute the same tests under its runner.
+import unittest
+
+
+class U75OneCallIntegrationTests(unittest.TestCase):
+    def test_whole_universe_decline_and_no_technical_candidate(self):
+        test_whole_universe_decline_and_no_technical_candidate()
+
+    def test_one_positive_asset_prevents_whole_universe_cash(self):
+        test_one_positive_asset_prevents_whole_universe_cash()
+
+    def test_missing_assets_never_prove_no_opportunities(self):
+        test_missing_assets_never_prove_no_opportunities()
+
+    def test_today_decision_does_not_read_future_bars(self):
+        test_today_decision_does_not_read_future_bars()
+
+    def test_cash_duration_is_inferred_each_day_not_fixed(self):
+        test_cash_duration_is_inferred_each_day_not_fixed()
+
+    def test_original_policy_is_kept_and_diagnostics_explain_override(self):
+        test_original_policy_is_kept_and_diagnostics_explain_override()
+
+    def test_u75_catalog_contract_and_winner_process_compatibility(self):
+        test_u75_catalog_contract_and_winner_process_compatibility()
+
+    def test_live_u75_policy_only_changes_decision_when_collective_signal(self):
+        test_live_u75_policy_only_changes_decision_when_collective_signal()
+
+    def test_one_endpoint_registered_and_annual_replay_routes_preserved(self):
+        test_one_endpoint_registered_and_annual_replay_routes_preserved()
+
+    def test_one_call_reuses_existing_job_without_installing_or_promoting(self):
+        test_one_call_reuses_existing_job_without_installing_or_promoting()
