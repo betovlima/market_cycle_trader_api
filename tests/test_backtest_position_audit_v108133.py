@@ -92,6 +92,19 @@ class PersistedCashPositionAuditTests(unittest.TestCase):
         self.assertEqual(result["position_coverage"]["cash_sessions"], 0)
         self.assertEqual(result["position_coverage"]["missing_sessions"], 1)
 
+    def test_terminal_sell_trade_overrides_nonterminal_trade_action(self):
+        # End-of-backtest forced sale may happen after another action:
+        # prediction.trade_action may still say SELL or BUY+SELL.
+        result = build_position_audit(
+            equity("2026-10-29"),
+            [prediction("2026-10-29", "NVDA", assets_held=0, cash_weight=1.0, trade_action="SELL")],
+            [], [],
+            [{"timestamp": stamp("2026-10-29"), "action": "FINAL_SELL", "asset": "NVDA"}],
+        )
+        self.assertTrue(result["position_history"][0]["terminal_liquidation"])
+        self.assertEqual(result["position_coverage"]["cash_sessions"], 0)
+        self.assertEqual(result["position_coverage"]["terminal_liquidations"], 1)
+
     def test_same_date_wrong_timestamp_is_not_accepted_as_effective_position(self):
         result = build_position_audit(
             equity("2025-01-02"),
