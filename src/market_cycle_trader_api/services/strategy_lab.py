@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from copy import deepcopy
 from functools import lru_cache
-from typing import Any
+from typing import Any, get_args
 
 import exchange_calendars as xcals
 import pandas as pd
@@ -43,7 +43,7 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     utc_now,
 )
-from ..schemas.requests import BacktestRequest
+from ..schemas.requests import BacktestRequest, StrategyMode
 from .model_research import (
     execution_settings_for,
     execution_settings_from_values,
@@ -415,6 +415,25 @@ class StrategyLabError(RuntimeError):
 
 class StrategyLabConflict(StrategyLabError):
     pass
+
+
+class UnsupportedBacktestStrategyMode(StrategyLabError):
+    """A stored, non-executable research strategy was selected."""
+
+
+def assert_supported_backtest_strategy(profile: dict[str, Any]) -> None:
+    """Keep retired historical policies readable, never silently map them to a new one."""
+    configuration = profile.get("configuration") if isinstance(profile.get("configuration"), dict) else {}
+    mode = str(configuration.get("strategy_mode") or "").strip()
+    if mode not in get_args(StrategyMode):
+        name = str(profile.get("name") or profile.get("_id") or "Selected Strategy")
+        raise UnsupportedBacktestStrategyMode(
+            f"RETIRED_BACKTEST_STRATEGY_MODE: {name} uses unsupported strategy_mode "
+            f"'{mode or '(missing)'}'. In System Settings > Strategies, select an "
+            "existing compatible Strategy for Strategy Research before starting a new "
+            "Backtest. Historical results remain accessible; the retired policy "
+            "is not converted or executed."
+        )
 
 
 class StrategyLabNotFound(StrategyLabError):
@@ -1509,6 +1528,7 @@ def get_research_strategy_context(db: Any) -> tuple[BacktestRequest, dict[str, A
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Selected Strategy Research baseline does not exist.")
+    assert_supported_backtest_strategy(profile)
     configuration = BacktestRequest.model_validate(profile.get("configuration") or {})
     return configuration, _public_profile(profile, include_configuration=False)
 
@@ -2283,6 +2303,7 @@ def select_research_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    assert_supported_backtest_strategy(profile)
     now = utc_now()
     reference_only = bool(str(profile.get("backtest_engine_binding") or "").strip())
     selection_updates = {
@@ -2345,6 +2366,7 @@ def select_research_strategy_only(
     )
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    assert_supported_backtest_strategy(profile)
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},
