@@ -228,6 +228,23 @@ def queue_backtest_job(
         # Never queue an alternate policy in place of the saved retired mode.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (RuntimeError, ValidationError) as exc:
+        # Legacy catalog migrations may reach Pydantic before the explicit
+        # profile guard. Still give the user a recoverable 409, never an opaque
+        # 500, for a strategy_mode outside today's supported set.
+        if isinstance(exc, ValidationError):
+            for issue in exc.errors():
+                if "strategy_mode" in issue.get("loc", ()) and issue.get("type") == "literal_error":
+                    mode = str(issue.get("input") or "(missing)")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"RETIRED_BACKTEST_STRATEGY_MODE: Selected Strategy Research "
+                            f"uses unsupported strategy_mode '{mode}'. In System Settings "
+                            "> Strategies, choose an existing compatible Strategy and "
+                            "select it for Strategy Research. Historical Backtests "
+                            "remain accessible. No replacement policy was executed."
+                        ),
+                    ) from exc
         raise HTTPException(status_code=500, detail=f"Selected backtest strategy is invalid: {exc}") from exc
 
     job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
