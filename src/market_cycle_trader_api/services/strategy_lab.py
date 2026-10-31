@@ -20,6 +20,7 @@ from ..core.config import (
     PACKAGE_DIR,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
     TCC_U77_FIXED_CHALLENGER_MODE,
+    TCC_U75_DAILY_PROTECTION_MODE,
 )
 from ..engine.tcc_u77_static_challenger import tcc_u77_contract_issues
 from ..engine.tcc_u67_operational_runtime import (
@@ -610,12 +611,14 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     if strategy_mode in {
         TCC_U67_CONTROL_OPERATIONAL_MODE,
         TCC_U77_FIXED_CHALLENGER_MODE,
+        TCC_U75_DAILY_PROTECTION_MODE,
     }:
+        u75_mode = strategy_mode == TCC_U75_DAILY_PROTECTION_MODE
         u77_mode = strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
-        contract_label = "TCC U77" if u77_mode else "TCC U67"
+        contract_label = ("U75 collective protection" if u75_mode else "TCC U77" if u77_mode else "TCC U67")
         expected_binding = (
-            "tcc_u77_fixed_challenger_backtest"
-            if u77_mode
+            "u75_daily_cash_protection_v101" if u75_mode
+            else "tcc_u77_fixed_challenger_backtest" if u77_mode
             else "tcc_u67_v1210_operational_backtest"
         )
         if engine_binding != expected_binding:
@@ -643,11 +646,14 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "model_family": model_family,
                 "backtest_engine_binding": engine_binding,
             }
-        issues = (
-            tcc_u77_contract_issues(configuration)
-            if u77_mode
-            else tcc_u67_contract_issues(configuration)
-        )
+        if u75_mode:
+            from ..engine.u75_market_protection import u75_contract_issues
+            issues = u75_contract_issues(configuration)
+        else:
+            issues = (
+                tcc_u77_contract_issues(configuration)
+                if u77_mode else tcc_u67_contract_issues(configuration)
+            )
         if issues:
             return {
                 "eligible": False,
@@ -664,8 +670,8 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         return {
             "eligible": True,
             "code": (
-                "tcc_u77_live_runtime_ready"
-                if u77_mode
+                "u75_daily_protection_live_runtime_ready" if u75_mode
+                else "tcc_u77_live_runtime_ready" if u77_mode
                 else "tcc_u67_live_runtime_ready"
             ),
             "reason": None,

@@ -14,7 +14,7 @@ import exchange_calendars as xcals
 import pandas as pd
 from pymongo import ReturnDocument
 
-from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE, TCC_U75_DAILY_PROTECTION_MODE
 from ..engine.live_model_signal import build_live_model_decision
 from ..engine.market_data import latest_safe_completed_xnys_session
 from ..engine.operational_market_snapshot import (
@@ -32,7 +32,7 @@ from .live_winner_events import append_live_event
 from .live_winner_candidates import winner_candidate_fields
 from .live_trader_state import verified_live_state
 
-_ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE})
+_ALLOWED = frozenset({TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE, TCC_U75_DAILY_PROTECTION_MODE})
 
 def _utc_datetime(value: Any) -> datetime:
     stamp = value
@@ -177,7 +177,10 @@ def prepare_live_winner_signal(
     })
     if str(strategy.strategy_mode) not in _ALLOWED or model["family"] != "lightgbm_utility":
         raise RuntimeError("Live Winner is not supported by this locked execution profile.")
-    if str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE:
+    if str(strategy.strategy_mode) == TCC_U75_DAILY_PROTECTION_MODE:
+        from ..engine.u75_market_protection import assert_u75_contract
+        assert_u75_contract(strategy)
+    elif str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE:
         assert_tcc_u77_contract(strategy)
     else:
         assert_tcc_u67_operational_contract(strategy)
@@ -225,7 +228,7 @@ def prepare_live_winner_signal(
         ).date().isoformat()
         if cutoff != required_day:
             raise RuntimeError("LiveDailyCutoffChanged: safe prior-session date changed.")
-        u77 = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
+        u77 = str(strategy.strategy_mode) in {TCC_U77_FIXED_CHALLENGER_MODE, TCC_U75_DAILY_PROTECTION_MODE}
         snapshot = download_operational_market_snapshot(
             job_id=f"live-{session}-{now.strftime('%Y%m%d%H%M%S%f')}",
             config=strategy.model_copy(update={"analysis_end_date": cutoff}),
