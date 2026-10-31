@@ -98,7 +98,9 @@ def build_position_audit(
 
     episodes: list[dict[str, Any]] = []
     for index, item in enumerate(history):
-        if item["asset"] != "CASH":
+        # Final sale only makes the account CASH at the terminal close;
+        # it does not mean capital stayed in CASH during that session.
+        if item["asset"] != "CASH" or item["terminal_liquidation"]:
             continue
         if episodes and index == episodes[-1]["_end_index"] + 1:
             episode = episodes[-1]
@@ -153,7 +155,8 @@ def build_position_audit(
             "recorded_sessions": recorded,
             "missing_sessions": total - recorded,
             "complete": recorded == total,
-            "cash_sessions": sum(row["asset"] == "CASH" for row in history),
+            "cash_sessions": sum(row["asset"] == "CASH" and not row["terminal_liquidation"] for row in history),
+            "terminal_liquidations": sum(row["asset"] == "CASH" and row["terminal_liquidation"] for row in history),
             "cash_episodes": [
                 {key: ep[key] for key in ("start_at", "last_recorded_at", "sessions")}
                 for ep in episodes
