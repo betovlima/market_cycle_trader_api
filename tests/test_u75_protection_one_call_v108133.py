@@ -168,11 +168,13 @@ def test_live_u75_policy_only_changes_decision_when_collective_signal():
 
 def test_one_endpoint_registered_and_annual_replay_routes_preserved():
     app = create_app()
-    routes = {(r.path, next(iter(r.methods)) if len(r.methods) == 1 else "")
-              for r in app.routes if getattr(r, "methods", None)}
-    assert ("/api/admin/strategies/u75-protection/install-and-backtest", "POST") in routes
-    assert ("/api/analytics/backtests/{job_id}", "GET") in routes
-    assert ("/api/analytics/backtests/{job_id}/files", "GET") in routes
+    routes = [(r.path, set(r.methods)) for r in app.routes if getattr(r, "methods", None)]
+    assert any(path == "/api/admin/strategies/u75-protection/install-and-backtest"
+               and "POST" in methods for path, methods in routes), routes
+    assert any(path == "/api/analytics/backtests/{job_id}"
+               and "GET" in methods for path, methods in routes), routes
+    assert any(path == "/api/analytics/backtests/{job_id}/files"
+               and "GET" in methods for path, methods in routes), routes
 
 
 def test_one_call_reuses_existing_job_without_installing_or_promoting():
