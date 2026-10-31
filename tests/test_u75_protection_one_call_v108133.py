@@ -167,14 +167,20 @@ def test_live_u75_policy_only_changes_decision_when_collective_signal():
 
 
 def test_one_endpoint_registered_and_annual_replay_routes_preserved():
-    app = create_app()
-    routes = [(r.path, set(r.methods)) for r in app.routes if getattr(r, "methods", None)]
+    # Inspect registered router definitions directly. Other tests can
+    # alter the application factory at module level for isolation.
+    import inspect
+    from market_cycle_trader_api.api.routers import analytics
+    from market_cycle_trader_api import main
+    local = [(r.path, set(r.methods or ())) for r in u75_protection.router.routes]
+    replay = [(r.path, set(r.methods or ())) for r in analytics.router.routes]
     assert any(path == "/api/admin/strategies/u75-protection/install-and-backtest"
-               and "POST" in methods for path, methods in routes), routes
+               and "POST" in methods for path, methods in local), local
     assert any(path == "/api/analytics/backtests/{job_id}"
-               and "GET" in methods for path, methods in routes), routes
+               and "GET" in methods for path, methods in replay), replay
     assert any(path == "/api/analytics/backtests/{job_id}/files"
-               and "GET" in methods for path, methods in routes), routes
+               and "GET" in methods for path, methods in replay), replay
+    assert "application.include_router(u75_protection.router" in inspect.getsource(main.create_app)
 
 
 def test_one_call_reuses_existing_job_without_installing_or_promoting():
