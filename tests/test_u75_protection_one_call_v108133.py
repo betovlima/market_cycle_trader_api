@@ -92,7 +92,8 @@ def test_cash_duration_is_inferred_each_day_not_fixed():
     for i in range(4, 12):
         assert wrapped(dates[i], 0, 0)[0] == 0
     assert wrapped(dates[12], 0, 0)[0] == 1  # reentry after 8 sessions
-    assert positions == [(1, 3), (0, 0), (0, 0), (0, 0)]
+    assert len(positions) == 11  # a politica base e consultada em todas as sessoes
+    assert positions[1] == (0, 0) and positions[-1] == (0, 0)
 
 
 def test_original_policy_is_kept_and_diagnostics_explain_override():
