@@ -28,6 +28,7 @@ from ..infrastructure.persistence.mongo_repository import (
     get_alpaca_integration_status,
 )
 from .admin_rotations import admin_job_rotations
+from .backtest_position_audit import build_position_audit
 from .dashboard import _public_metrics, _selected_internal_row
 from .serialization import iso_value
 
@@ -371,6 +372,15 @@ def _equity_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
         )
     return output
 
+
+
+def _position_prediction_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
+    """Observe executed positions from stored portfolio predictions, not rotations."""
+    return list(db[PREDICTIONS_COLLECTION].find(
+        {"job_id": job_id, "symbol": "PORTFOLIO", "backend": backend},
+        {"_id": 0, "timestamp": 1, "selected_asset": 1, "cash_weight": 1,
+         "assets_held": 1, "trade_action": 1},
+    ))
 
 
 def _decision_score_rows(db: Any, job_id: str, backend: str) -> list[dict[str, Any]]:
@@ -747,6 +757,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
             "trade_dependency": _trade_dependency([]),
             "rotations": [],
             "decision_scores": [],
+            **build_position_audit([], [], [], []),
         }
 
     equity = _equity_rows(db, job_id, backend)
@@ -755,6 +766,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
     sells = _completed_sells(trades)
     rotation_payload = admin_job_rotations(db, job_id)
     rotations = list(rotation_payload.get("rotations", []))
+    position_audit = build_position_audit(equity, _position_prediction_rows(db, job_id, backend), decision_scores, rotations, trades)
     monthly = _monthly_returns(equity)
     payload = {
         "job_id": job_id,
@@ -772,6 +784,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
         "trade_dependency": _trade_dependency(sells),
         "rotations": rotations,
         "decision_scores": decision_scores,
+        **position_audit,
     }
     _assert_strategy_neutral(payload)
     return payload

@@ -1,3 +1,7 @@
+## 2026-10-31 — API v10.8.133 | Auditoria CASH em backtests (somente leitura)
+
+Branch `feature/v10.8.133-persisted-cash-position-audit`. Novo `position_history`, `position_coverage` e `cash_investigation` no analytics histórico, usando somente posições efetivas persistidas de `backtest_predictions` para o job e backend selecionados. Não reconstruir CASH a partir de rotações. Ausência de registro permanece desconhecida. Respeitar a liquidação final e não confundi-la com tempo de mercado em caixa. Sem alterações de política, Live/Paper, ordens ou capital. Testes `tests/test_backtest_position_audit_v108133.py`. Documentação `docs/changes/v10.8.133-persisted-cash-position-audit.md`.
+
 ## 2026-10-30 — API v10.8.132 | Winner Live: janela pós-fechamento SIP
 
 **Correção:** o scheduler agora só inicia a preparação normal de dados RAW/SIP, treinamento e decisão de rotação depois de XNYS fechar + 20 minutos e antes da abertura da próxima sessão, conforme relógio da Alpaca e calendário oficial (inclui feriados e fechamentos antecipados). Antes da janela, registra no máximo um evento informativo `signal_waiting_for_daily_bar` por sessão/processo, sem gerar tentativas de download ou erros repetidos. A abertura mantém execução do sinal diário D−1 persistido; a recuperação excepcional de sinal ausente não foi modificada.
