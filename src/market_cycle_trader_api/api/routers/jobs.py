@@ -36,6 +36,7 @@ from ...services.strategy_lab import (
     get_research_strategy_context,
     get_research_strategy_model_snapshot,
     get_trader_winner_context,
+    UnsupportedBacktestStrategyMode,
 )
 from ...services.results import build_results
 from ...services.model_research import (
@@ -222,6 +223,10 @@ def queue_backtest_job(
                     "tcc_reference_input_source": tcc_reference_source,
                 }
             )
+    except UnsupportedBacktestStrategyMode as exc:
+        # A user-recoverable catalog selection error, not an internal/server fault.
+        # Never queue an alternate policy in place of the saved retired mode.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (RuntimeError, ValidationError) as exc:
         raise HTTPException(status_code=500, detail=f"Selected backtest strategy is invalid: {exc}") from exc
 
