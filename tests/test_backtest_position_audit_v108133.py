@@ -77,7 +77,9 @@ class PersistedCashPositionAuditTests(unittest.TestCase):
         )
         self.assertEqual([r["asset"] for r in result["position_history"]], ["NVDA", "CASH"])
         self.assertTrue(result["position_history"][-1]["terminal_liquidation"])
-        self.assertTrue(result["cash_investigation"][0]["terminal_liquidation"])
+        self.assertEqual(result["position_coverage"]["terminal_liquidations"], 1)
+        self.assertEqual(result["position_coverage"]["cash_sessions"], 0)
+        self.assertEqual(result["cash_investigation"], [])
 
     def test_partial_cash_is_not_a_cash_session(self):
         result = build_position_audit(
