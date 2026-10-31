@@ -1,3 +1,19 @@
+## 2026-10-31 — API v10.8.133 (branch de integração, não implantada) | U75 proteção coletiva diária em uma chamada
+
+**Objetivo:** adicionar uma Strategy experimental U75 à API sem misturar pesquisa, Winner e execução de ordens. Endpoint administrativo único: `POST /api/admin/strategies/u75-protection/install-and-backtest`. Registra/reutiliza perfil, seleciona apenas para Backtest, enfileira execução com histórico Alpaca RAW/SIP novo e mantém job/resultados/arquivos nos caminhos atuais da Reprodução anual (`/api/analytics/backtests/{job_id}` e `/files`); a API devolve o identificador do job, não finge backtest instantâneo.
+
+**Origem:** TCC `research/u75-stress-dynamic-cash-v1`, commit `a899dd258a83b09df05a2db25177737f4a1c6b36`, política v1.0.1. Control anterior US$ 80.685.454,79 apenas referência histórica, não resultado do MCT. U77 solicitado, 75 efetivos esperados; a política impede classificação de inexistência de oportunidades sem avaliação completa do U75.
+
+**Sinal:** critério coletivo da versão 1.0.1 do TCC; reavaliado a cada fechamento usando apenas barras concluídas. Não há permanência fixa em CASH. Critérios numéricos (35%, 45%, 55%, −1,5%) seguem hipóteses exploratórias sem comprovação estatística. Saldo CASH em USD nominal, juros zero na simulação atual. A decisão original continua sendo baseada no ranking do universo e a proteção nunca reage a um único ativo isolado.
+
+**Caminhos:** módulo `engine/u75_market_protection.py`; adaptadores existentes de Backtest, Live e Paper, com contrato de modelo idêntico; monitor e operações de Winner sem alteração. `services/u75_protection_strategy.py` instala idempotentemente. `api/routers/u75_protection.py` orquestra e responde 202. A promoção a Winner NÃO ocorre no endpoint e segue processo padrão de backteste certificado, Candidate, promoção e guardas operacionais, somente após validação de paridade dos sinais e aprovação científica.
+
+**Histórico de erros considerado:** criação mais backtest em várias chamadas; metadados de pontuação não repassados ao replay U67/U77 (corrigido na v10.8.129); arquivos da Reprodução anual ausentes em backend anterior à v10.8.131; travas artificiais de cinco pregões no TCC (removidas); vazamento por barra futura e risco de barra intradiária incompleta; colisão de jobs e Winner indevidamente modificado. Nada desta integração faz chamada de corretagem.
+
+**Validação:** CI GitHub e teste com banco/Alpaca são etapas distintas. Esta entrada descreve código em branch, não implica merge na main nem implantação Railway. Mais detalhes em `docs/changes/v10.8.133-u75-protection-one-call.md`.
+
+---
+
 ## 2026-10-30 — API v10.8.132 | Winner Live: janela pós-fechamento SIP
 
 **Correção:** o scheduler agora só inicia a preparação normal de dados RAW/SIP, treinamento e decisão de rotação depois de XNYS fechar + 20 minutos e antes da abertura da próxima sessão, conforme relógio da Alpaca e calendário oficial (inclui feriados e fechamentos antecipados). Antes da janela, registra no máximo um evento informativo `signal_waiting_for_daily_bar` por sessão/processo, sem gerar tentativas de download ou erros repetidos. A abertura mantém execução do sinal diário D−1 persistido; a recuperação excepcional de sinal ausente não foi modificada.
