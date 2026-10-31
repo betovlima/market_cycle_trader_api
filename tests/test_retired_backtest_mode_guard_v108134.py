@@ -69,6 +69,27 @@ class RetiredBacktestModeTests(unittest.TestCase):
     @patch("market_cycle_trader_api.api.routers.jobs.get_research_strategy_context")
     @patch("market_cycle_trader_api.api.routers.jobs.get_system_settings")
     @patch("market_cycle_trader_api.api.routers.jobs.database")
+    def test_legacy_pydantic_mode_error_also_returns_409(self, database, settings, context):
+        from pydantic import ValidationError
+        from market_cycle_trader_api.schemas.requests import BacktestRequest
+        db = MagicMock()
+        db.__getitem__.return_value.count_documents.return_value = 0
+        db.__getitem__.return_value.find_one.return_value = None
+        database.return_value = db
+        settings.return_value = {"training": {"enabled": True}}
+        try:
+            BacktestRequest.model_validate({"strategy_mode": OLD_MODE})
+        except ValidationError as error:
+            context.side_effect = error
+        with self.assertRaises(HTTPException) as raised:
+            queue_backtest_job(start_thread=False)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("RETIRED_BACKTEST_STRATEGY_MODE", str(raised.exception.detail))
+        self.assertFalse(db.__getitem__.return_value.insert_one.called)
+
+    @patch("market_cycle_trader_api.api.routers.jobs.get_research_strategy_context")
+    @patch("market_cycle_trader_api.api.routers.jobs.get_system_settings")
+    @patch("market_cycle_trader_api.api.routers.jobs.database")
     def test_post_jobs_returns_409_without_inserting_any_job(self, database, settings, context):
         db = MagicMock()
         db.__getitem__.return_value.count_documents.return_value = 0
