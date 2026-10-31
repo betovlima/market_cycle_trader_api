@@ -77,14 +77,20 @@ def _indicators(
         if df is None or "close" not in df:
             raise ValueError(f"U75 missing close history: {symbol}")
         close = pd.to_numeric(df["close"], errors="coerce")
-        close = close.loc[close.index <= date].dropna()
+        # Preserve missing observations: silently dropping them would turn
+        # 5/20 trading-session windows into irregular lookback periods.
+        close = close.loc[close.index <= date]
         if len(close) < 50 or not np.isfinite(float(close.iloc[-1])) or float(close.iloc[-1]) <= 0:
             continue
         if pd.Timestamp(close.index[-1]) != pd.Timestamp(date):
             continue
         p = float(close.iloc[-1])
-        r5 = p / float(close.iloc[-6]) - 1.0
-        r20 = p / float(close.iloc[-21]) - 1.0
+        p5 = float(close.iloc[-6])
+        p20 = float(close.iloc[-21])
+        if not np.isfinite([p5, p20]).all() or p5 <= 0 or p20 <= 0:
+            continue
+        r5 = p / p5 - 1.0
+        r20 = p / p20 - 1.0
         ma20 = float(close.iloc[-20:].mean())
         ma50 = float(close.iloc[-50:].mean())
         if not np.isfinite([r5, r20, ma20, ma50]).all() or ma50 <= 0 or ma20 <= 0:

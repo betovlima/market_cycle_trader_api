@@ -15,6 +15,7 @@ from ..core.config import (
     SWING_STRATEGY_MODES,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
     TCC_U77_FIXED_CHALLENGER_MODE,
+    TCC_U75_DAILY_PROTECTION_MODE,
 )
 from ..engine.live_model_signal import build_live_model_decision
 from ..engine.tcc_u77_static_challenger import U77_REQUESTED_ASSETS, assert_tcc_u77_contract
@@ -306,9 +307,13 @@ def _validated_context(
     if str(strategy.strategy_mode) in {
         TCC_U67_CONTROL_OPERATIONAL_MODE,
         TCC_U77_FIXED_CHALLENGER_MODE,
+        TCC_U75_DAILY_PROTECTION_MODE,
     }:
         try:
-            if str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE:
+            if str(strategy.strategy_mode) == TCC_U75_DAILY_PROTECTION_MODE:
+                from ..engine.u75_market_protection import assert_u75_contract
+                assert_u75_contract(strategy)
+            elif str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE:
                 assert_tcc_u77_contract(strategy)
             else:
                 assert_tcc_u67_operational_contract(strategy)
@@ -709,8 +714,9 @@ def prepare_next_paper_plan(
     frozen_control_mode = str(strategy.strategy_mode) in {
         TCC_U67_CONTROL_OPERATIONAL_MODE,
         TCC_U77_FIXED_CHALLENGER_MODE,
+        TCC_U75_DAILY_PROTECTION_MODE,
     }
-    u77_mode = str(strategy.strategy_mode) == TCC_U77_FIXED_CHALLENGER_MODE
+    u77_mode = str(strategy.strategy_mode) in {TCC_U77_FIXED_CHALLENGER_MODE, TCC_U75_DAILY_PROTECTION_MODE}
     if frozen_control_mode:
         target_session = latest_safe_completed_xnys_session().date().isoformat()
         live_job_id = (
@@ -914,6 +920,7 @@ def prepare_next_paper_plan(
         and str(strategy.strategy_mode) in {
             TCC_U67_CONTROL_OPERATIONAL_MODE,
             TCC_U77_FIXED_CHALLENGER_MODE,
+            TCC_U75_DAILY_PROTECTION_MODE,
         }
         and live_market.get("analysis_mode")
         == "current_session_intraday"
