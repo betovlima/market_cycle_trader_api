@@ -14,7 +14,7 @@ from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-EQUITY_COLUMNS = ("timestamp", "simulation_equity", "reference_equity", "drawdown")
+EQUITY_COLUMNS = ("timestamp", "simulation_equity", "reference_equity", "selected_asset", "drawdown")
 ROTATION_COLUMNS = (
     "executed_at", "from_asset", "to_asset", "realized_pnl",
     "transaction_fees", "buy_reason", "sell_reason",
