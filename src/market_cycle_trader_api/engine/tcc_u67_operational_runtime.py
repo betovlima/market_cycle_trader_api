@@ -828,9 +828,14 @@ def build_live_tcc_u67_decision(
             U77_REQUESTED_ASSETS,
             assert_tcc_u77_contract,
         )
+        from ..core.config import TCC_U75_DAILY_PROTECTION_MODE
         if requested_assets != U77_REQUESTED_ASSETS:
             raise ValueError("Unknown frozen Control universe")
-        assert_tcc_u77_contract(config)
+        if str(getattr(config, "strategy_mode", "")) == TCC_U75_DAILY_PROTECTION_MODE:
+            from .u75_market_protection import assert_u75_contract
+            assert_u75_contract(config)
+        else:
+            assert_tcc_u77_contract(config)
     frames, symbols, common_dates, scientific_config = _prepare_live_u67_panel(
         bars_by_symbol,
         config,
