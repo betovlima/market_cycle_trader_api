@@ -766,7 +766,7 @@ def backtest_analytics(db: Any, job_id: str) -> dict[str, Any]:
     sells = _completed_sells(trades)
     rotation_payload = admin_job_rotations(db, job_id)
     rotations = list(rotation_payload.get("rotations", []))
-    position_audit = build_position_audit(equity, _position_prediction_rows(db, job_id, backend), decision_scores, rotations)
+    position_audit = build_position_audit(equity, _position_prediction_rows(db, job_id, backend), decision_scores, rotations, trades)
     monthly = _monthly_returns(equity)
     payload = {
         "job_id": job_id,
