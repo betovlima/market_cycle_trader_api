@@ -11,19 +11,24 @@ from math import isfinite
 from typing import Any
 
 
-def _day(value: Any) -> str | None:
+def _instant(value: Any) -> str | None:
     if isinstance(value, datetime):
         moment = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return moment.astimezone(timezone.utc).date().isoformat()
+        return moment.astimezone(timezone.utc).isoformat()
     if not value:
         return None
     try:
         moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        return moment.astimezone(timezone.utc).date().isoformat()
+        return moment.astimezone(timezone.utc).isoformat()
     except (TypeError, ValueError):
         return None
+
+
+def _day(value: Any) -> str | None:
+    instant = _instant(value)
+    return instant[:10] if instant else None
 
 
 def _number(value: Any) -> float | None:
@@ -58,14 +63,13 @@ def build_position_audit(
     rotations: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Join only sessions that really exist; never forward-fill a missing position."""
-    by_date: dict[str, dict[str, Any]] = {}
-    for row in sorted(
-        persisted_predictions,
-        key=lambda item: str(item.get("timestamp") or ""),
-    ):
-        date = _day(row.get("timestamp"))
-        if date:
-            by_date[date] = row
+    # A matching calendar date alone is insufficient when multiple snapshots
+    # happen on the same day; join on the exact persisted execution timestamp.
+    by_instant: dict[str, dict[str, Any]] = {}
+    for row in persisted_predictions:
+        instant = _instant(row.get("timestamp"))
+        if instant:
+            by_instant[instant] = row
 
     scores = {date: row for row in decision_scores if (date := _day(row.get("execution_date")))}
     moves: dict[str, list[dict[str, Any]]] = {}
@@ -79,7 +83,7 @@ def build_position_audit(
         date = _day(equity_row.get("timestamp"))
         if date is None:
             continue
-        raw = by_date.get(date)
+        raw = by_instant.get(_instant(equity_row.get("timestamp")))
         position = _recorded_position(raw) if raw is not None else None
         action = str(raw.get("trade_action") or "").upper() if raw else ""
         history.append({
