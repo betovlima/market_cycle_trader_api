@@ -61,6 +61,7 @@ def build_position_audit(
     persisted_predictions: list[dict[str, Any]],
     decision_scores: list[dict[str, Any]],
     rotations: list[dict[str, Any]],
+    trades: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Join only sessions that really exist; never forward-fill a missing position."""
     # A matching calendar date alone is insufficient when multiple snapshots
@@ -78,6 +79,12 @@ def build_position_audit(
         if date:
             moves.setdefault(date, []).append(row)
 
+    terminal_sells = {
+        instant
+        for row in (trades or [])
+        if str(row.get("action") or "").upper() == "FINAL_SELL"
+        if (instant := _instant(row.get("timestamp")))
+    }
     history: list[dict[str, Any]] = []
     for equity_row in equity:
         date = _day(equity_row.get("timestamp"))
@@ -92,7 +99,7 @@ def build_position_audit(
             "cash_weight": _number(raw.get("cash_weight")) if raw else None,
             "assets_held": int(raw["assets_held"]) if raw and _number(raw.get("assets_held")) is not None else None,
             "trade_action": action or None,
-            "terminal_liquidation": "FINAL_SELL" in action,
+            "terminal_liquidation": "FINAL_SELL" in action or _instant(equity_row.get("timestamp")) in terminal_sells,
             "recorded": position is not None,
         })
 
