@@ -90,6 +90,17 @@ class PersistedCashPositionAuditTests(unittest.TestCase):
         self.assertEqual(result["position_coverage"]["cash_sessions"], 0)
         self.assertEqual(result["position_coverage"]["missing_sessions"], 1)
 
+    def test_same_date_wrong_timestamp_is_not_accepted_as_effective_position(self):
+        result = build_position_audit(
+            equity("2025-01-02"),
+            [{"timestamp": datetime(2025, 1, 2, 20, 0, tzinfo=timezone.utc),
+              "selected_asset": "CASH", "assets_held": 0, "cash_weight": 1}],
+            [], [],
+        )
+        self.assertEqual(result["position_coverage"]["recorded_sessions"], 0)
+        self.assertEqual(result["position_coverage"]["cash_sessions"], 0)
+        self.assertIsNone(result["position_history"][0]["asset"])
+
     def test_consecutive_cash_sessions_form_one_episode(self):
         result = build_position_audit(
             equity("2025-01-02", "2025-01-03", "2025-01-06"),
