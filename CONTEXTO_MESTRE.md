@@ -1,3 +1,7 @@
+## 2026-10-31 — API v10.8.134 | Modo histórico de backtest não executável
+
+Branch `fix/v10.8.134-retired-backtest-mode` baseada na API v10.8.133. `COMPOUND_ROTATION_SWING_TCC_U75_DAILY_CASH_V101` pode existir no catálogo histórico, mas não pertence ao `StrategyMode` executável. Novos backtests usam somente modos suportados; antes da fila a API detecta políticas descontinuadas e responde HTTP 409 `RETIRED_BACKTEST_STRATEGY_MODE`. Seleção de Research com modo retirado também falha 409. Backtests antigos não são alterados, nem se faz remapeamento U75 para U67/U77. Testes `tests/test_retired_backtest_mode_guard_v108134.py`. Documentação `docs/changes/v10.8.134-retired-backtest-mode.md`.
+
 ## 2026-10-31 — API v10.8.133 | Auditoria CASH em backtests (somente leitura)
 
 Branch `feature/v10.8.133-persisted-cash-position-audit`. Novo `position_history`, `position_coverage` e `cash_investigation` no analytics histórico, usando somente posições efetivas persistidas de `backtest_predictions` para o job e backend selecionados. Não reconstruir CASH a partir de rotações. Ausência de registro permanece desconhecida. Respeitar a liquidação final e não confundi-la com tempo de mercado em caixa. Sem alterações de política, Live/Paper, ordens ou capital. Testes `tests/test_backtest_position_audit_v108133.py`. Documentação `docs/changes/v10.8.133-persisted-cash-position-audit.md`.
