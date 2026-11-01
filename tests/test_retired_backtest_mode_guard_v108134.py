@@ -21,8 +21,8 @@ from market_cycle_trader_api.services.strategy_lab import (
 )
 
 
-OLD_MODE = "COMPOUND_ROTATION_SWING_TCC_U75_DAILY_CASH_V101"
-SUPPORTED_MODE = "COMPOUND_ROTATION_SWING_TCC_U67_V1210"
+OLD_MODE = "COMPOUND_ROTATION_SWING_NO_LONGER_SUPPORTED_TEST_ONLY"
+SUPPORTED_MODE = "COMPOUND_ROTATION_SWING_TCC_U75_DAILY_CASH_V101"
 
 
 class RetiredBacktestModeTests(unittest.TestCase):
@@ -37,8 +37,13 @@ class RetiredBacktestModeTests(unittest.TestCase):
         self.assertIn("Historical results remain accessible", detail)
         self.assertNotIn("will use", detail)
         self.assertEqual(_translate_error(raised.exception).status_code, 409)
+        # U75 is NOT retired. The experimental U75 engine must remain executable.
+        assert_supported_backtest_strategy({
+            "name": "U75 Daily Market Protection",
+            "configuration": {"strategy_mode": SUPPORTED_MODE},
+        })
 
-    def test_supported_mode_is_not_rejected_by_retired_mode_guard(self):
+    def test_u75_mode_is_executable_again(self):
         assert_supported_backtest_strategy({
             "configuration": {"strategy_mode": SUPPORTED_MODE}
         })
