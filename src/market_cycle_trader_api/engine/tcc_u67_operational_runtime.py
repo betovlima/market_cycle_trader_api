@@ -350,6 +350,7 @@ def run_tcc_u67_operational_backtest(
     trade_callback: Callable[[dict[str, Any]], None] | None = None,
     progress_detail_callback: Callable[[dict[str, Any]], None] | None = None,
     technical_log_callback: Callable[[str], None] | None = None,
+    u75_daily_protection: bool = False,
 ) -> list[Any]:
     """Replay the protected U67 policy on current, already-audited MCT bars."""
     eligible_assets = tuple(
@@ -577,6 +578,10 @@ def run_tcc_u67_operational_backtest(
         policies,
         decision_to_fold,
     )
+    if u75_daily_protection:
+        from .u75_market_protection import daily_u75_market_signals, overlay_u75_policy
+        signals = daily_u75_market_signals(frames, symbols, pd.DatetimeIndex(all_decision_dates[:-1]))
+        scheduled = overlay_u75_policy(scheduled, signals, diagnostics=replay_decision_diagnostics)
     result = _simular_exato(
         ("tcc_u77_fixed_challenger" if len(requested_assets) == 77 else "tcc_u67_v1210_control"),
         scheduled,
@@ -639,6 +644,23 @@ def run_tcc_u67_operational_backtest(
             "tcc_checkpoint_is_optimization_target": False,
         }
     )
+    if u75_daily_protection:
+        from .u75_market_protection import (SOURCE_REPOSITORY as U75_REPOSITORY,
+            SOURCE_COMMIT as U75_SOURCE_COMMIT, SOURCE_VERSION as U75_SOURCE_VERSION,
+            ENGINE_VERSION as U75_ENGINE_VERSION)
+        result.metrics.update({
+            "operational_contract": U75_ENGINE_VERSION,
+            "tcc_source_repository": U75_REPOSITORY,
+            "tcc_source_commit": U75_SOURCE_COMMIT,
+            "tcc_reproduction_version": U75_SOURCE_VERSION,
+            "u75_daily_cash_protection_enabled": True,
+            "u75_exploratory_thresholds_statistically_validated": False,
+            "u75_cash_interest_yield": 0.0,
+            "u75_cash_minimum_holding_days": None,
+            "u75_cash_maximum_holding_days": None,
+            "u75_cash_signal_days": sum(int(row["stress_without_candidate"]) for row in signals.values()),
+            "u75_raw_regime_diagnostic_days": sum(int(row["universe_stress"]) for row in signals.values()),
+        })
     if progress_callback is not None:
         progress_callback(
             92.0,
@@ -806,9 +828,14 @@ def build_live_tcc_u67_decision(
             U77_REQUESTED_ASSETS,
             assert_tcc_u77_contract,
         )
+        from ..core.config import TCC_U75_DAILY_PROTECTION_MODE
         if requested_assets != U77_REQUESTED_ASSETS:
             raise ValueError("Unknown frozen Control universe")
-        assert_tcc_u77_contract(config)
+        if str(getattr(config, "strategy_mode", "")) == TCC_U75_DAILY_PROTECTION_MODE:
+            from .u75_market_protection import assert_u75_contract
+            assert_u75_contract(config)
+        else:
+            assert_tcc_u77_contract(config)
     frames, symbols, common_dates, scientific_config = _prepare_live_u67_panel(
         bars_by_symbol,
         config,

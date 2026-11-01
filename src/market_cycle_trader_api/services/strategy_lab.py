@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from copy import deepcopy
 from functools import lru_cache
-from typing import Any
+from typing import Any, get_args
 
 import exchange_calendars as xcals
 import pandas as pd
@@ -20,6 +20,7 @@ from ..core.config import (
     PACKAGE_DIR,
     TCC_U67_CONTROL_OPERATIONAL_MODE,
     TCC_U77_FIXED_CHALLENGER_MODE,
+    TCC_U75_DAILY_PROTECTION_MODE,
 )
 from ..engine.tcc_u77_static_challenger import tcc_u77_contract_issues
 from ..engine.tcc_u67_operational_runtime import (
@@ -43,7 +44,7 @@ from ..infrastructure.persistence.mongo_repository import (
     bson_value,
     utc_now,
 )
-from ..schemas.requests import BacktestRequest
+from ..schemas.requests import BacktestRequest, StrategyMode
 from .model_research import (
     execution_settings_for,
     execution_settings_from_values,
@@ -417,6 +418,29 @@ class StrategyLabConflict(StrategyLabError):
     pass
 
 
+class UnsupportedBacktestStrategyMode(StrategyLabConflict):
+    """A stored, non-executable research strategy was selected."""
+
+
+def assert_supported_backtest_strategy(profile: dict[str, Any]) -> None:
+    """Keep retired historical policies readable, never silently map them to a new one."""
+    configuration = profile.get("configuration") if isinstance(profile.get("configuration"), dict) else {}
+    mode = str(configuration.get("strategy_mode") or "").strip()
+    # The isolated TCC v1.0.6 reference is bound to its own frozen engine.
+    # Legacy reference catalog entries can omit the normal strategy payload.
+    if not mode and str(profile.get("backtest_engine_binding") or "") == TCC_V106_BACKTEST_ENGINE_BINDING:
+        return
+    if mode not in get_args(StrategyMode):
+        name = str(profile.get("name") or profile.get("_id") or "Selected Strategy")
+        raise UnsupportedBacktestStrategyMode(
+            f"RETIRED_BACKTEST_STRATEGY_MODE: {name} uses unsupported strategy_mode "
+            f"'{mode or '(missing)'}'. In System Settings > Strategies, select an "
+            "existing compatible Strategy for Strategy Research before starting a new "
+            "Backtest. Historical results remain accessible; the retired policy "
+            "is not converted or executed."
+        )
+
+
 class StrategyLabNotFound(StrategyLabError):
     pass
 
@@ -610,12 +634,14 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
     if strategy_mode in {
         TCC_U67_CONTROL_OPERATIONAL_MODE,
         TCC_U77_FIXED_CHALLENGER_MODE,
+        TCC_U75_DAILY_PROTECTION_MODE,
     }:
+        u75_mode = strategy_mode == TCC_U75_DAILY_PROTECTION_MODE
         u77_mode = strategy_mode == TCC_U77_FIXED_CHALLENGER_MODE
-        contract_label = "TCC U77" if u77_mode else "TCC U67"
+        contract_label = ("U75 collective protection" if u75_mode else "TCC U77" if u77_mode else "TCC U67")
         expected_binding = (
-            "tcc_u77_fixed_challenger_backtest"
-            if u77_mode
+            "u75_daily_cash_protection_v101" if u75_mode
+            else "tcc_u77_fixed_challenger_backtest" if u77_mode
             else "tcc_u67_v1210_operational_backtest"
         )
         if engine_binding != expected_binding:
@@ -643,11 +669,14 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
                 "model_family": model_family,
                 "backtest_engine_binding": engine_binding,
             }
-        issues = (
-            tcc_u77_contract_issues(configuration)
-            if u77_mode
-            else tcc_u67_contract_issues(configuration)
-        )
+        if u75_mode:
+            from ..engine.u75_market_protection import u75_contract_issues
+            issues = u75_contract_issues(configuration)
+        else:
+            issues = (
+                tcc_u77_contract_issues(configuration)
+                if u77_mode else tcc_u67_contract_issues(configuration)
+            )
         if issues:
             return {
                 "eligible": False,
@@ -664,8 +693,8 @@ def _trader_runtime_compatibility(document: dict[str, Any]) -> dict[str, Any]:
         return {
             "eligible": True,
             "code": (
-                "tcc_u77_live_runtime_ready"
-                if u77_mode
+                "u75_daily_protection_live_runtime_ready" if u75_mode
+                else "tcc_u77_live_runtime_ready" if u77_mode
                 else "tcc_u67_live_runtime_ready"
             ),
             "reason": None,
@@ -1509,6 +1538,7 @@ def get_research_strategy_context(db: Any) -> tuple[BacktestRequest, dict[str, A
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Selected Strategy Research baseline does not exist.")
+    assert_supported_backtest_strategy(profile)
     configuration = BacktestRequest.model_validate(profile.get("configuration") or {})
     return configuration, _public_profile(profile, include_configuration=False)
 
@@ -2283,6 +2313,7 @@ def select_research_strategy(
     profile = db[STRATEGY_PROFILES_COLLECTION].find_one({"_id": strategy_id})
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    assert_supported_backtest_strategy(profile)
     now = utc_now()
     reference_only = bool(str(profile.get("backtest_engine_binding") or "").strip())
     selection_updates = {
@@ -2345,6 +2376,7 @@ def select_research_strategy_only(
     )
     if profile is None:
         raise StrategyLabNotFound("Strategy profile not found.")
+    assert_supported_backtest_strategy(profile)
     now = utc_now()
     updated_control = db[STRATEGY_CONTROL_COLLECTION].find_one_and_update(
         {"_id": CONTROL_ID, "revision": current_revision},

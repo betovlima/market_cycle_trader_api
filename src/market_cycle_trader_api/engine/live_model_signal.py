@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE, TCC_U75_DAILY_PROTECTION_MODE
 from .live_lightgbm_signal import build_live_lightgbm_decision
 from .tcc_u67_operational_runtime import build_live_tcc_u67_decision
 from .tcc_u77_static_challenger import U77_REQUESTED_ASSETS
@@ -43,6 +43,14 @@ def build_live_model_decision(
             holding_sessions=holding_sessions,
             requested_assets=U77_REQUESTED_ASSETS,
         )
+    if (model_family == "lightgbm_utility" and
+            str(getattr(config, "strategy_mode", "")) == TCC_U75_DAILY_PROTECTION_MODE):
+        from .u75_market_protection import apply_live_u75_protection
+        original = build_live_tcc_u67_decision(
+            bars_by_symbol, config, current_asset=current_asset,
+            holding_sessions=holding_sessions, requested_assets=U77_REQUESTED_ASSETS,
+        )
+        return apply_live_u75_protection(bars_by_symbol, original)
     if model_family == "lightgbm_utility":
         return build_live_lightgbm_decision(
             bars_by_symbol,

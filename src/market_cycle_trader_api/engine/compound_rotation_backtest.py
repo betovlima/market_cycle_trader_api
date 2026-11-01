@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE
+from ..core.config import TCC_U67_CONTROL_OPERATIONAL_MODE, TCC_U77_FIXED_CHALLENGER_MODE, TCC_U75_DAILY_PROTECTION_MODE
 from ..core.environment import load_project_environment
 
 
@@ -324,13 +324,17 @@ def run_job(
         str(effective_config.strategy_mode)
         == TCC_U67_CONTROL_OPERATIONAL_MODE
     )
+    tcc_u75_runtime = str(effective_config.strategy_mode) == TCC_U75_DAILY_PROTECTION_MODE
     tcc_u77_runtime = (
         str(effective_config.strategy_mode)
         == TCC_U77_FIXED_CHALLENGER_MODE
-    )
+    ) or tcc_u75_runtime
     if tcc_u67_runtime:
         assert_tcc_u67_operational_contract(effective_config)
-    if tcc_u77_runtime:
+    if tcc_u75_runtime:
+        from .u75_market_protection import assert_u75_contract
+        assert_u75_contract(effective_config)
+    elif tcc_u77_runtime:
         assert_tcc_u77_contract(effective_config)
     tcc_protected_runtime = tcc_u67_runtime or tcc_u77_runtime
     bars_by_symbol: dict[str, pd.DataFrame] = {}
@@ -684,6 +688,7 @@ def run_job(
                 trade_callback=emit_trade,
                 progress_detail_callback=emit_progress_detail,
                 technical_log_callback=emit_research_technical,
+                u75_daily_protection=tcc_u75_runtime,
             )
         else:
             results = run_rotation_models(
