@@ -426,6 +426,10 @@ def assert_supported_backtest_strategy(profile: dict[str, Any]) -> None:
     """Keep retired historical policies readable, never silently map them to a new one."""
     configuration = profile.get("configuration") if isinstance(profile.get("configuration"), dict) else {}
     mode = str(configuration.get("strategy_mode") or "").strip()
+    # The isolated TCC v1.0.6 reference is bound to its own frozen engine.
+    # Legacy reference catalog entries can omit the normal strategy payload.
+    if not mode and str(profile.get("backtest_engine_binding") or "") == TCC_V106_BACKTEST_ENGINE_BINDING:
+        return
     if mode not in get_args(StrategyMode):
         name = str(profile.get("name") or profile.get("_id") or "Selected Strategy")
         raise UnsupportedBacktestStrategyMode(
