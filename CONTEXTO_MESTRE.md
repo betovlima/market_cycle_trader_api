@@ -1,6 +1,21 @@
-## 2026-10-31 — API v10.8.134 | Modo histórico de backtest não executável
+## 2026-10-31 — API v10.8.134 | Recuperação do motor U75 e auditoria CASH na mesma versão
 
-Branch `fix/v10.8.134-retired-backtest-mode` baseada na API v10.8.133. `COMPOUND_ROTATION_SWING_TCC_U75_DAILY_CASH_V101` pode existir no catálogo histórico, mas não pertence ao `StrategyMode` executável. Novos backtests usam somente modos suportados; antes da fila a API detecta políticas descontinuadas e responde HTTP 409 `RETIRED_BACKTEST_STRATEGY_MODE`. Seleção de Research com modo retirado também falha 409. Backtests antigos não são alterados, nem se faz remapeamento U75 para U67/U77. Testes `tests/test_retired_backtest_mode_guard_v108134.py`. Documentação `docs/changes/v10.8.134-retired-backtest-mode.md`.
+A estratégia `COMPOUND_ROTATION_SWING_TCC_U75_DAILY_CASH_V101` **NÃO estava descontinuada**: pertence à branch `feature/v10.8.133-u75-daily-protection-one-call`, registrada pelo endpoint `POST /api/admin/strategies/u75-protection/install-and-backtest`. A API 10.8.134 restabelece a implementação completa da U75 (validação Pydantic, configuração/identidade, proteção coletiva de CASH, adaptadores Backtest/Live/Paper, instalador e endpoint) em conjunto com a auditoria histórica `position_history`, `position_coverage` e `cash_investigation`. Esta integração corrige a regressão criada por desenvolvimento paralelo. **Não migrar U75 para U67/U77, não criar uma segunda estratégia, não apagar dados nem alterar Winner.** A guarda HTTP 409 `RETIRED_BACKTEST_STRATEGY_MODE` só protege contra identificadores realmente ausentes do `StrategyMode`, nunca U75. Verificar testes U75 e auditoria do CASH antes de integrar à main; desenvolvimento em branch, não em produção.
+
+## 2026-10-31 — API v10.8.133 (branch de integração, não implantada) | U75 proteção coletiva diária em uma chamada
+
+**Objetivo:** adicionar uma Strategy experimental U75 à API sem misturar pesquisa, Winner e execução de ordens. Endpoint administrativo único: `POST /api/admin/strategies/u75-protection/install-and-backtest`. Registra/reutiliza perfil, seleciona apenas para Backtest, enfileira execução com histórico Alpaca RAW/SIP novo e mantém job/resultados/arquivos nos caminhos atuais da Reprodução anual (`/api/analytics/backtests/{job_id}` e `/files`); a API devolve o identificador do job, não finge backtest instantâneo.
+
+**Origem:** TCC `research/u75-stress-dynamic-cash-v1`, commit `a899dd258a83b09df05a2db25177737f4a1c6b36`, política v1.0.1. Control anterior US$ 80.685.454,79 apenas referência histórica, não resultado do MCT. U77 solicitado, 75 efetivos esperados; a política impede classificação de inexistência de oportunidades sem avaliação completa do U75.
+
+**Sinal:** critério coletivo da versão 1.0.1 do TCC; reavaliado a cada fechamento usando apenas barras concluídas. Não há permanência fixa em CASH. Critérios numéricos (35%, 45%, 55%, −1,5%) seguem hipóteses exploratórias sem comprovação estatística. Saldo CASH em USD nominal, juros zero na simulação atual. A decisão original continua sendo baseada no ranking do universo e a proteção nunca reage a um único ativo isolado.
+
+**Caminhos:** módulo `engine/u75_market_protection.py`; adaptadores existentes de Backtest, Live e Paper, com contrato de modelo idêntico; monitor e operações de Winner sem alteração. `services/u75_protection_strategy.py` instala idempotentemente. `api/routers/u75_protection.py` orquestra e responde 202. A promoção a Winner NÃO ocorre no endpoint e segue processo padrão de backteste certificado, Candidate, promoção e guardas operacionais, somente após validação de paridade dos sinais e aprovação científica.
+
+**Histórico de erros considerado:** criação mais backtest em várias chamadas; metadados de pontuação não repassados ao replay U67/U77 (corrigido na v10.8.129); arquivos da Reprodução anual ausentes em backend anterior à v10.8.131; travas artificiais de cinco pregões no TCC (removidas); vazamento por barra futura e risco de barra intradiária incompleta; colisão de jobs e Winner indevidamente modificado. Nada desta integração faz chamada de corretagem.
+
+**Validação:** CI GitHub e teste com banco/Alpaca são etapas distintas. Esta entrada descreve código em branch, não implica merge na main nem implantação Railway. Mais detalhes em `docs/changes/v10.8.133-u75-protection-one-call.md`.
+
 
 ## 2026-10-31 — API v10.8.133 | Auditoria CASH em backtests (somente leitura)
 
