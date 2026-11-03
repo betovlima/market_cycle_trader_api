@@ -1,3 +1,15 @@
+## 2026-11-03 — API v10.8.133 | Alpaca OAuth na leitura do Portfolio Live
+
+**Rastreabilidade:** origem `feature/alpaca-connect-oauth-current-user-v1`, destino `main`, tag anotada `v10.8.133` e frontend correspondente `v10.7.50` (`betovlima/market_cycle_trader`). A tag e GitHub Release são publicadas por `.github/workflows/publish-version-tag.yml` depois do CI verde da `main`. Notas integrais: `docs/releases/v10.8.133.md`. Detalhes técnicos: `docs/changes/alpaca-oauth-current-admin-readonly-pilot.md`.
+
+**Funcionalidade:** autorização Alpaca Connect OAuth 2.0 pelo administrador MCT; `state` aleatório, de uso único, vinculado ao subject da sessão e persistido por hash no Mongo. Callback público apenas para receber a resposta da Alpaca, validado pelo state e sem exigir cookie do navegador. Troca de código por token Bearer, rejeição de permissões de trading, validação rigorosa do ID da conta Live e token criptografado Fernet por identidade. `/api/alpaca-oauth/{status,start,callback,verify,disconnect}` disponibiliza o ciclo da conexão. Nenhum token ou Client Secret é enviado ao frontend.
+
+**Integração:** `GET /api/live-market/portfolio` e `GET /api/live-market/portfolio/export.zip` utilizam `TradingClient(oauth_token=..., paper=False)` quando a sessão administrativa tem vínculo OAuth válido. `broker_authentication=oauth` indica origem da leitura; sem vínculo, conserva `api_keys`. Token expirado, inválido ou conta divergente provoca falha explícita, nunca fallback silencioso. Saldo, equity, ordens, posições e relógio vêm da Alpaca; decisão, histórico e auditoria permanecem dados internos, filtrados pela conta confirmada.
+
+**Sem mudanças:** agendadores, engine e execução de ordens Winner, API keys Live originais, Paper, TCC, políticas quantitativas e controles operacionais. Piloto para conta Live esperada do administrador; **não habilita trading OAuth nem multiusuário**. A integração real foi validada localmente em 03/11/2026 pela resposta `broker_authentication=oauth`, não por uma ordem via OAuth. O merge no GitHub não certifica atualização Railway.
+
+---
+
 ## 2026-10-30 — API v10.8.132 | Winner Live: janela pós-fechamento SIP
 
 **Correção:** o scheduler agora só inicia a preparação normal de dados RAW/SIP, treinamento e decisão de rotação depois de XNYS fechar + 20 minutos e antes da abertura da próxima sessão, conforme relógio da Alpaca e calendário oficial (inclui feriados e fechamentos antecipados). Antes da janela, registra no máximo um evento informativo `signal_waiting_for_daily_bar` por sessão/processo, sem gerar tentativas de download ou erros repetidos. A abertura mantém execução do sinal diário D−1 persistido; a recuperação excepcional de sinal ausente não foi modificada.
