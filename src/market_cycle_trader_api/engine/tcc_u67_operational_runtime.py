@@ -36,6 +36,7 @@ from ..tcc_u67_v1210_reference.modelo_lightgbm import (
     _selecionar_switch_margin_fold,
 )
 from .live_lightgbm_signal import LiveLightGBMDecision
+from .live_feature_attribution import explain_live_utilities
 from ..tcc_u67_v1210_reference.rotacao import (
     _benchmark_pesos_iguais,
     _crescimento_politica_simples,
@@ -924,6 +925,15 @@ def build_live_tcc_u67_decision(
         for index, label in enumerate(labels)
         if np.isfinite(float(utilities[index]))
     }
+    # Read-only attribution uses the same final models and completed-session
+    # feature row as the already-computed decision. It cannot change scores.
+    try:
+        feature_attributions = explain_live_utilities(
+            final_models, frames, symbols, decision_date, utilities,
+            ROTATION_FEATURES,
+        )
+    except Exception:
+        feature_attributions = {}
 
     return LiveLightGBMDecision(
         decision_date=decision_date,
@@ -947,4 +957,5 @@ def build_live_tcc_u67_decision(
         effective_compute_device="cpu",
         compute_fallback_reason=None,
         random_state=int(scientific_config.random_state),
+        feature_attributions=feature_attributions,
     )
