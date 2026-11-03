@@ -19,8 +19,7 @@ from fastapi.responses import RedirectResponse
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
 
-router = APIRouter(prefix="/api/alpaca-oauth", tags=["alpaca-oauth-readonly"],
-                   dependencies=[Depends(require_admin_session)])
+router = APIRouter(prefix="/api/alpaca-oauth", tags=["alpaca-oauth-readonly"])
 PENDING = "alpaca_oauth_pending"
 CONNECTIONS = "alpaca_oauth_connections"
 AUTHORIZE = "https://app.alpaca.markets/oauth/authorize"
@@ -53,8 +52,8 @@ def _config():
     return c
 
 
-def _key(identity):
-    return hashlib.sha256(identity.subject.encode("utf-8")).hexdigest() + ":live"
+def _key(subject: str) -> str:
+    return hashlib.sha256(subject.encode("utf-8")).hexdigest() + ":live"
 
 
 def _digest(value):
@@ -90,7 +89,7 @@ def _read_account(token):
 
 
 def _status(db, identity):
-    saved = db[CONNECTIONS].find_one({"_id": _key(identity)},
+    saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)},
                                       {"encrypted_token": 0})
     return {"configured": True, "connected": bool(saved),
             "environment": "live", "read_only": True, "trading_enabled": False,
@@ -131,8 +130,7 @@ def start(request: Request,
 
 
 @router.get("/callback")
-def callback(identity: Annotated[SessionIdentity, Depends(require_admin_session)],
-             code: str | None = Query(default=None, max_length=2048),
+def callback(code: str | None = Query(default=None, max_length=2048),
              state: str | None = Query(default=None, max_length=256),
              error: str | None = Query(default=None, max_length=256)):
     try:
@@ -143,9 +141,13 @@ def callback(identity: Annotated[SessionIdentity, Depends(require_admin_session)
         return _back(c["frontend"], "invalid_state")
     db = database()
     saved = db[PENDING].find_one_and_delete({"_id": _digest(state)})
-    if (not saved or saved.get("subject") != identity.subject
-        or not isinstance(saved.get("expires"), datetime)):
+    # Alpaca returns via a top-level cross-site redirect, where the MCT
+    # session cookie may be absent. The one-use state identifies the
+    # administrator who initiated /start (which requires an admin session).
+    if (not saved or not isinstance(saved.get("subject"), str)
+        or not saved["subject"] or not isinstance(saved.get("expires"), datetime)):
         return _back(c["frontend"], "invalid_state")
+    subject = saved["subject"]
     expires = saved["expires"]
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
@@ -173,8 +175,8 @@ def callback(identity: Annotated[SessionIdentity, Depends(require_admin_session)
     if str(account["id"]) != c["expected"]:
         return _back(c["frontend"], "account_mismatch")
     encrypted = Fernet(c["key"].encode("ascii")).encrypt(token.encode("utf-8")).decode("ascii")
-    db[CONNECTIONS].update_one({"_id": _key(identity)}, {
-        "$set": {"subject": identity.subject, "environment": "live",
+    db[CONNECTIONS].update_one({"_id": _key(subject)}, {
+        "$set": {"subject": subject, "environment": "live",
                  "account_id": str(account["id"]),
                  "account_status": str(account.get("status") or ""),
                  "encrypted_token": encrypted, "read_only": True,
@@ -190,7 +192,7 @@ def verify(identity: Annotated[SessionIdentity, Depends(require_admin_session)])
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
     db = database()
-    saved = db[CONNECTIONS].find_one({"_id": _key(identity)})
+    saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)})
     if not saved:
         raise HTTPException(404, "Alpaca OAuth is not connected.")
     try:
@@ -201,7 +203,7 @@ def verify(identity: Annotated[SessionIdentity, Depends(require_admin_session)])
         raise HTTPException(503, "Alpaca OAuth verification failed.") from exc
     if str(account["id"]) != c["expected"] or str(account["id"]) != saved["account_id"]:
         raise HTTPException(409, "Alpaca account identity changed.")
-    db[CONNECTIONS].update_one({"_id": _key(identity)}, {"$set": {
+    db[CONNECTIONS].update_one({"_id": _key(identity.subject)}, {"$set": {
         "account_status": str(account.get("status") or ""),
         "verified_at": datetime.now(timezone.utc),
     }})
@@ -216,6 +218,6 @@ def disconnect(request: Request,
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
     _same_origin(request, c["frontend"])
-    database()[CONNECTIONS].delete_one({"_id": _key(identity)})
+    database()[CONNECTIONS].delete_one({"_id": _key(identity.subject)})
     # Only local token is removed; the Alpaca-side grant can be revoked separately.
     return {"connected": False}
