@@ -164,6 +164,8 @@ def start_trading(request: Request,
     db[PENDING].insert_one({
         "_id": _digest(state), "subject": identity.subject,
         "requested_scope": "trading",
+        # A disconnected/replaced grant must invalidate an old browser flow.
+        "linked_token_hash": _digest(str(linked.get("encrypted_token") or "")),
         "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
     })
     url = AUTHORIZE + "?" + urlencode({
@@ -196,8 +198,16 @@ def callback(code: str | None = Query(default=None, max_length=2048),
     requested_scope = saved.get("requested_scope", "read")
     if requested_scope not in {"read", "trading"}:
         return _back(c["frontend"], "invalid_state")
-    if requested_scope == "trading" and not _trading_consent_enabled():
-        return _back(c["frontend"], "trading_unavailable")
+    if requested_scope == "trading":
+        if not _trading_consent_enabled():
+            return _back(c["frontend"], "trading_unavailable")
+        current = db[CONNECTIONS].find_one({"_id": _key(subject)})
+        if (not isinstance(current, dict) or current.get("subject") != subject
+            or current.get("environment") != "live"
+            or current.get("account_id") != c["expected"]
+            or not isinstance(saved.get("linked_token_hash"), str)
+            or _digest(str(current.get("encrypted_token") or "")) != saved["linked_token_hash"]):
+            return _back(c["frontend"], "invalid_state")
     expires = saved["expires"]
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
