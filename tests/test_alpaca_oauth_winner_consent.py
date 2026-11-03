@@ -128,6 +128,7 @@ class OAuthWinnerConsentTests(unittest.TestCase):
 
     def test_trading_grant_is_encrypted_but_does_not_enable_orders(self):
         self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        self.db[oauth.CONNECTIONS].update_one.return_value.matched_count = 1
         self.db[oauth.PENDING].find_one_and_delete.return_value = {
             "subject": self.subject, "requested_scope": "trading",
             "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
@@ -146,6 +147,11 @@ class OAuthWinnerConsentTests(unittest.TestCase):
               })):
             result = oauth.callback(code="code", state="state", error=None)
             self.assertIn("trading_connected", result.headers["location"])
+        self.assertFalse(self.db[oauth.CONNECTIONS].update_one.call_args.kwargs["upsert"])
+        self.assertEqual(
+            self.db[oauth.CONNECTIONS].update_one.call_args.args[0]["encrypted_token"],
+            self.linked["encrypted_token"],
+        )
         stored = self.db[oauth.CONNECTIONS].update_one.call_args.args[1]["$set"]
         self.assertTrue(stored["trading_authorized"])
         self.assertFalse(stored["read_only"])
@@ -160,6 +166,28 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         self.assertTrue(status["trading_authorized"])
         self.assertFalse(status["trading_enabled"])
         self.assertNotIn("encrypted_token", status)
+
+    def test_callback_cas_failure_never_reconnects_revoked_grant(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        self.db[oauth.CONNECTIONS].update_one.return_value.matched_count = 0
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "access_token": "token", "token_type": "bearer", "scope": "trading",
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth.requests, "post", return_value=response),
+              patch.object(oauth, "_read_account",
+                           return_value={"id": self.config["expected"]})):
+            result = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("invalid_state", result.headers["location"])
+        self.assertFalse(self.db[oauth.CONNECTIONS].update_one.call_args.kwargs["upsert"])
 
     def test_disconnected_or_replaced_oauth_grant_invalidates_pending_trading_state(self):
         self.db[oauth.PENDING].find_one_and_delete.return_value = {
