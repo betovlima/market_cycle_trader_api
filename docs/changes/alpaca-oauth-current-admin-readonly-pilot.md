@@ -16,7 +16,7 @@ Não é uma ativação do recurso multiusuário.
 2. Cadastre o MCT como aplicativo OAuth e obtenha **Client ID** e **Client Secret**.
 3. Informe à Alpaca o **Redirect URI exato** do backend:
 
-   `https://SEU-BACKEND/api/alpaca-oauth/callback`
+   `https://marketcycletraderapi-production.up.railway.app/api/alpaca-oauth/callback`
 
 4. Atenda às exigências de análise/aprovação aplicáveis da Alpaca. Somente após
    o cadastro e emissão das credenciais será possível fazer uma autorização
@@ -29,8 +29,8 @@ Documentação: https://docs.alpaca.markets/us/docs/registering-your-app
 ```env
 ALPACA_OAUTH_CLIENT_ID=CLIENT_ID_DO_APLICATIVO
 ALPACA_OAUTH_CLIENT_SECRET=CLIENT_SECRET_DO_APLICATIVO
-ALPACA_OAUTH_REDIRECT_URI=https://SEU-BACKEND/api/alpaca-oauth/callback
-ALPACA_OAUTH_FRONTEND_URL=https://SEU-FRONTEND/
+ALPACA_OAUTH_REDIRECT_URI=https://marketcycletraderapi-production.up.railway.app/api/alpaca-oauth/callback
+ALPACA_OAUTH_FRONTEND_URL=https://marketcycletrader-production.up.railway.app/
 ALPACA_OAUTH_EXPECTED_ACCOUNT_ID=ID_DA_CONTA_LIVE_ATUAL
 ALPACA_OAUTH_ENCRYPTION_KEY=CHAVE_FERNET_GERADA
 ```
