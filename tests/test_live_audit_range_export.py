@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from market_cycle_trader_api.services import live_portfolio as service
+from market_cycle_trader_api.tcc_u67_v1210_reference.rotacao import ROTATION_FEATURES
 from market_cycle_trader_api.api.routers import live_market as router
 
 
@@ -111,7 +112,7 @@ class LiveRangeExportTests(unittest.TestCase):
 
     def test_date_range_includes_all_dates_and_does_not_mix_accounts(self):
         result = self.download(date(2026, 10, 26), date(2026, 11, 2))
-        self.assertEqual(len(result), 5)
+        self.assertEqual(len(result), 6)
         self.assertEqual(json.loads(result["live_portfolio.json"]), self.snapshot)
         decisions = list(csv.DictReader(io.StringIO(result["live_decisions_period.csv"])))
         scores = list(csv.DictReader(io.StringIO(result["live_utility_scores_period.csv"])))
@@ -140,6 +141,9 @@ class LiveRangeExportTests(unittest.TestCase):
         self.assertEqual(manifest["days_with_decisions"], 3)
         self.assertEqual(manifest["utility_score_rows"], 6)
         self.assertEqual(manifest["date_basis"], "decision_date (completed market session)")
+        self.assertEqual(manifest["shap_attribution_rows"], 0)
+        self.assertEqual(len(list(csv.DictReader(io.StringIO(
+            result["live_feature_contributions_period.csv"])))), 0)
 
     def test_same_day_is_inclusive_and_missing_dates_not_fabricated(self):
         result = self.download(date(2026, 10, 27), date(2026, 10, 27))
@@ -154,6 +158,70 @@ class LiveRangeExportTests(unittest.TestCase):
         ))), 0)
         self.assertEqual(json.loads(result["audit_period.json"])["decision_count"], 0)
         self.assertIn("live_portfolio.json", result)
+
+    def test_recorded_shap_is_exported_with_52_feature_values(self):
+        feature_values = {name: float(index) / 100 for index, name
+                          in enumerate(ROTATION_FEATURES)}
+        contributions = {name: 0.01 for name in ROTATION_FEATURES}
+        sample = _run(
+            "live-1", "2026-11-02", "2026-11-03",
+            {"CAPR": 0.94, "DNN": 0.46, "CASH": 0.0},
+            feature_attributions={
+                "CAPR": {
+                    "method": "lightgbm_tree_shap",
+                    "base_value": 0.94 - len(ROTATION_FEATURES) * 0.01,
+                    "prediction": 0.94,
+                    "feature_values": feature_values,
+                    "contributions": contributions,
+                },
+            },
+        )
+        self.db = FakeDB([sample])
+        result = self.download(date(2026, 11, 2), date(2026, 11, 2))
+        rows = list(csv.DictReader(io.StringIO(
+            result["live_feature_contributions_period.csv"]
+        )))
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["symbol"], "CAPR")
+        self.assertEqual(row["method"], "lightgbm_tree_shap")
+        self.assertEqual(len(ROTATION_FEATURES), 52)
+        self.assertEqual(float(row["prediction"]), 0.94)
+        self.assertAlmostEqual(float(row["reconstructed_prediction"]), 0.94)
+        self.assertEqual(
+            float(row["shap_return_120"]), contributions["return_120"],
+        )
+        self.assertEqual(
+            float(row["value_ema_distance_20"]),
+            feature_values["ema_distance_20"],
+        )
+        manifest = json.loads(result["audit_period.json"])
+        self.assertEqual(manifest["shap_attribution_rows"], 1)
+        self.assertEqual(manifest["shap_decisions_covered"], 1)
+
+    def test_inconsistent_shap_is_never_exported_as_factual(self):
+        sample = _run(
+            "live-1", "2026-11-02", "2026-11-03",
+            {"CAPR": 0.94, "DNN": 0.46},
+            feature_attributions={
+                "CAPR": {
+                    "method": "lightgbm_tree_shap",
+                    "base_value": 100.0,
+                    "prediction": 0.94,
+                    "feature_values": {name: 0.0 for name in ROTATION_FEATURES},
+                    "contributions": {name: 0.0 for name in ROTATION_FEATURES},
+                },
+            },
+        )
+        self.db = FakeDB([sample])
+        result = self.download(date(2026, 11, 2), date(2026, 11, 2))
+        rows = list(csv.DictReader(io.StringIO(
+            result["live_feature_contributions_period.csv"]
+        )))
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            json.loads(result["audit_period.json"])["shap_attribution_rows"], 0
+        )
 
     def test_reject_invalid_or_one_sided_range(self):
         for first, last in [
