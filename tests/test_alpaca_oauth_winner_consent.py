@@ -220,6 +220,30 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         self.assertIn("trading_unavailable", result.headers["location"])
         post.assert_not_called()
 
+    def test_portfolio_reading_survives_trading_grant_upgrade(self):
+        grant = "trading-token-do-not-expose"
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": self.subject,
+            "environment": "live",
+            "read_only": False,
+            "trading_authorized": True,
+            "oauth_scope": "trading",
+            "account_id": self.config["expected"],
+            "encrypted_token": Fernet(self.config["key"].encode()).encrypt(
+                grant.encode()
+            ).decode(),
+        }
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(
+            id=self.config["expected"],
+        )
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch("alpaca.trading.client.TradingClient", return_value=broker) as factory):
+            client = oauth.connected_readonly_client(self.db, self.identity)
+        self.assertIs(client, broker)
+        factory.assert_called_once_with(oauth_token=grant, paper=False)
+        broker.submit_order.assert_not_called()
+
     def test_preflight_with_readonly_grant_never_creates_broker(self):
         self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
         with patch.object(live_oauth_winner, "connected_trading_client") as client:
