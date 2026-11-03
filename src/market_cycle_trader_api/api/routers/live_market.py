@@ -209,6 +209,7 @@ def execution_dry_run(payload: LiveDryRunRequest) -> dict[str, Any]:
 
 @router.get("/portfolio/export.zip")
 def export_portfolio(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
 ) -> Response:
