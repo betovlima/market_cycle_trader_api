@@ -243,7 +243,14 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         return _back(c["frontend"], "account_mismatch")
     trade_authorized = requested_scope == "trading"
     encrypted = Fernet(c["key"].encode("ascii")).encrypt(token.encode("utf-8")).decode("ascii")
-    db[CONNECTIONS].update_one({"_id": _key(subject)}, {
+    update_query = {"_id": _key(subject)}
+    if trade_authorized:
+        # Compare-and-swap: do not restore a grant that was disconnected or
+        # replaced between the initial check and token verification.
+        update_query.update({
+            "subject": subject, "encrypted_token": current["encrypted_token"],
+        })
+    updated = db[CONNECTIONS].update_one(update_query, {
         "$set": {"subject": subject, "environment": "live",
                  "account_id": str(account["id"]),
                  "account_status": str(account.get("status") or ""),
@@ -251,7 +258,9 @@ def callback(code: str | None = Query(default=None, max_length=2048),
                  "trading_authorized": trade_authorized,
                  "oauth_scope": "trading" if trade_authorized else "read",
                  "verified_at": datetime.now(timezone.utc)},
-    }, upsert=True)
+    }, upsert=not trade_authorized)
+    if trade_authorized and updated.matched_count != 1:
+        return _back(c["frontend"], "invalid_state")
     return _back(c["frontend"], "trading_connected" if trade_authorized else "connected")
 
 
