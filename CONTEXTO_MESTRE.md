@@ -1,3 +1,13 @@
+## 2026-11-03 — Winner OAuth, etapa 2 experimental | Consentimento de negociação e pré-validação por conta
+
+**Branch:** `feature/alpaca-oauth-winner-trading-v1` a partir de `main` API `v10.8.133`; frontend homônimo a partir de `v10.7.50`. **Sem alteração de versão, tag, merge ou deploy** nesta etapa experimental. Documentação: `docs/changes/alpaca-oauth-winner-trading-stage2.md`.
+
+**Implementação:** `POST /api/alpaca-oauth/start-trading` pede autorização explícita com `scope=trading`, apenas se o administrador já estiver conectado à conta Live esperada e `ALPACA_OAUTH_TRADING_CONSENT_ENABLED=1` no backend (padrão desligado). O callback exige o mesmo `state` de uso único, `subject`, TTL de dez minutos, escopo solicitado e vínculo pré-existente. Token criptografado no Mongo. Upgrade com comparação atômica do token anterior impede reativar conta desconectada ou substituída durante autorização. `trading_authorized` indica consentimento da Alpaca, **não** ativação da Winner (`trading_enabled=False`).
+
+**Winner:** `GET /api/alpaca-oauth/winner/readiness` confere conta verificada, relógio e sessão qualificada por `account_id:session`, comparando estratégia e sinal persistido, **sem enviar ou cancelar ordens**. O scheduler, executor, controle global Live e credenciais atuais continuam inalterados. Arquitetura multiusuário e execução por OAuth **não concluídas**: requerem separar seleção Winner, controles, sessões, locks, estados, ordens e agendamento por `subject + alpaca_account_id` e aprovação para negociar com contas de terceiros. Testes em `tests/test_alpaca_oauth_winner_consent.py`, mais regressões preexistentes.
+
+---
+
 ## 2026-11-03 — API v10.8.133 | Alpaca OAuth na leitura do Portfolio Live
 
 **Rastreabilidade:** origem `feature/alpaca-connect-oauth-current-user-v1`, PR #89 (https://github.com/betovlima/market_cycle_trader_api/pull/89), destino `main`, tag anotada `v10.8.133` e frontend correspondente `v10.7.50` (`betovlima/market_cycle_trader`). A tag e GitHub Release são publicadas por `.github/workflows/publish-version-tag.yml` depois do CI verde da `main`. Notas integrais: `docs/releases/v10.8.133.md`. Detalhes técnicos: `docs/changes/alpaca-oauth-current-admin-readonly-pilot.md`.
