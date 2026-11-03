@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from ...auth.security import SessionIdentity, require_admin_session
+from .alpaca_oauth import connected_readonly_client
 from ...core.runtime import database
 from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
@@ -30,9 +31,17 @@ router = APIRouter(prefix="/api/live-market", tags=["live-market-readonly"])
 
 
 @router.get("/portfolio")
-def portfolio() -> dict[str, Any]:
+def portfolio(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Prefer linked OAuth for the viewing admin; never for Winner execution."""
     try:
-        return live_portfolio_snapshot(database())
+        db = database()
+        broker = connected_readonly_client(db, identity)
+        return live_portfolio_snapshot(
+            db, broker_client=broker,
+            broker_authentication="oauth" if broker is not None else "api_keys",
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
@@ -215,8 +224,12 @@ def export_portfolio(
 ) -> Response:
     """Read-only audit ZIP; saved Live decision rankings are date-scoped."""
     try:
+        db = database()
+        broker = connected_readonly_client(db, identity)
         payload = build_live_portfolio_export(
-            database(), start_date=start_date, end_date=end_date,
+            db, start_date=start_date, end_date=end_date,
+            broker_client=broker,
+            broker_authentication="oauth" if broker is not None else "api_keys",
         )
     except ValueError as exc:
         raise HTTPException(
