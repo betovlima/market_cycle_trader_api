@@ -49,6 +49,17 @@ def winner_candidate_fields(decision: Any) -> dict[str, Any]:
     fields["candidate_count"] = len(decision_candidates({
         **fields, "current_asset": current, "target_asset": target,
     }))
+    # Optional read-only explanation, generated from the very same trained
+    # models and features as the persisted Live decision.
+    explanations = getattr(decision, "feature_attributions", None)
+    if isinstance(explanations, dict):
+        fields["feature_attributions"] = explanations
+        expected = sum(symbol != "CASH" for symbol in utilities)
+        found = len(explanations)
+        fields["feature_attribution_status"] = (
+            "complete" if found == expected else
+            "partial" if found else "unavailable"
+        )
     return fields
 
 
