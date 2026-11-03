@@ -282,5 +282,37 @@ class AlpacaOauthPilotTests(unittest.TestCase):
         self.assertEqual(response.media_type, "application/zip")
 
 
+    def test_snapshot_reads_authorized_broker_without_api_key_client(self):
+        from market_cycle_trader_api.services import live_portfolio
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(
+            id=self.cfg["expected"], cash="1500", equity="2000",
+            buying_power="1500", non_marginable_buying_power="1500",
+            status="ACTIVE", trading_blocked=False,
+        )
+        broker.get_all_positions.return_value = []
+        broker.get_orders.return_value = []
+        broker.get_clock.return_value = SimpleNamespace(
+            timestamp=datetime.now(timezone.utc), is_open=False,
+            next_open=None, next_close=None,
+        )
+        with (patch.object(live_portfolio, "create_live_readonly_client") as legacy,
+              patch.object(live_portfolio, "_store_observation", return_value=[]),
+              patch.object(live_portfolio, "latest_live_winner_decision", return_value=None),
+              patch.object(live_portfolio, "_verified_order_origins", return_value={}),
+              patch.object(live_portfolio, "_last_verified_live_execution",
+                           return_value={"session": None, "origin": None})):
+            result = live_portfolio.live_portfolio_snapshot(
+                self.db, broker_client=broker, broker_authentication="oauth",
+            )
+        legacy.assert_not_called()
+        self.assertEqual(result["portfolio_value"], 2000)
+        self.assertEqual(result["strategy_cash"], 1500)
+        self.assertEqual(result["positions"], [])
+        self.assertEqual(result["recent_orders"], [])
+        self.assertEqual(result["broker_authentication"], "oauth")
+        broker.submit_order.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
