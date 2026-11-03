@@ -2,7 +2,7 @@
 
 **Data:** 03/11/2026  
 **Repositório:** `betovlima/market_cycle_trader_api`  
-**Branch:** `feature/alpaca-oauth-winner-trading-v1`  
+**Branch:** `feature/alpaca-oauth-winner-trading-v1` · [PR draft #90](https://github.com/betovlima/market_cycle_trader_api/pull/90)  
 **Origem:** `main` da API `v10.8.133`  
 **Frontend associado:** `feature/alpaca-oauth-winner-trading-v1`, derivada de `v10.7.50`  
 **Estado:** implementação experimental **sem execução de ordens OAuth**, não publicada na `main`; ainda sem tag.
