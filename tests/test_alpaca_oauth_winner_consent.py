@@ -85,6 +85,7 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         saved = self.db[oauth.PENDING].insert_one.call_args.args[0]
         self.assertEqual(saved["subject"], self.subject)
         self.assertEqual(saved["requested_scope"], "trading")
+        self.assertEqual(saved["linked_token_hash"], oauth._digest(self.linked["encrypted_token"]))
         self.assertNotEqual(saved["_id"], query["state"][0])
 
     def test_trade_scope_cannot_be_granted_from_readonly_state(self):
@@ -106,8 +107,10 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
     def test_requested_trading_scope_must_be_returned_by_alpaca(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
         self.db[oauth.PENDING].find_one_and_delete.return_value = {
             "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
             "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
         }
         response = MagicMock(status_code=200)
@@ -124,8 +127,10 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         read_account.assert_not_called()
 
     def test_trading_grant_is_encrypted_but_does_not_enable_orders(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
         self.db[oauth.PENDING].find_one_and_delete.return_value = {
             "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
             "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
         }
         response = MagicMock(status_code=200)
@@ -155,6 +160,24 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         self.assertTrue(status["trading_authorized"])
         self.assertFalse(status["trading_enabled"])
         self.assertNotIn("encrypted_token", status)
+
+    def test_disconnected_or_replaced_oauth_grant_invalidates_pending_trading_state(self):
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        for current in (None, {**self.linked, "encrypted_token": "other-grant"}):
+            with self.subTest(current=current):
+                self.db[oauth.CONNECTIONS].find_one.return_value = current
+                with (patch.object(oauth, "_config", return_value=self.config),
+                      patch.object(oauth, "_trading_consent_enabled", return_value=True),
+                      patch.object(oauth, "database", return_value=self.db),
+                      patch.object(oauth.requests, "post") as token_exchange):
+                    result = oauth.callback(code="code", state="state", error=None)
+                self.assertIn("invalid_state", result.headers["location"])
+                token_exchange.assert_not_called()
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
     def test_disable_flag_while_authorizing_rejects_callback(self):
         self.db[oauth.PENDING].find_one_and_delete.return_value = {
