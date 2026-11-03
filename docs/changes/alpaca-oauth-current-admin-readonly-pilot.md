@@ -2,10 +2,11 @@
 
 ## Escopo
 
-Este teste autoriza **somente leitura** da conta Alpaca **Live** já utilizada
-pelo MCT. Não altera a estratégia Winner, os agendadores, o Portfolio Live
-atual nem a criação/envio de ordens. A engine continua usando as variáveis
-de ambiente `ALPACA_LIVE_API_KEY_ID` e `ALPACA_LIVE_SECRET_KEY`.
+Esta entrega autoriza **somente leitura** da conta Alpaca **Live** já utilizada
+pelo MCT e liga o **Portfolio Live e sua exportação** ao token OAuth
+associado à sessão administrativa. Não altera a estratégia Winner, seus
+agendadores nem a criação/envio de ordens. A engine continua usando
+`ALPACA_LIVE_API_KEY_ID` e `ALPACA_LIVE_SECRET_KEY`.
 
 A conexão OAuth fica no MongoDB, separada e vinculada ao subject autenticado.
 Não é uma ativação do recurso multiusuário.
@@ -143,7 +144,7 @@ O OAuth permanece somente leitura.
 6. Para testar falha segura, simule um token ilegível em teste automatizado:
    Portfolio Live retorna erro e **não** consulta a conta por API keys.
 
-A etapa 1 ainda **não foi publicada** na `main` nem implantada no Railway.
+**Registro de release:** API `v10.8.133` e frontend `v10.7.50`, originados da branch `feature/alpaca-connect-oauth-current-user-v1` e destinados à `main`. Notas detalhadas em `docs/releases/v10.8.133.md`. Merge, tag e deploy no Railway são eventos diferentes; validar o ambiente remoto separadamente.
 
 ## Limites
 
