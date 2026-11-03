@@ -1,7 +1,7 @@
 """Live visibility API. Never submit, modify or cancel brokerage orders."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -208,16 +208,32 @@ def execution_dry_run(payload: LiveDryRunRequest) -> dict[str, Any]:
 
 
 @router.get("/portfolio/export.zip")
-def export_portfolio() -> Response:
+def export_portfolio(
+    start_date: date | None = Query(default=None),
+    end_date: date | None = Query(default=None),
+) -> Response:
+    """Read-only audit ZIP; saved Live decision rankings are date-scoped."""
     try:
-        payload = build_live_portfolio_export(database())
+        payload = build_live_portfolio_export(
+            database(), start_date=start_date, end_date=end_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc),
+        ) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),
+        ) from exc
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    period = (
+        f"_{start_date.isoformat()}_{end_date.isoformat()}"
+        if start_date is not None and end_date is not None else ""
+    )
     return Response(
         content=payload,
         media_type="application/zip",
         headers={"Content-Disposition": (
-            f'attachment; filename="mct_live_transaction_audit_{timestamp}.zip"'
+            f'attachment; filename="mct_live_transaction_audit{period}_{timestamp}.zip"'
         )},
     )
