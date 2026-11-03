@@ -1,6 +1,6 @@
 ## 2026-11-03 — Winner OAuth, etapa 2 experimental | Consentimento de negociação e pré-validação por conta
 
-**Branch:** `feature/alpaca-oauth-winner-trading-v1` a partir de `main` API `v10.8.133`; frontend homônimo a partir de `v10.7.50`. **Sem alteração de versão, tag, merge ou deploy** nesta etapa experimental. Documentação: `docs/changes/alpaca-oauth-winner-trading-stage2.md`.
+**Branch:** `feature/alpaca-oauth-winner-trading-v1`, PR draft [#90](https://github.com/betovlima/market_cycle_trader_api/pull/90), a partir de `main` API `v10.8.133`; frontend homônimo a partir de `v10.7.50`. **Sem alteração de versão, tag, merge ou deploy** nesta etapa experimental. Documentação: `docs/changes/alpaca-oauth-winner-trading-stage2.md`.
 
 **Implementação:** `POST /api/alpaca-oauth/start-trading` pede autorização explícita com `scope=trading`, apenas se o administrador já estiver conectado à conta Live esperada e `ALPACA_OAUTH_TRADING_CONSENT_ENABLED=1` no backend (padrão desligado). O callback exige o mesmo `state` de uso único, `subject`, TTL de dez minutos, escopo solicitado e vínculo pré-existente. Token criptografado no Mongo. Upgrade com comparação atômica do token anterior impede reativar conta desconectada ou substituída durante autorização. `trading_authorized` indica consentimento da Alpaca, **não** ativação da Winner (`trading_enabled=False`).
 
