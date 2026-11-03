@@ -36,8 +36,17 @@ ALPACA_OAUTH_ENCRYPTION_KEY=CHAVE_FERNET_GERADA
 ```
 
 O callback precisa ser idêntico ao cadastrado na Alpaca. O frontend deve
-usar a origem configurada, sem query string, e a sessão administrativa
-deve continuar válida no redirecionamento.
+usar a origem configurada, sem query string. O retorno da Alpaca ao callback
+não depende do cookie de sessão, pois navegadores podem não enviá-lo após
+o redirecionamento externo. Em vez disso, o callback valida o `state`
+aleatório, de uso único e válido por dez minutos, criado por `/start`
+a partir de uma sessão administrativa autenticada. `/status`, `/start`,
+`/verify` e `/disconnect` continuam exigindo sessão administrativa.
+
+No ambiente local, `ALPACA_OAUTH_REDIRECT_URI` deve apontar para o callback
+da API local (se estiver cadastrado na Alpaca), e
+`ALPACA_OAUTH_FRONTEND_URL` deve apontar para a origem local do frontend.
+Não misture o callback de produção com o estado criado na API local.
 
 Gerar a chave Fernet localmente:
 
@@ -76,8 +85,9 @@ revogação da autorização no lado da Alpaca pode ser feita separadamente.
 - `GET /api/alpaca-oauth/verify` testa novamente a leitura da conta.
 - `POST /api/alpaca-oauth/disconnect` elimina o token armazenado.
 
-Todas as rotas exigem sessão de administrador atual. As rotas POST
-também conferem a origem do navegador. Tokens, segredos e códigos de
+Todas as rotas, **exceto `/callback`**, exigem sessão de administrador atual.
+O callback valida o `state` vinculado ao administrador que iniciou a conexão.
+As rotas POST também conferem a origem do navegador. Tokens, segredos e códigos de
 autorização nunca são retornados pela API ou gravados sem criptografia.
 A URL de autorização não contém o `client_secret`.
 
