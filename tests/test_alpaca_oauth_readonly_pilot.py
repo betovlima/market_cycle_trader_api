@@ -51,7 +51,7 @@ class AlpacaOauthPilotTests(unittest.TestCase):
         with (patch.object(oauth, "_config", return_value=self.cfg),
               patch.object(oauth, "database", return_value=self.db),
               patch.object(oauth.requests, "post") as post):
-            result = oauth.callback(self.identity, code="short-code",
+            result = oauth.callback(code="short-code",
                                     state="unknown-state", error=None)
         self.assertIn("invalid_state", result.headers["location"])
         post.assert_not_called()
@@ -70,7 +70,7 @@ class AlpacaOauthPilotTests(unittest.TestCase):
               patch.object(oauth, "database", return_value=self.db),
               patch.object(oauth.requests, "post", return_value=response),
               patch.object(oauth.requests, "get") as get):
-            result = oauth.callback(self.identity, code="test-code",
+            result = oauth.callback(code="test-code",
                                     state="test-state", error=None)
         self.assertIn("permission_failed", result.headers["location"])
         get.assert_not_called()
@@ -91,10 +91,13 @@ class AlpacaOauthPilotTests(unittest.TestCase):
               patch.object(oauth, "database", return_value=self.db),
               patch.object(oauth.requests, "post", return_value=exchange),
               patch.object(oauth.requests, "get", return_value=account)):
-            result = oauth.callback(self.identity, code="code",
+            result = oauth.callback(code="code",
                                     state="state", error=None)
         self.assertIn("connected", result.headers["location"])
+        self.assertEqual(self.db[oauth.CONNECTIONS].update_one.call_args.args[0]["_id"],
+                         oauth._key(self.identity.subject))
         saved = self.db[oauth.CONNECTIONS].update_one.call_args.args[1]["$set"]
+        self.assertEqual(saved["subject"], self.identity.subject)
         self.assertNotEqual(saved["encrypted_token"], "sensitive-test-token")
         self.assertEqual(
             Fernet(self.cfg["key"].encode()).decrypt(
@@ -116,7 +119,7 @@ class AlpacaOauthPilotTests(unittest.TestCase):
               patch.object(oauth, "database", return_value=self.db),
               patch.object(oauth.requests, "post", return_value=exchange),
               patch.object(oauth.requests, "get", return_value=account)):
-            result = oauth.callback(self.identity, code="code", state="state", error=None)
+            result = oauth.callback(code="code", state="state", error=None)
         self.assertIn("account_mismatch", result.headers["location"])
         self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
@@ -131,6 +134,40 @@ class AlpacaOauthPilotTests(unittest.TestCase):
         self.assertNotIn("account_id", result)
         self.assertNotIn("encrypted_token", result)
         self.assertFalse(result["trading_enabled"])
+
+
+    def test_callback_redirects_without_session_but_others_still_require_admin(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.include_router(oauth.router)
+        client = TestClient(app)
+        with patch.object(oauth, "_config", return_value=self.cfg):
+            callback = client.get("/api/alpaca-oauth/callback", follow_redirects=False)
+            self.assertEqual(callback.status_code, 303)
+            self.assertIn("alpaca_oauth=invalid_state", callback.headers["location"])
+            for method, path in (
+                ("get", "/api/alpaca-oauth/status"),
+                ("post", "/api/alpaca-oauth/start"),
+                ("get", "/api/alpaca-oauth/verify"),
+                ("post", "/api/alpaca-oauth/disconnect"),
+            ):
+                response = getattr(client, method)(path, follow_redirects=False)
+                self.assertEqual(response.status_code, 401, (method, path))
+
+    def test_state_without_a_subject_cannot_connect_an_account(self):
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": "",
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        with (patch.object(oauth, "_config", return_value=self.cfg),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth.requests, "post") as post):
+            response = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("invalid_state", response.headers["location"])
+        post.assert_not_called()
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
 
 if __name__ == "__main__":
