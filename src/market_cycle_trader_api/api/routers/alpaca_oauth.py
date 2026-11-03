@@ -270,6 +270,18 @@ def verify(identity: Annotated[SessionIdentity, Depends(require_admin_session)])
     return _status(db, identity)
 
 
+@router.get("/winner/readiness")
+def winner_oauth_readiness(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+):
+    """Only inspect the authorized account and Winner metadata; no orders."""
+    from ...services.live_oauth_winner import oauth_winner_readiness
+    try:
+        return oauth_winner_readiness(database(), identity)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
 @router.post("/disconnect")
 def disconnect(request: Request,
                identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
