@@ -185,7 +185,13 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         client.assert_not_called()
 
     def test_preflight_uses_account_qualified_session_and_never_trades(self):
-        self.db[oauth.CONNECTIONS].find_one.return_value = {
+        connections = MagicMock()
+        runs = MagicMock()
+        self.db.__getitem__.side_effect = lambda name: {
+            oauth.CONNECTIONS: connections,
+            live_oauth_winner.LIVE_RUNS: runs,
+        }[name]
+        connections.find_one.return_value = {
             "subject": self.subject, "environment": "live",
             "account_id": self.config["expected"],
             "trading_authorized": True, "oauth_scope": "trading",
@@ -200,7 +206,7 @@ class OAuthWinnerConsentTests(unittest.TestCase):
             next_open=datetime(2026, 11, 4, 14, 30, tzinfo=timezone.utc),
             is_open=False,
         )
-        self.db[live_oauth_winner.LIVE_RUNS].find_one.return_value = {
+        runs.find_one.return_value = {
             "_id": f"{self.config['expected']}:2026-11-04",
             "winner_strategy_id": "winner-1",
             "winner_configuration_hash": "sha",
