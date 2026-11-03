@@ -1,0 +1,60 @@
+name: publish-version-tag
+
+# Publish an annotated tag and GitHub release only after the main-branch
+# regression workflow succeeds. Historical release notes are versioned.
+on:
+  workflow_run:
+    workflows: [engine-parity-tests]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Verify main and prepare annotated release tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          tag="v${version}"
+          notes="docs/releases/${tag}.md"
+          if [ ! -s "$notes" ]; then
+            echo "No explicit release notes for $tag, skipping."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - name: Create annotated tag and GitHub release
+        if: ${{ steps.version.outputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NOTES: ${{ steps.version.outputs.notes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it unchanged."
+            exit 0
+          fi
+          if [ -z "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -F "$NOTES"
+            git push origin "refs/tags/$TAG"
+          fi
+          gh release create "$TAG" --verify-tag --title "MCT API $TAG | Alpaca OAuth Portfolio Live" --notes-file "$NOTES"
