@@ -91,6 +91,60 @@ As rotas POST também conferem a origem do navegador. Tokens, segredos e código
 autorização nunca são retornados pela API ou gravados sem criptografia.
 A URL de autorização não contém o `client_secret`.
 
+## Etapa 1: Portfolio Live via OAuth (piloto atual)
+
+Após conectar e verificar o aplicativo Alpaca no MCT, o **Portfolio Live
+da sessão administrativa atual** passa a utilizar o token OAuth criptografado
+salvo no MongoDB para consultar a API Alpaca Trading Live. Não é necessário
+adicionar variáveis OAuth ao frontend.
+
+A leitura utiliza `TradingClient(oauth_token=..., paper=False)` do
+`alpaca-py` e confirma em cada nova consulta que o `account.id` retornado
+corresponde ao ID persistido para o usuário e ao
+`ALPACA_OAUTH_EXPECTED_ACCOUNT_ID` (ou `ALPACA_LIVE_ACCOUNT_ID`).
+Antes disso, o token é descriptografado **somente dentro da API**.
+O navegador nunca recebe token, Client Secret nem ID integral da conta.
+
+- `GET /api/live-market/portfolio`: informações atuais da conta, patrimônio,
+  caixa, poder de compra, posições, ordens recentes, histórico e auditoria já
+  vinculados à conta verificada.
+- `GET /api/live-market/portfolio/export.zip`: a mesma fonte de leitura,
+  inclusive nos períodos solicitados na exportação de auditoria.
+- O retorno inclui `broker_authentication: "oauth"` quando o token está ativo
+  e `"api_keys"` quando ainda não foi conectada uma conta OAuth.
+- Se há conexão OAuth armazenada, mas seu token expirou, está ilegível ou
+  não corresponde à conta esperada, a API **não retorna dados usando
+  silenciosamente as chaves Live**. O Portfolio Live apresenta erro.
+- A tela identifica a fonte de leitura e atualiza após verificar ou
+  desconectar a conexão. Desconectar restaura o modo legado com chaves
+  administrativas, restrito ao administrador atual.
+
+**Isolamento:** esta fase **não é multiusuário**. A conta OAuth deve ser
+a mesma conta Live previamente configurada na API. Os metadados Winner
+existentes continuam relacionados a essa conta. Nenhuma consulta aceita
+um ID de conta escolhido pelo frontend.
+
+**Sem alteração de ordens:** os agendadores, a engine Winner, os serviços
+de execução e os métodos de emissão/cancelamento de ordens continuam usando
+as credenciais Live originais e mantêm suas verificações operacionais.
+O OAuth permanece somente leitura.
+
+### Teste local
+
+1. Atualize as branches de API e frontend e reinicie ambos.
+2. Acesse MCT como administrador, abra **Live** e confirme o estado OAuth
+   conectado. Caso já esteja conectado, use **Verificar conexão**.
+3. Confira o indicador **Acesso à corretora: OAuth da Alpaca (somente leitura)**
+   e compare patrimônio, caixa, posições e ordens com a conta Alpaca Live.
+4. Faça um download de auditoria e confirme que
+   `live_portfolio.json` declara `broker_authentication: "oauth"`.
+5. Desconecte OAuth e confira o indicador de **Chaves da Alpaca** e o
+   funcionamento legado. Reconecte para voltar ao OAuth.
+6. Para testar falha segura, simule um token ilegível em teste automatizado:
+   Portfolio Live retorna erro e **não** consulta a conta por API keys.
+
+A etapa 1 ainda **não foi publicada** na `main` nem implantada no Railway.
+
 ## Limites
 
 - Não concede `trading` nem `account:write`: se a Alpaca retornar
