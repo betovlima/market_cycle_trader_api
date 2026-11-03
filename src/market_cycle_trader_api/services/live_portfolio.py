@@ -21,6 +21,7 @@ from .live_winner_session import LIVE_RUNS, latest_live_session
 from .live_order_execution import ORDER_LEDGER
 from .live_winner_candidates import latest_live_winner_decision
 from .live_trader_state import LIVE_STATE
+from ..tcc_u67_v1210_reference.rotacao import ROTATION_FEATURES
 
 LIVE_PORTFOLIO_SNAPSHOTS_COLLECTION = "live_portfolio_snapshots"
 
@@ -329,6 +330,13 @@ _LIVE_AUDIT_SCORE_COLUMNS = (
     "current_asset", "target_asset", "is_current", "is_target",
     "is_raw_best", "gap_vs_best", "cash_edge",
 )
+_LIVE_AUDIT_SHAP_COLUMNS = (
+    "decision_date", "execution_session", "symbol", "method",
+    "base_value", "prediction", "contribution_sum",
+    "reconstructed_prediction", "reconstruction_error",
+    *(f"value_{name}" for name in ROTATION_FEATURES),
+    *(f"shap_{name}" for name in ROTATION_FEATURES),
+)
 _LIVE_AUDIT_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.-]{0,11}$")
 
 
@@ -362,7 +370,7 @@ def _audit_asset(value: Any) -> str:
 
 def _live_decisions_in_period(
     db: Any, *, account_id: str, start_date: date, end_date: date,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """All saved LIVE post-close rankings in an inclusive decision-date interval.
 
     Account-scoped using the verified current Alpaca Live account identity.
@@ -374,7 +382,7 @@ def _live_decisions_in_period(
         "action": 1, "status": 1, "candidate_count": 1,
         "selected_utility": 1, "effective_switch_margin": 1,
         "calibrated_candidate_margin": 1, "calibration_score": 1,
-        "utilities": 1, "cash_edges": 1,
+        "utilities": 1, "cash_edges": 1, "feature_attributions": 1,
     }
     # The model's decision_date is the completed session whose daily
     # prices were used. The next execution_session must not be used to
@@ -396,6 +404,7 @@ def _live_decisions_in_period(
     ))
     decisions: list[dict[str, Any]] = []
     scores: list[dict[str, Any]] = []
+    shap_rows: list[dict[str, Any]] = []
     for run in runs:
         utility_map = run.get("utilities")
         if not isinstance(utility_map, dict):
@@ -416,6 +425,8 @@ def _live_decisions_in_period(
         raw_best = _audit_asset(run.get("raw_best_asset"))
         cash_edges = run.get("cash_edges")
         safe_edges = cash_edges if isinstance(cash_edges, dict) else {}
+        explanations = run.get("feature_attributions")
+        safe_explanations = explanations if isinstance(explanations, dict) else {}
         best = ranked[0][1] if ranked else None
         decisions.append({
             "decision_date": decision_date,
@@ -448,7 +459,48 @@ def _live_decisions_in_period(
                 "gap_vs_best": best - score,
                 "cash_edge": edge,
             })
-    return decisions, scores
+            explanation = safe_explanations.get(symbol)
+            if not isinstance(explanation, dict):
+                continue
+            if explanation.get("method") != "lightgbm_tree_shap":
+                continue
+            base = _finite_audit_number(explanation.get("base_value"))
+            predicted = _finite_audit_number(explanation.get("prediction"))
+            raw_inputs = explanation.get("feature_values")
+            raw_contributions = explanation.get("contributions")
+            if (base is None or predicted is None
+                or not isinstance(raw_inputs, dict)
+                or not isinstance(raw_contributions, dict)
+                or abs(predicted - score) > 1e-6 * max(1.0, abs(score))):
+                continue
+            row_data: dict[str, Any] = {}
+            for name in ROTATION_FEATURES:
+                observed = _finite_audit_number(raw_inputs.get(name))
+                shap = _finite_audit_number(raw_contributions.get(name))
+                if observed is None or shap is None:
+                    break
+                row_data[f"value_{name}"] = observed
+                row_data[f"shap_{name}"] = shap
+            if len(row_data) != 2 * len(ROTATION_FEATURES):
+                continue
+            total = sum(row_data[f"shap_{name}"] for name in ROTATION_FEATURES)
+            reconstructed = base + total
+            error = abs(reconstructed - score)
+            if error > 1e-6 * max(1.0, abs(score)):
+                continue
+            shap_rows.append({
+                "decision_date": decision_date,
+                "execution_session": session,
+                "symbol": symbol,
+                "method": "lightgbm_tree_shap",
+                "base_value": base,
+                "prediction": score,
+                "contribution_sum": total,
+                "reconstructed_prediction": reconstructed,
+                "reconstruction_error": error,
+                **row_data,
+            })
+    return decisions, scores, shap_rows
 
 
 def build_live_portfolio_export(
@@ -466,6 +518,7 @@ def build_live_portfolio_export(
     snapshot = live_portfolio_snapshot(db)
     decisions: list[dict[str, Any]] = []
     scores: list[dict[str, Any]] = []
+    shap_rows: list[dict[str, Any]] = []
     if start_date is not None and end_date is not None:
         # Separate read-only broker call binds historical Mongo records to the
         # *current* Alpaca Live account. Never accept an account ID from client.
@@ -473,7 +526,7 @@ def build_live_portfolio_export(
         account_id = str(getattr(broker.get_account(), "id", "") or "")
         if not account_id:
             raise RuntimeError("Live broker account identity unavailable.")
-        decisions, scores = _live_decisions_in_period(
+        decisions, scores, shap_rows = _live_decisions_in_period(
             db, account_id=account_id,
             start_date=start_date, end_date=end_date,
         )
@@ -501,6 +554,10 @@ def build_live_portfolio_export(
                 _audit_csv(scores, _LIVE_AUDIT_SCORE_COLUMNS),
             )
             archive.writestr(
+                "live_feature_contributions_period.csv",
+                _audit_csv(shap_rows, _LIVE_AUDIT_SHAP_COLUMNS),
+            )
+            archive.writestr(
                 "audit_period.json",
                 json.dumps({
                     "start_date": start_date.isoformat(),
@@ -508,6 +565,12 @@ def build_live_portfolio_export(
                     "date_basis": "decision_date (completed market session)",
                     "decision_count": len(decisions),
                     "utility_score_rows": len(scores),
+                    "shap_attribution_rows": len(shap_rows),
+                    "shap_decisions_covered": len({
+                        (r["decision_date"], r["execution_session"])
+                        for r in shap_rows
+                    }),
+                    "shap_method": "lightgbm_tree_shap",
                     "days_with_decisions": len({
                         d["decision_date"] for d in decisions
                     }),
@@ -519,10 +582,17 @@ def build_live_portfolio_export(
             readme += (
                 f"Included completed decision dates {start_date.isoformat()} "
                 f"through {end_date.isoformat()} (inclusive).\n"
-                "The two CSVs contain only existing saved Live decision "
+                "The two ranking CSVs contain only existing saved Live decision "
                 "rankings for this broker account. Missing sessions are "
                 "not reconstructed; zero matching decisions creates "
                 "header-only files. Utility is not an asset's share price.\n"
+                "live_feature_contributions_period.csv contains only recorded "
+                "TreeSHAP explanations from the same training run as each Live "
+                "decision, one row per asset, with 52 feature values and 52 "
+                "contributions. The baseline plus contributions reconstructs "
+                "the utility prediction. Older decisions without explanations "
+                "are not backfilled or fabricated. Missing explanations yield "
+                "a header-only CSV. This export never retrains a model.\n"
             )
         archive.writestr("README.txt", readme)
     return output.getvalue()
