@@ -177,6 +177,7 @@ class LiveRangeExportTests(unittest.TestCase):
             return_value=b"PK fake",
         ) as build:
             result = router.export_portfolio(
+                identity=SimpleNamespace(subject="admin"),
                 start_date=date(2026, 10, 26),
                 end_date=date(2026, 11, 2),
             )
@@ -195,6 +196,7 @@ class LiveRangeExportTests(unittest.TestCase):
         with patch.object(router, "database", return_value=self.db):
             with self.assertRaises(HTTPException) as context:
                 router.export_portfolio(
+                    identity=SimpleNamespace(subject="admin"),
                     start_date=date(2026, 11, 2),
                     end_date=date(2026, 10, 26),
                 )
