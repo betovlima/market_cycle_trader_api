@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api.routers import (
     access_admin,
+    alpaca_oauth,
     admin_rotations,
     analytics,
     asset_discovery,
@@ -133,6 +134,7 @@ def create_app() -> FastAPI:
 
     application.include_router(health.router)
     application.include_router(auth.router)
+    application.include_router(alpaca_oauth.router)
     application.include_router(reviewer_access.public_router)
     application.include_router(reviewer_access.admin_router)
     application.include_router(access_admin.router)
