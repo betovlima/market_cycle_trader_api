@@ -241,6 +241,8 @@ class LiveRangeExportTests(unittest.TestCase):
 
     def test_http_route_passes_dates_and_produces_period_filename(self):
         with patch.object(router, "database", return_value=self.db), patch.object(
+            router, "connected_readonly_client", return_value=None,
+        ), patch.object(
             router, "build_live_portfolio_export",
             return_value=b"PK fake",
         ) as build:
@@ -254,6 +256,8 @@ class LiveRangeExportTests(unittest.TestCase):
                 self.db,
                 start_date=date(2026, 10, 26),
                 end_date=date(2026, 11, 2),
+                broker_client=None,
+                broker_authentication="api_keys",
             )
             self.assertIn(
                 "2026-10-26_2026-11-02",
@@ -261,7 +265,8 @@ class LiveRangeExportTests(unittest.TestCase):
             )
 
     def test_http_invalid_range_returns_422(self):
-        with patch.object(router, "database", return_value=self.db):
+        with (patch.object(router, "database", return_value=self.db),
+              patch.object(router, "connected_readonly_client", return_value=None)):
             with self.assertRaises(HTTPException) as context:
                 router.export_portfolio(
                     identity=SimpleNamespace(subject="admin"),
