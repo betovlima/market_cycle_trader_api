@@ -1,9 +1,11 @@
 """Live portfolio from Live Alpaca only; no access to Paper transaction state."""
 from __future__ import annotations
 
+import csv
 import io
 import json
 import math
+import re
 import zipfile
 from datetime import date, datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -313,18 +315,214 @@ def live_robot_status(db: Any) -> dict[str, Any]:
     }
 
 
-def build_live_portfolio_export(db: Any) -> bytes:
+
+# Stored post-close Winner runs use ISO decision dates (not execution dates).
+# This read-only export never recomputes the ranking or generates Alpaca orders.
+_LIVE_AUDIT_DECISION_COLUMNS = (
+    "decision_date", "execution_session", "current_asset", "target_asset",
+    "raw_best_asset", "action", "status", "candidate_count",
+    "selected_utility", "effective_switch_margin",
+    "calibrated_candidate_margin", "calibration_score",
+)
+_LIVE_AUDIT_SCORE_COLUMNS = (
+    "decision_date", "execution_session", "rank", "symbol", "utility",
+    "current_asset", "target_asset", "is_current", "is_target",
+    "is_raw_best", "gap_vs_best", "cash_edge",
+)
+_LIVE_AUDIT_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.-]{0,11}$")
+
+
+def _audit_csv(rows: list[dict[str, Any]], columns: tuple[str, ...]) -> str:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        # CSV formula safety, including fields originating from persisted data.
+        writer.writerow({
+            key: ("'" + value if isinstance(value, str) and value.startswith(
+                ("=", "+", "-", "@", "\t", "\r")
+            ) else value)
+            for key, value in row.items() if key in columns
+        })
+    return stream.getvalue()
+
+
+def _finite_audit_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _audit_asset(value: Any) -> str:
+    asset = str(value or "").upper()
+    return asset if _LIVE_AUDIT_SYMBOL_RE.fullmatch(asset) else ""
+
+
+def _live_decisions_in_period(
+    db: Any, *, account_id: str, start_date: date, end_date: date,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """All saved LIVE post-close rankings in an inclusive decision-date interval.
+
+    Account-scoped using the verified current Alpaca Live account identity.
+    Never read Paper collections or include broker credentials/account IDs.
+    """
+    projection = {
+        "_id": 0, "decision_date": 1, "execution_session": 1,
+        "current_asset": 1, "target_asset": 1, "raw_best_asset": 1,
+        "action": 1, "status": 1, "candidate_count": 1,
+        "selected_utility": 1, "effective_switch_margin": 1,
+        "calibrated_candidate_margin": 1, "calibration_score": 1,
+        "utilities": 1, "cash_edges": 1,
+    }
+    # The model's decision_date is the completed session whose daily
+    # prices were used. The next execution_session must not be used to
+    # group a decision into a different requested day.
+    cursor = db[LIVE_RUNS].find({
+        "live_account_id": account_id,
+        "winner_signal_prepared": True,
+        "decision_date": {
+            "$gte": start_date.isoformat(), "$lte": end_date.isoformat(),
+        },
+        "utilities": {"$type": "object"},
+    }, projection)
+    runs = list(cursor)
+    if len(runs) > 500:
+        raise RuntimeError("Too many Live decision records in the requested range.")
+    runs.sort(key=lambda r: (
+        str(r.get("decision_date") or ""),
+        str(r.get("execution_session") or ""),
+    ))
+    decisions: list[dict[str, Any]] = []
+    scores: list[dict[str, Any]] = []
+    for run in runs:
+        utility_map = run.get("utilities")
+        if not isinstance(utility_map, dict):
+            continue
+        session = str(run.get("execution_session") or "")[:10]
+        decision_date = str(run.get("decision_date") or "")[:10]
+        if not (start_date.isoformat() <= decision_date <= end_date.isoformat()):
+            continue
+        ranked = []
+        for original_symbol, raw_value in utility_map.items():
+            symbol = _audit_asset(original_symbol)
+            score = _finite_audit_number(raw_value)
+            if symbol and score is not None and symbol != "CASH":
+                ranked.append((symbol, score))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        current = _audit_asset(run.get("current_asset"))
+        target = _audit_asset(run.get("target_asset"))
+        raw_best = _audit_asset(run.get("raw_best_asset"))
+        cash_edges = run.get("cash_edges")
+        safe_edges = cash_edges if isinstance(cash_edges, dict) else {}
+        best = ranked[0][1] if ranked else None
+        decisions.append({
+            "decision_date": decision_date,
+            "execution_session": session,
+            "current_asset": current,
+            "target_asset": target,
+            "raw_best_asset": raw_best,
+            "action": str(run.get("action") or ""),
+            "status": str(run.get("status") or ""),
+            "candidate_count": len(ranked),
+            "selected_utility": _finite_audit_number(run.get("selected_utility")),
+            "effective_switch_margin": _finite_audit_number(
+                run.get("effective_switch_margin")
+            ),
+            "calibrated_candidate_margin": _finite_audit_number(
+                run.get("calibrated_candidate_margin")
+            ),
+            "calibration_score": _finite_audit_number(run.get("calibration_score")),
+        })
+        for rank, (symbol, score) in enumerate(ranked, start=1):
+            edge = _finite_audit_number(safe_edges.get(symbol))
+            scores.append({
+                "decision_date": decision_date,
+                "execution_session": session, "rank": rank,
+                "symbol": symbol, "utility": score,
+                "current_asset": current, "target_asset": target,
+                "is_current": symbol == current,
+                "is_target": symbol == target,
+                "is_raw_best": symbol == raw_best,
+                "gap_vs_best": best - score,
+                "cash_edge": edge,
+            })
+    return decisions, scores
+
+
+def build_live_portfolio_export(
+    db: Any, *, start_date: date | None = None, end_date: date | None = None,
+) -> bytes:
+    """Original snapshot plus optional date-filtered, account-scoped Live history."""
+    if (start_date is None) != (end_date is None):
+        raise ValueError("Both start_date and end_date are required together.")
+    if start_date is not None and end_date is not None:
+        if end_date < start_date:
+            raise ValueError("End date must be on or after start date.")
+        if (end_date - start_date).days > 365:
+            raise ValueError("Audit date range cannot exceed 366 calendar days.")
+
     snapshot = live_portfolio_snapshot(db)
+    decisions: list[dict[str, Any]] = []
+    scores: list[dict[str, Any]] = []
+    if start_date is not None and end_date is not None:
+        # Separate read-only broker call binds historical Mongo records to the
+        # *current* Alpaca Live account. Never accept an account ID from client.
+        broker = create_live_readonly_client()
+        account_id = str(getattr(broker.get_account(), "id", "") or "")
+        if not account_id:
+            raise RuntimeError("Live broker account identity unavailable.")
+        decisions, scores = _live_decisions_in_period(
+            db, account_id=account_id,
+            start_date=start_date, end_date=end_date,
+        )
+
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             "live_portfolio.json",
             json.dumps(snapshot, ensure_ascii=False, indent=2),
         )
-        archive.writestr(
-            "README.txt",
-            "LIVE account only. Broker orders and equity observations; "
-            "no Paper orders, inferred model decisions or deposit-adjusted P/L. "
-            "No order submission performed.\n",
+        readme = (
+            "LIVE account only. live_portfolio.json is the CURRENT snapshot, "
+            "not a historically reconstructed portfolio. Its recent broker "
+            "orders and equity observations have their original limits.\n"
+            "No Paper orders, inferred model decisions or deposit-adjusted P/L. "
+            "No broker orders are submitted.\n"
         )
+        if start_date is not None and end_date is not None:
+            archive.writestr(
+                "live_decisions_period.csv",
+                _audit_csv(decisions, _LIVE_AUDIT_DECISION_COLUMNS),
+            )
+            archive.writestr(
+                "live_utility_scores_period.csv",
+                _audit_csv(scores, _LIVE_AUDIT_SCORE_COLUMNS),
+            )
+            archive.writestr(
+                "audit_period.json",
+                json.dumps({
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "date_basis": "decision_date (completed market session)",
+                    "decision_count": len(decisions),
+                    "utility_score_rows": len(scores),
+                    "days_with_decisions": len({
+                        d["decision_date"] for d in decisions
+                    }),
+                    "historical_source": "persisted Live Winner decisions",
+                    "complete_only_for_saved_live_decisions": True,
+                    "live_portfolio_is_current_snapshot": True,
+                }, ensure_ascii=False, indent=2),
+            )
+            readme += (
+                f"Included completed decision dates {start_date.isoformat()} "
+                f"through {end_date.isoformat()} (inclusive).\n"
+                "The two CSVs contain only existing saved Live decision "
+                "rankings for this broker account. Missing sessions are "
+                "not reconstructed; zero matching decisions creates "
+                "header-only files. Utility is not an asset's share price.\n"
+            )
+        archive.writestr("README.txt", readme)
     return output.getvalue()
