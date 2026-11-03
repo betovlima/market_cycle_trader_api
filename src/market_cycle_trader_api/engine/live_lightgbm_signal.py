@@ -37,6 +37,7 @@ class LiveLightGBMDecision:
     effective_compute_device: str
     compute_fallback_reason: str | None
     random_state: int
+    feature_attributions: dict[str, dict[str, Any]] | None = None
 
 
 def build_live_lightgbm_decision(
