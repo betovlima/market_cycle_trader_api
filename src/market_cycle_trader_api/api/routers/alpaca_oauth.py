@@ -12,7 +12,7 @@ from typing import Annotated
 from urllib.parse import urlencode, urlsplit
 
 import requests
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
@@ -221,3 +221,39 @@ def disconnect(request: Request,
     database()[CONNECTIONS].delete_one({"_id": _key(identity.subject)})
     # Only local token is removed; the Alpaca-side grant can be revoked separately.
     return {"connected": False}
+
+
+def connected_readonly_client(db, identity: SessionIdentity):
+    """Broker for the requesting admin's OAuth Live portfolio, if linked.
+
+    Never return an API-key client on an invalid/expired OAuth grant. The
+    Winner scheduler and order executor must not import this function.
+    """
+    saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)})
+    if not saved:
+        return None
+    try:
+        config = _config()
+        if (saved.get("subject") != identity.subject
+            or saved.get("environment") != "live"
+            or saved.get("read_only") is not True
+            or str(saved.get("account_id") or "") != config["expected"]):
+            raise RuntimeError("Alpaca OAuth account binding is invalid. Reconnect Alpaca.")
+        token = Fernet(config["key"].encode("ascii")).decrypt(
+            str(saved["encrypted_token"]).encode("ascii")
+        ).decode("utf-8")
+    except RuntimeError:
+        raise
+    except (KeyError, TypeError, ValueError, UnicodeError, InvalidToken) as exc:
+        raise RuntimeError("Alpaca OAuth authorization cannot be read. Reconnect Alpaca.") from exc
+
+    from alpaca.trading.client import TradingClient
+    try:
+        client = TradingClient(oauth_token=token, paper=False)
+        account_id = str(getattr(client.get_account(), "id", "") or "")
+    except Exception as exc:
+        raise RuntimeError("Alpaca OAuth authorization cannot be verified. Reconnect Alpaca.") from exc
+    if account_id != saved["account_id"] or account_id != config["expected"]:
+        raise RuntimeError("Alpaca OAuth account identity mismatch. Reconnect Alpaca.")
+    return client
+
