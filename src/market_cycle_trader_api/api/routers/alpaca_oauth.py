@@ -1,6 +1,7 @@
-"""Experimental Alpaca Connect OAuth: existing administrator, read-only Live.
+"""Alpaca Connect: administrator-bound Live OAuth and optional trading consent.
 
-No trading access and no modification to the MCT Winner order engine.
+Trading grants can be requested separately, but this module never submits
+broker orders or enables the Winner executor or background scheduler.
 """
 from __future__ import annotations
 
@@ -88,11 +89,20 @@ def _read_account(token):
         raise RuntimeError("Alpaca account lookup failed.") from exc
 
 
+def _trading_consent_enabled() -> bool:
+    """Default-off gate for requesting the privileged OAuth trading scope."""
+    return os.getenv("ALPACA_OAUTH_TRADING_CONSENT_ENABLED", "").strip() == "1"
+
+
 def _status(db, identity):
     saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)},
                                       {"encrypted_token": 0})
+    authorized = bool(saved and saved.get("trading_authorized") is True)
     return {"configured": True, "connected": bool(saved),
-            "environment": "live", "read_only": True, "trading_enabled": False,
+            "environment": "live", "read_only": not authorized,
+            "trading_authorized": authorized,
+            "trading_consent_available": _trading_consent_enabled(),
+            "trading_enabled": False,  # A grant never arms the Winner executor.
             "account_id_suffix": str(saved.get("account_id") or "")[-6:] if saved else None,
             "account_status": saved.get("account_status") if saved else None}
 
@@ -103,7 +113,8 @@ def connection_status(identity: Annotated[SessionIdentity, Depends(require_admin
         _config()
     except RuntimeError:
         return {"configured": False, "connected": False, "environment": "live",
-                "read_only": True, "trading_enabled": False}
+                "read_only": True, "trading_authorized": False,
+                "trading_consent_available": False, "trading_enabled": False}
     return _status(database(), identity)
 
 
@@ -120,6 +131,7 @@ def start(request: Request,
     db = database()
     db[PENDING].create_index("expires", expireAfterSeconds=0)
     db[PENDING].insert_one({"_id": _digest(state), "subject": identity.subject,
+                            "requested_scope": "read",
                             "expires": now + timedelta(minutes=10)})
     # Alpaca defaults to read-only when the optional scope is not requested.
     url = AUTHORIZE + "?" + urlencode({
@@ -127,6 +139,39 @@ def start(request: Request,
         "redirect_uri": c["redirect"], "state": state, "env": "live",
     })
     return {"authorization_url": url}
+
+
+@router.post("/start-trading")
+def start_trading(request: Request,
+                  identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
+    """Explicit fresh user consent, separate from the read-only OAuth flow."""
+    if not _trading_consent_enabled():
+        raise HTTPException(409, "Alpaca trading consent is not enabled.")
+    try:
+        c = _config()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    _same_origin(request, c["frontend"])
+    db = database()
+    linked = db[CONNECTIONS].find_one({"_id": _key(identity.subject)})
+    if (not isinstance(linked, dict)
+        or linked.get("subject") != identity.subject
+        or linked.get("environment") != "live"
+        or linked.get("account_id") != c["expected"]):
+        raise HTTPException(409, "Connect and verify the existing Live account first.")
+    state = secrets.token_urlsafe(40)
+    db[PENDING].create_index("expires", expireAfterSeconds=0)
+    db[PENDING].insert_one({
+        "_id": _digest(state), "subject": identity.subject,
+        "requested_scope": "trading",
+        "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
+    })
+    url = AUTHORIZE + "?" + urlencode({
+        "response_type": "code", "client_id": c["client"],
+        "redirect_uri": c["redirect"], "state": state,
+        "scope": "trading", "env": "live",
+    })
+    return {"authorization_url": url, "trading_enabled": False}
 
 
 @router.get("/callback")
@@ -148,6 +193,11 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         or not saved["subject"] or not isinstance(saved.get("expires"), datetime)):
         return _back(c["frontend"], "invalid_state")
     subject = saved["subject"]
+    requested_scope = saved.get("requested_scope", "read")
+    if requested_scope not in {"read", "trading"}:
+        return _back(c["frontend"], "invalid_state")
+    if requested_scope == "trading" and not _trading_consent_enabled():
+        return _back(c["frontend"], "trading_unavailable")
     expires = saved["expires"]
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
@@ -166,23 +216,33 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         grant = r.json()
         token = str(grant.get("access_token") or "")
         scope = set(str(grant.get("scope") or "").split())
-        if (not token or str(grant.get("token_type") or "").lower() != "bearer"
-            or scope.intersection({"trading", "account:write"})):
+        if not token or str(grant.get("token_type") or "").lower() != "bearer":
+            return _back(c["frontend"], "permission_failed")
+        if "account:write" in scope:
+            return _back(c["frontend"], "permission_failed")
+        if requested_scope == "trading":
+            if "trading" not in scope:
+                return _back(c["frontend"], "trading_permission_failed")
+        elif "trading" in scope:
+            # Read-only authorizations must never silently escalate.
             return _back(c["frontend"], "permission_failed")
         account = _read_account(token)
     except (requests.RequestException, RuntimeError, ValueError, AttributeError, TypeError):
         return _back(c["frontend"], "verification_failed")
     if str(account["id"]) != c["expected"]:
         return _back(c["frontend"], "account_mismatch")
+    trade_authorized = requested_scope == "trading"
     encrypted = Fernet(c["key"].encode("ascii")).encrypt(token.encode("utf-8")).decode("ascii")
     db[CONNECTIONS].update_one({"_id": _key(subject)}, {
         "$set": {"subject": subject, "environment": "live",
                  "account_id": str(account["id"]),
                  "account_status": str(account.get("status") or ""),
-                 "encrypted_token": encrypted, "read_only": True,
+                 "encrypted_token": encrypted, "read_only": not trade_authorized,
+                 "trading_authorized": trade_authorized,
+                 "oauth_scope": "trading" if trade_authorized else "read",
                  "verified_at": datetime.now(timezone.utc)},
     }, upsert=True)
-    return _back(c["frontend"], "connected")
+    return _back(c["frontend"], "trading_connected" if trade_authorized else "connected")
 
 
 @router.get("/verify")
@@ -236,7 +296,9 @@ def connected_readonly_client(db, identity: SessionIdentity):
         config = _config()
         if (saved.get("subject") != identity.subject
             or saved.get("environment") != "live"
-            or saved.get("read_only") is not True
+            or (saved.get("read_only") is not True
+                and not (saved.get("trading_authorized") is True
+                         and saved.get("oauth_scope") == "trading"))
             or str(saved.get("account_id") or "") != config["expected"]):
             raise RuntimeError("Alpaca OAuth account binding is invalid. Reconnect Alpaca.")
         token = Fernet(config["key"].encode("ascii")).decrypt(
@@ -257,3 +319,21 @@ def connected_readonly_client(db, identity: SessionIdentity):
         raise RuntimeError("Alpaca OAuth account identity mismatch. Reconnect Alpaca.")
     return client
 
+
+def connected_trading_client(db, identity: SessionIdentity):
+    """Resolve the admin's verified trading grant for read-only Winner preflight.
+
+    A returned client is never used to submit or cancel orders in this module.
+    OAuth account identity is always checked live; no API-key fallback.
+    """
+    saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)})
+    if (not isinstance(saved, dict)
+        or saved.get("subject") != identity.subject
+        or saved.get("trading_authorized") is not True
+        or saved.get("oauth_scope") != "trading"
+        or saved.get("read_only") is not False):
+        raise RuntimeError("Alpaca OAuth trading permission has not been authorized.")
+    client = connected_readonly_client(db, identity)
+    if client is None:
+        raise RuntimeError("Alpaca OAuth account is disconnected.")
+    return client
