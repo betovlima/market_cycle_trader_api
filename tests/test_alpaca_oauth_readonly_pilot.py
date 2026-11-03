@@ -137,24 +137,21 @@ class AlpacaOauthPilotTests(unittest.TestCase):
 
 
     def test_callback_redirects_without_session_but_others_still_require_admin(self):
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
+        # FastAPI's route dependency graph can be checked without TestClient
+        # (the CI environment intentionally does not install httpx2).
+        from market_cycle_trader_api.auth.security import require_admin_session
 
-        app = FastAPI()
-        app.include_router(oauth.router)
-        client = TestClient(app)
         with patch.object(oauth, "_config", return_value=self.cfg):
-            callback = client.get("/api/alpaca-oauth/callback", follow_redirects=False)
-            self.assertEqual(callback.status_code, 303)
-            self.assertIn("alpaca_oauth=invalid_state", callback.headers["location"])
-            for method, path in (
-                ("get", "/api/alpaca-oauth/status"),
-                ("post", "/api/alpaca-oauth/start"),
-                ("get", "/api/alpaca-oauth/verify"),
-                ("post", "/api/alpaca-oauth/disconnect"),
-            ):
-                response = getattr(client, method)(path, follow_redirects=False)
-                self.assertEqual(response.status_code, 401, (method, path))
+            response = oauth.callback(code=None, state=None, error=None)
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("alpaca_oauth=invalid_state", response.headers["location"])
+
+        for route in oauth.router.routes:
+            dependencies = [item.call for item in route.dependant.dependencies]
+            if route.path.endswith("/callback"):
+                self.assertNotIn(require_admin_session, dependencies)
+            else:
+                self.assertIn(require_admin_session, dependencies, route.path)
 
     def test_state_without_a_subject_cannot_connect_an_account(self):
         self.db[oauth.PENDING].find_one_and_delete.return_value = {
