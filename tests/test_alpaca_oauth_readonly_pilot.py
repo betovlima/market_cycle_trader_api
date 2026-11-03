@@ -170,5 +170,117 @@ class AlpacaOauthPilotTests(unittest.TestCase):
         self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
 
+    def test_readonly_client_uses_token_of_authenticated_admin(self):
+        grant = "token-visible-only-in-mock"
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": self.identity.subject,
+            "environment": "live",
+            "read_only": True,
+            "account_id": self.cfg["expected"],
+            "encrypted_token": Fernet(self.cfg["key"].encode()).encrypt(grant.encode()).decode(),
+        }
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(id=self.cfg["expected"])
+        with (patch.object(oauth, "_config", return_value=self.cfg),
+              patch("alpaca.trading.client.TradingClient", return_value=broker) as create):
+            result = oauth.connected_readonly_client(self.db, self.identity)
+        self.assertIs(result, broker)
+        create.assert_called_once_with(oauth_token=grant, paper=False)
+        self.db[oauth.CONNECTIONS].find_one.assert_called_once_with(
+            {"_id": oauth._key(self.identity.subject)}
+        )
+
+    def test_disconnected_account_does_not_create_oauth_broker(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = None
+        with (patch.object(oauth, "_config") as config,
+              patch("alpaca.trading.client.TradingClient") as create):
+            self.assertIsNone(oauth.connected_readonly_client(self.db, self.identity))
+        config.assert_not_called()
+        create.assert_not_called()
+
+    def test_invalid_binding_fails_closed_without_creating_client(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": "google:another-user",
+            "environment": "live",
+            "read_only": True,
+            "account_id": self.cfg["expected"],
+            "encrypted_token": "invalid-token",
+        }
+        with (patch.object(oauth, "_config", return_value=self.cfg),
+              patch("alpaca.trading.client.TradingClient") as create):
+            with self.assertRaisesRegex(RuntimeError, "binding is invalid"):
+                oauth.connected_readonly_client(self.db, self.identity)
+        create.assert_not_called()
+
+    def test_broker_account_mismatch_fails_closed(self):
+        grant = Fernet(self.cfg["key"].encode()).encrypt(b"test-token").decode()
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": self.identity.subject, "environment": "live", "read_only": True,
+            "account_id": self.cfg["expected"], "encrypted_token": grant,
+        }
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(id="other-account")
+        with (patch.object(oauth, "_config", return_value=self.cfg),
+              patch("alpaca.trading.client.TradingClient", return_value=broker)):
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                oauth.connected_readonly_client(self.db, self.identity)
+
+    def test_live_portfolio_prefers_verified_oauth_and_never_sends_orders(self):
+        from market_cycle_trader_api.api.routers import live_market
+        broker = MagicMock()
+        with (patch.object(live_market, "database", return_value=self.db),
+              patch.object(live_market, "connected_readonly_client", return_value=broker),
+              patch.object(live_market, "live_portfolio_snapshot", return_value={
+                  "status": "ready", "broker_authentication": "oauth",
+              }) as snapshot):
+            response = live_market.portfolio(self.identity)
+        self.assertEqual(response["broker_authentication"], "oauth")
+        snapshot.assert_called_once_with(
+            self.db, broker_client=broker, broker_authentication="oauth",
+        )
+        broker.submit_order.assert_not_called()
+
+    def test_live_portfolio_without_oauth_retains_existing_api_key_reads(self):
+        from market_cycle_trader_api.api.routers import live_market
+        with (patch.object(live_market, "database", return_value=self.db),
+              patch.object(live_market, "connected_readonly_client", return_value=None),
+              patch.object(live_market, "live_portfolio_snapshot", return_value={
+                  "status": "ready", "broker_authentication": "api_keys",
+              }) as snapshot):
+            response = live_market.portfolio(self.identity)
+        self.assertEqual(response["broker_authentication"], "api_keys")
+        snapshot.assert_called_once_with(
+            self.db, broker_client=None, broker_authentication="api_keys",
+        )
+
+    def test_live_portfolio_must_not_fallback_if_oauth_fails(self):
+        from fastapi import HTTPException
+        from market_cycle_trader_api.api.routers import live_market
+        with (patch.object(live_market, "database", return_value=self.db),
+              patch.object(live_market, "connected_readonly_client",
+                           side_effect=RuntimeError("OAuth token expired")),
+              patch.object(live_market, "live_portfolio_snapshot") as snapshot):
+            with self.assertRaises(HTTPException) as failure:
+                live_market.portfolio(self.identity)
+        self.assertEqual(failure.exception.status_code, 503)
+        snapshot.assert_not_called()
+
+    def test_live_portfolio_export_uses_same_oauth_broker(self):
+        from market_cycle_trader_api.api.routers import live_market
+        broker = MagicMock()
+        with (patch.object(live_market, "database", return_value=self.db),
+              patch.object(live_market, "connected_readonly_client", return_value=broker),
+              patch.object(live_market, "build_live_portfolio_export",
+                           return_value=b"PK\\x03\\x04") as export):
+            response = live_market.export_portfolio(
+                self.identity, start_date=None, end_date=None,
+            )
+        export.assert_called_once_with(
+            self.db, start_date=None, end_date=None, broker_client=broker,
+            broker_authentication="oauth",
+        )
+        self.assertEqual(response.media_type, "application/zip")
+
+
 if __name__ == "__main__":
     unittest.main()
