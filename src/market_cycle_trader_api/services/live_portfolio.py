@@ -210,8 +210,11 @@ def _last_verified_live_execution(
     return {"session": raw_session, "origin": origin}
 
 
-def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
-    client = create_live_readonly_client()
+def live_portfolio_snapshot(
+    db: Any, *, broker_client: Any = None, broker_authentication: str = "api_keys",
+) -> dict[str, Any]:
+    """Observe the authorized Live account; never use OAuth for order execution."""
+    client = broker_client if broker_client is not None else create_live_readonly_client()
     account = client.get_account()
     account_id = str(getattr(account, 'id', '') or '')
     if not account_id:
@@ -247,6 +250,7 @@ def live_portfolio_snapshot(db: Any) -> dict[str, Any]:
     return {
         "status": "ready",
         "environment": "live",
+        "broker_authentication": broker_authentication,
         "recorded_at": recorded_now.isoformat(),
         "account_status": _label(getattr(account, "status", None)),
         "trading_blocked": bool(getattr(account, "trading_blocked", False)),
@@ -505,6 +509,7 @@ def _live_decisions_in_period(
 
 def build_live_portfolio_export(
     db: Any, *, start_date: date | None = None, end_date: date | None = None,
+    broker_client: Any = None, broker_authentication: str = "api_keys",
 ) -> bytes:
     """Original snapshot plus optional date-filtered, account-scoped Live history."""
     if (start_date is None) != (end_date is None):
@@ -515,14 +520,16 @@ def build_live_portfolio_export(
         if (end_date - start_date).days > 365:
             raise ValueError("Audit date range cannot exceed 366 calendar days.")
 
-    snapshot = live_portfolio_snapshot(db)
+    snapshot = live_portfolio_snapshot(
+        db, broker_client=broker_client, broker_authentication=broker_authentication,
+    )
     decisions: list[dict[str, Any]] = []
     scores: list[dict[str, Any]] = []
     shap_rows: list[dict[str, Any]] = []
     if start_date is not None and end_date is not None:
         # Separate read-only broker call binds historical Mongo records to the
         # *current* Alpaca Live account. Never accept an account ID from client.
-        broker = create_live_readonly_client()
+        broker = broker_client if broker_client is not None else create_live_readonly_client()
         account_id = str(getattr(broker.get_account(), "id", "") or "")
         if not account_id:
             raise RuntimeError("Live broker account identity unavailable.")
