@@ -107,6 +107,15 @@ class SharedWinnerSignalTests(unittest.TestCase):
 class AccountPreviewWithSharedWinnerTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
+        self.connections = MagicMock()
+        self.sessions = MagicMock()
+        self.orders = MagicMock()
+        collections = {
+            "alpaca_oauth_connections": self.connections,
+            "live_winner_session_runs": self.sessions,
+            "live_winner_broker_orders": self.orders,
+        }
+        self.db.__getitem__.side_effect = lambda name: collections[name]
         self.identity = SimpleNamespace(subject="trader-one")
         self.db["alpaca_oauth_connections"].find_one.return_value = {
             "subject": "trader-one", "environment": "live",
