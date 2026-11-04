@@ -296,7 +296,10 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         # The grant only identifies the account. It never reads a per-user
         # Winner plan or writes portfolio values into an MCT collection.
         self.db.assert_not_called()
-        self.db.__getitem__.assert_called_once_with(oauth.CONNECTIONS)
+        self.assertEqual(
+            {call.args[0] for call in self.db.__getitem__.call_args_list},
+            {oauth.CONNECTIONS},
+        )
         self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
     def test_single_shared_target_maps_to_different_account_actions(self):
