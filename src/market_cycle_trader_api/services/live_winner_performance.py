@@ -158,6 +158,9 @@ def live_winner_performance(broker: Any, *, start_date: date | None) -> dict[str
         return _unavailable(start_date, "baseline_after_start")
     if base_asof is None and first_day < start_date:
         return _unavailable(start_date, "prior_closing_baseline_missing")
+    if base_asof is None and last == 0:
+        # One closing bar is only a starting baseline, not a return period.
+        return _unavailable(start_date, "insufficient_return_period")
 
     effective_start = base_asof if base_asof is not None else first_day
     return {
