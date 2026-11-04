@@ -259,56 +259,45 @@ class OAuthWinnerConsentTests(unittest.TestCase):
                 oauth.connected_trading_client(self.db, self.identity)
         client.assert_not_called()
 
-    def test_preflight_uses_account_qualified_session_and_never_trades(self):
-        connections = MagicMock()
-        runs = MagicMock()
-        self.db.__getitem__.side_effect = lambda name: {
-            oauth.CONNECTIONS: connections,
-            live_oauth_winner.LIVE_RUNS: runs,
-        }[name]
-        connections.find_one.return_value = {
+    def test_preflight_checks_shared_winner_without_per_account_signal(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
             "subject": self.subject, "environment": "live",
             "account_id": self.config["expected"],
             "trading_authorized": True, "oauth_scope": "trading",
             "read_only": False,
         }
-        client = MagicMock()
-        client.get_account.return_value = SimpleNamespace(
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(
             id=self.config["expected"], status="ACTIVE",
         )
-        client.get_clock.return_value = SimpleNamespace(
+        broker.get_clock.return_value = SimpleNamespace(
             timestamp=datetime(2026, 11, 3, 14, 0, tzinfo=timezone.utc),
             next_open=datetime(2026, 11, 4, 14, 30, tzinfo=timezone.utc),
             is_open=False,
         )
-        runs.find_one.return_value = {
-            "_id": f"{self.config['expected']}:2026-11-04",
-            "winner_strategy_id": "winner-1",
-            "winner_configuration_hash": "sha",
-            "winner_revision": 1,
-            "status": "recalibrated_no_orders",
-            "winner_signal_prepared": True,
-            "post_close_signal_ready": True,
-            "snapshot_sha256": "sha256",
-            "target_asset": "CAPR",
-        }
         with (patch.object(live_oauth_winner, "connected_trading_client",
-                           return_value=client),
+                           return_value=broker),
               patch.object(live_oauth_winner, "get_trader_winner_summary",
                            return_value={
-                               "id": "winner-1", "configuration_hash": "sha",
-                               "revision": 1, "name": "Winner",
-                           })):
+                               "id": "winner-shared", "configuration_hash": "sha",
+                               "revision": 1, "name": "Winner global",
+                           }) as shared):
             result = live_oauth_winner.oauth_winner_readiness(self.db, self.identity)
         self.assertEqual(result["status"], "trading_authorized_execution_disabled")
-        self.assertTrue(result["winner_signal_prepared"])
+        self.assertTrue(result["shared_winner"])
+        self.assertTrue(result["winner_configured"])
+        self.assertEqual(result["winner_strategy_id"], "winner-shared")
+        self.assertFalse(result["shared_signal_prepared"])
+        self.assertFalse(result["winner_signal_prepared"])
         self.assertFalse(result["order_submission_enabled"])
-        self.db[live_oauth_winner.LIVE_RUNS].find_one.assert_called_once_with(
-            {"_id": f"{self.config['expected']}:2026-11-04"}
-        )
-        client.submit_order.assert_not_called()
-        client.cancel_order_by_id.assert_not_called()
-        self.db[live_oauth_winner.LIVE_RUNS].update_one.assert_not_called()
+        shared.assert_called_once_with(self.db)
+        broker.submit_order.assert_not_called()
+        broker.cancel_order_by_id.assert_not_called()
+        # The grant only identifies the account. It never reads a per-user
+        # Winner plan or writes portfolio values into an MCT collection.
+        self.db.assert_not_called()
+        self.db.__getitem__.assert_called_once_with(oauth.CONNECTIONS)
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
     def test_existing_live_executor_and_scheduler_remain_api_key_based(self):
         from market_cycle_trader_api.services import (
