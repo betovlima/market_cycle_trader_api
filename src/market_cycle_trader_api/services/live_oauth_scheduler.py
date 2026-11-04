@@ -25,6 +25,7 @@ def execute_oauth_accounts_for_shared_winner(db: Any, *, session: str) -> dict[s
     processed = 0
     completed = 0
     failed = 0
+    processed_account_ids: set[str] = set()
     # Only the users who explicitly granted trading scope. No access tokens
     # are loaded in the batch query; each trade independently resolves its
     # owner's token and verifies the actual Alpaca account.
@@ -36,10 +37,20 @@ def execute_oauth_accounts_for_shared_winner(db: Any, *, session: str) -> dict[s
     for grant in grants:
         if not isinstance(grant, dict) or not grant.get("subject"):
             continue
-        if str(grant.get("account_id") or "") == signal.source_account_id:
+        account_id = str(grant.get("account_id") or "").strip()
+        if not account_id:
+            # No account-specific order can be safely identified here.
+            continue
+        if account_id == signal.source_account_id:
             # The canonical account already runs with the legacy API keys.
             # Never execute it again via OAuth during this migration.
             continue
+        if account_id in processed_account_ids:
+            # Distinct MCT logins can authorize the same Alpaca account.
+            # It is still one broker account, so never fan out twice.
+            # A failed first attempt still requires its own reconciliation.
+            continue
+        processed_account_ids.add(account_id)
         identity = SimpleNamespace(
             subject=str(grant["subject"]),
             role=str(grant.get("role") or "trader"),
