@@ -372,16 +372,21 @@ def personal_portfolio(
         portfolio = personal_live_portfolio_snapshot(broker)
         # Account identity comes from this user's verified OAuth grant only.
         # No fallback to the admin's Live API keys and no monetary persistence.
-        grant = db[CONNECTIONS].find_one(
-            {"_id": _key(identity.subject)},
-            {"account_id": 1, "verified_at": 1},
-        )
-        if isinstance(grant, dict) and grant.get("account_id"):
-            first = first_live_winner_date(
-                db, account_id=str(grant["account_id"]),
-                joined_at=grant.get("verified_at"),
+        try:
+            grant = db[CONNECTIONS].find_one(
+                {"_id": _key(identity.subject)},
+                {"account_id": 1, "verified_at": 1},
             )
-        else:
+            if isinstance(grant, dict) and grant.get("account_id"):
+                first = first_live_winner_date(
+                    db, account_id=str(grant["account_id"]),
+                    joined_at=grant.get("verified_at"),
+                )
+            else:
+                first = None
+        except Exception:
+            # An optional historical query cannot break this user's current
+            # Alpaca portfolio. Never fall back to another account's keys.
             first = None
         portfolio["winner_performance"] = live_winner_performance(
             broker, start_date=first,
