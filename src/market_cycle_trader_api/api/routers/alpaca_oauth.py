@@ -14,6 +14,7 @@ from urllib.parse import urlencode, urlsplit
 
 import requests
 from cryptography.fernet import Fernet, InvalidToken
+from pymongo.errors import DuplicateKeyError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
@@ -176,24 +177,37 @@ def start_trading(request: Request,
     _same_origin(request, c["frontend"])
     db = database()
     linked = db[CONNECTIONS].find_one({"_id": _key(identity.subject)})
-    if (not isinstance(linked, dict)
+    role = str(getattr(identity, "role", "admin") or "admin")
+    # An invited trader may grant trading on the FIRST Alpaca connection.
+    # The existing admin Live account still requires its verified read-only
+    # linkage before any escalation; an invited trader is not bound to the
+    # admin's ALPACA_LIVE_ACCOUNT_ID.
+    first_trader_connection = linked is None and role == "trader"
+    if not first_trader_connection and (
+        not isinstance(linked, dict)
         or linked.get("subject") != identity.subject
         or linked.get("environment") != "live"
         or (_expected_account_id(c, identity)
-            and linked.get("account_id") != _expected_account_id(c, identity))):
+            and linked.get("account_id") != _expected_account_id(c, identity))
+    ):
         raise HTTPException(409, "Connect and verify the existing Live account first.")
     state = secrets.token_urlsafe(40)
     db[PENDING].create_index("expires", expireAfterSeconds=0)
-    db[PENDING].insert_one({
+    pending = {
         "_id": _digest(state), "subject": identity.subject,
         "requested_scope": "trading",
         "expected_account_id": _expected_account_id(c, identity),
-        "role": str(getattr(identity, "role", "admin") or "admin"),
-        "linked_account_id": linked["account_id"],
-        # A disconnected/replaced grant must invalidate an old browser flow.
-        "linked_token_hash": _digest(str(linked.get("encrypted_token") or "")),
+        "role": role,
+        "first_trader_connection": first_trader_connection,
         "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
-    })
+    }
+    if not first_trader_connection:
+        pending.update({
+            "linked_account_id": linked["account_id"],
+            # A disconnected/replaced grant invalidates a prior browser flow.
+            "linked_token_hash": _digest(str(linked.get("encrypted_token") or "")),
+        })
+    db[PENDING].insert_one(pending)
     url = AUTHORIZE + "?" + urlencode({
         "response_type": "code", "client_id": c["client"],
         "redirect_uri": c["redirect"], "state": state,
@@ -223,15 +237,26 @@ def callback(code: str | None = Query(default=None, max_length=2048),
     requested_scope = saved.get("requested_scope", "read")
     if requested_scope not in {"read", "trading"}:
         return _back(c["frontend"], "invalid_state")
+    first_trader_connection = (
+        requested_scope == "trading"
+        and saved.get("first_trader_connection") is True
+    )
     if requested_scope == "trading":
         if not _trading_consent_enabled():
             return _back(c["frontend"], "trading_unavailable")
         current = db[CONNECTIONS].find_one({"_id": _key(subject)})
-        if (not isinstance(current, dict) or current.get("subject") != subject
-            or current.get("environment") != "live"
-            or current.get("account_id") != saved.get("linked_account_id", c["expected"])
-            or not isinstance(saved.get("linked_token_hash"), str)
-            or _digest(str(current.get("encrypted_token") or "")) != saved["linked_token_hash"]):
+        if first_trader_connection:
+            # Claim token was issued after the invited Trader signed in.
+            # A new grant must never replace a connection added meanwhile.
+            if (saved.get("role") != "trader"
+                or saved.get("expected_account_id") not in ("", None)
+                or current is not None):
+                return _back(c["frontend"], "invalid_state")
+        elif (not isinstance(current, dict) or current.get("subject") != subject
+              or current.get("environment") != "live"
+              or current.get("account_id") != saved.get("linked_account_id", c["expected"])
+              or not isinstance(saved.get("linked_token_hash"), str)
+              or _digest(str(current.get("encrypted_token") or "")) != saved["linked_token_hash"]):
             return _back(c["frontend"], "invalid_state")
     expires = saved["expires"]
     if expires.tzinfo is None:
@@ -266,30 +291,42 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         return _back(c["frontend"], "verification_failed")
     expected_account = str(saved.get("expected_account_id", c["expected"]) or "")
     if ((expected_account and str(account["id"]) != expected_account)
-        or (requested_scope == "trading"
+        or (requested_scope == "trading" and not first_trader_connection
             and str(account["id"]) != str(current["account_id"]))):
         return _back(c["frontend"], "account_mismatch")
     trade_authorized = requested_scope == "trading"
     encrypted = Fernet(c["key"].encode("ascii")).encrypt(token.encode("utf-8")).decode("ascii")
-    update_query = {"_id": _key(subject)}
-    if trade_authorized:
-        # Compare-and-swap: do not restore a grant that was disconnected or
-        # replaced between the initial check and token verification.
-        update_query.update({
-            "subject": subject, "encrypted_token": current["encrypted_token"],
-        })
-    updated = db[CONNECTIONS].update_one(update_query, {
-        "$set": {"subject": subject, "environment": "live",
-                 "role": saved.get("role", "admin"),
-                 "account_id": str(account["id"]),
-                 "account_status": str(account.get("status") or ""),
-                 "encrypted_token": encrypted, "read_only": not trade_authorized,
-                 "trading_authorized": trade_authorized,
-                 "oauth_scope": "trading" if trade_authorized else "read",
-                 "verified_at": datetime.now(timezone.utc)},
-    }, upsert=not trade_authorized)
-    if trade_authorized and updated.matched_count != 1:
-        return _back(c["frontend"], "invalid_state")
+    connection_data = {
+        "subject": subject, "environment": "live",
+        "role": saved.get("role", "admin"),
+        "account_id": str(account["id"]),
+        "account_status": str(account.get("status") or ""),
+        "encrypted_token": encrypted, "read_only": not trade_authorized,
+        "trading_authorized": trade_authorized,
+        "oauth_scope": "trading" if trade_authorized else "read",
+        "verified_at": datetime.now(timezone.utc),
+    }
+    if first_trader_connection:
+        try:
+            db[CONNECTIONS].insert_one({
+                "_id": _key(subject), **connection_data,
+            })
+        except DuplicateKeyError:
+            # An authorization from another tab or a subsequent disconnect
+            # must never be overwritten by this older callback.
+            return _back(c["frontend"], "invalid_state")
+    else:
+        update_query = {"_id": _key(subject)}
+        if trade_authorized:
+            # Compare-and-swap: keep admin/upgrade revocation protection.
+            update_query.update({
+                "subject": subject, "encrypted_token": current["encrypted_token"],
+            })
+        updated = db[CONNECTIONS].update_one(
+            update_query, {"$set": connection_data}, upsert=not trade_authorized,
+        )
+        if trade_authorized and updated.matched_count != 1:
+            return _back(c["frontend"], "invalid_state")
     return _back(c["frontend"], "trading_connected" if trade_authorized else "connected")
 
 
