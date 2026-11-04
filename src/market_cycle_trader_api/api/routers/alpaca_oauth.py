@@ -139,6 +139,7 @@ def start(request: Request,
     db[PENDING].insert_one({"_id": _digest(state), "subject": identity.subject,
                             "requested_scope": "read",
                             "expected_account_id": _expected_account_id(c, identity),
+                            "role": str(getattr(identity, "role", "admin") or "admin"),
                             "expires": now + timedelta(minutes=10)})
     # Alpaca defaults to read-only when the optional scope is not requested.
     url = AUTHORIZE + "?" + urlencode({
@@ -173,6 +174,7 @@ def start_trading(request: Request,
         "_id": _digest(state), "subject": identity.subject,
         "requested_scope": "trading",
         "expected_account_id": _expected_account_id(c, identity),
+        "role": str(getattr(identity, "role", "admin") or "admin"),
         "linked_account_id": linked["account_id"],
         # A disconnected/replaced grant must invalidate an old browser flow.
         "linked_token_hash": _digest(str(linked.get("encrypted_token") or "")),
@@ -264,6 +266,7 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         })
     updated = db[CONNECTIONS].update_one(update_query, {
         "$set": {"subject": subject, "environment": "live",
+                 "role": saved.get("role", "admin"),
                  "account_id": str(account["id"]),
                  "account_status": str(account.get("status") or ""),
                  "encrypted_token": encrypted, "read_only": not trade_authorized,
