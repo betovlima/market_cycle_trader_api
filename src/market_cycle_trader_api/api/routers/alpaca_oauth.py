@@ -303,6 +303,24 @@ def verify(identity: Annotated[SessionIdentity, Depends(require_portfolio_sessio
     return _status(db, identity)
 
 
+@router.get("/portfolio")
+def personal_portfolio(
+    identity: Annotated[SessionIdentity, Depends(require_portfolio_session)],
+):
+    """Individual Alpaca portfolio, with NO API-key fallback and no MCT balance writes."""
+    from ...services.live_personal_portfolio import personal_live_portfolio_snapshot
+    try:
+        db = database()
+        broker = connected_readonly_client(db, identity)
+        if broker is None:
+            raise HTTPException(404, "Connect your Alpaca account first.")
+        return personal_live_portfolio_snapshot(broker)
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
 @router.get("/winner/readiness")
 def winner_oauth_readiness(
     identity: Annotated[SessionIdentity, Depends(require_portfolio_session)],
