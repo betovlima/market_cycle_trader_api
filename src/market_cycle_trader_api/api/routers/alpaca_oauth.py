@@ -363,12 +363,30 @@ def personal_portfolio(
 ):
     """Individual Alpaca portfolio, with NO API-key fallback and no MCT balance writes."""
     from ...services.live_personal_portfolio import personal_live_portfolio_snapshot
+    from ...services.live_winner_performance import first_live_winner_date, live_winner_performance
     try:
         db = database()
         broker = connected_readonly_client(db, identity)
         if broker is None:
             raise HTTPException(404, "Connect your Alpaca account first.")
-        return personal_live_portfolio_snapshot(broker)
+        portfolio = personal_live_portfolio_snapshot(broker)
+        # Account identity comes from this user's verified OAuth grant only.
+        # No fallback to the admin's Live API keys and no monetary persistence.
+        grant = db[CONNECTIONS].find_one(
+            {"_id": _key(identity.subject)},
+            {"account_id": 1, "verified_at": 1},
+        )
+        if isinstance(grant, dict) and grant.get("account_id"):
+            first = first_live_winner_date(
+                db, account_id=str(grant["account_id"]),
+                joined_at=grant.get("verified_at"),
+            )
+        else:
+            first = None
+        portfolio["winner_performance"] = live_winner_performance(
+            broker, start_date=first,
+        )
+        return portfolio
     except HTTPException:
         raise
     except RuntimeError as exc:
