@@ -5,7 +5,22 @@
 **Branch:** `feature/alpaca-oauth-winner-trading-v1` · [PR draft #90](https://github.com/betovlima/market_cycle_trader_api/pull/90)  
 **Origem:** `main` da API `v10.8.133`  
 **Frontend associado:** `feature/alpaca-oauth-winner-trading-v1`, derivada de `v10.7.50`  
-**Estado:** implementação experimental **sem execução de ordens OAuth**, não publicada na `main`; ainda sem tag.
+**Estado:** branch experimental com execução OAuth por conta **implementada em código e validada com mocks**, mas sem publicação na `main`, sem tag nova ou teste de ordem real.
+
+## Situação atual da branch em 04/11/2026
+
+**Uma Winner, um sinal diário da conta de referência, múltiplas execuções OAuth por corretora.** A etapa evoluiu além do simples consentimento descrito no histórico abaixo:
+
+- `services/live_shared_winner_signal.py` reutiliza a decisão Winner D−1 **já calculada e persistida para a conta Live principal**, sem treinar um modelo por usuário. Valida sessão XNYS, snapshot, data de decisão, configuração Winner e origem. **A política que produziu esse alvo ainda considerou a posição e a idade da posição da conta principal.** Portanto, o alvo compartilhado é a decisão canônica existente, não uma inferência matemática totalmente independente do estado de carteira. Essa limitação não pode ser omitida na avaliação da estratégia.
+- `services/live_oauth_execution.py` consulta pelo OAuth os recursos e a posição atuais de cada conta e traduz o mesmo alvo para `buy`, `hold`, `rotate`, `sell_to_cash` ou `stay_in_cash`. Calcula a compra usando o **caixa recebido da Alpaca**, não um capital interno. Reutiliza ordem e relógio da corretora, calendário XNYS, janela e ledger de idempotência existentes. A conta principal continua com o executor de API Keys.
+- `services/live_oauth_scheduler.py` distribui o sinal para os titulares com `trading` explicitamente autorizado, exclui a conta principal e evita processar duas vezes o **mesmo Alpaca account ID** mesmo quando mais de um usuário MCT vincula essa conta. Erros de uma conta não impedem as demais. O agendamento está acoplado ao ciclo Live já existente, sem criar uma segunda Winner nem uma chave de ativação de ordens.
+- **Consequência operacional importante:** depois que esta branch for implantada, `Live ATIVO` com OAuth `trading` autorizado para uma **conta diferente da principal** poderá enviar ordens reais automaticamente durante o pregão válido. Não há segundo botão de execução. Local continua PARADO, e os MongoDBs de desenvolvimento e produção são distintos. **Não publicar na `main` nem implantar sem revisar os testes e obter aprovação explícita da transição operacional.**
+- `GET /api/alpaca-oauth/portfolio` oferece carteira individual ao usuário autenticado, com patrimônio, caixa, posições e ordens da **própria Alpaca**, sem fallback para API Keys de outra conta e **sem gravar saldos no MongoDB**. O histórico legado de observações da conta administrativa continua existindo somente para gráficos/auditoria.
+- `GET /api/alpaca-oauth/winner/readiness` é apenas consulta e informa a Winner global, o sinal compartilhado (se houver), a posição real da conta e a ação derivada, sem executar ordens por si só. `trading_enabled` do status indica o **Live atual** e o tipo de conta, não só o consentimento OAuth.
+
+**Escopo dos testes:** `test_live_shared_winner_signal.py`, `test_live_oauth_shared_execution.py`, `test_live_oauth_shared_scheduler.py`, `test_alpaca_oauth_multiuser_portfolio.py` e `test_alpaca_oauth_winner_consent.py` usam mocks. Nenhuma ordem real é necessária ou foi enviada por esses testes. As tags atuais continuam `v10.8.133` e `v10.7.50` na `main`; PR draft #90 da API e PR draft #43 do frontend permanecem em revisão.
+
+---
 
 ## Objetivo e diferença entre permissões
 
@@ -50,7 +65,7 @@ A regra desta etapa é **uma única estratégia Winner**, com um único catálog
 
 ## Limites encontrados na arquitetura existente
 
-O código atual da Winner Live ainda é single-account:
+**Histórico da arquitetura legada (antes desta implementação):** a Winner Live dependia de uma conta única:
 
 - `live_control.py` usa o documento global `live_trader_control._id="default"`.
 - `live_observation_scheduler.py` executa apenas um ciclo e usa `create_live_readonly_client()`, ligado às chaves globais.
@@ -71,9 +86,9 @@ O código atual da Winner Live ainda é single-account:
 
 ## O que NÃO mudou
 
-- O scheduler atual continua utilizando o mesmo broker por API Keys e não seleciona usuários OAuth.
+- O scheduler base da Winner principal permanece em API Keys; a branch agora inclui um fanout OAuth por conta, acionado pelo ciclo Live existente.
 - O endpoint existente `POST /api/live-execution/winner/execute` continua com seu mecanismo original. **Não** é redirecionado ao token OAuth.
-- Não existe endpoint de submissão de ordens por OAuth nesta entrega.
+- Não existe endpoint HTTP de submissão de ordens por OAuth. A execução OAuth na branch é uma tarefa do scheduler Live já existente, que somente opera quando o Live está ativo.
 - Os parâmetros, decisão, modelos e estratégia financeira da Winner não foram alterados.
 - `ALPACA_LIVE_API_KEY_ID` e `ALPACA_LIVE_SECRET_KEY` permanecem inalteradas.
 - A etapa 1, que já foi validada, continua sendo o caminho estável de leitura da carteira.
@@ -86,7 +101,7 @@ Por padrão a variável abaixo deve estar **ausente** ou diferente de `1`:
 ALPACA_OAUTH_TRADING_CONSENT_ENABLED=0
 ```
 
-Quando `1` apenas no ambiente local de testes, o botão **Autorizar permissão de negociação** pode abrir o consentimento da Alpaca para a conta Live já vinculada. Este teste não é uma ordem e não habilita o robô. Verificar `GET /api/alpaca-oauth/status` e `GET /api/alpaca-oauth/winner/readiness`. Mesmo com `trading_authorized=True`, confirmar que **`trading_enabled=False` e `order_submission_enabled=False`**. Não habilitar produção por essa configuração.
+Quando `1` apenas no ambiente local de testes, o botão **Autorizar permissão de negociação** pode abrir o consentimento da Alpaca para a conta Live já vinculada. Este teste não é uma ordem e não habilita o robô. Verificar `GET /api/alpaca-oauth/status` e `GET /api/alpaca-oauth/winner/readiness`. Com Live local PARADO, confirmar que **`trading_enabled=False` e `order_submission_enabled=False`**. Em ambiente com Live ATIVO, `trading_enabled` pode indicar disponibilidade operacional para contas OAuth não principais; o endpoint de readiness é apenas consulta e nunca envia ordens. Não habilitar produção por essa configuração.
 
 Os testes `tests/test_alpaca_oauth_winner_consent.py` validam flag desligada, autorização explícita, estado vinculado ao administrador, escopo obrigatório, cifragem, a única Winner global e a tradução do mesmo alvo para ações diferentes conforme a posição na Alpaca, sempre sem enviar ordens; os testes anteriores da etapa 1 precisam continuar aprovados. Executar `python -m unittest discover -s tests -p "test_*.py" -v`.
 
