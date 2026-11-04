@@ -277,6 +277,8 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         )
         with (patch.object(live_oauth_winner, "connected_trading_client",
                            return_value=broker),
+              patch.object(live_oauth_winner, "read_shared_winner_signal",
+                           return_value=None),
               patch.object(live_oauth_winner, "get_trader_winner_summary",
                            return_value={
                                "id": "winner-shared", "configuration_hash": "sha",
