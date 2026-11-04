@@ -100,6 +100,19 @@ def _trading_consent_enabled() -> bool:
     return os.getenv("ALPACA_OAUTH_TRADING_CONSENT_ENABLED", "").strip() == "1"
 
 
+def _oauth_winner_operational(db, saved) -> bool:
+    """Current existing Live operating state, not a new activation switch."""
+    if not isinstance(saved, dict) or saved.get("trading_authorized") is not True:
+        return False
+    from ...services.live_control import live_control_status
+    from ...services.live_shared_winner_signal import _canonical_account_id
+    canonical = _canonical_account_id()
+    if canonical and str(saved.get("account_id") or "") == canonical:
+        # Main Winner account still trades through its existing API keys.
+        return False
+    return live_control_status(db)["control_mode"] in {"active", "exit_only"}
+
+
 def _status(db, identity):
     saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)},
                                       {"encrypted_token": 0})
@@ -108,7 +121,8 @@ def _status(db, identity):
             "environment": "live", "read_only": not authorized,
             "trading_authorized": authorized,
             "trading_consent_available": _trading_consent_enabled(),
-            "trading_enabled": False,  # A grant never arms the Winner executor.
+            "trading_enabled": _oauth_winner_operational(db, saved),
+            "execution_source": "oauth" if authorized else None,
             "account_id_suffix": str(saved.get("account_id") or "")[-6:] if saved else None,
             "account_status": saved.get("account_status") if saved else None}
 
