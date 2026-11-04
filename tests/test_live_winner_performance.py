@@ -22,9 +22,14 @@ def epoch(day: str) -> int:
 class LiveWinnerPerformanceTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
-        self.db[ORDER_LEDGER].find_one.return_value = None
-        self.db[LIVE_RUNS].find_one.return_value = None
-        self.db[LIVE_STATE].find_one.return_value = None
+        self.collections = {
+            ORDER_LEDGER: MagicMock(),
+            LIVE_RUNS: MagicMock(),
+            LIVE_STATE: MagicMock(),
+        }
+        self.db.__getitem__.side_effect = self.collections.__getitem__
+        for collection in self.collections.values():
+            collection.find_one.return_value = None
 
     def test_canonical_account_uses_earliest_verified_winner_or_reconciled_entry(self):
         self.db[LIVE_RUNS].find_one.return_value = {
