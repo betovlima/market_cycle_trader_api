@@ -17,7 +17,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
-from ...auth.security import SessionIdentity, require_admin_session
+from ...auth.security import SessionIdentity, require_portfolio_session
 from ...core.runtime import database
 
 router = APIRouter(prefix="/api/alpaca-oauth", tags=["alpaca-oauth-readonly"])
@@ -38,7 +38,7 @@ def _config():
     }.items()}
     c["expected"] = (os.getenv("ALPACA_OAUTH_EXPECTED_ACCOUNT_ID")
                      or os.getenv("ALPACA_LIVE_ACCOUNT_ID") or "").strip()
-    if not all(c.values()):
+    if not all(c[name] for name in ("client", "secret", "redirect", "frontend", "key")):
         raise RuntimeError("Alpaca OAuth configuration is missing.")
     for value in (c["redirect"], c["frontend"]):
         p = urlsplit(value)
@@ -51,6 +51,12 @@ def _config():
     except (ValueError, TypeError) as exc:
         raise RuntimeError("Invalid Alpaca OAuth encryption key.") from exc
     return c
+
+
+def _expected_account_id(config, identity) -> str:
+    """Preserve the existing admin Live binding; traders link their own Alpaca."""
+    role = str(getattr(identity, "role", "admin") or "admin")
+    return str(config["expected"] or "") if role == "admin" else ""
 
 
 def _key(subject: str) -> str:
@@ -108,7 +114,7 @@ def _status(db, identity):
 
 
 @router.get("/status")
-def connection_status(identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
+def connection_status(identity: Annotated[SessionIdentity, Depends(require_portfolio_session)]):
     try:
         _config()
     except RuntimeError:
@@ -120,7 +126,7 @@ def connection_status(identity: Annotated[SessionIdentity, Depends(require_admin
 
 @router.post("/start")
 def start(request: Request,
-          identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
+          identity: Annotated[SessionIdentity, Depends(require_portfolio_session)]):
     try:
         c = _config()
     except RuntimeError as exc:
@@ -132,6 +138,7 @@ def start(request: Request,
     db[PENDING].create_index("expires", expireAfterSeconds=0)
     db[PENDING].insert_one({"_id": _digest(state), "subject": identity.subject,
                             "requested_scope": "read",
+                            "expected_account_id": _expected_account_id(c, identity),
                             "expires": now + timedelta(minutes=10)})
     # Alpaca defaults to read-only when the optional scope is not requested.
     url = AUTHORIZE + "?" + urlencode({
@@ -143,7 +150,7 @@ def start(request: Request,
 
 @router.post("/start-trading")
 def start_trading(request: Request,
-                  identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
+                  identity: Annotated[SessionIdentity, Depends(require_portfolio_session)]):
     """Explicit fresh user consent, separate from the read-only OAuth flow."""
     if not _trading_consent_enabled():
         raise HTTPException(409, "Alpaca trading consent is not enabled.")
@@ -157,13 +164,16 @@ def start_trading(request: Request,
     if (not isinstance(linked, dict)
         or linked.get("subject") != identity.subject
         or linked.get("environment") != "live"
-        or linked.get("account_id") != c["expected"]):
+        or (_expected_account_id(c, identity)
+            and linked.get("account_id") != _expected_account_id(c, identity))):
         raise HTTPException(409, "Connect and verify the existing Live account first.")
     state = secrets.token_urlsafe(40)
     db[PENDING].create_index("expires", expireAfterSeconds=0)
     db[PENDING].insert_one({
         "_id": _digest(state), "subject": identity.subject,
         "requested_scope": "trading",
+        "expected_account_id": _expected_account_id(c, identity),
+        "linked_account_id": linked["account_id"],
         # A disconnected/replaced grant must invalidate an old browser flow.
         "linked_token_hash": _digest(str(linked.get("encrypted_token") or "")),
         "expires": datetime.now(timezone.utc) + timedelta(minutes=10),
@@ -188,9 +198,8 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         return _back(c["frontend"], "invalid_state")
     db = database()
     saved = db[PENDING].find_one_and_delete({"_id": _digest(state)})
-    # Alpaca returns via a top-level cross-site redirect, where the MCT
-    # session cookie may be absent. The one-use state identifies the
-    # administrator who initiated /start (which requires an admin session).
+    # Alpaca redirects cross-site; the MCT cookie may not travel with it.
+    # The one-use state binds this callback to the authenticated user at /start.
     if (not saved or not isinstance(saved.get("subject"), str)
         or not saved["subject"] or not isinstance(saved.get("expires"), datetime)):
         return _back(c["frontend"], "invalid_state")
@@ -204,7 +213,7 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         current = db[CONNECTIONS].find_one({"_id": _key(subject)})
         if (not isinstance(current, dict) or current.get("subject") != subject
             or current.get("environment") != "live"
-            or current.get("account_id") != c["expected"]
+            or current.get("account_id") != saved.get("linked_account_id", c["expected"])
             or not isinstance(saved.get("linked_token_hash"), str)
             or _digest(str(current.get("encrypted_token") or "")) != saved["linked_token_hash"]):
             return _back(c["frontend"], "invalid_state")
@@ -239,7 +248,10 @@ def callback(code: str | None = Query(default=None, max_length=2048),
         account = _read_account(token)
     except (requests.RequestException, RuntimeError, ValueError, AttributeError, TypeError):
         return _back(c["frontend"], "verification_failed")
-    if str(account["id"]) != c["expected"]:
+    expected_account = str(saved.get("expected_account_id", c["expected"]) or "")
+    if ((expected_account and str(account["id"]) != expected_account)
+        or (requested_scope == "trading"
+            and str(account["id"]) != str(current["account_id"]))):
         return _back(c["frontend"], "account_mismatch")
     trade_authorized = requested_scope == "trading"
     encrypted = Fernet(c["key"].encode("ascii")).encrypt(token.encode("utf-8")).decode("ascii")
@@ -265,7 +277,7 @@ def callback(code: str | None = Query(default=None, max_length=2048),
 
 
 @router.get("/verify")
-def verify(identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
+def verify(identity: Annotated[SessionIdentity, Depends(require_portfolio_session)]):
     try:
         c = _config()
     except RuntimeError as exc:
@@ -280,7 +292,9 @@ def verify(identity: Annotated[SessionIdentity, Depends(require_admin_session)])
         account = _read_account(token)
     except Exception as exc:
         raise HTTPException(503, "Alpaca OAuth verification failed.") from exc
-    if str(account["id"]) != c["expected"] or str(account["id"]) != saved["account_id"]:
+    expected_account = _expected_account_id(c, identity)
+    if ((expected_account and str(account["id"]) != expected_account)
+        or str(account["id"]) != saved["account_id"]):
         raise HTTPException(409, "Alpaca account identity changed.")
     db[CONNECTIONS].update_one({"_id": _key(identity.subject)}, {"$set": {
         "account_status": str(account.get("status") or ""),
@@ -291,7 +305,7 @@ def verify(identity: Annotated[SessionIdentity, Depends(require_admin_session)])
 
 @router.get("/winner/readiness")
 def winner_oauth_readiness(
-    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+    identity: Annotated[SessionIdentity, Depends(require_portfolio_session)],
 ):
     """Only inspect the authorized account and Winner metadata; no orders."""
     from ...services.live_oauth_winner import oauth_winner_readiness
@@ -303,7 +317,7 @@ def winner_oauth_readiness(
 
 @router.post("/disconnect")
 def disconnect(request: Request,
-               identity: Annotated[SessionIdentity, Depends(require_admin_session)]):
+               identity: Annotated[SessionIdentity, Depends(require_portfolio_session)]):
     try:
         c = _config()
     except RuntimeError as exc:
@@ -315,10 +329,10 @@ def disconnect(request: Request,
 
 
 def connected_readonly_client(db, identity: SessionIdentity):
-    """Broker for the requesting admin's OAuth Live portfolio, if linked.
+    """Broker for the requesting user's OAuth Live portfolio, if linked.
 
-    Never return an API-key client on an invalid/expired OAuth grant. The
-    Winner scheduler and order executor must not import this function.
+    Never return an API-key client on an invalid/expired OAuth grant.
+    The legacy API-key Winner executor remains independent.
     """
     saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)})
     if not saved:
@@ -330,7 +344,8 @@ def connected_readonly_client(db, identity: SessionIdentity):
             or (saved.get("read_only") is not True
                 and not (saved.get("trading_authorized") is True
                          and saved.get("oauth_scope") == "trading"))
-            or str(saved.get("account_id") or "") != config["expected"]):
+            or (_expected_account_id(config, identity)
+                and str(saved.get("account_id") or "") != _expected_account_id(config, identity))):
             raise RuntimeError("Alpaca OAuth account binding is invalid. Reconnect Alpaca.")
         token = Fernet(config["key"].encode("ascii")).decrypt(
             str(saved["encrypted_token"]).encode("ascii")
@@ -346,13 +361,15 @@ def connected_readonly_client(db, identity: SessionIdentity):
         account_id = str(getattr(client.get_account(), "id", "") or "")
     except Exception as exc:
         raise RuntimeError("Alpaca OAuth authorization cannot be verified. Reconnect Alpaca.") from exc
-    if account_id != saved["account_id"] or account_id != config["expected"]:
+    if (account_id != saved["account_id"]
+        or (_expected_account_id(config, identity)
+            and account_id != _expected_account_id(config, identity))):
         raise RuntimeError("Alpaca OAuth account identity mismatch. Reconnect Alpaca.")
     return client
 
 
 def connected_trading_client(db, identity: SessionIdentity):
-    """Resolve the admin's verified trading grant for read-only Winner preflight.
+    """Resolve the requesting user's verified trading grant for read-only Winner preflight.
 
     A returned client is never used to submit or cancel orders in this module.
     OAuth account identity is always checked live; no API-key fallback.
