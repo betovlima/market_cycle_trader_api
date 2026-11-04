@@ -16,6 +16,23 @@ from .strategy_lab import get_trader_winner_summary
 EASTERN = ZoneInfo("America/New_York")
 
 
+def account_action_for_shared_target(*, target_asset: str, current_asset: str) -> str:
+    """Translate ONE shared target into an action for an Alpaca-held asset.
+
+    No account values are stored or used here. Exact mapping matches the
+    existing Winner Live action selection; there are no broker writes.
+    """
+    target = str(target_asset or "").strip().upper()
+    current = str(current_asset or "").strip().upper()
+    if not target or not current:
+        raise ValueError("Both the shared Winner target and current Alpaca asset are required.")
+    if target == current:
+        return "stay_in_cash" if target == "CASH" else "hold"
+    if current == "CASH":
+        return "buy"
+    return "sell_to_cash" if target == "CASH" else "rotate"
+
+
 def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
     """Read OAuth account identity and the global Winner, without any writes."""
     # Verify the trading grant before contacting Alpaca. If it has not been
