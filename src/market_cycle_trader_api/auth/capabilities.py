@@ -62,17 +62,9 @@ _ROLE_CAPABILITIES = {
         "asset_discovery.view",
         "asset_discovery.export",
     },
+    # Invited Traders are Alpaca Live account holders, not research users.
+    # Admin keeps every panel; research viewer/reviewer roles remain unchanged.
     "trader": {
-        "dashboard.view",
-        "dashboard.strategy_intelligence.view",
-        "backtest.view",
-        "annual_replay.view",
-        "backtest.start",
-        "tuning.view",
-        "research_models.view",
-        "temporal_intelligence.view",
-        "decision_science.view",
-        "analytics.view",
         "portfolio.view",
     },
     "admin": set(CAPABILITY_NAMES),
