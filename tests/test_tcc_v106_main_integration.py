@@ -16,7 +16,11 @@ from market_cycle_trader_api.services.strategy_lab import (
 
 class MainReferenceIntegrationTests(unittest.TestCase):
     def test_distinct_integrated_api_version(self) -> None:
-        self.assertEqual(API_VERSION, "10.8.133")
+        # Preserve the integrated minimum without breaking on patch releases.
+        self.assertGreaterEqual(
+            tuple(int(part) for part in API_VERSION.split(".")),
+            (10, 8, 133),
+        )
 
     def test_main_heartbeat_and_tcc_data_path_coexist(self) -> None:
         source = inspect.getsource(compound_rotation_backtest.run_job)
