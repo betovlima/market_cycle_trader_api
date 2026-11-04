@@ -7,6 +7,17 @@
 **Frontend associado:** `feature/alpaca-oauth-winner-trading-v1`, derivada de `v10.7.50`  
 **Estado:** branch experimental com execução OAuth por conta **implementada em código e validada com mocks**, mas sem publicação na `main`, sem tag nova ou teste de ordem real.
 
+## Fluxo de entrada do novo usuário (04/11/2026)
+
+1. O administrador gera um convite **Trader** na Administração do MCT e entrega a URL de acesso com validação de identidade.
+2. O convidado abre o link, confirma a conta Google autorizada e ingressa com role `trader`. Esse papel tem `portfolio.view`.
+3. Após autenticação, o frontend abre diretamente **Live / Minha carteira Alpaca**. Se ele ainda não vinculou a corretora, há um único botão **Conectar e autorizar operações na Alpaca**, que chama `POST /api/alpaca-oauth/start-trading` solicitando `scope=trading` logo no primeiro vínculo. O usuário concede o escopo explicitamente na página oficial da Alpaca. Não é mais necessário um OAuth preliminar somente leitura para novos Trader.
+4. A API vincula o token criptografado ao subject Google verificado e ao `account.id` da própria Alpaca, sem gravar saldo financeiro no MCT. O state de dez minutos permanece de uso único. Para o primeiro vínculo, apenas `role=trader` pode iniciar sem conexão anterior; o callback grava via `insert_one`, sem substituir vínculo que outra aba cadastrou. A conta administrativa mantém o upgrade somente após a leitura validada e suas comparações atômicas originais.
+5. O usuário volta ao Live e visualiza sua carteira na Alpaca. **Não se envia ordem na autorização.** Quando o Live estiver ATIVO e o sinal D−1 da Winner estiver pronto para a sessão XNYS, o agendador inclui essa conta no **próximo ciclo elegível**, desde que a autorização continue válida. Usuário pode fechar o navegador ou sair do MCT; o serviço Railway e o token persistido são independentes da sessão web.
+6. Se a autorização ocorrer após o ciclo de hoje, a conta permanece à espera de ciclo futuro. Não executar uma ordem imediatamente só por ter feito login. O tratamento de conta com várias posições ou divergências de broker segue os requisitos já existentes de conciliação; não misturar saldos e não criar travas adicionais.
+
+**Implantação:** fluxo somente na branch experimental; a `main` permanece inalterada. O consentimento usa a configuração existente `ALPACA_OAUTH_TRADING_CONSENT_ENABLED`, que habilita apenas a solicitação de permissão, não cria um controle adicional de operação. Em produção atual, a flag ainda não está definida. O comportamento automatizado não estará disponível até integração e publicação aprovada.
+
 ## Situação atual da branch em 04/11/2026
 
 **Uma Winner, um sinal diário da conta de referência, múltiplas execuções OAuth por corretora.** A etapa evoluiu além do simples consentimento descrito no histórico abaixo:
