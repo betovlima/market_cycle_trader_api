@@ -299,6 +299,26 @@ class OAuthWinnerConsentTests(unittest.TestCase):
         self.db.__getitem__.assert_called_once_with(oauth.CONNECTIONS)
         self.db[oauth.CONNECTIONS].update_one.assert_not_called()
 
+    def test_single_shared_target_maps_to_different_account_actions(self):
+        derive = live_oauth_winner.account_action_for_shared_target
+        cases = [
+            ("CAPR", "CASH", "buy"),
+            ("CAPR", "CAPR", "hold"),
+            ("CAPR", "MAN", "rotate"),
+            ("CASH", "CAPR", "sell_to_cash"),
+            ("CASH", "CASH", "stay_in_cash"),
+        ]
+        for target, current, expected in cases:
+            with self.subTest(target=target, current=current):
+                self.assertEqual(
+                    derive(target_asset=target, current_asset=current),
+                    expected,
+                )
+        with self.assertRaises(ValueError):
+            derive(target_asset="CAPR", current_asset="")
+        # No user balance/capital is supplied, no persistent account value
+        # is created and no broker client is instantiated.
+
     def test_existing_live_executor_and_scheduler_remain_api_key_based(self):
         from market_cycle_trader_api.services import (
             live_observation_scheduler, live_order_execution
