@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
-
-from fastapi.testclient import TestClient
+from inspect import getsource
 
 from market_cycle_trader_api.auth.capabilities import capabilities_for_role
 from market_cycle_trader_api.auth.security import SessionIdentity
@@ -75,32 +72,33 @@ class TraderLiveOnlyAccessTests(unittest.TestCase):
                 self.assertTrue(trader_live_denied("trader", method, path))
                 self.assertFalse(trader_live_denied("admin", method, path))
 
-    def test_existing_live_and_research_http_requests_are_denied_before_handlers(self):
-        # Exercises the actual HTTP middleware, not just the helper.
+    def test_http_boundary_is_mounted_before_other_application_routers(self):
+        # This suite runs on the production requirements set (no httpx).
+        # The pure predicate tests above exercise all allowed/denied paths.
         from market_cycle_trader_api.main import create_app
 
-        identity = SessionIdentity(
-            subject="google:invited-trader",
-            role="trader",
-            scope="trader:read portfolio:read",
-            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        source = getsource(create_app)
+        self.assertIn(
+            "if trader_live_denied(identity.role, request.method, request.url.path):",
+            source,
         )
-
-        with patch("market_cycle_trader_api.main.get_session_manager") as factory:
-            factory.return_value.decode_session_token.return_value = identity
-            client = TestClient(create_app())
-            for path in (
-                "/api/dashboard/summary",
-                "/api/analytics/backtests",
-                "/api/admin/strategies",
-                "/api/live-market/portfolio",
-            ):
-                with self.subTest(path=path):
-                    response = client.get(
-                        path, cookies={"market_cycle_trader_session": "mock-cookie"},
-                    )
-                    self.assertEqual(response.status_code, 403)
-                    self.assertIn("Only your Alpaca Live", response.json()["detail"])
+        self.assertIn("Only your Alpaca Live portfolio is available", source)
+        self.assertLess(
+            source.index("if trader_live_denied("),
+            source.index("application.include_router(dashboard.router"),
+        )
+        self.assertTrue(
+            SessionIdentity(
+                subject="google:trader", role="trader",
+                scope="trader:read portfolio:read", expires_at=None,
+            ).can_view_portfolio
+        )
+        self.assertFalse(
+            SessionIdentity(
+                subject="google:trader", role="trader",
+                scope="trader:read portfolio:read", expires_at=None,
+            ).has_capability("backtest.view")
+        )
 
 
 if __name__ == "__main__":
