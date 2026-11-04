@@ -145,19 +145,25 @@ def live_winner_performance(broker: Any, *, start_date: date | None) -> dict[str
     if first_day > start_date or final_day < start_date:
         return _unavailable(start_date, "history_does_not_cover_start")
 
-    # Alpaca may use the first available 1D equity bar as the base when no
-    # prior closing value is available. Then the first day's P/L is unknown;
-    # we must not call that return 'since the Winner began'.
+    # The Alpaca-py PortfolioHistory model may omit base_value_asof even
+    # when Alpaca sends it. If omitted, Alpaca defines the first daily point
+    # as its base. Display that *partial* period honestly rather than
+    # implying we know the return during the enrollment day's session.
     base_asof = _date(getattr(history, "base_value_asof", None))
-    if base_asof is None or base_asof > start_date:
+    if base_asof is not None and base_asof > start_date:
+        return _unavailable(start_date, "baseline_after_start")
+    if base_asof is None and first_day != start_date:
         return _unavailable(start_date, "prior_closing_baseline_missing")
 
+    effective_start = base_asof if base_asof is not None else first_day
     return {
         "status": "available",
         "return_pct": float(returns[last]),  # Fraction, like broker unrealized_plpc.
         "profit_loss": float(pnls[last]),
-        "start_date": start_date.isoformat(),
+        "start_date": effective_start.isoformat(),
+        "winner_enrolled_date": start_date.isoformat(),
         "as_of": final_day.isoformat(),
+        "coverage": "complete" if base_asof is not None else "from_first_daily_close",
         "reason": None,
         "source": "alpaca_portfolio_history",
         "scope": "broker_account_during_winner",
