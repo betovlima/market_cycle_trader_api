@@ -1,7 +1,8 @@
-"""Read-only feasibility checks for an OAuth-authorized Winner account.
+"""Inspect one shared Winner strategy and an individually authorized Alpaca account.
 
-This is NOT a scheduler, optimizer, trading endpoint or broker order executor.
-The original Live execution pathway remains keyed to the existing API keys.
+The shared Winner strategy is NOT reproduced per user. Account positions and
+balances belong to Alpaca. This module neither calculates a new daily signal
+nor submits broker orders; the legacy Live executor is unchanged.
 """
 from __future__ import annotations
 
@@ -10,14 +11,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..api.routers.alpaca_oauth import connected_trading_client
-from .live_winner_session import LIVE_RUNS
 from .strategy_lab import get_trader_winner_summary
 
 EASTERN = ZoneInfo("America/New_York")
 
 
 def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
-    """Check the OAuth account and its existing Winner plan without any writes."""
+    """Read OAuth account identity and the global Winner, without any writes."""
     # Verify the trading grant before contacting Alpaca. If it has not been
     # issued, even a valid read-only OAuth token must NOT be treated as trade access.
     from ..api.routers.alpaca_oauth import CONNECTIONS, _key
@@ -56,23 +56,16 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
     else:
         session = None
 
-    # Only account-qualified session IDs. Global 'execution_session' lookups
-    # are insufficient for a multi-tenant Winner execution architecture.
-    run = db[LIVE_RUNS].find_one({"_id": f"{account_id}:{session}"}) if session else None
+    # There is ONE Winner strategy. Do not infer a shared daily signal from
+    # an account-specific legacy session, and do not build per-user winners.
+    # The current D-1 calculation still depends on current_asset and
+    # holding_sessions; extracting a truly shared signal is a separate change.
     winner = get_trader_winner_summary(db)
-    winner_matches = bool(
-        isinstance(winner, dict) and isinstance(run, dict)
-        and str(winner.get("id") or "") == str(run.get("winner_strategy_id") or "")
-        and str(winner.get("configuration_hash") or "") ==
-            str(run.get("winner_configuration_hash") or "")
-        and int(winner.get("revision") or 0) == int(run.get("winner_revision") or 0)
-    )
-    signal_prepared = bool(
-        winner_matches and run.get("status") == "recalibrated_no_orders"
-        and run.get("winner_signal_prepared") is True
-        and run.get("post_close_signal_ready") is True
-        and run.get("snapshot_sha256")
-        and run.get("target_asset")
+    winner_configured = bool(
+        isinstance(winner, dict)
+        and winner.get("id")
+        and winner.get("configuration_hash")
+        and winner.get("name")
     )
     return {
         **common,
@@ -82,9 +75,16 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
         "account_status": str(getattr(account, "status", "") or ""),
         "market_open": bool(getattr(clock, "is_open", False)),
         "execution_session": session,
-        "winner_name": winner.get("name") if isinstance(winner, dict) else None,
-        "winner_identity_matches": winner_matches,
-        "winner_signal_prepared": signal_prepared,
+        "winner_name": winner.get("name") if winner_configured else None,
+        "winner_strategy_id": str(winner["id"]) if winner_configured else None,
+        "shared_winner": True,
+        "winner_configured": winner_configured,
+        # No cross-account daily signal is persisted by this experimental path.
+        "shared_signal_prepared": False,
+        "winner_signal_prepared": False,
         "order_submission_enabled": False,
-        "reason": "User-scoped scheduler, per-account execution controls and order isolation are not enabled.",
+        "reason": (
+            "One shared Winner is configured. A shared D-1 signal and individual "
+            "Alpaca executions have not been connected to OAuth yet."
+        ),
     }
