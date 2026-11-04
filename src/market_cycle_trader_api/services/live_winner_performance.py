@@ -8,7 +8,7 @@ in Live Winner, NOT attribution to the model alone (manual trades can exist).
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timezone, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -108,6 +108,7 @@ def live_winner_performance(broker: Any, *, start_date: date | None) -> dict[str
         history = broker.get_portfolio_history(
             GetPortfolioHistoryRequest(
                 start=datetime.combine(start_date, time(9, 30), tzinfo=_EASTERN),
+                end=datetime.now(timezone.utc),
                 timeframe="1D", cashflow_types="ALL",
             )
         )
@@ -142,7 +143,10 @@ def live_winner_performance(broker: Any, *, start_date: date | None) -> dict[str
     except (ValueError, OverflowError, TypeError, OSError):
         return _unavailable(start_date, "invalid_alpaca_timestamps")
 
-    if first_day > start_date or final_day < start_date:
+    # Enrollment can happen over a weekend/holiday. The first relevant
+    # broker day may therefore be a few calendar days later.
+    if (first_day - start_date > timedelta(days=5)
+        or final_day < start_date):
         return _unavailable(start_date, "history_does_not_cover_start")
 
     # The Alpaca-py PortfolioHistory model may omit base_value_asof even
@@ -152,7 +156,7 @@ def live_winner_performance(broker: Any, *, start_date: date | None) -> dict[str
     base_asof = _date(getattr(history, "base_value_asof", None))
     if base_asof is not None and base_asof > start_date:
         return _unavailable(start_date, "baseline_after_start")
-    if base_asof is None and first_day != start_date:
+    if base_asof is None and first_day < start_date:
         return _unavailable(start_date, "prior_closing_baseline_missing")
 
     effective_start = base_asof if base_asof is not None else first_day
