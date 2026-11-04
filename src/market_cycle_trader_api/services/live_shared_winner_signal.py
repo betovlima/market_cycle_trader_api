@@ -42,12 +42,11 @@ def _canonical_account_id() -> str:
 
     Never take a source account ID from a client query parameter.
     """
-    account_id = str(os.getenv("ALPACA_LIVE_ACCOUNT_ID") or "").strip()
-    if not account_id:
-        raise RuntimeError(
-            "The canonical Winner signal requires ALPACA_LIVE_ACCOUNT_ID."
-        )
-    return account_id
+    return str(
+        os.getenv("ALPACA_LIVE_ACCOUNT_ID")
+        or os.getenv("ALPACA_OAUTH_EXPECTED_ACCOUNT_ID")
+        or ""
+    ).strip()
 
 
 def read_shared_winner_signal(
@@ -63,6 +62,10 @@ def read_shared_winner_signal(
     if session_date.tzinfo is not None or not calendar.is_session(session_date):
         raise ValueError("The requested Winner session must be an XNYS trading day.")
     source_account_id = _canonical_account_id()
+    if not source_account_id:
+        # Consent and account verification can still work while no canonical
+        # signal source is configured in the local development environment.
+        return None
     run = db[LIVE_RUNS].find_one({
         "_id": f"{source_account_id}:{session_date.date().isoformat()}",
     })
