@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ..api.routers.alpaca_oauth import connected_trading_client
+from ..api.routers.alpaca_oauth import connected_trading_client, _oauth_winner_operational
 from .live_shared_winner_signal import read_shared_winner_signal
 from .strategy_lab import get_trader_winner_summary
 
@@ -106,6 +106,7 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
         **common,
         "status": "trading_authorized_execution_disabled",
         "trading_authorized": True,
+        "oauth_winner_execution_enabled": _oauth_winner_operational(db, saved),
         "account_id_suffix": account_id[-6:],
         "account_status": str(getattr(account, "status", "") or ""),
         "market_open": bool(getattr(clock, "is_open", False)),
@@ -123,8 +124,8 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
         "account_action": action,
         "order_submission_enabled": False,
         "reason": (
-            "One validated D-1 target is shared across OAuth accounts. "
-            "Individual order execution remains disabled on this route."
+            "This endpoint never submits orders. The existing Live mode "
+            "determines whether the scheduled OAuth execution can run."
             if shared_signal is not None else
             "Waiting for the existing Winner to persist its canonical D-1 signal."
         ),
