@@ -1,0 +1,453 @@
+"""OAuth Winner trading permission: explicit consent, no live order execution."""
+from __future__ import annotations
+
+import os
+import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
+
+from cryptography.fernet import Fernet
+from fastapi import HTTPException
+
+from market_cycle_trader_api.api.routers import alpaca_oauth as oauth
+from market_cycle_trader_api.services import live_oauth_winner
+
+
+class OAuthWinnerConsentTests(unittest.TestCase):
+    def setUp(self):
+        self.subject = "google:admin-for-tests"
+        self.identity = SimpleNamespace(subject=self.subject)
+        self.origin = SimpleNamespace(headers={"origin": "https://frontend.example.com"})
+        self.config = {
+            "client": "test-client", "secret": "not-a-real-secret",
+            "redirect": "https://api.example.com/api/alpaca-oauth/callback",
+            "frontend": "https://frontend.example.com/",
+            "expected": "verified-live-account",
+            "key": Fernet.generate_key().decode("ascii"),
+        }
+        self.db = MagicMock()
+        self.linked = {
+            "subject": self.subject,
+            "environment": "live",
+            "account_id": self.config["expected"],
+            "read_only": True,
+            "encrypted_token": Fernet(self.config["key"].encode()).encrypt(
+                b"read-only-token"
+            ).decode(),
+        }
+
+    def test_trading_consent_defaults_off(self):
+        with patch.dict(os.environ, {"ALPACA_OAUTH_TRADING_CONSENT_ENABLED": ""}):
+            self.assertFalse(oauth._trading_consent_enabled())
+
+    def test_trading_consent_disabled_fails_before_db_write(self):
+        with patch.object(oauth, "_trading_consent_enabled", return_value=False):
+            with self.assertRaises(HTTPException) as err:
+                oauth.start_trading(self.origin, self.identity)
+        self.assertEqual(err.exception.status_code, 409)
+        self.db[oauth.PENDING].insert_one.assert_not_called()
+
+    def test_trading_start_requires_existing_verified_account(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = None
+        with (patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db)):
+            with self.assertRaises(HTTPException) as err:
+                oauth.start_trading(self.origin, self.identity)
+        self.assertEqual(err.exception.status_code, 409)
+        self.db[oauth.PENDING].insert_one.assert_not_called()
+
+    def test_invited_trader_starts_with_single_trading_consent(self):
+        trader = SimpleNamespace(subject="google:invited-trader", role="trader")
+        self.db[oauth.CONNECTIONS].find_one.return_value = None
+        with (patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db)):
+            response = oauth.start_trading(self.origin, trader)
+        params = parse_qs(urlsplit(response["authorization_url"]).query)
+        self.assertEqual(params["scope"], ["trading"])
+        self.assertEqual(params["env"], ["live"])
+        self.assertFalse(response["trading_enabled"])
+        pending = self.db[oauth.PENDING].insert_one.call_args.args[0]
+        self.assertEqual(pending["subject"], trader.subject)
+        self.assertEqual(pending["role"], "trader")
+        self.assertTrue(pending["first_trader_connection"])
+        self.assertEqual(pending["expected_account_id"], "")
+        self.assertNotIn("linked_token_hash", pending)
+        self.assertNotIn("linked_account_id", pending)
+
+    def test_invited_trader_first_callback_saves_encrypted_token_without_readonly_step(self):
+        trader_subject = "google:invited-trader"
+        self.db[oauth.CONNECTIONS].find_one.return_value = None
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": trader_subject, "role": "trader",
+            "first_trader_connection": True, "requested_scope": "trading",
+            "expected_account_id": "",
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        exchange = MagicMock(status_code=200)
+        exchange.json.return_value = {
+            "access_token": "alpaca-trader-token", "token_type": "bearer",
+            "scope": "trading",
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth.requests, "post", return_value=exchange),
+              patch.object(oauth, "_read_account",
+                           return_value={"id": "independent-alpaca-account",
+                                         "status": "ACTIVE"})):
+            response = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("trading_connected", response.headers["location"])
+        saved = self.db[oauth.CONNECTIONS].insert_one.call_args.args[0]
+        self.assertEqual(saved["_id"], oauth._key(trader_subject))
+        self.assertEqual(saved["account_id"], "independent-alpaca-account")
+        self.assertTrue(saved["trading_authorized"])
+        self.assertFalse(saved["read_only"])
+        self.assertEqual(saved["role"], "trader")
+        self.assertEqual(
+            Fernet(self.config["key"].encode()).decrypt(
+                saved["encrypted_token"].encode()
+            ).decode(), "alpaca-trader-token",
+        )
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
+
+    def test_new_trader_callback_cannot_replace_connection_added_during_consent(self):
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": "google:invited-trader", "role": "trader",
+            "first_trader_connection": True, "requested_scope": "trading",
+            "expected_account_id": "",
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": "google:invited-trader", "encrypted_token": "newer"
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth.requests, "post") as exchange):
+            response = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("invalid_state", response.headers["location"])
+        exchange.assert_not_called()
+        self.db[oauth.CONNECTIONS].insert_one.assert_not_called()
+
+    def test_new_trader_callback_is_atomic_if_another_tab_connects(self):
+        from pymongo.errors import DuplicateKeyError
+        self.db[oauth.CONNECTIONS].find_one.return_value = None
+        self.db[oauth.CONNECTIONS].insert_one.side_effect = DuplicateKeyError("duplicate")
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": "google:invited-trader", "role": "trader",
+            "first_trader_connection": True, "requested_scope": "trading",
+            "expected_account_id": "",
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        exchange = MagicMock(status_code=200)
+        exchange.json.return_value = {
+            "access_token": "token", "token_type": "bearer", "scope": "trading"
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth.requests, "post", return_value=exchange),
+              patch.object(oauth, "_read_account",
+                           return_value={"id": "alpaca-A", "status": "ACTIVE"})):
+            response = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("invalid_state", response.headers["location"])
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
+
+    def test_first_trading_connection_is_not_allowed_for_admin(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = None
+        with (patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db)):
+            with self.assertRaises(HTTPException) as error:
+                oauth.start_trading(self.origin, SimpleNamespace(
+                    subject="google:admin", role="admin"
+                ))
+        self.assertEqual(error.exception.status_code, 409)
+        self.db[oauth.PENDING].insert_one.assert_not_called()
+
+    def test_trading_start_requires_same_origin(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        bad_origin = SimpleNamespace(headers={"origin": "https://attacker.example"})
+        with (patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db)):
+            with self.assertRaises(HTTPException) as err:
+                oauth.start_trading(bad_origin, self.identity)
+        self.assertEqual(err.exception.status_code, 403)
+        self.db[oauth.PENDING].insert_one.assert_not_called()
+
+    def test_trading_start_requests_exact_scope_and_is_bound_to_user(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        with (patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db)):
+            result = oauth.start_trading(self.origin, self.identity)
+        query = parse_qs(urlsplit(result["authorization_url"]).query)
+        self.assertEqual(query["scope"], ["trading"])
+        self.assertEqual(query["env"], ["live"])
+        self.assertEqual(query["response_type"], ["code"])
+        self.assertFalse(result["trading_enabled"])
+        self.assertNotIn("client_secret", query)
+        saved = self.db[oauth.PENDING].insert_one.call_args.args[0]
+        self.assertEqual(saved["subject"], self.subject)
+        self.assertEqual(saved["requested_scope"], "trading")
+        self.assertEqual(saved["linked_token_hash"], oauth._digest(self.linked["encrypted_token"]))
+        self.assertNotEqual(saved["_id"], query["state"][0])
+
+    def test_trade_scope_cannot_be_granted_from_readonly_state(self):
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "read",
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "access_token": "token", "token_type": "bearer", "scope": "trading"
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth.requests, "post", return_value=response),
+              patch.object(oauth, "_read_account") as read_account):
+            result = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("permission_failed", result.headers["location"])
+        read_account.assert_not_called()
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
+
+    def test_requested_trading_scope_must_be_returned_by_alpaca(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "access_token": "token", "token_type": "bearer", "scope": ""
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth.requests, "post", return_value=response),
+              patch.object(oauth, "_read_account") as read_account):
+            result = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("trading_permission_failed", result.headers["location"])
+        read_account.assert_not_called()
+
+    def test_trading_grant_is_encrypted_but_does_not_enable_orders(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        self.db[oauth.CONNECTIONS].update_one.return_value.matched_count = 1
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "access_token": "granted-token", "token_type": "bearer", "scope": "trading"
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth.requests, "post", return_value=response),
+              patch.object(oauth, "_read_account", return_value={
+                  "id": self.config["expected"], "status": "ACTIVE",
+              })):
+            result = oauth.callback(code="code", state="state", error=None)
+            self.assertIn("trading_connected", result.headers["location"])
+        self.assertFalse(self.db[oauth.CONNECTIONS].update_one.call_args.kwargs["upsert"])
+        self.assertEqual(
+            self.db[oauth.CONNECTIONS].update_one.call_args.args[0]["encrypted_token"],
+            self.linked["encrypted_token"],
+        )
+        stored = self.db[oauth.CONNECTIONS].update_one.call_args.args[1]["$set"]
+        self.assertTrue(stored["trading_authorized"])
+        self.assertFalse(stored["read_only"])
+        self.assertEqual(stored["oauth_scope"], "trading")
+        self.assertNotEqual(stored["encrypted_token"], "granted-token")
+        plaintext = Fernet(self.config["key"].encode()).decrypt(
+            stored["encrypted_token"].encode()
+        ).decode()
+        self.assertEqual(plaintext, "granted-token")
+        self.db[oauth.CONNECTIONS].find_one.return_value = stored
+        status = oauth._status(self.db, self.identity)
+        self.assertTrue(status["trading_authorized"])
+        self.assertFalse(status["trading_enabled"])
+        self.assertNotIn("encrypted_token", status)
+
+    def test_callback_cas_failure_never_reconnects_revoked_grant(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        self.db[oauth.CONNECTIONS].update_one.return_value.matched_count = 0
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "access_token": "token", "token_type": "bearer", "scope": "trading",
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "_trading_consent_enabled", return_value=True),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth.requests, "post", return_value=response),
+              patch.object(oauth, "_read_account",
+                           return_value={"id": self.config["expected"]})):
+            result = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("invalid_state", result.headers["location"])
+        self.assertFalse(self.db[oauth.CONNECTIONS].update_one.call_args.kwargs["upsert"])
+
+    def test_disconnected_or_replaced_oauth_grant_invalidates_pending_trading_state(self):
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "linked_token_hash": oauth._digest(self.linked["encrypted_token"]),
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        for current in (None, {**self.linked, "encrypted_token": "other-grant"}):
+            with self.subTest(current=current):
+                self.db[oauth.CONNECTIONS].find_one.return_value = current
+                with (patch.object(oauth, "_config", return_value=self.config),
+                      patch.object(oauth, "_trading_consent_enabled", return_value=True),
+                      patch.object(oauth, "database", return_value=self.db),
+                      patch.object(oauth.requests, "post") as token_exchange):
+                    result = oauth.callback(code="code", state="state", error=None)
+                self.assertIn("invalid_state", result.headers["location"])
+                token_exchange.assert_not_called()
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
+
+    def test_disable_flag_while_authorizing_rejects_callback(self):
+        self.db[oauth.PENDING].find_one_and_delete.return_value = {
+            "subject": self.subject, "requested_scope": "trading",
+            "expires": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch.object(oauth, "_trading_consent_enabled", return_value=False),
+              patch.object(oauth, "database", return_value=self.db),
+              patch.object(oauth.requests, "post") as post):
+            result = oauth.callback(code="code", state="state", error=None)
+        self.assertIn("trading_unavailable", result.headers["location"])
+        post.assert_not_called()
+
+    def test_portfolio_reading_survives_trading_grant_upgrade(self):
+        grant = "trading-token-do-not-expose"
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": self.subject,
+            "environment": "live",
+            "read_only": False,
+            "trading_authorized": True,
+            "oauth_scope": "trading",
+            "account_id": self.config["expected"],
+            "encrypted_token": Fernet(self.config["key"].encode()).encrypt(
+                grant.encode()
+            ).decode(),
+        }
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(
+            id=self.config["expected"],
+        )
+        with (patch.object(oauth, "_config", return_value=self.config),
+              patch("alpaca.trading.client.TradingClient", return_value=broker) as factory):
+            client = oauth.connected_readonly_client(self.db, self.identity)
+        self.assertIs(client, broker)
+        factory.assert_called_once_with(oauth_token=grant, paper=False)
+        broker.submit_order.assert_not_called()
+
+    def test_preflight_with_readonly_grant_never_creates_broker(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        with patch.object(live_oauth_winner, "connected_trading_client") as client:
+            result = live_oauth_winner.oauth_winner_readiness(self.db, self.identity)
+        self.assertEqual(result["status"], "trading_consent_required")
+        self.assertFalse(result["order_submission_enabled"])
+        client.assert_not_called()
+
+    def test_trading_client_requires_explicit_trade_grant(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = self.linked
+        with patch.object(oauth, "connected_readonly_client") as client:
+            with self.assertRaisesRegex(RuntimeError, "not been authorized"):
+                oauth.connected_trading_client(self.db, self.identity)
+        client.assert_not_called()
+
+    def test_preflight_checks_shared_winner_without_per_account_signal(self):
+        self.db[oauth.CONNECTIONS].find_one.return_value = {
+            "subject": self.subject, "environment": "live",
+            "account_id": self.config["expected"],
+            "trading_authorized": True, "oauth_scope": "trading",
+            "read_only": False,
+        }
+        broker = MagicMock()
+        broker.get_account.return_value = SimpleNamespace(
+            id=self.config["expected"], status="ACTIVE",
+        )
+        broker.get_clock.return_value = SimpleNamespace(
+            timestamp=datetime(2026, 11, 3, 14, 0, tzinfo=timezone.utc),
+            next_open=datetime(2026, 11, 4, 14, 30, tzinfo=timezone.utc),
+            is_open=False,
+        )
+        with (patch.object(live_oauth_winner, "connected_trading_client",
+                           return_value=broker),
+              patch.object(live_oauth_winner, "read_shared_winner_signal",
+                           return_value=None),
+              patch.object(live_oauth_winner, "_oauth_winner_operational",
+                           return_value=False),
+              patch.object(live_oauth_winner, "get_trader_winner_summary",
+                           return_value={
+                               "id": "winner-shared", "configuration_hash": "sha",
+                               "revision": 1, "name": "Winner global",
+                           }) as shared):
+            result = live_oauth_winner.oauth_winner_readiness(self.db, self.identity)
+        self.assertEqual(result["status"], "trading_authorized_execution_disabled")
+        self.assertTrue(result["shared_winner"])
+        self.assertTrue(result["winner_configured"])
+        self.assertEqual(result["winner_strategy_id"], "winner-shared")
+        self.assertFalse(result["shared_signal_prepared"])
+        self.assertFalse(result["winner_signal_prepared"])
+        self.assertFalse(result["order_submission_enabled"])
+        shared.assert_called_once_with(self.db)
+        broker.submit_order.assert_not_called()
+        broker.cancel_order_by_id.assert_not_called()
+        # The grant only identifies the account. It never reads a per-user
+        # Winner plan or writes portfolio values into an MCT collection.
+        self.db.assert_not_called()
+        self.assertEqual(
+            {call.args[0] for call in self.db.__getitem__.call_args_list},
+            {oauth.CONNECTIONS},
+        )
+        self.db[oauth.CONNECTIONS].update_one.assert_not_called()
+
+    def test_single_shared_target_maps_to_different_account_actions(self):
+        derive = live_oauth_winner.account_action_for_shared_target
+        cases = [
+            ("CAPR", "CASH", "buy"),
+            ("CAPR", "CAPR", "hold"),
+            ("CAPR", "MAN", "rotate"),
+            ("CASH", "CAPR", "sell_to_cash"),
+            ("CASH", "CASH", "stay_in_cash"),
+        ]
+        for target, current, expected in cases:
+            with self.subTest(target=target, current=current):
+                self.assertEqual(
+                    derive(target_asset=target, current_asset=current),
+                    expected,
+                )
+        with self.assertRaises(ValueError):
+            derive(target_asset="CAPR", current_asset="")
+        # No user balance/capital is supplied, no persistent account value
+        # is created and no broker client is instantiated.
+
+    def test_existing_live_executor_and_scheduler_remain_api_key_based(self):
+        from market_cycle_trader_api.services import (
+            live_observation_scheduler, live_order_execution
+        )
+        import inspect
+        scheduler = inspect.getsource(live_observation_scheduler.LiveObservationScheduler._run)
+        executor = inspect.getsource(live_order_execution.execute_prepared_live_winner_session)
+        self.assertIn("execute_prepared_live_winner_session(", scheduler)
+        self.assertIn("create_live_execution_client()", executor)
+        self.assertNotIn("connected_trading_client", scheduler)
+        self.assertNotIn("connected_trading_client", executor)
+
+
+if __name__ == "__main__":
+    unittest.main()

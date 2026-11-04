@@ -139,7 +139,7 @@ class AlpacaOauthPilotTests(unittest.TestCase):
     def test_callback_redirects_without_session_but_others_still_require_admin(self):
         # FastAPI's route dependency graph can be checked without TestClient
         # (the CI environment intentionally does not install httpx2).
-        from market_cycle_trader_api.auth.security import require_admin_session
+        from market_cycle_trader_api.auth.security import require_portfolio_session
 
         with patch.object(oauth, "_config", return_value=self.cfg):
             response = oauth.callback(code=None, state=None, error=None)
@@ -149,9 +149,9 @@ class AlpacaOauthPilotTests(unittest.TestCase):
         for route in oauth.router.routes:
             dependencies = [item.call for item in route.dependant.dependencies]
             if route.path.endswith("/callback"):
-                self.assertNotIn(require_admin_session, dependencies)
+                self.assertNotIn(require_portfolio_session, dependencies)
             else:
-                self.assertIn(require_admin_session, dependencies, route.path)
+                self.assertIn(require_portfolio_session, dependencies, route.path)
 
     def test_state_without_a_subject_cannot_connect_an_account(self):
         self.db[oauth.PENDING].find_one_and_delete.return_value = {

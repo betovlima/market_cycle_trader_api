@@ -22,6 +22,7 @@ from .live_winner_session import plan_next_live_session, LIVE_RUNS
 from .live_winner_events import append_live_event
 from .live_winner_signal import prepare_live_winner_signal
 from .live_order_execution import execute_prepared_live_winner_session
+from .live_oauth_scheduler import execute_oauth_accounts_for_shared_winner
 from .live_workflow_monitor import execute_monitored_live_stage
 
 LIVE_OBSERVATIONS = "live_trader_session_observations"
@@ -284,6 +285,22 @@ class LiveObservationScheduler:
                                 ),
                                 brokerage=True,
                             )
+                    # One Winner signal, many independently authorized
+                    # brokerage accounts. The legacy key-based account still
+                    # executes above and is excluded from this OAuth fanout.
+                    # No additional operating flag or cash ledger is created.
+                    if (isinstance(armed, dict)
+                        and armed.get("execution_session")
+                        and result.get("market_open")
+                        and _regular_xnys_session_open(
+                            session=armed["execution_session"],
+                            broker_timestamp=result["recorded_at"],
+                            broker_is_open=True,
+                        )):
+                        stage = "oauth_account_execution"
+                        execute_oauth_accounts_for_shared_winner(
+                            db, session=armed["execution_session"],
+                        )
                 self._last_error = None
                 self._last_error_fingerprint = None
             except Exception as exc:
