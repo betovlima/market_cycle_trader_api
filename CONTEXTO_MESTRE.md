@@ -1,3 +1,13 @@
+## 2026-11-04 — Etapa 2 OAuth Winner compartilhada, execução individual por Alpaca (branch experimental)
+
+**Branch/PR:** `feature/alpaca-oauth-winner-trading-v1` · [API PR #90](https://github.com/betovlima/market_cycle_trader_api/pull/90) e [frontend PR #43](https://github.com/betovlima/market_cycle_trader/pull/43), ambos draft. Base da `main`: API `v10.8.133`, front `v10.7.50`. Sem nova versão, tag ou deploy. Detalhes em `docs/changes/alpaca-oauth-winner-trading-stage2.md`.
+
+**Implementação da branch:** a Winner e seus parâmetros/treinamento continuam únicos. `live_shared_winner_signal.py` reutiliza a decisão validada D−1 da conta principal, sem treinar por usuário; nota técnica: esse alvo foi originalmente calculado considerando `current_asset` e `holding_sessions` da conta principal, portanto não é inferência universal completamente independente da posição. `live_oauth_scheduler.py` distribui o alvo a contas OAuth com `trading`, exclui a conta principal e não processa duas vezes o mesmo `account_id`, inclusive se dois logins o vincularem. `live_oauth_execution.py` consulta posições e caixa **diretamente da Alpaca do titular**, deriva ação e usa ledger de ordem por conta com as regras existentes XNYS e Live. Nenhum saldo financeiro operacional próprio do MCT; históricos monetários legados servem apenas à auditoria. `live_personal_portfolio.py` e `GET /api/alpaca-oauth/portfolio` mostram patrimônio/ordens individualizados sem fallback para API Keys de outra pessoa.
+
+**Regra Live:** o mesmo modo operacional existente controla as operações. Local PARADO não envia ordens; produção ATIVA mantém sua operação atual. **Quando esta branch for implantada**, uma conta OAuth `trading` adicional, diferente da principal, poderá operar automaticamente se o Live estiver ATIVO. Isso deve ser homologado e aprovado antes do merge; não criar travas/flags operacionais adicionais. Testes atuais são mocks, sem ordem real.
+
+---
+
 ## 2026-11-03 — Winner OAuth, etapa 2 experimental | Consentimento de negociação e pré-validação por conta
 
 **Branch:** `feature/alpaca-oauth-winner-trading-v1`, PR draft [#90](https://github.com/betovlima/market_cycle_trader_api/pull/90), a partir de `main` API `v10.8.133`; frontend homônimo a partir de `v10.7.50`. **Sem alteração de versão, tag, merge ou deploy** nesta etapa experimental. Documentação: `docs/changes/alpaca-oauth-winner-trading-stage2.md`.
