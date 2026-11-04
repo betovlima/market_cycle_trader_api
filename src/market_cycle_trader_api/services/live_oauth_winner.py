@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..api.routers.alpaca_oauth import connected_trading_client
+from .live_shared_winner_signal import read_shared_winner_signal
 from .strategy_lab import get_trader_winner_summary
 
 EASTERN = ZoneInfo("America/New_York")
@@ -84,6 +85,23 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
         and winner.get("configuration_hash")
         and winner.get("name")
     )
+    # The single canonical Winner produces the D-1 target; the OAuth
+    # account supplies its own actual holdings. No monetary value is written
+    # into the MCT. This endpoint remains an inspection-only API.
+    shared_signal = read_shared_winner_signal(db, session=session) if session else None
+    positions = list(broker.get_all_positions())
+    current_asset = (
+        "CASH" if not positions else
+        str(getattr(positions[0], "symbol", "") or "").strip().upper()
+        if len(positions) == 1 else None
+    )
+    action = (
+        account_action_for_shared_target(
+            target_asset=shared_signal.target_asset, current_asset=current_asset,
+        )
+        if shared_signal is not None and current_asset is not None
+        else None
+    )
     return {
         **common,
         "status": "trading_authorized_execution_disabled",
@@ -96,12 +114,18 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
         "winner_strategy_id": str(winner["id"]) if winner_configured else None,
         "shared_winner": True,
         "winner_configured": winner_configured,
-        # No cross-account daily signal is persisted by this experimental path.
-        "shared_signal_prepared": False,
-        "winner_signal_prepared": False,
+        "shared_signal_prepared": shared_signal is not None,
+        "winner_signal_prepared": shared_signal is not None,
+        "shared_target_asset": shared_signal.target_asset if shared_signal else None,
+        "shared_decision_date": shared_signal.decision_date if shared_signal else None,
+        "current_asset": current_asset,
+        "position_count": len(positions),
+        "account_action": action,
         "order_submission_enabled": False,
         "reason": (
-            "One shared Winner is configured. A shared D-1 signal and individual "
-            "Alpaca executions have not been connected to OAuth yet."
+            "One validated D-1 target is shared across OAuth accounts. "
+            "Individual order execution remains disabled on this route."
+            if shared_signal is not None else
+            "Waiting for the existing Winner to persist its canonical D-1 signal."
         ),
     }
