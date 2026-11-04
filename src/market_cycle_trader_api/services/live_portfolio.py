@@ -247,9 +247,14 @@ def live_portfolio_snapshot(
         db, account_id=account_id, positions=positions, recorded_now=recorded_now,
     )
     unrealized = sum(p["unrealized_pnl"] for p in positions)
-    start_date = first_live_winner_date(
-        db, account_id=account_id, canonical_account=True,
-    )
+    try:
+        start_date = first_live_winner_date(
+            db, account_id=account_id, canonical_account=True,
+        )
+    except Exception:
+        # Historical metrics are optional: a missing ledger must never hide
+        # current Alpaca balances or interfere with Live trading.
+        start_date = None
     winner_performance = live_winner_performance(client, start_date=start_date)
 
     return {
