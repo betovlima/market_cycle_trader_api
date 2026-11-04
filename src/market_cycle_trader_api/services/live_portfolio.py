@@ -20,6 +20,7 @@ from .live_control import live_control_status
 from .live_winner_session import LIVE_RUNS, latest_live_session
 from .live_order_execution import ORDER_LEDGER
 from .live_winner_candidates import latest_live_winner_decision
+from .live_account_return import alpaca_account_cumulative_return
 from .live_trader_state import LIVE_STATE
 from ..tcc_u67_v1210_reference.rotacao import ROTATION_FEATURES
 
@@ -264,6 +265,7 @@ def live_portfolio_snapshot(
         "unrealized_pnl": unrealized,
         "total_pnl": None,
         "total_return": None,
+        "winner_performance": alpaca_account_cumulative_return(client, current_equity=equity),
         "position": positions[0] if len(positions) == 1 else None,
         "positions": positions,
         "last_decision_date": latest_decision.get("decision_date") if latest_decision else None,

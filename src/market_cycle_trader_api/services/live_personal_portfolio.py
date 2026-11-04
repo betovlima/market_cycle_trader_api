@@ -13,6 +13,7 @@ from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
 
 from .live_portfolio import _float, _label, _order, _position, _timestamp
+from .live_account_return import alpaca_account_cumulative_return
 
 
 def personal_live_portfolio_snapshot(broker: Any) -> dict[str, Any]:
@@ -51,6 +52,7 @@ def personal_live_portfolio_snapshot(broker: Any) -> dict[str, Any]:
         ),
         "market_value": sum(p["market_value"] for p in positions),
         "unrealized_pnl": sum(p["unrealized_pnl"] for p in positions),
+        "winner_performance": alpaca_account_cumulative_return(broker, current_equity=equity),
         "positions": positions,
         "recent_orders": orders,
         "market_clock": {
