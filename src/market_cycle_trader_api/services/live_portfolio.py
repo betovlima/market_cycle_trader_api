@@ -20,6 +20,7 @@ from .live_control import live_control_status
 from .live_winner_session import LIVE_RUNS, latest_live_session
 from .live_order_execution import ORDER_LEDGER
 from .live_winner_candidates import latest_live_winner_decision
+from .live_winner_performance import first_live_winner_date, live_winner_performance
 from .live_trader_state import LIVE_STATE
 from ..tcc_u67_v1210_reference.rotacao import ROTATION_FEATURES
 
@@ -246,6 +247,15 @@ def live_portfolio_snapshot(
         db, account_id=account_id, positions=positions, recorded_now=recorded_now,
     )
     unrealized = sum(p["unrealized_pnl"] for p in positions)
+    try:
+        start_date = first_live_winner_date(
+            db, account_id=account_id, canonical_account=True,
+        )
+    except Exception:
+        # Historical metrics are optional: a missing ledger must never hide
+        # current Alpaca balances or interfere with Live trading.
+        start_date = None
+    winner_performance = live_winner_performance(client, start_date=start_date)
 
     return {
         "status": "ready",
@@ -263,7 +273,8 @@ def live_portfolio_snapshot(
         "realized_pnl": None,
         "unrealized_pnl": unrealized,
         "total_pnl": None,
-        "total_return": None,
+        "total_return": None,  # Legacy metric is not broker-verified.
+        "winner_performance": winner_performance,
         "position": positions[0] if len(positions) == 1 else None,
         "positions": positions,
         "last_decision_date": latest_decision.get("decision_date") if latest_decision else None,
