@@ -146,6 +146,8 @@ class AccountPreviewWithSharedWinnerTests(unittest.TestCase):
                            return_value=self.broker),
               patch.object(live_oauth_winner, "read_shared_winner_signal",
                            return_value=signal),
+              patch.object(live_oauth_winner, "_oauth_winner_operational",
+                           return_value=False),
               patch.object(live_oauth_winner, "get_trader_winner_summary",
                            return_value=winner())):
             return live_oauth_winner.oauth_winner_readiness(self.db, self.identity)
