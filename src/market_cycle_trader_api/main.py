@@ -49,6 +49,7 @@ from .decision_science.router import router as decision_science_router
 from .roc_decision_policy.router import router as roc_decision_policy_router
 from .auth.config import get_auth_settings
 from .auth.replay_guest import replay_guest_denied
+from .auth.trader_live import trader_live_denied
 from .auth.security import SESSION_COOKIE_NAME, get_session_manager, require_admin_session, require_backtest_access, require_capability, require_portfolio_session, require_trader_access, require_trader_session
 from .auth.access_service import get_access_service
 from .auth.reviewer_access_service import get_reviewer_access_service
@@ -129,6 +130,11 @@ def create_app() -> FastAPI:
                     return JSONResponse(
                         status_code=403,
                         content={"detail": "Only Annual Replay is available for this account."},
+                    )
+                if trader_live_denied(identity.role, request.method, request.url.path):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Only your Alpaca Live portfolio is available for this account."},
                     )
         return await call_next(request)
 

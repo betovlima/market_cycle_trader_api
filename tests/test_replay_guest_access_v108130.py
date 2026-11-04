@@ -13,8 +13,10 @@ class ProfessorReplayAccessTests(unittest.TestCase):
     def test_replay_guest_has_only_annual_replay_capability(self):
         capabilities = capabilities_for_role("replay_guest")
         self.assertEqual({key for key, enabled in capabilities.items() if enabled}, {"annual_replay.view"})
-        for role in ("viewer", "reviewer", "trader", "admin"):
+        for role in ("viewer", "reviewer", "admin"):
             self.assertTrue(capabilities_for_role(role)["annual_replay.view"])
+        # Invited Traders have access to their Alpaca Live portfolio only.
+        self.assertFalse(capabilities_for_role("trader")["annual_replay.view"])
 
     def test_guest_invitation_requires_authorized_google_email(self):
         invite = InvitationCreateRequest(
