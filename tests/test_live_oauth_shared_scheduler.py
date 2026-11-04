@@ -74,6 +74,48 @@ class OAuthSharedSchedulerTests(unittest.TestCase):
         )
         self.db[live_oauth_scheduler.CONNECTIONS].find.assert_called_once()
 
+    def test_same_alpaca_account_is_processed_only_once(self):
+        self.db[live_oauth_scheduler.CONNECTIONS].find.return_value = [
+            {"subject": "google:user-1", "role": "trader", "account_id": "alpaca-shared"},
+            {"subject": "google:user-2", "role": "trader", "account_id": "alpaca-shared"},
+            {"subject": "google:user-3", "role": "trader", "account_id": "alpaca-separate"},
+        ]
+        with (patch.object(live_oauth_scheduler, "live_control_status",
+                           return_value={"control_mode": "active"}),
+              patch.object(live_oauth_scheduler, "read_shared_winner_signal",
+                           return_value=self._signal()),
+              patch.object(live_oauth_scheduler, "execute_shared_winner_for_oauth_account",
+                           return_value={"status": "completed"}) as execute):
+            result = live_oauth_scheduler.execute_oauth_accounts_for_shared_winner(
+                self.db, session="2026-11-05",
+            )
+        self.assertEqual(result, {
+            "status": "processed", "processed": 2, "completed": 2, "failed": 0,
+        })
+        self.assertEqual(
+            {call.args[1].subject for call in execute.call_args_list},
+            {"google:user-1", "google:user-3"},
+        )
+
+    def test_failed_attempt_still_does_not_submit_again_through_second_login(self):
+        self.db[live_oauth_scheduler.CONNECTIONS].find.return_value = [
+            {"subject": "google:user-1", "role": "trader", "account_id": "alpaca-shared"},
+            {"subject": "google:user-2", "role": "trader", "account_id": "alpaca-shared"},
+        ]
+        with (patch.object(live_oauth_scheduler, "live_control_status",
+                           return_value={"control_mode": "active"}),
+              patch.object(live_oauth_scheduler, "read_shared_winner_signal",
+                           return_value=self._signal()),
+              patch.object(live_oauth_scheduler, "execute_shared_winner_for_oauth_account",
+                           side_effect=RuntimeError("First order may need reconciliation")) as execute):
+            result = live_oauth_scheduler.execute_oauth_accounts_for_shared_winner(
+                self.db, session="2026-11-05",
+            )
+        self.assertEqual(result, {
+            "status": "processed", "processed": 1, "completed": 0, "failed": 1,
+        })
+        execute.assert_called_once()
+
     def test_no_shared_signal_means_no_user_execution(self):
         with (patch.object(live_oauth_scheduler, "live_control_status",
                            return_value={"control_mode": "active"}),
