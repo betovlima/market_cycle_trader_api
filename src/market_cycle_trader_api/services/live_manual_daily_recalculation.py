@@ -75,6 +75,8 @@ def daily_recalculation_status(db: Any) -> dict[str, Any]:
         return {**result, "status": "waiting_daily_bar", "reason": "daily_bar_delay"}
     if ready != "ready":
         return {**result, "status": "outside_window", "reason": "not_post_close_window"}
+    if run.get("manual_daily_requested_at"):
+        return {**result, "status": "queued", "reason": "scheduler_will_prepare_pending_daily_signal"}
     return {**result, "status": "ready", "can_request": True,
             "reason": "pending_daily_signal"}
 
