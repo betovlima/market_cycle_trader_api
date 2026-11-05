@@ -1,0 +1,2 @@
+# Keep the scientific reference exactly as the canonical LF Git blobs.
+src/market_cycle_trader_api/tcc_v106_reference/*.py text eol=lf
