@@ -7,8 +7,8 @@ Heavy work runs as a FastAPI BackgroundTask and reports through MongoDB.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 import exchange_calendars as xcals
@@ -48,7 +48,7 @@ def _verified_current_session(broker: Any) -> tuple[str, str, datetime]:
     raw = getattr(clock, "timestamp", None)
     if not account_id or not isinstance(raw, datetime) or raw.tzinfo is None:
         raise RuntimeError("Cannot verify Live broker account and timestamp.")
-    session = raw.astimezone(pd.Timestamp.now(tz=_EASTERN).tzinfo).date().isoformat()
+    session = raw.astimezone(ZoneInfo(_EASTERN)).date().isoformat()
     # Both the real broker clock and exchange calendar must agree.
     if not _regular_xnys_session_open(
         session=session, broker_timestamp=raw,
@@ -99,7 +99,7 @@ def manual_intraday_status(db: Any) -> dict[str, Any]:
     timestamp = getattr(clock, "timestamp", None)
     if not account_id or not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
         raise RuntimeError("Cannot verify Alpaca Live account and clock.")
-    session = timestamp.astimezone(pd.Timestamp.now(tz=_EASTERN).tzinfo).date().isoformat()
+    session = timestamp.astimezone(ZoneInfo(_EASTERN)).date().isoformat()
     available = _regular_xnys_session_open(
         session=session, broker_timestamp=timestamp,
         broker_is_open=bool(getattr(clock, "is_open", False)),
@@ -133,7 +133,7 @@ def request_manual_intraday_analysis(db: Any, *, actor: str) -> dict[str, Any]:
     existing = db[MANUAL_ANALYSES].find_one({"_id": doc_id})
     if existing and existing.get("status") in _ACTIVE:
         return {**_safe_public(existing, account_id=account_id, session=session, market_open=True),
-                "queued_new": False}
+                "queued_new": False, "_account_id": account_id}
     analysis_id = uuid4().hex
     now = datetime.now(timezone.utc)
     try:
@@ -152,11 +152,11 @@ def request_manual_intraday_analysis(db: Any, *, actor: str) -> dict[str, Any]:
     except DuplicateKeyError:
         existing = db[MANUAL_ANALYSES].find_one({"_id": doc_id})
         return {**_safe_public(existing, account_id=account_id, session=session, market_open=True),
-                "queued_new": False}
+                "queued_new": False, "_account_id": account_id}
     if not claimed or claimed.get("analysis_id") != analysis_id:
         raise RuntimeError("Cannot claim isolated Live manual analysis.")
     return {**_safe_public(claimed, account_id=account_id, session=session, market_open=True),
-            "queued_new": True}
+            "queued_new": True, "_account_id": account_id}
 
 
 def run_manual_intraday_analysis(account_id: str, session: str, analysis_id: str) -> None:
