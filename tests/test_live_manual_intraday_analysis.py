@@ -35,6 +35,12 @@ def live_broker(now=NOW, market_open=True):
 class ManualLiveIntradayAnalysisTests(unittest.TestCase):
     def setUp(self):
         self.db = MagicMock()
+        # Distinct MongoDB collections must have distinct mock objects:
+        # a plain MagicMock.__getitem__ would accidentally share one.
+        collections = {}
+        self.db.__getitem__.side_effect = lambda key: collections.setdefault(
+            key, MagicMock(name=key),
+        )
         self.collection = self.db[subject.MANUAL_ANALYSES]
         self.collection.find_one.return_value = None
         self.broker = live_broker()
