@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Any, Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
 from ...auth.security import SessionIdentity, require_admin_session
@@ -18,6 +18,10 @@ from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_expired_recovery import queue_expired_live_analysis
 from ...services.live_manual_daily_recalculation import (
     daily_recalculation_status, request_daily_recalculation,
+)
+from ...services.live_manual_intraday_analysis import (
+    manual_intraday_status, request_manual_intraday_analysis,
+    run_manual_intraday_analysis,
 )
 from ...services.live_winner_events import list_live_events, export_live_events
 from ...services.live_workflow_monitor import live_workflow_monitor
@@ -137,6 +141,56 @@ def winner_daily_recalculation_request(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Daily Winner preparation is unavailable or changed; refresh its status.",
+        ) from exc
+
+
+@router.get("/winner/manual-current-session/status")
+def winner_manual_current_session_status(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Read-only intraday analysis and its progress for canonical Live account."""
+    try:
+        return manual_intraday_status(database())
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Alpaca Live analysis status is unavailable. Verify broker connection.",
+        ) from exc
+
+
+class ManualLiveIntradayRequest(BaseModel):
+    confirm: Literal["ANALYZE_LIVE_CURRENT_SESSION_NO_ORDERS"]
+
+
+@router.post("/winner/manual-current-session/analyze")
+def winner_manual_current_session_analyze(
+    payload: ManualLiveIntradayRequest,
+    background_tasks: BackgroundTasks,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Recalculate the current session without altering Live runs or sending orders.
+
+    Available even if an automatic daily signal is already valid or executed.
+    Training + historical download happen outside the HTTP response in a
+    read-only worker. No Paper collections are consulted.
+    """
+    try:
+        result = request_manual_intraday_analysis(
+            database(), actor=(identity.email or "").strip() or identity.subject,
+        )
+        account_id = result.pop("_account_id", None)
+        if result.pop("queued_new", False):
+            if not account_id:
+                raise RuntimeError("Missing verified Live account for background analysis.")
+            background_tasks.add_task(
+                run_manual_intraday_analysis, account_id,
+                result["session"], result["analysis_id"],
+            )
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Live intraday analysis requires a verified regular market session and account.",
         ) from exc
 
 
