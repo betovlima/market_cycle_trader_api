@@ -16,6 +16,9 @@ from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_winner_preflight import capture_live_winner_preflight
 from ...services.live_expired_recovery import queue_expired_live_analysis
+from ...services.live_manual_daily_recalculation import (
+    daily_recalculation_status, request_daily_recalculation,
+)
 from ...services.live_winner_events import list_live_events, export_live_events
 from ...services.live_workflow_monitor import live_workflow_monitor
 from ...services.live_manual_reconciliation import (
@@ -100,6 +103,41 @@ def recover_expired_live_analysis(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.get("/winner/daily-recalculation/status")
+def winner_daily_recalculation_status(
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Read-only eligibility for a missing canonical D-1 Winner signal."""
+    try:
+        return daily_recalculation_status(database())
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=public_live_broker_error(),
+        ) from exc
+
+
+class LiveDailyRecalculationRequest(BaseModel):
+    confirm: Literal["REQUEST_DAILY_SIGNAL_NO_ORDERS"]
+
+
+@router.post("/winner/daily-recalculation/request")
+def winner_daily_recalculation_request(
+    payload: LiveDailyRecalculationRequest,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Queue only an incomplete post-close daily calculation; never an order."""
+    try:
+        return request_daily_recalculation(
+            database(), actor=(identity.email or "").strip() or identity.subject,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Daily Winner preparation is unavailable or changed; refresh its status.",
+        ) from exc
 
 
 @router.get("/winner/monitor")
