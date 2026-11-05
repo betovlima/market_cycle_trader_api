@@ -134,6 +134,21 @@ class LiveDailyRecalculationTests(unittest.TestCase):
         self.assertEqual(result["status"], "already_claimed")
         self.run.update_one.assert_not_called()
 
+    def test_live_routes_demand_admin_session(self):
+        from market_cycle_trader_api.api.routers import live_market
+        from market_cycle_trader_api.auth.security import require_admin_session
+        for suffix in (
+            "/api/live-market/winner/daily-recalculation/status",
+            "/api/live-market/winner/daily-recalculation/request",
+        ):
+            route = next(route for route in live_market.router.routes
+                         if route.path == suffix)
+            self.assertIn(require_admin_session,
+                          {dep.call for dep in route.dependant.dependencies})
+        route = next(route for route in live_market.router.routes
+                     if route.path.endswith("/daily-recalculation/request"))
+        self.assertIn("POST", route.methods)
+
     def test_missing_actor_is_blocked(self):
         with self.assertRaisesRegex(ValueError, "administrator"):
             subject.request_daily_recalculation(self.db, actor="")
