@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from ...auth.security import SessionIdentity, require_admin_session
 from ...core.runtime import database
+from ...infrastructure.trading.broker_errors import public_live_broker_error
 from ...infrastructure.trading.alpaca_live import create_live_readonly_client
 from ...services.live_control import live_control_status
 from ...services.live_winner_session import LIVE_RUNS
@@ -54,7 +55,7 @@ def execute_current_winner_live(
     except HTTPException:
         raise
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=public_live_broker_error()) from exc
 
     if result.get("status") != "completed":
         raise HTTPException(status_code=409, detail=f"Live Winner did not execute: {result.get('status')}")
