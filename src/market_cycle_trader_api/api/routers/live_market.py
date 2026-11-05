@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from ...auth.security import SessionIdentity, require_admin_session
 from .alpaca_oauth import connected_readonly_client
 from ...core.runtime import database
+from ...infrastructure.trading.broker_errors import public_live_broker_error
 from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_execution_dry_run import preview_live_intent
@@ -43,7 +44,7 @@ def portfolio(
             broker_authentication="oauth" if broker is not None else "api_keys",
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_live_broker_error()) from exc
 
 
 @router.get("/robot/status")
@@ -237,7 +238,7 @@ def export_portfolio(
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_live_broker_error(),
         ) from exc
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     period = (
