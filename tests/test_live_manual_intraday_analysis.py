@@ -166,6 +166,42 @@ class ManualLiveIntradayAnalysisTests(unittest.TestCase):
         self.db["live_winner_session_runs"].update_one.assert_not_called()
         self.broker.submit_order.assert_not_called()
 
+    def test_admin_api_queues_background_analysis_but_not_broker_orders(self):
+        from market_cycle_trader_api.api.routers import live_market
+        from market_cycle_trader_api.auth.security import require_admin_session
+        routes = [
+            route for route in live_market.router.routes
+            if route.path.startswith("/api/live-market/winner/manual-current-session/")
+        ]
+        self.assertEqual({route.path.rsplit("/", 1)[-1] for route in routes},
+                         {"status", "analyze"})
+        for route in routes:
+            self.assertIn(require_admin_session,
+                          {dep.call for dep in route.dependant.dependencies})
+        bg = BackgroundTasks()
+        with (
+            patch.object(live_market, "database", return_value=self.db),
+            patch.object(live_market, "request_manual_intraday_analysis", return_value={
+                "status": "running", "analysis_id": "a" * 32,
+                "session": SESSION, "_account_id": ACCOUNT, "queued_new": True,
+            }),
+            patch.object(live_market, "run_manual_intraday_analysis") as worker,
+        ):
+            result = live_market.winner_manual_current_session_analyze(
+                live_market.ManualLiveIntradayRequest(
+                    confirm="ANALYZE_LIVE_CURRENT_SESSION_NO_ORDERS",
+                ),
+                bg,
+                SimpleNamespace(email="admin@example.com", subject="admin"),
+            )
+        self.assertEqual(result["status"], "running")
+        self.assertNotIn("_account_id", result)
+        self.assertNotIn("queued_new", result)
+        self.assertEqual(len(bg.tasks), 1)
+        self.assertIs(bg.tasks[0].func, worker)
+        worker.assert_not_called()
+        self.broker.submit_order.assert_not_called()
+
     def test_invalid_worker_analysis_fails_without_exposing_provider_text(self):
         self.collection.update_one.return_value = SimpleNamespace(matched_count=1)
         with (
