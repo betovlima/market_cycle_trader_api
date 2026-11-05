@@ -55,8 +55,56 @@ class LiveDailyRecalculationTests(unittest.TestCase):
             state = subject.daily_recalculation_status(self.db)
         self.assertEqual(state["status"], "market_open")
         self.assertFalse(state["can_request"])
+        self.assertEqual(state["execution_session"], SESSION)
+        self.assertEqual(state["decision_date"], PRIOR)
+        self.assertEqual(state["observed_at"], "2026-11-05T15:00:00+00:00")
+        self.assertEqual(state["market_close_at"], "2026-11-05T21:00:00+00:00")
+        self.assertEqual(
+            state["expected_daily_bar_check_at"], "2026-11-05T21:20:00+00:00"
+        )
+        self.assertIsNone(state["eligible_at"])  # not yet ready
+        self.assertIsNone(state["run_phase"])
+        self.assertFalse(state["order_submission_enabled"])
         self.run.update_one.assert_not_called()
         live.submit_order.assert_not_called()
+
+    def test_preparation_progress_reports_real_run_phase_not_fake_percent(self):
+        self.run.find_one.return_value = {
+            "status": "preparing_signal",
+            "phase": "post_close_winner_training",
+            "preparation_attempts": 2,
+            "last_preparation_error_type": "ConnectionError",
+        }
+        with (
+            patch(PREFIX + "live_control_status", return_value={"control_mode": "active"}),
+            patch(PREFIX + "create_live_readonly_client", return_value=self.live),
+        ):
+            state = subject.daily_recalculation_status(self.db)
+        self.assertEqual(state["status"], "processing")
+        self.assertEqual(state["run_status"], "preparing_signal")
+        self.assertEqual(state["run_phase"], "post_close_winner_training")
+        self.assertEqual(state["preparation_attempts"], 2)
+        self.assertEqual(state["last_preparation_error_type"], "ConnectionError")
+        self.assertFalse(state["can_request"])
+        self.assertNotIn("progress_pct", state)
+        self.run.update_one.assert_not_called()
+        self.live.submit_order.assert_not_called()
+
+    def test_daily_data_wait_reports_expected_check_not_a_false_progress(self):
+        early = broker(now=datetime(2026, 11, 5, 21, 7, tzinfo=timezone.utc))
+        with (
+            patch(PREFIX + "live_control_status", return_value={"control_mode": "active"}),
+            patch(PREFIX + "create_live_readonly_client", return_value=early),
+        ):
+            state = subject.daily_recalculation_status(self.db)
+        self.assertEqual(state["status"], "waiting_daily_bar")
+        self.assertEqual(state["decision_date"], PRIOR)
+        self.assertEqual(state["execution_session"], SESSION)
+        self.assertEqual(state["expected_daily_bar_check_at"], "2026-11-05T21:20:00+00:00")
+        self.assertEqual(state["eligible_at"], "2026-11-05T21:20:00+00:00")
+        self.assertFalse(state["can_request"])
+        self.run.update_one.assert_not_called()
+        early.submit_order.assert_not_called()
 
     def test_pause_blocks_live_daily_reanalysis(self):
         with patch(PREFIX + "live_control_status", return_value={"control_mode": "paused"}), patch(
