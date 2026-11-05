@@ -96,8 +96,14 @@ def request_daily_recalculation(db: Any, *, actor: str) -> dict[str, Any]:
             **readiness, "status": "already_claimed", "can_request": False,
             "reason": "session_status_" + str(status),
         }
+    # Bind the audit write to the same verified canonical Alpaca account,
+    # never to another account's run with an identical execution date.
+    broker = create_live_readonly_client()
+    account_id = str(getattr(broker.get_account(), "id", "") or "").strip()
+    if not account_id:
+        raise RuntimeError("Live account identity is unavailable.")
     db[LIVE_RUNS].update_one(
-        {"execution_session": readiness["execution_session"],
+        {"_id": f'{account_id}:{readiness["execution_session"]}',
          "status": "waiting_for_winner_signal",
          "winner_signal_prepared": False},
         {"$set": {
