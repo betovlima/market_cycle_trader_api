@@ -12,6 +12,7 @@ from .alpaca_oauth import connected_readonly_client
 from ...core.runtime import database
 from ...infrastructure.trading.canonical_live_oauth import (
     canonical_live_auth_mode, create_canonical_live_oauth_client,
+    canonical_live_oauth_diagnostic,
 )
 from ...infrastructure.trading.broker_errors import public_live_broker_error
 from ...services.live_control import LiveControlConflict, set_live_control_mode
@@ -61,6 +62,14 @@ def portfolio(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_live_broker_error()) from exc
+
+
+@router.get("/oauth-diagnostic")
+def oauth_diagnostic(
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Explicit administrator-only OAuth connectivity checks; never order submission."""
+    return canonical_live_oauth_diagnostic(database())
 
 
 @router.get("/robot/status")
