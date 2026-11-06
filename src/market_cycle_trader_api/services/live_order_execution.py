@@ -67,6 +67,14 @@ def _execute_leg(
     side: str, symbol: str, quantity: float | None, notional: float | None,
     winner_hash: str,
 ) -> Any:
+    from ..infrastructure.trading.canonical_live_oauth import (
+        canonical_live_auth_mode, canonical_oauth_orders_enabled,
+    )
+    # Check the saved authorization at each order leg, not just when the client
+    # was originally created. Stop new orders immediately if disarmed.
+    if (canonical_live_auth_mode(db) == "oauth"
+        and not canonical_oauth_orders_enabled(db)):
+        raise RuntimeError("Canonical Live OAuth real orders are blocked.")
     client_order_id = _unique_order_id(account, session, side, symbol)
     record = {
         "_id": client_order_id, "market": "live", "broker_account_id": account,
@@ -134,6 +142,8 @@ def execute_prepared_live_winner_session(db: Any, session: str) -> dict[str, Any
     control = live_control_status(db)
     if control["control_mode"] not in {"active", "exit_only"}:
         return {"status": "blocked_by_live_mode", "order_submission_enabled": False}
+    if control.get("canonical_broker_authentication") == "oauth" and not control.get("order_submission_enabled"):
+        return {"status": "blocked_by_oauth_authorization", "order_submission_enabled": False}
     run = db[LIVE_RUNS].find_one({"execution_session": session})
     if not run or run.get("status") != "recalibrated_no_orders":
         return {"status": "no_recalibrated_live_plan", "order_submission_enabled": False}
