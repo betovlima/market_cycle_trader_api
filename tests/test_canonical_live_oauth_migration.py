@@ -195,7 +195,7 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
             patch("market_cycle_trader_api.services.live_shared_winner_signal._canonical_account_id",
                   return_value=self.account_id),
             patch("market_cycle_trader_api.services.live_control.live_control_status",
-                  return_value={"control_mode": "active"}),
+                  return_value={"control_mode": "active", "order_submission_enabled": True}),
         ):
             self.assertTrue(alpaca_oauth._oauth_winner_operational(self.db, saved))
             with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_AUTH_MODE": "api_keys"}):
