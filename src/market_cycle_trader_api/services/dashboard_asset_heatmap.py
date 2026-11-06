@@ -156,6 +156,7 @@ def dashboard_asset_heatmap(db: Any) -> dict[str, Any]:
         response = {
             "universe": "trader_winner",
             "strategy_name": str(profile.get("name") or "Winner"),
+            "strategy_sequence": int(profile.get("strategy_sequence") or 0),
             "as_of": safe_date,
             "generated_at": now.isoformat(),
             "source": "alpaca_sip_completed_daily_raw",

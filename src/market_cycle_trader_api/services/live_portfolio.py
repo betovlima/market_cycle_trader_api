@@ -304,12 +304,13 @@ def live_robot_status(db: Any) -> dict[str, Any]:
     run = latest_live_session(db)
     control = live_control_status(db)
     execution_active = control["control_mode"] in {"active", "exit_only"}
+    authorized = bool(control.get("order_submission_enabled"))
     return {
         **control,
         "mode": "live_operational" if execution_active else "live_inactive",
-        "real_orders_armed": execution_active,
-        "execution_enabled": execution_active,
-        "order_submission_enabled": execution_active,
+        "real_orders_armed": authorized,
+        "execution_enabled": authorized,
+        "order_submission_enabled": authorized,
         "phase": run.get("phase") if run else control.get("phase"),
         "position_observer_alive": observation["scheduler_alive"],
         "scheduler_alive": observation["scheduler_alive"],

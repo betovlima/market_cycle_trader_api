@@ -10,8 +10,15 @@ from pydantic import BaseModel, Field
 from ...auth.security import SessionIdentity, require_admin_session
 from .alpaca_oauth import connected_readonly_client
 from ...core.runtime import database
+from ...infrastructure.trading.canonical_live_oauth import (
+    canonical_live_auth_mode, create_canonical_live_oauth_client,
+    canonical_live_oauth_diagnostic,
+)
 from ...infrastructure.trading.broker_errors import public_live_broker_error
-from ...services.live_control import LiveControlConflict, set_live_control_mode
+from ...services.live_control import (
+    LiveControlConflict, set_live_control_mode, canonical_live_broker_settings,
+    update_canonical_live_broker,
+)
 from ...services.live_execution_readiness import live_execution_readiness
 from ...services.live_execution_dry_run import preview_live_intent
 from ...services.live_winner_preflight import capture_live_winner_preflight
@@ -42,14 +49,65 @@ router = APIRouter(prefix="/api/live-market", tags=["live-market-readonly"])
 def portfolio(
     identity: Annotated[SessionIdentity, Depends(require_admin_session)],
 ) -> dict[str, Any]:
-    """Prefer linked OAuth for the viewing admin; never for Winner execution."""
+    """Show the broker used by the canonical Winner in explicit OAuth mode."""
     try:
         db = database()
-        broker = connected_readonly_client(db, identity)
+        if canonical_live_auth_mode(db) == "oauth":
+            # Identical canonical broker identity for UI and order executor.
+            # Never return a legacy API-key snapshot in OAuth mode.
+            broker = create_canonical_live_oauth_client(db)
+            auth = "oauth"
+        else:
+            broker = connected_readonly_client(db, identity)
+            auth = "oauth" if broker is not None else "api_keys"
         return live_portfolio_snapshot(
-            db, broker_client=broker,
-            broker_authentication="oauth" if broker is not None else "api_keys",
+            db, broker_client=broker, broker_authentication=auth,
         )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_live_broker_error()) from exc
+
+
+@router.get("/oauth-diagnostic")
+def oauth_diagnostic(
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Explicit administrator-only OAuth connectivity checks; never order submission."""
+    return canonical_live_oauth_diagnostic(database(), _identity)
+
+
+@router.get("/broker/settings")
+def broker_settings(
+    _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Administrator-only persisted canonical broker preferences."""
+    return canonical_live_broker_settings(database())
+
+
+class LiveBrokerSettingsRequest(BaseModel):
+    expected_revision: int = Field(ge=0)
+    enable_orders: bool
+    confirmation: Literal[
+        "BIND_VERIFIED_OAUTH_NO_ORDERS",
+        "ENABLE_LIVE_REAL_ORDERS",
+        "DISABLE_LIVE_REAL_ORDERS",
+    ]
+
+
+@router.post("/broker/settings")
+def change_broker_settings(
+    payload: LiveBrokerSettingsRequest,
+    identity: Annotated[SessionIdentity, Depends(require_admin_session)],
+) -> dict[str, Any]:
+    """Explicitly bind OAuth and manage the real-order gate; no broker orders."""
+    try:
+        return update_canonical_live_broker(
+            database(), identity=identity,
+            expected_revision=payload.expected_revision,
+            enable_orders=payload.enable_orders,
+            confirmation=payload.confirmation,
+        )
+    except LiveControlConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_live_broker_error()) from exc
 
@@ -318,11 +376,15 @@ def export_portfolio(
     """Read-only audit ZIP; saved Live decision rankings are date-scoped."""
     try:
         db = database()
-        broker = connected_readonly_client(db, identity)
+        if canonical_live_auth_mode(db) == "oauth":
+            broker = create_canonical_live_oauth_client(db)
+            auth = "oauth"
+        else:
+            broker = connected_readonly_client(db, identity)
+            auth = "oauth" if broker is not None else "api_keys"
         payload = build_live_portfolio_export(
             db, start_date=start_date, end_date=end_date,
-            broker_client=broker,
-            broker_authentication="oauth" if broker is not None else "api_keys",
+            broker_client=broker, broker_authentication=auth,
         )
     except ValueError as exc:
         raise HTTPException(
