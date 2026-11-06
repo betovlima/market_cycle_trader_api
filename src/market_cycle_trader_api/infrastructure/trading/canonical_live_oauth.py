@@ -29,6 +29,13 @@ def canonical_live_auth_mode() -> str:
     return mode
 
 
+def canonical_oauth_orders_enabled() -> bool:
+    """An additional explicit dev migration gate; off means NO OAuth orders."""
+    return canonical_live_auth_mode() == "oauth" and (
+        str(os.getenv("MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS") or "").strip() == "1"
+    )
+
+
 def _owner_key(subject: str) -> str:
     return hashlib.sha256(subject.encode("utf-8")).hexdigest() + ":live"
 
