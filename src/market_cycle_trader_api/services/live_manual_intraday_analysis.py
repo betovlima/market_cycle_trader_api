@@ -148,9 +148,14 @@ def request_manual_intraday_analysis(db: Any, *, actor: str) -> dict[str, Any]:
                 "market": "live", "session": session, "account_id": account_id,
                 "status": "running", "phase": "validating", "analysis_id": analysis_id,
                 "started_at": now, "completed_at": None, "actor": actor,
+                "analysis_mode": (
+                    "current_session_intraday" if market_open else "completed_daily_only"
+                ),
                 "order_submission_enabled": False,
                 "failure_type": None, "target_asset": None,
                 "action": None, "snapshot_sha256": None,
+                "historical_cutoff": None, "decision_date": None,
+                "intraday_market_data_cutoff_utc": None, "intraday_data_delay_minutes": None,
             }},
             upsert=True, return_document=ReturnDocument.AFTER,
         )
