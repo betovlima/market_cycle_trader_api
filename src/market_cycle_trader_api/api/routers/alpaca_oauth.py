@@ -114,7 +114,8 @@ def _oauth_winner_operational(db, saved) -> bool:
         # The fan-out scheduler always excludes the canonical account.
         if canonical_live_auth_mode() != "oauth":
             return False
-    return live_control_status(db)["control_mode"] in {"active", "exit_only"}
+    control = live_control_status(db)
+    return bool(control.get("order_submission_enabled", False))
 
 
 def _status(db, identity):
