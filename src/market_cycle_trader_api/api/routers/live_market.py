@@ -148,7 +148,7 @@ def winner_daily_recalculation_request(
 def winner_manual_current_session_status(
     identity: Annotated[SessionIdentity, Depends(require_admin_session)],
 ) -> dict[str, Any]:
-    """Read-only intraday analysis and its progress for canonical Live account."""
+    """Read-only Winner analysis and progress, regardless of market hours."""
     try:
         return manual_intraday_status(database())
     except RuntimeError as exc:
@@ -168,11 +168,11 @@ def winner_manual_current_session_analyze(
     background_tasks: BackgroundTasks,
     identity: Annotated[SessionIdentity, Depends(require_admin_session)],
 ) -> dict[str, Any]:
-    """Recalculate the current session without altering Live runs or sending orders.
+    """Recalculate the Winner without altering Live runs or sending orders.
 
-    Available even if an automatic daily signal is already valid or executed.
-    Training + historical download happen outside the HTTP response in a
-    read-only worker. No Paper collections are consulted.
+    Regular market: completed daily history plus current intraday movement.
+    Outside regular market: latest safe completed daily history only.
+    This request never makes a real execution eligible.
     """
     try:
         result = request_manual_intraday_analysis(
@@ -190,7 +190,7 @@ def winner_manual_current_session_analyze(
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Live intraday analysis requires a verified regular market session and account.",
+            detail="Live read-only analysis requires a verified Alpaca account and market clock.",
         ) from exc
 
 

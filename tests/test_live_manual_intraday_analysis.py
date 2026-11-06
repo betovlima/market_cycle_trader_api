@@ -50,8 +50,10 @@ class ManualLiveIntradayAnalysisTests(unittest.TestCase):
         self.assertEqual(account, ACCOUNT)
         self.assertEqual(session, SESSION)
         self.assertEqual(stamp, NOW)
-        with self.assertRaisesRegex(RuntimeError, "regular market"):
-            subject._verified_current_session(live_broker(market_open=False))
+        account2, session2, _ = subject._verified_current_session(
+            live_broker(market_open=False)
+        )
+        self.assertEqual((account2, session2), (ACCOUNT, SESSION))
 
     def test_analysis_available_even_if_the_live_session_has_already_executed(self):
         self.db["live_winner_session_runs"].find_one.return_value = {
@@ -95,14 +97,58 @@ class ManualLiveIntradayAnalysisTests(unittest.TestCase):
         self.assertEqual(result["analysis_id"], "old")
         self.collection.find_one_and_update.assert_not_called()
 
-    def test_analysis_is_not_available_after_market_close(self):
+    def test_analysis_remains_available_after_market_close_and_when_completed(self):
         late = live_broker(
             now=datetime(2026, 11, 5, 22, tzinfo=timezone.utc),
             market_open=False,
         )
+        self.collection.find_one.return_value = {
+            "status": "prepared", "analysis_id": "previous-analysis",
+            "analysis_mode": "current_session_intraday",
+        }
         with patch(PREFIX + "create_live_readonly_client", return_value=late):
             result = subject.manual_intraday_status(self.db)
+        self.assertTrue(result["can_analyze"])
+        self.assertFalse(result["market_open"])
+        self.assertEqual(result["method"], "latest_safe_completed_daily")
+        self.assertEqual(result["status"], "prepared")
+        self.assertFalse(result["order_submission_enabled"])
+
+    def test_off_hours_request_can_restart_completed_analysis(self):
+        late = live_broker(
+            now=datetime(2026, 11, 5, 22, tzinfo=timezone.utc),
+            market_open=False,
+        )
+        self.collection.find_one.return_value = {
+            "status": "prepared", "analysis_id": "previous",
+        }
+        self.collection.find_one_and_update.return_value = {
+            "_id": f"{ACCOUNT}:{SESSION}", "status": "running",
+            "analysis_id": "b" * 32,
+        }
+        with (
+            patch(PREFIX + "create_live_readonly_client", return_value=late),
+            patch(PREFIX + "uuid4", return_value=SimpleNamespace(hex="b" * 32)),
+        ):
+            result = subject.request_manual_intraday_analysis(self.db, actor="admin")
+        self.assertTrue(result["queued_new"])
+        self.assertEqual(result["analysis_id"], "b" * 32)
+        self.assertFalse(result["market_open"])
         self.assertFalse(result["can_analyze"])
+        self.broker.submit_order.assert_not_called()
+
+    def test_weekend_uses_last_safe_completed_xnys_session(self):
+        weekend = live_broker(
+            now=datetime(2026, 11, 7, 18, tzinfo=timezone.utc),
+            market_open=False,
+        )
+        account, session, _ = subject._verified_current_session(weekend)
+        self.assertEqual(account, ACCOUNT)
+        self.assertEqual(session, "2026-11-06")
+        with patch(PREFIX + "create_live_readonly_client", return_value=weekend):
+            result = subject.manual_intraday_status(self.db)
+        self.assertTrue(result["can_analyze"])
+        self.assertEqual(result["session"], "2026-11-06")
 
     def test_background_worker_builds_advisory_result_without_editing_live_run(self):
         token = "a" * 32
@@ -171,6 +217,76 @@ class ManualLiveIntradayAnalysisTests(unittest.TestCase):
         intraday.assert_called_once()
         self.db["live_winner_session_runs"].update_one.assert_not_called()
         self.broker.submit_order.assert_not_called()
+
+    def test_off_hours_worker_uses_safe_daily_only_and_never_downloads_intraday(self):
+        token = "b" * 32
+        late = live_broker(
+            now=datetime(2026, 11, 5, 22, tzinfo=timezone.utc),
+            market_open=False,
+        )
+        self.collection.update_one.return_value = SimpleNamespace(matched_count=1)
+        cfg = MagicMock()
+        cfg.strategy_mode = subject.TCC_U67_CONTROL_OPERATIONAL_MODE
+        cfg.assets = ["CAPR", "AMZN"]
+        cfg.model_copy.return_value = cfg
+        frame = pd.DataFrame(
+            {"close": [100.0]}, index=pd.to_datetime(["2026-11-05"], utc=True)
+        )
+        snap = SimpleNamespace(
+            frames={"CAPR": frame, "AMZN": frame},
+            manifest={"snapshot_sha256": "daily-hash"},
+        )
+        decision = SimpleNamespace(
+            decision_date=pd.Timestamp(SESSION),
+            target_asset="CAPR", raw_best_asset="CAPR",
+            selected_utility=0.14, utilities={"CAPR": 0.14, "AMZN": 0.11},
+        )
+        self.db["live_winner_session_runs"].find_one.return_value = {
+            "status": "completed", "target_asset": "CAPR",
+        }
+        with (
+            patch(PREFIX + "database", return_value=self.db),
+            patch(PREFIX + "create_live_readonly_client", return_value=late),
+            patch(PREFIX + "verified_live_state", return_value={
+                "managed_symbol": "CAPR", "managed_quantity": 5.0,
+                "holding_sessions": 3, "revision": 7,
+                "last_execution_session": SESSION,
+            }),
+            patch(PREFIX + "get_trader_winner_context", return_value=(
+                cfg, {"id": "w1", "revision": 2, "configuration_hash": "h1"},
+            )),
+            patch(PREFIX + "get_trader_winner_model_snapshot", return_value={
+                "family": "lightgbm_utility", "settings_snapshot": {},
+            }),
+            patch(PREFIX + "apply_training_runtime_settings", return_value=cfg),
+            patch(PREFIX + "apply_execution_profile", return_value=cfg),
+            patch(PREFIX + "assert_tcc_u67_operational_contract"),
+            patch(PREFIX + "assert_tcc_u67_model_snapshot"),
+            patch(PREFIX + "latest_safe_completed_xnys_session",
+                  return_value=pd.Timestamp(SESSION)),
+            patch(PREFIX + "download_operational_market_snapshot",
+                  return_value=snap) as download,
+            patch(PREFIX + "append_current_session_intraday") as intraday,
+            patch(PREFIX + "build_live_model_decision",
+                  return_value=decision),
+        ):
+            subject.run_manual_intraday_analysis(ACCOUNT, SESSION, token)
+        saved = [
+            call.args[1]["$set"] for call in self.collection.update_one.call_args_list
+            if call.args[1]["$set"].get("status") == "prepared"
+        ]
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["analysis_mode"], "completed_daily_only")
+        self.assertEqual(saved[0]["historical_cutoff"], SESSION)
+        self.assertEqual(saved[0]["decision_date"], SESSION)
+        self.assertEqual(saved[0]["action"], "hold")
+        self.assertIsNone(saved[0]["intraday_market_data_cutoff_utc"])
+        self.assertIsNone(saved[0]["intraday_data_delay_minutes"])
+        self.assertFalse(saved[0]["order_submission_enabled"])
+        download.assert_called_once()
+        intraday.assert_not_called()
+        late.submit_order.assert_not_called()
+        self.db["live_winner_session_runs"].update_one.assert_not_called()
 
     def test_admin_api_queues_background_analysis_but_not_broker_orders(self):
         from market_cycle_trader_api.api.routers import live_market

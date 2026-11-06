@@ -1,6 +1,7 @@
-"""Manual current-session Winner analysis for the canonical Alpaca Live account.
+"""Read-only Winner reanalysis for the canonical Alpaca Live account.
 
-Read-only calculation, independent of the automatic D-1 run and Paper state.
+Outside regular hours, score only the last safe completed daily bar.
+The calculation is independent of the automatic D-1 run and Paper state.
 A separate, explicit endpoint is required to execute a verified manual result.
 Heavy work runs as a FastAPI BackgroundTask and reports through MongoDB.
 """
@@ -42,21 +43,29 @@ _EASTERN = "America/New_York"
 
 
 def _verified_current_session(broker: Any) -> tuple[str, str, datetime]:
+    """Choose a stable session id, even when the XNYS market is closed."""
     account = broker.get_account()
-    account_id = str(getattr(account, "id", "") or "")
+    account_id = str(getattr(account, "id", "") or "").strip()
     clock = broker.get_clock()
     raw = getattr(clock, "timestamp", None)
     if not account_id or not isinstance(raw, datetime) or raw.tzinfo is None:
         raise RuntimeError("Cannot verify Live broker account and timestamp.")
-    session = raw.astimezone(ZoneInfo(_EASTERN)).date().isoformat()
-    # Both the real broker clock and exchange calendar must agree.
-    if not _regular_xnys_session_open(
-        session=session, broker_timestamp=raw,
+    local = pd.Timestamp(raw).tz_convert(_EASTERN).normalize().tz_localize(None)
+    calendar = xcals.get_calendar("XNYS")
+    session = (
+        local.date().isoformat() if calendar.is_session(local) else
+        latest_safe_completed_xnys_session(now=raw).date().isoformat()
+    )
+    return account_id, session, raw
+
+
+def _is_regular_market_open(broker: Any, session: str, stamp: datetime) -> bool:
+    clock = broker.get_clock()
+    return _regular_xnys_session_open(
+        session=session, broker_timestamp=stamp,
         broker_is_open=bool(getattr(clock, "is_open", False)),
         broker_next_close=getattr(clock, "next_close", None),
-    ):
-        raise RuntimeError("Live current-session analysis requires the regular market to be open.")
-    return account_id, session, raw
+    )
 
 
 def _safe_public(doc: dict[str, Any] | None, *,
@@ -84,27 +93,22 @@ def _safe_public(doc: dict[str, Any] | None, *,
         "original_signal_status": doc.get("original_signal_status"),
         "failure_type": doc.get("failure_type"),
         "phase": doc.get("phase"),
-        "can_analyze": bool(market_open and status not in _ACTIVE),
+        "can_analyze": status not in _ACTIVE,
+        "market_open": bool(market_open),
+        "analysis_mode": doc.get("analysis_mode"),
         "order_submission_enabled": False,
-        "method": "completed_daily_plus_current_intraday",
+        "method": (
+            "completed_daily_plus_current_intraday"
+            if market_open else "latest_safe_completed_daily"
+        ),
     }
     return visible
 
 
 def manual_intraday_status(db: Any) -> dict[str, Any]:
     broker = create_live_readonly_client()
-    account = broker.get_account()
-    account_id = str(getattr(account, "id", "") or "")
-    clock = broker.get_clock()
-    timestamp = getattr(clock, "timestamp", None)
-    if not account_id or not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
-        raise RuntimeError("Cannot verify Alpaca Live account and clock.")
-    session = timestamp.astimezone(ZoneInfo(_EASTERN)).date().isoformat()
-    available = _regular_xnys_session_open(
-        session=session, broker_timestamp=timestamp,
-        broker_is_open=bool(getattr(clock, "is_open", False)),
-        broker_next_close=getattr(clock, "next_close", None),
-    )
+    account_id, session, timestamp = _verified_current_session(broker)
+    available = _is_regular_market_open(broker, session, timestamp)
     doc = db[MANUAL_ANALYSES].find_one({"_id": f"{account_id}:{session}"})
     # The operator may retry a job orphaned by a worker restart, but only
     # after a generous time allowance. No stale "running" job can authorize
@@ -128,11 +132,12 @@ def request_manual_intraday_analysis(db: Any, *, actor: str) -> dict[str, Any]:
     if not actor:
         raise RuntimeError("Administrator identity is required.")
     broker = create_live_readonly_client()
-    account_id, session, _ = _verified_current_session(broker)
+    account_id, session, stamp = _verified_current_session(broker)
+    market_open = _is_regular_market_open(broker, session, stamp)
     doc_id = f"{account_id}:{session}"
     existing = db[MANUAL_ANALYSES].find_one({"_id": doc_id})
     if existing and existing.get("status") in _ACTIVE:
-        return {**_safe_public(existing, account_id=account_id, session=session, market_open=True),
+        return {**_safe_public(existing, account_id=account_id, session=session, market_open=market_open),
                 "queued_new": False, "_account_id": account_id}
     analysis_id = uuid4().hex
     now = datetime.now(timezone.utc)
@@ -143,19 +148,24 @@ def request_manual_intraday_analysis(db: Any, *, actor: str) -> dict[str, Any]:
                 "market": "live", "session": session, "account_id": account_id,
                 "status": "running", "phase": "validating", "analysis_id": analysis_id,
                 "started_at": now, "completed_at": None, "actor": actor,
+                "analysis_mode": (
+                    "current_session_intraday" if market_open else "completed_daily_only"
+                ),
                 "order_submission_enabled": False,
                 "failure_type": None, "target_asset": None,
                 "action": None, "snapshot_sha256": None,
+                "historical_cutoff": None, "decision_date": None,
+                "intraday_market_data_cutoff_utc": None, "intraday_data_delay_minutes": None,
             }},
             upsert=True, return_document=ReturnDocument.AFTER,
         )
     except DuplicateKeyError:
         existing = db[MANUAL_ANALYSES].find_one({"_id": doc_id})
-        return {**_safe_public(existing, account_id=account_id, session=session, market_open=True),
+        return {**_safe_public(existing, account_id=account_id, session=session, market_open=market_open),
                 "queued_new": False, "_account_id": account_id}
     if not claimed or claimed.get("analysis_id") != analysis_id:
         raise RuntimeError("Cannot claim isolated Live manual analysis.")
-    return {**_safe_public(claimed, account_id=account_id, session=session, market_open=True),
+    return {**_safe_public(claimed, account_id=account_id, session=session, market_open=market_open),
             "queued_new": True, "_account_id": account_id}
 
 
@@ -171,6 +181,7 @@ def run_manual_intraday_analysis(account_id: str, session: str, analysis_id: str
         verified_account, current_session, broker_timestamp = _verified_current_session(broker)
         if verified_account != account_id or current_session != session:
             raise RuntimeError("Live account/session identity changed during analysis.")
+        market_open = _is_regular_market_open(broker, session, broker_timestamp)
         state = verified_live_state(db, broker, session=session)
         if state["last_execution_session"] == session:
             # Analysis is still allowed after an executed session. It never
@@ -196,11 +207,15 @@ def run_manual_intraday_analysis(account_id: str, session: str, analysis_id: str
         else:
             assert_tcc_u67_operational_contract(strategy)
         assert_tcc_u67_model_snapshot(model)
-        calendar = xcals.get_calendar("XNYS")
-        previous = calendar.previous_session(pd.Timestamp(session)).date().isoformat()
-        safe = latest_safe_completed_xnys_session(now=broker_timestamp, data_delay_minutes=0).date().isoformat()
-        if safe != previous:
-            raise RuntimeError("Latest completed XNYS candle does not match the required previous session.")
+        safe = latest_safe_completed_xnys_session(now=broker_timestamp).date().isoformat()
+        if market_open:
+            previous = xcals.get_calendar("XNYS").previous_session(
+                pd.Timestamp(session)
+            ).date().isoformat()
+            if safe != previous:
+                raise RuntimeError("Latest safe daily bar differs from the expected previous session.")
+        else:
+            previous = safe
 
         phase("downloading_daily_history")
         snapshot = download_operational_market_snapshot(
@@ -213,22 +228,34 @@ def run_manual_intraday_analysis(account_id: str, session: str, analysis_id: str
                 or not snapshot.manifest.get("snapshot_sha256")):
             raise RuntimeError("Full completed-daily snapshot is unavailable.")
 
-        phase("collecting_current_session")
-        frames, market = append_current_session_intraday(
-            snapshot.frames, strategy, session=session, now=broker_timestamp,
-        )
-        if (market.get("analysis_mode") != "current_session_intraday"
-            or market.get("live_session") != session
-            or len(frames) != len(snapshot.frames)):
-            raise RuntimeError("Current-session market-data coverage is incomplete.")
+        if market_open:
+            phase("collecting_current_session")
+            frames, market = append_current_session_intraday(
+                snapshot.frames, strategy, session=session, now=broker_timestamp,
+            )
+            if (market.get("analysis_mode") != "current_session_intraday"
+                or market.get("live_session") != session
+                or len(frames) != len(snapshot.frames)):
+                raise RuntimeError("Current-session market-data coverage is incomplete.")
+        else:
+            frames = snapshot.frames
+            market = {
+                "analysis_mode": "completed_daily_only",
+                "analysis_timestamp_utc": broker_timestamp.astimezone(timezone.utc).isoformat(),
+                "intraday_market_data_cutoff_utc": None,
+                "intraday_data_delay_minutes": None,
+                "live_feed": "sip",
+            }
+
         phase("model_calibration")
         decision = build_live_model_decision(
             frames, strategy, model_family=model["family"],
             current_asset=state["managed_symbol"],
             holding_sessions=state["holding_sessions"],
         )
-        if str(decision.decision_date)[:10] != session:
-            raise RuntimeError("Intraday Winner decision_date does not match the current session.")
+        expected_decision_date = session if market_open else previous
+        if str(decision.decision_date)[:10] != expected_decision_date:
+            raise RuntimeError("Advisory Winner decision date differs from the safe data cutoff.")
         target = str(decision.target_asset).upper()
         if not target or (target != "CASH" and target not in strategy.assets):
             raise RuntimeError("Live Winner selected a non-eligible target.")
@@ -252,12 +279,12 @@ def run_manual_intraday_analysis(account_id: str, session: str, analysis_id: str
             "live_state_revision": state["revision"],
             "current_quantity": state["managed_quantity"],
             "selected_utility": float(decision.selected_utility),
-            "decision_date": session, "historical_cutoff": previous,
+            "decision_date": expected_decision_date, "historical_cutoff": previous,
             "snapshot_sha256": snapshot.manifest["snapshot_sha256"],
-            "analysis_mode": "current_session_intraday",
+            "analysis_mode": market["analysis_mode"],
             "analysis_timestamp_utc": market["analysis_timestamp_utc"],
             "intraday_market_data_cutoff_utc": market["intraday_market_data_cutoff_utc"],
-            "intraday_data_delay_minutes": int(market.get("intraday_data_delay_minutes") or 0),
+            "intraday_data_delay_minutes": market.get("intraday_data_delay_minutes"),
             "live_feed": market.get("live_feed"),
             "original_signal_target": run.get("target_asset"),
             "original_signal_status": run.get("status"),
