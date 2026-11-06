@@ -144,11 +144,11 @@ class ManualLiveIntradayAnalysisTests(unittest.TestCase):
         )
         account, session, _ = subject._verified_current_session(weekend)
         self.assertEqual(account, ACCOUNT)
-        self.assertEqual(session, SESSION)
+        self.assertEqual(session, "2026-11-06")
         with patch(PREFIX + "create_live_readonly_client", return_value=weekend):
             result = subject.manual_intraday_status(self.db)
         self.assertTrue(result["can_analyze"])
-        self.assertEqual(result["session"], SESSION)
+        self.assertEqual(result["session"], "2026-11-06")
 
     def test_background_worker_builds_advisory_result_without_editing_live_run(self):
         token = "a" * 32
