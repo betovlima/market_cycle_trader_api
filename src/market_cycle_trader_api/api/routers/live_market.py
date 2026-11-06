@@ -49,7 +49,7 @@ def portfolio(
     """Show the broker used by the canonical Winner in explicit OAuth mode."""
     try:
         db = database()
-        if canonical_live_auth_mode() == "oauth":
+        if canonical_live_auth_mode(db) == "oauth":
             # Identical canonical broker identity for UI and order executor.
             # Never return a legacy API-key snapshot in OAuth mode.
             broker = create_canonical_live_oauth_client(db)
@@ -336,7 +336,7 @@ def export_portfolio(
     """Read-only audit ZIP; saved Live decision rankings are date-scoped."""
     try:
         db = database()
-        if canonical_live_auth_mode() == "oauth":
+        if canonical_live_auth_mode(db) == "oauth":
             broker = create_canonical_live_oauth_client(db)
             auth = "oauth"
         else:
