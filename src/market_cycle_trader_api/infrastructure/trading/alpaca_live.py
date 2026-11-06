@@ -7,7 +7,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .canonical_live_oauth import canonical_live_auth_mode, create_canonical_live_oauth_client
+from .canonical_live_oauth import (
+    canonical_live_auth_mode, canonical_oauth_orders_enabled,
+    create_canonical_live_oauth_client,
+)
 
 
 def live_credentials() -> tuple[str, str]:
@@ -51,5 +54,9 @@ def create_live_readonly_client() -> Any:
 
 
 def create_live_execution_client() -> Any:
-    """Live Alpaca client using exactly the configured canonical auth mode."""
+    """Fail-closed Live writer; the dev OAuth migration is read-only by default."""
+    if canonical_live_auth_mode() == "oauth" and not canonical_oauth_orders_enabled():
+        raise RuntimeError(
+            "Canonical OAuth Live order submission is disabled in this environment."
+        )
     return create_live_readonly_client()
