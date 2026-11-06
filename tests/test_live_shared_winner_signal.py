@@ -46,6 +46,8 @@ class SharedWinnerSignalTests(unittest.TestCase):
 
     def _read(self, session="2026-11-05"):
         with (patch.object(shared, "_canonical_account_id", return_value="primary-account"),
+              patch("market_cycle_trader_api.infrastructure.trading.canonical_live_oauth.canonical_live_auth_mode",
+                    return_value="api_keys"),
               patch.object(shared, "get_trader_winner_summary", return_value=winner())):
             return shared.read_shared_winner_signal(self.db, session=session)
 
