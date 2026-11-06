@@ -17,7 +17,7 @@ from .live_shared_winner_signal import read_shared_winner_signal
 
 
 def execute_oauth_accounts_for_shared_winner(db: Any, *, session: str) -> dict[str, Any]:
-    if canonical_live_auth_mode() == "oauth" and not canonical_oauth_orders_enabled():
+    if canonical_live_auth_mode(db) == "oauth" and not canonical_oauth_orders_enabled(db):
         return {"status": "oauth_dev_orders_disabled", "processed": 0}
     if live_control_status(db)["control_mode"] not in {"active", "exit_only"}:
         return {"status": "live_stopped", "processed": 0}
