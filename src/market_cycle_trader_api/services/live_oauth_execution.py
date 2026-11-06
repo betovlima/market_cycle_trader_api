@@ -54,7 +54,7 @@ def execute_shared_winner_for_oauth_account(
     No new operational locks are introduced. Existing Live mode, XNYS
     session, broker and order-ledger reconciliation are reused.
     """
-    if canonical_live_auth_mode() == "oauth" and not canonical_oauth_orders_enabled():
+    if canonical_live_auth_mode(db) == "oauth" and not canonical_oauth_orders_enabled(db):
         return {"status": "oauth_dev_orders_disabled", "order_submission_enabled": False}
     mode = live_control_status(db)["control_mode"]
     if mode not in {"active", "exit_only"}:
