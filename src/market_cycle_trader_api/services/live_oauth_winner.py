@@ -104,7 +104,11 @@ def oauth_winner_readiness(db: Any, identity: Any) -> dict[str, Any]:
     )
     return {
         **common,
-        "status": "trading_authorized_execution_disabled",
+        "status": (
+            "trading_authorized_execution_enabled"
+            if _oauth_winner_operational(db, saved)
+            else "trading_authorized_execution_disabled"
+        ),
         "trading_authorized": True,
         "oauth_winner_execution_enabled": _oauth_winner_operational(db, saved),
         "account_id_suffix": account_id[-6:],
