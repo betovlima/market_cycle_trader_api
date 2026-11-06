@@ -69,7 +69,7 @@ def oauth_diagnostic(
     _identity: Annotated[SessionIdentity, Depends(require_admin_session)],
 ) -> dict[str, Any]:
     """Explicit administrator-only OAuth connectivity checks; never order submission."""
-    return canonical_live_oauth_diagnostic(database())
+    return canonical_live_oauth_diagnostic(database(), _identity)
 
 
 @router.get("/robot/status")
