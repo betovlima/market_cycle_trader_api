@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field
 from ...auth.security import SessionIdentity, require_admin_session
 from .alpaca_oauth import connected_readonly_client
 from ...core.runtime import database
+from ...infrastructure.trading.canonical_live_oauth import (
+    canonical_live_auth_mode, create_canonical_live_oauth_client,
+)
 from ...infrastructure.trading.broker_errors import public_live_broker_error
 from ...services.live_control import LiveControlConflict, set_live_control_mode
 from ...services.live_execution_readiness import live_execution_readiness
@@ -42,13 +45,19 @@ router = APIRouter(prefix="/api/live-market", tags=["live-market-readonly"])
 def portfolio(
     identity: Annotated[SessionIdentity, Depends(require_admin_session)],
 ) -> dict[str, Any]:
-    """Prefer linked OAuth for the viewing admin; never for Winner execution."""
+    """Show the broker used by the canonical Winner in explicit OAuth mode."""
     try:
         db = database()
-        broker = connected_readonly_client(db, identity)
+        if canonical_live_auth_mode() == "oauth":
+            # Identical canonical broker identity for UI and order executor.
+            # Never return a legacy API-key snapshot in OAuth mode.
+            broker = create_canonical_live_oauth_client(db)
+            auth = "oauth"
+        else:
+            broker = connected_readonly_client(db, identity)
+            auth = "oauth" if broker is not None else "api_keys"
         return live_portfolio_snapshot(
-            db, broker_client=broker,
-            broker_authentication="oauth" if broker is not None else "api_keys",
+            db, broker_client=broker, broker_authentication=auth,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=public_live_broker_error()) from exc
@@ -318,11 +327,15 @@ def export_portfolio(
     """Read-only audit ZIP; saved Live decision rankings are date-scoped."""
     try:
         db = database()
-        broker = connected_readonly_client(db, identity)
+        if canonical_live_auth_mode() == "oauth":
+            broker = create_canonical_live_oauth_client(db)
+            auth = "oauth"
+        else:
+            broker = connected_readonly_client(db, identity)
+            auth = "oauth" if broker is not None else "api_keys"
         payload = build_live_portfolio_export(
             db, start_date=start_date, end_date=end_date,
-            broker_client=broker,
-            broker_authentication="oauth" if broker is not None else "api_keys",
+            broker_client=broker, broker_authentication=auth,
         )
     except ValueError as exc:
         raise HTTPException(
