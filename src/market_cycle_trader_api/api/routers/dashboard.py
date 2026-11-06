@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ...auth.security import SessionIdentity, require_capability, require_portfolio_session
 from ...core.runtime import database
+from ...services.dashboard_asset_heatmap import dashboard_asset_heatmap
 from ...services.dashboard import (
     dashboard_job_detail,
     dashboard_latest_research_tree,
@@ -24,6 +25,21 @@ def get_dashboard_summary(
     
 
     return dashboard_summary(database(), limit=limit)
+
+
+@router.get("/asset-heatmap")
+def get_dashboard_asset_heatmap(
+    _identity: Annotated[SessionIdentity, Depends(require_capability("dashboard.view"))],
+) -> dict[str, Any]:
+    """Read-only, completed daily price changes for the registered Winner assets."""
+    from fastapi import HTTPException
+    try:
+        return dashboard_asset_heatmap(database())
+    except Exception as exc:
+        # Never disclose Alpaca keys, upstream URLs or account identifiers.
+        raise HTTPException(
+            status_code=503, detail="Winner daily heatmap is temporarily unavailable."
+        ) from exc
 
 
 @router.get("/research-tree")
