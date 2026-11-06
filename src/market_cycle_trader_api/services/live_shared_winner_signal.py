@@ -61,7 +61,11 @@ def read_shared_winner_signal(
     calendar = xcals.get_calendar("XNYS")
     if session_date.tzinfo is not None or not calendar.is_session(session_date):
         raise ValueError("The requested Winner session must be an XNYS trading day.")
-    source_account_id = _canonical_account_id()
+    from ..infrastructure.trading.canonical_live_oauth import canonical_live_auth_mode, canonical_live_account_id
+    source_account_id = (
+        canonical_live_account_id(db)
+        if canonical_live_auth_mode(db) == "oauth" else _canonical_account_id()
+    )
     if not source_account_id:
         # Consent and account verification can still work while no canonical
         # signal source is configured in the local development environment.
