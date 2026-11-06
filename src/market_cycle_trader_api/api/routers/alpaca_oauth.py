@@ -20,6 +20,7 @@ from fastapi.responses import RedirectResponse
 
 from ...auth.security import SessionIdentity, require_portfolio_session
 from ...core.runtime import database
+from ...infrastructure.trading.canonical_live_oauth import canonical_live_auth_mode
 
 router = APIRouter(prefix="/api/alpaca-oauth", tags=["alpaca-oauth-readonly"])
 PENDING = "alpaca_oauth_pending"
@@ -109,8 +110,10 @@ def _oauth_winner_operational(db, saved) -> bool:
     from ...services.live_shared_winner_signal import _canonical_account_id
     canonical = _canonical_account_id()
     if canonical and str(saved.get("account_id") or "") == canonical:
-        # Main Winner account still trades through its existing API keys.
-        return False
+        # The canonical account only uses OAuth when the migration is opted in.
+        # The fan-out scheduler always excludes the canonical account.
+        if canonical_live_auth_mode() != "oauth":
+            return False
     return live_control_status(db)["control_mode"] in {"active", "exit_only"}
 
 
@@ -119,6 +122,7 @@ def _status(db, identity):
                                       {"encrypted_token": 0})
     authorized = bool(saved and saved.get("trading_authorized") is True)
     return {"configured": True, "connected": bool(saved),
+            "canonical_live_auth_mode": canonical_live_auth_mode(),
             "environment": "live", "read_only": not authorized,
             "trading_authorized": authorized,
             "trading_consent_available": _trading_consent_enabled(),
