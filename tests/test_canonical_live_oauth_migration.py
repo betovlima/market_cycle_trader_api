@@ -98,6 +98,42 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
                     auth.create_canonical_live_oauth_client(self.db)
             broker.assert_not_called()
 
+    def test_diagnostic_explains_saved_admin_role_mismatch_without_weakening_grant(self):
+        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
+        self.db[auth._CONNECTIONS].find_one.return_value = {
+            **self.grant, "role": "trader",
+        }
+        identity = SimpleNamespace(subject=self.subject, role="admin")
+        result = auth.canonical_live_oauth_diagnostic(self.db, identity)
+        self.assertEqual(result["failure_code"], "OAUTH_CURRENT_ADMIN_SAVED_ROLE_MISMATCH")
+        self.assertFalse(result["connected_to_canonical_account"])
+        self.assertNotIn(self.account_id, repr(result))
+        self.assertNotIn(self.token, repr(result))
+        self.client.submit_order.assert_not_called()
+
+    def test_diagnostic_explains_account_mismatch_and_never_selects_other_account(self):
+        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
+        self.db[auth._CONNECTIONS].find_one.return_value = {
+            **self.grant, "account_id": "another-account",
+        }
+        identity = SimpleNamespace(subject=self.subject, role="admin")
+        result = auth.canonical_live_oauth_diagnostic(self.db, identity)
+        self.assertEqual(result["failure_code"], "OAUTH_CURRENT_ADMIN_ACCOUNT_MISMATCH")
+        self.assertFalse(result["connected_to_canonical_account"])
+        self.assertNotIn("another-account", repr(result))
+        self.client.submit_order.assert_not_called()
+
+    def test_diagnostic_explains_missing_trading_scope_without_order_access(self):
+        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
+        self.db[auth._CONNECTIONS].find_one.return_value = {
+            **self.grant, "oauth_scope": "read", "read_only": True,
+        }
+        identity = SimpleNamespace(subject=self.subject, role="admin")
+        result = auth.canonical_live_oauth_diagnostic(self.db, identity)
+        self.assertEqual(result["failure_code"], "OAUTH_CURRENT_ADMIN_TRADING_GRANT_MISSING")
+        self.assertFalse(result["connected_to_canonical_account"])
+        self.client.submit_order.assert_not_called()
+
     def test_safe_diagnostic_identifies_missing_id_without_exposing_any_token(self):
         with patch.dict(os.environ, {
             "ALPACA_LIVE_ACCOUNT_ID": "",
