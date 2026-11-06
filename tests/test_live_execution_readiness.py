@@ -15,7 +15,7 @@ class LiveReadinessTests(unittest.TestCase):
             id="acct", trading_blocked=False, account_blocked=False,
         )
         broker.return_value.get_orders.return_value = []
-        control.return_value = {"control_mode": "active"}
+        control.return_value = {"control_mode": "active", "order_submission_enabled": True}
         winner.return_value = {"id": "winner", "configuration_hash": "hash"}
         result = live_execution_readiness(object())
         self.assertTrue(result["ready_for_real_orders"])
@@ -44,7 +44,7 @@ class LiveReadinessTests(unittest.TestCase):
             id="acct", trading_blocked=False, account_blocked=False,
         )
         broker.return_value.get_orders.return_value = [SimpleNamespace(id="pending")]
-        control.return_value = {"control_mode": "active"}
+        control.return_value = {"control_mode": "active", "order_submission_enabled": True}
         winner.return_value = {"id": "winner", "configuration_hash": "hash"}
         result = live_execution_readiness(object())
         self.assertFalse(result["ready_for_real_orders"])
