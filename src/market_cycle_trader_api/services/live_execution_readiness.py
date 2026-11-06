@@ -49,11 +49,17 @@ def live_execution_readiness(db: Any) -> dict[str, Any]:
     except Exception:
         add("winner_selected", False, "Cannot read Winner selection.")
 
+    add(
+        "live_order_permission",
+        bool(control.get("order_submission_enabled")),
+        "Real-order permission is enabled." if control.get("order_submission_enabled")
+        else "Real orders are blocked by Live control or OAuth authorization.",
+    )
     ready = all(item["passed"] for item in checks)
     return {
         "market": "live",
         "ready_for_real_orders": ready,
-        "order_submission_enabled": mode in {"active", "exit_only"},
+        "order_submission_enabled": bool(control.get("order_submission_enabled")),
         "control_mode": mode,
         "checks": checks,
         "message": "Live follows the existing operating mode. Each order independently validates session, Winner, broker positions and idempotency.",
