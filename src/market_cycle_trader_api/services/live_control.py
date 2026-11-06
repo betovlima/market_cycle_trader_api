@@ -8,7 +8,8 @@ from pymongo import ReturnDocument
 from ..infrastructure.persistence.mongo_repository import utc_now
 from ..infrastructure.trading.alpaca_live import live_credentials
 from ..infrastructure.trading.canonical_live_oauth import (
-    canonical_live_auth_mode, create_canonical_live_oauth_client,
+    canonical_live_auth_mode, canonical_oauth_orders_enabled,
+    create_canonical_live_oauth_client,
 )
 
 LIVE_CONTROL_COLLECTION = "live_trader_control"
@@ -40,6 +41,13 @@ def _current(db: Any) -> dict[str, Any]:
 def live_control_status(db: Any) -> dict[str, Any]:
     state = _current(db)
     mode = str(state.get("control_mode") or "stopped")
+    execution_allowed = (
+        mode in {"active", "exit_only"}
+        and (
+            canonical_live_auth_mode() != "oauth"
+            or canonical_oauth_orders_enabled()
+        )
+    )
     return {
         "control_mode": mode,
         "revision": int(state.get("revision") or 0),
@@ -47,9 +55,10 @@ def live_control_status(db: Any) -> dict[str, Any]:
         "phase": "live_operational" if mode in {"active", "exit_only"} else "live_inactive",
         "enabled": mode in {"active", "exit_only"},
         "monitoring_enabled": mode in {"active", "exit_only"},
-        "execution_enabled": mode in {"active", "exit_only"},
+        "execution_enabled": execution_allowed,
         "scheduler_alive": False,
-        "order_submission_enabled": mode in {"active", "exit_only"},
+        "canonical_broker_authentication": canonical_live_auth_mode(),
+        "order_submission_enabled": execution_allowed,
         "last_control_update_at": state.get("updated_at"),
         "last_control_updated_by": state.get("updated_by"),
         "last_control_reason": state.get("reason"),
