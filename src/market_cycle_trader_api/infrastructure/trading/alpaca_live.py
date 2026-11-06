@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .canonical_live_oauth import canonical_live_auth_mode, create_canonical_live_oauth_client
+
 
 def live_credentials() -> tuple[str, str]:
     key = str(os.getenv("ALPACA_LIVE_API_KEY_ID") or "").strip()
@@ -29,6 +31,12 @@ def live_credentials() -> tuple[str, str]:
 
 
 def create_live_readonly_client() -> Any:
+    """Single canonical broker transport for both reads and execution.
+
+    OAuth mode *never* falls back to API keys, even if valid keys exist.
+    """
+    if canonical_live_auth_mode() == "oauth":
+        return create_canonical_live_oauth_client()
     from alpaca.trading.client import TradingClient
 
     key, secret = live_credentials()
@@ -43,5 +51,5 @@ def create_live_readonly_client() -> Any:
 
 
 def create_live_execution_client() -> Any:
-    """Live Alpaca trading client, isolated from Paper credentials and account."""
+    """Live Alpaca client using exactly the configured canonical auth mode."""
     return create_live_readonly_client()
