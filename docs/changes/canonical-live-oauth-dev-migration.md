@@ -14,7 +14,7 @@ Os candles historicos SIP/RAW ainda podem usar as credenciais separadas de marke
 
 - MCT_CANONICAL_LIVE_AUTH_MODE=oauth : escolhe OAuth. Valor padrao api_keys mantem o comportamento anterior.
 - MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS=0 : PADRAO; desabilita o envio real de ordens no fluxo OAuth, independentemente do estado operacional Live. Teste primeiro somente com 0. O valor 1 permite passar para as protecoes operacionais preexistentes e **pode enviar ordens reais** quando Live esta ativo.
-- ALPACA_LIVE_ACCOUNT_ID : ID exato da conta Live principal. Obrigatorio no modo OAuth.
+- ALPACA_LIVE_ACCOUNT_ID ou ALPACA_OAUTH_EXPECTED_ACCOUNT_ID : ID exato da conta Live principal. Um deles e obrigatorio no modo OAuth. Se os dois estiverem definidos, os valores precisam ser identicos. Nao utilizar o identificador de outra conta.
 - ALPACA_OAUTH_ENCRYPTION_KEY : mesma chave Fernet utilizada no cadastro original do grant OAuth. Nao criar chave nova se o token ja foi criptografado.
 - MCT_CANONICAL_LIVE_OAUTH_SUBJECT : opcional. Seleciona o login do administrador se existirem multiplos grants validos para a mesma conta. Sem ele, e exigido um unico grant com role admin e trading autorizado.
 
@@ -39,3 +39,9 @@ O grant precisa estar cadastrado na colecao alpaca_oauth_connections com subject
 - OAuth invalido = erro imediato, sem fallback para API Keys.
 
 Nao usar este experimento para modificar o patrimonio ou ordem real sem autorizacao explicita e plano de homologacao.
+
+## Diagnostico de conectividade (sem ordens)
+
+No frontend da branch de dev, ao detectar modo OAuth, o administrador pode clicar em **Diagnosticar Live OAuth**. O endpoint `GET /api/live-market/oauth-diagnostic` e somente-leitura e requer sessao de administrador. Ele testa primeiro o grant e a vinculacao explicita da conta principal, depois consulta posicoes, ordens e relogio da Alpaca. Nenhuma ordem de corretora e enviada. A resposta inclui apenas um codigo seguro, sem token, account ID, credenciais ou mensagens internas do provedor.
+
+Um `CANONICAL_ACCOUNT_ID_MISSING` indica que nenhuma das duas variaveis de account ID foi carregada pela API. `CANONICAL_ACCOUNT_ID_CONFLICT` significa que os dois IDs sao diferentes. `OAUTH_ADMIN_GRANT_MISSING` significa que nao existe um grant adequado de administrador no banco de dev. `OAUTH_BROKER_ORDERS_UNAVAILABLE` indica que a conexao foi verificada, mas a consulta de ordens falhou. Se o diagnostico retornar `ready` e o portfolio ainda estiver indisponivel, o problema pode estar em processamento ou historico/observacoes da carteira, que exigem outra investigacao.
