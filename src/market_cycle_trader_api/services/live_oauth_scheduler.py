@@ -10,12 +10,15 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..api.routers.alpaca_oauth import CONNECTIONS
+from ..infrastructure.trading.canonical_live_oauth import canonical_live_auth_mode, canonical_oauth_orders_enabled
 from .live_control import live_control_status
 from .live_oauth_execution import execute_shared_winner_for_oauth_account
 from .live_shared_winner_signal import read_shared_winner_signal
 
 
 def execute_oauth_accounts_for_shared_winner(db: Any, *, session: str) -> dict[str, Any]:
+    if canonical_live_auth_mode() == "oauth" and not canonical_oauth_orders_enabled():
+        return {"status": "oauth_dev_orders_disabled", "processed": 0}
     if live_control_status(db)["control_mode"] not in {"active", "exit_only"}:
         return {"status": "live_stopped", "processed": 0}
     signal = read_shared_winner_signal(db, session=session)
@@ -42,8 +45,8 @@ def execute_oauth_accounts_for_shared_winner(db: Any, *, session: str) -> dict[s
             # No account-specific order can be safely identified here.
             continue
         if account_id == signal.source_account_id:
-            # The canonical account already runs with the legacy API keys.
-            # Never execute it again via OAuth during this migration.
+            # The canonical account is handled by the main Live executor,
+            # whether its transport is API keys or OAuth. Never execute twice.
             continue
         if account_id in processed_account_ids:
             # Distinct MCT logins can authorize the same Alpaca account.
