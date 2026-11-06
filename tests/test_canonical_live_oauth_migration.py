@@ -36,6 +36,7 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
             "ALPACA_LIVE_ACCOUNT_ID": self.account_id,
             "ALPACA_OAUTH_ENCRYPTION_KEY": self.key,
             "MCT_CANONICAL_LIVE_OAUTH_SUBJECT": "",
+            "MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": "1",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -58,6 +59,20 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
         for call in make.call_args_list:
             self.assertEqual(call.kwargs, {"oauth_token": self.token, "paper": False})
         self.client.submit_order.assert_not_called()
+
+    def test_dev_mode_defaults_to_no_order_client_even_with_valid_grant(self):
+        with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": ""}):
+            with (
+                patch("market_cycle_trader_api.core.runtime.database", return_value=self.db),
+                patch("alpaca.trading.client.TradingClient") as make,
+                patch.object(alpaca_live, "live_credentials") as keys,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "order submission is disabled"):
+                    alpaca_live.create_live_execution_client()
+                # Reads and portfolio can still authenticate in advisory mode.
+                self.assertFalse(auth.canonical_oauth_orders_enabled())
+            make.assert_not_called()
+            keys.assert_not_called()
 
     def test_no_grant_fails_closed_even_if_keys_exist(self):
         self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
@@ -185,6 +200,18 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
             self.assertTrue(alpaca_oauth._oauth_winner_operational(self.db, saved))
             with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_AUTH_MODE": "api_keys"}):
                 self.assertFalse(alpaca_oauth._oauth_winner_operational(self.db, saved))
+
+    def test_live_status_reports_oauth_readonly_when_order_flag_disabled(self):
+        db = MagicMock()
+        db[live_control.LIVE_CONTROL_COLLECTION].find_one.return_value = {
+            "_id": "default", "control_mode": "active", "revision": 7,
+        }
+        with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": ""}):
+            result = live_control.live_control_status(db)
+        self.assertEqual(result["control_mode"], "active")
+        self.assertEqual(result["canonical_broker_authentication"], "oauth")
+        self.assertFalse(result["execution_enabled"])
+        self.assertFalse(result["order_submission_enabled"])
 
     def test_oauth_readonly_status_never_submits_trades(self):
         self.assertEqual(auth.canonical_live_auth_mode(), "oauth")
