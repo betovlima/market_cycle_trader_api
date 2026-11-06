@@ -118,7 +118,43 @@ def create_canonical_live_oauth_client(db: Any | None = None) -> Any:
 
 
 
-def canonical_live_oauth_diagnostic(db: Any) -> dict[str, Any]:
+def _current_admin_grant_failure(db: Any, identity: Any) -> str | None:
+    """Compare only the calling administrator's OAuth grant with the canonical criteria.
+
+    Never expose account IDs, owner subjects, tokens or grant contents.
+    The check is diagnostic only: it cannot change how an executor finds grants.
+    """
+    if identity is None or str(getattr(identity, "role", "")).lower() != "admin":
+        return None
+    subject = str(getattr(identity, "subject", "") or "").strip()
+    if not subject:
+        return None
+    selected = str(os.getenv(_SUBJECT_ENV) or "").strip()
+    if selected and selected != subject:
+        return "OAUTH_ADMIN_SUBJECT_SELECTION_MISMATCH"
+    saved = db[_CONNECTIONS].find_one(
+        {"_id": _owner_key(subject)},
+        {"subject": 1, "account_id": 1, "environment": 1, "role": 1,
+         "trading_authorized": 1, "oauth_scope": 1, "read_only": 1},
+    )
+    if not isinstance(saved, dict):
+        return "OAUTH_CURRENT_ADMIN_GRANT_MISSING"
+    if saved.get("subject") != subject:
+        return "OAUTH_OWNER_BINDING_INVALID"
+    if saved.get("environment") != "live":
+        return "OAUTH_CURRENT_ADMIN_ENVIRONMENT_MISMATCH"
+    if str(saved.get("account_id") or "").strip() != canonical_live_account_id():
+        return "OAUTH_CURRENT_ADMIN_ACCOUNT_MISMATCH"
+    if saved.get("role") != "admin":
+        return "OAUTH_CURRENT_ADMIN_SAVED_ROLE_MISMATCH"
+    if (saved.get("trading_authorized") is not True
+        or saved.get("oauth_scope") != "trading"
+        or saved.get("read_only") is not False):
+        return "OAUTH_CURRENT_ADMIN_TRADING_GRANT_MISSING"
+    return "OAUTH_GRANT_SELECTION_UNAVAILABLE"
+
+
+def canonical_live_oauth_diagnostic(db: Any, identity: Any = None) -> dict[str, Any]:
     """Admin-only, on-demand read-only diagnosis. No provider errors or tokens.
 
     The ordinary Live portfolio route deliberately keeps its generic 503.
@@ -150,7 +186,13 @@ def canonical_live_oauth_diagnostic(db: Any) -> dict[str, Any]:
     try:
         broker = create_canonical_live_oauth_client(db)
     except RuntimeError as exc:
-        result["failure_code"] = failures.get(str(exc), "OAUTH_CANONICAL_VERIFICATION_FAILED")
+        code = failures.get(str(exc), "OAUTH_CANONICAL_VERIFICATION_FAILED")
+        if code in {"OAUTH_ADMIN_GRANT_MISSING", "OAUTH_ADMIN_GRANT_UNAVAILABLE"}:
+            try:
+                code = _current_admin_grant_failure(db, identity) or code
+            except Exception:
+                pass  # Do not turn diagnostics into another source of private errors.
+        result["failure_code"] = code
         return result
     except Exception:
         result["failure_code"] = "OAUTH_CANONICAL_VERIFICATION_FAILED"
