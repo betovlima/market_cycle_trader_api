@@ -36,6 +36,22 @@ def canonical_oauth_orders_enabled() -> bool:
     )
 
 
+def canonical_live_account_id() -> str:
+    """Resolve the same explicit canonical ID used by the shared Winner signal.
+
+    Dev setups with only ALPACA_OAUTH_EXPECTED_ACCOUNT_ID remain supported.
+    Two inconsistent bindings are never silently reconciled.
+    """
+    primary = str(os.getenv("ALPACA_LIVE_ACCOUNT_ID") or "").strip()
+    oauth_expected = str(os.getenv("ALPACA_OAUTH_EXPECTED_ACCOUNT_ID") or "").strip()
+    if primary and oauth_expected and primary != oauth_expected:
+        raise RuntimeError("Canonical Live OAuth account configuration conflicts.")
+    expected = primary or oauth_expected
+    if not expected:
+        raise RuntimeError("Canonical Live OAuth account ID is not configured.")
+    return expected
+
+
 def _owner_key(subject: str) -> str:
     return hashlib.sha256(subject.encode("utf-8")).hexdigest() + ":live"
 
@@ -63,8 +79,10 @@ def _read_canonical_grant(db: Any, expected_account: str) -> dict[str, Any]:
         # Avoid choosing an arbitrary administrator token when more than one
         # subject has authorized the same canonical Alpaca account.
         matches = list(db[_CONNECTIONS].find(filters).limit(2))
-        if len(matches) != 1:
-            raise RuntimeError("Canonical Live OAuth grant is missing or ambiguous.")
+        if not matches:
+            raise RuntimeError("Canonical Live OAuth administrator grant is missing.")
+        if len(matches) > 1:
+            raise RuntimeError("Canonical Live OAuth administrator grants are ambiguous.")
         grant = matches[0]
     subject = str(grant.get("subject") or "").strip()
     if not subject or str(grant.get("_id") or "") != _owner_key(subject):
@@ -74,9 +92,7 @@ def _read_canonical_grant(db: Any, expected_account: str) -> dict[str, Any]:
 
 def create_canonical_live_oauth_client(db: Any | None = None) -> Any:
     """Resolve a verified OAuth client, with no API-key or Paper fallback."""
-    expected_account = str(os.getenv("ALPACA_LIVE_ACCOUNT_ID") or "").strip()
-    if not expected_account:
-        raise RuntimeError("Canonical Live OAuth requires ALPACA_LIVE_ACCOUNT_ID.")
+    expected_account = canonical_live_account_id()
     encryption_key = str(os.getenv("ALPACA_OAUTH_ENCRYPTION_KEY") or "").strip()
     if not encryption_key:
         raise RuntimeError("Canonical Live OAuth encryption is not configured.")
