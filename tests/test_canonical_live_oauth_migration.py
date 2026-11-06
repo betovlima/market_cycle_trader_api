@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,7 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             "MCT_CANONICAL_LIVE_AUTH_MODE": "oauth",
             "ALPACA_LIVE_ACCOUNT_ID": self.account_id,
+            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": "",
             "ALPACA_OAUTH_ENCRYPTION_KEY": self.key,
             "MCT_CANONICAL_LIVE_OAUTH_SUBJECT": "",
             "MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": "1",
@@ -42,7 +44,9 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.client = MagicMock()
         self.client.get_account.return_value = SimpleNamespace(id=self.account_id)
-        self.client.get_clock.return_value = SimpleNamespace(is_open=False)
+        self.client.get_clock.return_value = SimpleNamespace(
+            is_open=False, timestamp=datetime(2026, 11, 6, 15, 0, tzinfo=timezone.utc),
+        )
 
     def test_read_and_order_clients_both_use_verified_oauth_and_no_api_keys(self):
         with (
@@ -74,6 +78,64 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
             make.assert_not_called()
             keys.assert_not_called()
 
+    def test_existing_oauth_expected_account_id_works_without_legacy_id(self):
+        # Dev has OAuth already linked but not necessarily old API-key account ID.
+        with patch.dict(os.environ, {
+            "ALPACA_LIVE_ACCOUNT_ID": "",
+            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": self.account_id,
+        }):
+            with patch("alpaca.trading.client.TradingClient", return_value=self.client):
+                self.assertIs(auth.create_canonical_live_oauth_client(self.db), self.client)
+            self.assertEqual(auth.canonical_live_account_id(), self.account_id)
+
+    def test_conflicting_live_and_oauth_binding_ids_block_before_broker_calls(self):
+        with patch.dict(os.environ, {
+            "ALPACA_LIVE_ACCOUNT_ID": self.account_id,
+            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": "other-account",
+        }):
+            with patch("alpaca.trading.client.TradingClient") as broker:
+                with self.assertRaisesRegex(RuntimeError, "configuration conflicts"):
+                    auth.create_canonical_live_oauth_client(self.db)
+            broker.assert_not_called()
+
+    def test_safe_diagnostic_identifies_missing_id_without_exposing_any_token(self):
+        with patch.dict(os.environ, {
+            "ALPACA_LIVE_ACCOUNT_ID": "",
+            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": "",
+            "MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": "",
+        }):
+            result = auth.canonical_live_oauth_diagnostic(self.db)
+        self.assertEqual(result["failure_code"], "CANONICAL_ACCOUNT_ID_MISSING")
+        self.assertFalse(result["connected_to_canonical_account"])
+        self.assertFalse(result["orders_enabled"])
+        self.assertNotIn(self.token, repr(result))
+        self.assertNotIn(self.account_id, repr(result))
+        self.client.submit_order.assert_not_called()
+
+    def test_safe_diagnostic_separates_broker_orders_failure_from_grant_failure(self):
+        self.client.get_orders.side_effect = RuntimeError("private access token and URL should be hidden")
+        with patch("alpaca.trading.client.TradingClient", return_value=self.client):
+            result = auth.canonical_live_oauth_diagnostic(self.db)
+        self.assertEqual(result["failure_code"], "OAUTH_BROKER_ORDERS_UNAVAILABLE")
+        self.assertTrue(result["connected_to_canonical_account"])
+        self.assertEqual(result["stage"], "orders")
+        self.assertNotIn("private", repr(result))
+        self.client.submit_order.assert_not_called()
+
+    def test_safe_diagnostic_ready_requires_broker_read_access(self):
+        with patch("alpaca.trading.client.TradingClient", return_value=self.client):
+            result = auth.canonical_live_oauth_diagnostic(self.db)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["stage"], "broker_reads")
+        self.assertTrue(result["connected_to_canonical_account"])
+        self.client.submit_order.assert_not_called()
+
+    def test_safe_diagnostic_endpoint_is_admin_only_and_get_only(self):
+        route = next(r for r in live_market.router.routes
+                     if r.path == "/api/live-market/oauth-diagnostic")
+        self.assertEqual(route.methods, {"GET"})
+        self.assertTrue(route.dependant.dependencies)
+
     def test_no_grant_fails_closed_even_if_keys_exist(self):
         self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
         with (
@@ -81,7 +143,7 @@ class CanonicalLiveOAuthTests(unittest.TestCase):
             patch.object(alpaca_live, "live_credentials") as old_keys,
             patch("alpaca.trading.client.TradingClient") as make,
         ):
-            with self.assertRaisesRegex(RuntimeError, "missing or ambiguous"):
+            with self.assertRaisesRegex(RuntimeError, "grant is missing"):
                 alpaca_live.create_live_execution_client()
         old_keys.assert_not_called()
         make.assert_not_called()
