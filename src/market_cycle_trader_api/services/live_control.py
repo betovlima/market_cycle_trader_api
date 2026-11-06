@@ -41,8 +41,10 @@ def _current(db: Any) -> dict[str, Any]:
 def live_control_status(db: Any) -> dict[str, Any]:
     state = _current(db)
     mode = str(state.get("control_mode") or "stopped")
-    auth_mode = canonical_live_auth_mode(db)
-    orders_armed = canonical_oauth_orders_enabled(db)
+    auth_mode = str(state.get("broker_auth_mode") or "api_keys")
+    if auth_mode not in {"api_keys", "oauth"}:
+        raise RuntimeError("Invalid persisted Live broker authentication.")
+    orders_armed = auth_mode == "oauth" and state.get("oauth_orders_allowed") is True
     execution_allowed = (
         mode in {"active", "exit_only"}
         and (
@@ -156,7 +158,7 @@ def update_canonical_live_broker(
     mode = str(state.get("control_mode") or "stopped")
     currently_oauth = state.get("broker_auth_mode") == "oauth"
     binding_change = not currently_oauth
-    if (binding_change or enable_orders) and mode != "stopped":
+    if (binding_change or enable_orders or confirmation == "BIND_VERIFIED_OAUTH_NO_ORDERS") and mode != "stopped":
         raise LiveControlConflict("Stop the Live robot before binding OAuth or enabling orders.")
     if enable_orders:
         if not currently_oauth or state.get("oauth_orders_allowed") is not False:
