@@ -51,6 +51,8 @@ class DailyStockHeatmapTests(unittest.TestCase):
         self.assertEqual(result["as_of"], "2026-11-05")
         self.assertEqual(result["source"], "alpaca_sip_completed_daily_raw")
         self.assertEqual(result["total_assets"], 3)
+        self.assertEqual(result["strategy_name"], "Winner")
+        self.assertEqual(result["strategy_sequence"], 0)
         self.assertEqual(result["available_assets"], 1)
         self.assertEqual(result["timeframes"], [1, 5, 20])
         rows = {item["symbol"]: item for item in result["items"]}
