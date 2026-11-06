@@ -1,7 +1,9 @@
-"""Dev-only migration tests: canonical Live OAuth, never actual broker orders."""
+"""Canonical Alpaca OAuth is configured by the administrator in Live, not .env.
+
+All broker operations are mocked. No real orders, API keys or tokens are sent.
+"""
 from __future__ import annotations
 
-import os
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -11,308 +13,207 @@ from cryptography.fernet import Fernet
 
 from market_cycle_trader_api.infrastructure.trading import canonical_live_oauth as auth
 from market_cycle_trader_api.infrastructure.trading import alpaca_live
-from market_cycle_trader_api.api.routers import alpaca_oauth, live_market
+from market_cycle_trader_api.api.routers import live_market
 from market_cycle_trader_api.services import live_control
 
 
 class CanonicalLiveOAuthTests(unittest.TestCase):
     def setUp(self):
-        self.account_id = "canonical-live-account"
-        self.subject = "google:canonical-admin"
+        self.account_id = "verified-canonical-live"
+        self.subject = "google:administrator"
         self.key = Fernet.generate_key().decode("ascii")
-        self.token = "private-bearer-for-mocks-only"
+        self.token = "only-used-by-mocks"
+        self.state = {
+            "_id": "default", "control_mode": "stopped", "revision": 7,
+            "broker_auth_mode": "oauth", "oauth_orders_allowed": False,
+            "oauth_subject": self.subject, "oauth_account_id": self.account_id,
+        }
         self.grant = {
             "_id": auth._owner_key(self.subject),
-            "subject": self.subject, "role": "admin",
-            "environment": "live", "account_id": self.account_id,
-            "trading_authorized": True, "oauth_scope": "trading",
-            "read_only": False,
-            "encrypted_token": Fernet(self.key.encode()).encrypt(self.token.encode()).decode(),
+            "subject": self.subject, "role": "admin", "environment": "live",
+            "account_id": self.account_id, "trading_authorized": True,
+            "read_only": False, "oauth_scope": "trading",
+            "encrypted_token": Fernet(self.key.encode()).encrypt(
+                self.token.encode()
+            ).decode(),
         }
         self.db = MagicMock()
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = [self.grant]
-        self.db[auth._CONNECTIONS].find_one.return_value = self.grant
-        self.env = patch.dict(os.environ, {
-            "MCT_CANONICAL_LIVE_AUTH_MODE": "oauth",
-            "ALPACA_LIVE_ACCOUNT_ID": self.account_id,
-            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": "",
-            "ALPACA_OAUTH_ENCRYPTION_KEY": self.key,
-            "MCT_CANONICAL_LIVE_OAUTH_SUBJECT": "",
-            "MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": "1",
-        })
-        self.env.start()
-        self.addCleanup(self.env.stop)
+        self.control = MagicMock()
+        self.connections = MagicMock()
+        self.history = MagicMock()
+        self.control.find_one.side_effect = lambda *args, **kw: dict(self.state)
+        self.control.find_one_and_update.side_effect = self._save
+        self.connections.find_one.return_value = self.grant
+        self.db.__getitem__.side_effect = lambda key: {
+            "live_trader_control": self.control,
+            "live_trader_control_history": self.history,
+            "alpaca_oauth_connections": self.connections,
+        }.get(key, MagicMock())
         self.client = MagicMock()
         self.client.get_account.return_value = SimpleNamespace(id=self.account_id)
         self.client.get_clock.return_value = SimpleNamespace(
-            is_open=False, timestamp=datetime(2026, 11, 6, 15, 0, tzinfo=timezone.utc),
+            timestamp=datetime(2026, 11, 6, 15, tzinfo=timezone.utc),
+            is_open=False,
         )
+        self.identity = SimpleNamespace(
+            is_admin=True, role="admin", subject=self.subject, email="admin@example.test",
+        )
+        self.env = patch.dict("os.environ", {
+            "ALPACA_OAUTH_ENCRYPTION_KEY": self.key,
+            "MCT_CANONICAL_LIVE_AUTH_MODE": "api_keys",
+            "MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": "1",
+            "MCT_CANONICAL_LIVE_OAUTH_SUBJECT": "another-user",
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
 
-    def test_read_and_order_clients_both_use_verified_oauth_and_no_api_keys(self):
+    def _save(self, query, update, **kwargs):
+        if query.get("revision") != self.state["revision"]:
+            return None
+        self.state.update(update["$set"])
+        self.state["revision"] += update["$inc"]["revision"]
+        return dict(self.state)
+
+    def test_old_environment_flags_have_no_effect_on_persisted_policy(self):
+        self.assertEqual(auth.canonical_live_auth_mode(self.db), "oauth")
+        self.assertFalse(auth.canonical_oauth_orders_enabled(self.db))
+        self.assertEqual(auth.canonical_live_account_id(self.db), self.account_id)
+
+    def test_canonical_broker_reads_by_persisted_verified_oauth_without_api_keys(self):
         with (
-            patch("alpaca.trading.client.TradingClient", return_value=self.client) as make,
+            patch("alpaca.trading.client.TradingClient", return_value=self.client) as factory,
             patch("market_cycle_trader_api.core.runtime.database", return_value=self.db),
-            patch.object(alpaca_live, "live_credentials") as old_keys,
+            patch.object(alpaca_live, "live_credentials") as keys,
         ):
             read_client = alpaca_live.create_live_readonly_client()
-            execute_client = alpaca_live.create_live_execution_client()
-        self.assertIs(read_client, self.client)
-        self.assertIs(execute_client, self.client)
-        old_keys.assert_not_called()
-        self.assertEqual(make.call_count, 2)
-        for call in make.call_args_list:
-            self.assertEqual(call.kwargs, {"oauth_token": self.token, "paper": False})
-        self.client.submit_order.assert_not_called()
-
-    def test_dev_mode_defaults_to_no_order_client_even_with_valid_grant(self):
-        with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": ""}):
-            with (
-                patch("market_cycle_trader_api.core.runtime.database", return_value=self.db),
-                patch("alpaca.trading.client.TradingClient") as make,
-                patch.object(alpaca_live, "live_credentials") as keys,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "order submission is disabled"):
-                    alpaca_live.create_live_execution_client()
-                # Reads and portfolio can still authenticate in advisory mode.
-                self.assertFalse(auth.canonical_oauth_orders_enabled())
-            make.assert_not_called()
-            keys.assert_not_called()
-
-    def test_existing_oauth_expected_account_id_works_without_legacy_id(self):
-        # Dev has OAuth already linked but not necessarily old API-key account ID.
-        with patch.dict(os.environ, {
-            "ALPACA_LIVE_ACCOUNT_ID": "",
-            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": self.account_id,
-        }):
-            with patch("alpaca.trading.client.TradingClient", return_value=self.client):
-                self.assertIs(auth.create_canonical_live_oauth_client(self.db), self.client)
-            self.assertEqual(auth.canonical_live_account_id(), self.account_id)
-
-    def test_conflicting_live_and_oauth_binding_ids_block_before_broker_calls(self):
-        with patch.dict(os.environ, {
-            "ALPACA_LIVE_ACCOUNT_ID": self.account_id,
-            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": "other-account",
-        }):
-            with patch("alpaca.trading.client.TradingClient") as broker:
-                with self.assertRaisesRegex(RuntimeError, "configuration conflicts"):
-                    auth.create_canonical_live_oauth_client(self.db)
-            broker.assert_not_called()
-
-    def test_diagnostic_explains_saved_admin_role_mismatch_without_weakening_grant(self):
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
-        self.db[auth._CONNECTIONS].find_one.return_value = {
-            **self.grant, "role": "trader",
-        }
-        identity = SimpleNamespace(subject=self.subject, role="admin")
-        result = auth.canonical_live_oauth_diagnostic(self.db, identity)
-        self.assertEqual(result["failure_code"], "OAUTH_CURRENT_ADMIN_SAVED_ROLE_MISMATCH")
-        self.assertFalse(result["connected_to_canonical_account"])
-        self.assertNotIn(self.account_id, repr(result))
-        self.assertNotIn(self.token, repr(result))
-        self.client.submit_order.assert_not_called()
-
-    def test_diagnostic_explains_account_mismatch_and_never_selects_other_account(self):
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
-        self.db[auth._CONNECTIONS].find_one.return_value = {
-            **self.grant, "account_id": "another-account",
-        }
-        identity = SimpleNamespace(subject=self.subject, role="admin")
-        result = auth.canonical_live_oauth_diagnostic(self.db, identity)
-        self.assertEqual(result["failure_code"], "OAUTH_CURRENT_ADMIN_ACCOUNT_MISMATCH")
-        self.assertFalse(result["connected_to_canonical_account"])
-        self.assertNotIn("another-account", repr(result))
-        self.client.submit_order.assert_not_called()
-
-    def test_diagnostic_explains_missing_trading_scope_without_order_access(self):
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
-        self.db[auth._CONNECTIONS].find_one.return_value = {
-            **self.grant, "oauth_scope": "read", "read_only": True,
-        }
-        identity = SimpleNamespace(subject=self.subject, role="admin")
-        result = auth.canonical_live_oauth_diagnostic(self.db, identity)
-        self.assertEqual(result["failure_code"], "OAUTH_CURRENT_ADMIN_TRADING_GRANT_MISSING")
-        self.assertFalse(result["connected_to_canonical_account"])
-        self.client.submit_order.assert_not_called()
-
-    def test_safe_diagnostic_identifies_missing_id_without_exposing_any_token(self):
-        with patch.dict(os.environ, {
-            "ALPACA_LIVE_ACCOUNT_ID": "",
-            "ALPACA_OAUTH_EXPECTED_ACCOUNT_ID": "",
-            "MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": "",
-        }):
-            result = auth.canonical_live_oauth_diagnostic(self.db)
-        self.assertEqual(result["failure_code"], "CANONICAL_ACCOUNT_ID_MISSING")
-        self.assertFalse(result["connected_to_canonical_account"])
-        self.assertFalse(result["orders_enabled"])
-        self.assertNotIn(self.token, repr(result))
-        self.assertNotIn(self.account_id, repr(result))
-        self.client.submit_order.assert_not_called()
-
-    def test_safe_diagnostic_separates_broker_orders_failure_from_grant_failure(self):
-        self.client.get_orders.side_effect = RuntimeError("private access token and URL should be hidden")
-        with patch("alpaca.trading.client.TradingClient", return_value=self.client):
-            result = auth.canonical_live_oauth_diagnostic(self.db)
-        self.assertEqual(result["failure_code"], "OAUTH_BROKER_ORDERS_UNAVAILABLE")
-        self.assertTrue(result["connected_to_canonical_account"])
-        self.assertEqual(result["stage"], "orders")
-        self.assertNotIn("private", repr(result))
-        self.client.submit_order.assert_not_called()
-
-    def test_safe_diagnostic_ready_requires_broker_read_access(self):
-        with patch("alpaca.trading.client.TradingClient", return_value=self.client):
-            result = auth.canonical_live_oauth_diagnostic(self.db)
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["stage"], "broker_reads")
-        self.assertTrue(result["connected_to_canonical_account"])
-        self.client.submit_order.assert_not_called()
-
-    def test_safe_diagnostic_endpoint_is_admin_only_and_get_only(self):
-        route = next(r for r in live_market.router.routes
-                     if r.path == "/api/live-market/oauth-diagnostic")
-        self.assertEqual(route.methods, {"GET"})
-        self.assertTrue(route.dependant.dependencies)
-
-    def test_no_grant_fails_closed_even_if_keys_exist(self):
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = []
-        with (
-            patch("market_cycle_trader_api.core.runtime.database", return_value=self.db),
-            patch.object(alpaca_live, "live_credentials") as old_keys,
-            patch("alpaca.trading.client.TradingClient") as make,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "grant is missing"):
+            self.assertIs(read_client, self.client)
+            with self.assertRaisesRegex(RuntimeError, "order submission is disabled"):
                 alpaca_live.create_live_execution_client()
-        old_keys.assert_not_called()
-        make.assert_not_called()
+        factory.assert_called_once_with(oauth_token=self.token, paper=False)
+        keys.assert_not_called()
+        self.client.submit_order.assert_not_called()
 
-    def test_two_admin_grants_same_account_are_ambiguous(self):
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = [
-            self.grant, {**self.grant, "subject": "another-admin"},
-        ]
-        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
-            auth.create_canonical_live_oauth_client(self.db)
+    def test_enable_orders_requires_admin_explicit_second_action_and_robot_stopped(self):
+        with patch("alpaca.trading.client.TradingClient", return_value=self.client):
+            with self.assertRaisesRegex(live_control.LiveControlConflict, "First bind"):
+                # Already bound, but an enable must use a separate action.
+                self.state["broker_auth_mode"] = "api_keys"
+                live_control.update_canonical_live_broker(
+                    self.db, identity=self.identity, expected_revision=7,
+                    enable_orders=True, confirmation="ENABLE_LIVE_REAL_ORDERS",
+                )
+            self.state["broker_auth_mode"] = "oauth"
+            with patch("market_cycle_trader_api.api.routers.alpaca_oauth.connected_trading_client",
+                       return_value=self.client):
+                status = live_control.update_canonical_live_broker(
+                    self.db, identity=self.identity, expected_revision=7,
+                    enable_orders=True, confirmation="ENABLE_LIVE_REAL_ORDERS",
+                )
+        self.assertTrue(status["oauth_orders_allowed"])
+        self.assertEqual(status["control_mode"], "stopped")
+        self.assertFalse(status["order_submission_enabled"])
+        self.assertEqual(self.state["revision"], 8)
+        self.history.insert_one.assert_called_once()
+        self.client.submit_order.assert_not_called()
 
-    def test_explicit_owner_disambiguates_but_cannot_cross_account(self):
-        with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_OAUTH_SUBJECT": self.subject}):
-            with patch("alpaca.trading.client.TradingClient", return_value=self.client):
-                self.assertIs(auth.create_canonical_live_oauth_client(self.db), self.client)
-            query = self.db[auth._CONNECTIONS].find_one.call_args.args[0]
-            self.assertEqual(query["account_id"], self.account_id)
-            self.assertEqual(query["subject"], self.subject)
-            self.assertEqual(query["_id"], auth._owner_key(self.subject))
-            self.assertEqual(query["role"], "admin")
+    def test_bind_current_admin_oauth_from_legacy_starts_disarmed(self):
+        self.state.update(broker_auth_mode="api_keys", oauth_orders_allowed=False,
+                          oauth_subject=None, oauth_account_id=None)
+        with patch("market_cycle_trader_api.api.routers.alpaca_oauth.connected_trading_client",
+                   return_value=self.client):
+            updated = live_control.update_canonical_live_broker(
+                self.db, identity=self.identity, expected_revision=7,
+                enable_orders=False, confirmation="BIND_VERIFIED_OAUTH_NO_ORDERS",
+            )
+        self.assertEqual(updated["mode"], "oauth")
+        self.assertFalse(updated["oauth_orders_allowed"])
+        self.assertEqual(updated["oauth_account_suffix"], self.account_id[-6:])
+        self.assertEqual(self.state["oauth_subject"], self.subject)
+        self.assertEqual(self.state["revision"], 8)
 
-    def test_invalid_owner_binding_does_not_connect(self):
-        self.db[auth._CONNECTIONS].find.return_value.limit.return_value = [{
-            **self.grant, "_id": "arbitrary-id",
-        }]
-        with patch("alpaca.trading.client.TradingClient") as make:
-            with self.assertRaisesRegex(RuntimeError, "owner binding"):
-                auth.create_canonical_live_oauth_client(self.db)
-        make.assert_not_called()
+    def test_bind_rejects_another_user_or_non_admin_grant(self):
+        self.state.update(broker_auth_mode="api_keys", oauth_account_id=None)
+        self.grant["role"] = "trader"
+        with self.assertRaisesRegex(live_control.LiveControlConflict, "administrator OAuth"):
+            live_control.update_canonical_live_broker(
+                self.db, identity=self.identity, expected_revision=7,
+                enable_orders=False, confirmation="BIND_VERIFIED_OAUTH_NO_ORDERS",
+            )
+        self.control.find_one_and_update.assert_not_called()
 
-    def test_revoked_or_unreadable_token_blocks_execution(self):
-        for encrypted in ("garbage", "", None):
-            with self.subTest(encrypted=encrypted):
-                self.db[auth._CONNECTIONS].find.return_value.limit.return_value = [{
-                    **self.grant, "encrypted_token": encrypted,
-                }]
-                with patch("alpaca.trading.client.TradingClient") as make:
-                    with self.assertRaisesRegex(RuntimeError, "cannot be decrypted"):
-                        auth.create_canonical_live_oauth_client(self.db)
-                make.assert_not_called()
+    def test_orders_can_be_disarmed_while_active_without_reconnecting_broker(self):
+        self.state.update(control_mode="active", oauth_orders_allowed=True)
+        with patch("market_cycle_trader_api.api.routers.alpaca_oauth.connected_trading_client") as broker:
+            result = live_control.update_canonical_live_broker(
+                self.db, identity=self.identity, expected_revision=7,
+                enable_orders=False, confirmation="DISABLE_LIVE_REAL_ORDERS",
+            )
+        self.assertFalse(result["order_submission_enabled"])
+        broker.assert_not_called()
+        self.assertFalse(self.state["oauth_orders_allowed"])
 
-    def test_oauth_token_rejected_by_broker_does_not_fallback(self):
-        with (
-            patch("alpaca.trading.client.TradingClient", return_value=self.client),
-            patch.object(alpaca_live, "live_credentials") as old_keys,
-        ):
-            self.client.get_account.side_effect = RuntimeError("authorization revoked")
-            with self.assertRaisesRegex(RuntimeError, "verification failed"):
-                auth.create_canonical_live_oauth_client(self.db)
-        old_keys.assert_not_called()
+    def test_running_robot_cannot_enable_or_rebind_oauth(self):
+        self.state.update(control_mode="active")
+        with self.assertRaisesRegex(live_control.LiveControlConflict, "Stop the Live robot"):
+            live_control.update_canonical_live_broker(
+                self.db, identity=self.identity, expected_revision=7,
+                enable_orders=True, confirmation="ENABLE_LIVE_REAL_ORDERS",
+            )
+        self.control.find_one_and_update.assert_not_called()
 
-    def test_mismatched_broker_account_fails_before_any_order(self):
-        self.client.get_account.return_value = SimpleNamespace(id="different-broker-account")
+    def test_stale_revision_does_not_write_or_arm(self):
+        with self.assertRaisesRegex(live_control.LiveControlConflict, "Refresh"):
+            live_control.update_canonical_live_broker(
+                self.db, identity=self.identity, expected_revision=6,
+                enable_orders=True, confirmation="ENABLE_LIVE_REAL_ORDERS",
+            )
+        self.history.insert_one.assert_not_called()
+
+    def test_broker_mismatch_rejected_with_no_order(self):
+        self.client.get_account.return_value = SimpleNamespace(id="a-different-account")
         with patch("alpaca.trading.client.TradingClient", return_value=self.client):
             with self.assertRaisesRegex(RuntimeError, "broker account mismatch"):
                 auth.create_canonical_live_oauth_client(self.db)
         self.client.submit_order.assert_not_called()
 
-    def test_mode_invalid_fails_before_any_credential_use(self):
-        with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_AUTH_MODE": "maybe"}):
-            with self.assertRaisesRegex(RuntimeError, "Invalid canonical"):
-                alpaca_live.create_live_execution_client()
+    def test_revoked_token_is_not_replaced_with_api_keys(self):
+        self.grant["encrypted_token"] = "cannot-be-decrypted"
+        with patch.object(alpaca_live, "live_credentials") as keys:
+            with self.assertRaisesRegex(RuntimeError, "cannot be decrypted"):
+                auth.create_canonical_live_oauth_client(self.db)
+        keys.assert_not_called()
 
-    def test_live_controls_validate_oauth_without_reading_legacy_keys(self):
-        # Prevent activating a Live control mode without valid OAuth.
-        db = MagicMock()
-        db[live_control.LIVE_CONTROL_COLLECTION].find_one.return_value = {
-            "_id": "default", "control_mode": "stopped", "revision": 0,
-        }
-        with (
-            patch.object(live_control, "create_canonical_live_oauth_client",
-                         side_effect=RuntimeError("OAuth revoked")) as check,
-            patch.object(live_control, "live_credentials") as old_keys,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "OAuth revoked"):
-                live_control.set_live_control_mode(
-                    db, mode="active", expected_revision=0,
-                    actor_email="admin@example.com", reason="dev test",
-                )
-        check.assert_called_once_with(db)
-        old_keys.assert_not_called()
-        db[live_control.LIVE_CONTROL_COLLECTION].find_one_and_update.assert_not_called()
+    def test_safe_diagnostic_current_admin_and_broker_checks(self):
+        with patch("alpaca.trading.client.TradingClient", return_value=self.client):
+            result = auth.canonical_live_oauth_diagnostic(self.db, self.identity)
+        self.assertEqual(result["status"], "ready")
+        self.assertFalse(result["orders_enabled"])
+        self.assertNotIn(self.account_id, repr(result))
+        self.assertNotIn(self.token, repr(result))
+        self.client.submit_order.assert_not_called()
 
-    def test_admin_portfolio_and_export_use_same_canonical_oauth_not_fallback(self):
-        identity = SimpleNamespace(subject=self.subject, role="admin")
+    def test_admin_portfolio_and_export_share_canonical_broker(self):
         with (
             patch.object(live_market, "database", return_value=self.db),
             patch.object(live_market, "create_canonical_live_oauth_client",
-                         return_value=self.client) as maker,
+                         return_value=self.client) as factory,
             patch.object(live_market, "connected_readonly_client") as legacy,
             patch.object(live_market, "live_portfolio_snapshot",
-                         return_value={"status": "ready"}) as snapshot,
+                         return_value={"status": "ready"}),
             patch.object(live_market, "build_live_portfolio_export",
-                         return_value=b"test-zip") as exporter,
+                         return_value=b"test-zip"),
         ):
-            self.assertEqual(live_market.portfolio(identity)["status"], "ready")
-            response = live_market.export_portfolio(identity, None, None)
-        self.assertEqual(maker.call_count, 2)
+            self.assertEqual(live_market.portfolio(self.identity)["status"], "ready")
+            self.assertEqual(live_market.export_portfolio(self.identity, None, None).body, b"test-zip")
+        self.assertEqual(factory.call_count, 2)
         legacy.assert_not_called()
-        snapshot.assert_called_once_with(
-            self.db, broker_client=self.client, broker_authentication="oauth",
-        )
-        self.assertEqual(exporter.call_args.kwargs["broker_client"], self.client)
-        self.assertEqual(exporter.call_args.kwargs["broker_authentication"], "oauth")
-        self.assertEqual(response.body, b"test-zip")
-        self.client.submit_order.assert_not_called()
 
-    def test_canonical_oauth_label_enabled_only_in_explicit_mode_and_live_active(self):
-        saved = {"trading_authorized": True, "account_id": self.account_id}
-        with (
-            patch("market_cycle_trader_api.services.live_shared_winner_signal._canonical_account_id",
-                  return_value=self.account_id),
-            patch("market_cycle_trader_api.services.live_control.live_control_status",
-                  return_value={"control_mode": "active", "order_submission_enabled": True}),
-        ):
-            self.assertTrue(alpaca_oauth._oauth_winner_operational(self.db, saved))
-            with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_AUTH_MODE": "api_keys"}):
-                self.assertFalse(alpaca_oauth._oauth_winner_operational(self.db, saved))
-
-    def test_live_status_reports_oauth_readonly_when_order_flag_disabled(self):
-        db = MagicMock()
-        db[live_control.LIVE_CONTROL_COLLECTION].find_one.return_value = {
-            "_id": "default", "control_mode": "active", "revision": 7,
-        }
-        with patch.dict(os.environ, {"MCT_CANONICAL_LIVE_OAUTH_ALLOW_ORDERS": ""}):
-            result = live_control.live_control_status(db)
-        self.assertEqual(result["control_mode"], "active")
-        self.assertEqual(result["canonical_broker_authentication"], "oauth")
-        self.assertFalse(result["execution_enabled"])
-        self.assertFalse(result["order_submission_enabled"])
-
-    def test_oauth_readonly_status_never_submits_trades(self):
-        self.assertEqual(auth.canonical_live_auth_mode(), "oauth")
+    def test_settings_endpoints_are_admin_only_and_no_order_submission(self):
+        for path in ("/api/live-market/broker/settings",
+                     "/api/live-market/oauth-diagnostic"):
+            routes = [r for r in live_market.router.routes if r.path == path]
+            self.assertTrue(routes)
+            self.assertTrue(all(route.dependant.dependencies for route in routes))
         self.client.submit_order.assert_not_called()
 
 
