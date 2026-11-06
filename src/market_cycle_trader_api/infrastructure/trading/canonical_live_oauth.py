@@ -115,3 +115,73 @@ def create_canonical_live_oauth_client(db: Any | None = None) -> Any:
     if account_id != expected_account or account_id != str(grant["account_id"]):
         raise RuntimeError("Canonical Live OAuth broker account mismatch.")
     return client
+
+
+
+def canonical_live_oauth_diagnostic(db: Any) -> dict[str, Any]:
+    """Admin-only, on-demand read-only diagnosis. No provider errors or tokens.
+
+    The ordinary Live portfolio route deliberately keeps its generic 503.
+    This endpoint returns only predefined, non-sensitive failure codes.
+    """
+    mode = canonical_live_auth_mode()
+    result: dict[str, Any] = {
+        "authentication": mode,
+        "orders_enabled": canonical_oauth_orders_enabled(),
+        "connected_to_canonical_account": False,
+        "status": "not_applicable" if mode != "oauth" else "blocked",
+        "stage": "configuration" if mode == "oauth" else None,
+        "failure_code": None,
+    }
+    if mode != "oauth":
+        return result
+    failures = {
+        "Canonical Live OAuth account ID is not configured.": "CANONICAL_ACCOUNT_ID_MISSING",
+        "Canonical Live OAuth account configuration conflicts.": "CANONICAL_ACCOUNT_ID_CONFLICT",
+        "Canonical Live OAuth encryption is not configured.": "OAUTH_ENCRYPTION_KEY_MISSING",
+        "Canonical Live OAuth administrator grant is unavailable.": "OAUTH_ADMIN_GRANT_UNAVAILABLE",
+        "Canonical Live OAuth administrator grant is missing.": "OAUTH_ADMIN_GRANT_MISSING",
+        "Canonical Live OAuth administrator grants are ambiguous.": "OAUTH_ADMIN_GRANT_AMBIGUOUS",
+        "Canonical Live OAuth owner binding is invalid.": "OAUTH_OWNER_BINDING_INVALID",
+        "Canonical Live OAuth token cannot be decrypted.": "OAUTH_TOKEN_UNREADABLE",
+        "Canonical Live OAuth account verification failed.": "OAUTH_BROKER_VERIFICATION_FAILED",
+        "Canonical Live OAuth broker account mismatch.": "OAUTH_ACCOUNT_MISMATCH",
+    }
+    try:
+        broker = create_canonical_live_oauth_client(db)
+    except RuntimeError as exc:
+        result["failure_code"] = failures.get(str(exc), "OAUTH_CANONICAL_VERIFICATION_FAILED")
+        return result
+    except Exception:
+        result["failure_code"] = "OAUTH_CANONICAL_VERIFICATION_FAILED"
+        return result
+    result["connected_to_canonical_account"] = True
+    # Verify separately the broker reads used by the full Live portfolio.
+    # Do not reveal response bodies or exception messages.
+    checks = (
+        ("positions", lambda: broker.get_all_positions()),
+        ("orders", lambda: _read_live_orders(broker)),
+        ("clock", lambda: _read_live_clock(broker)),
+    )
+    for name, check in checks:
+        result["stage"] = name
+        try:
+            check()
+        except Exception:
+            result["failure_code"] = "OAUTH_BROKER_" + name.upper() + "_UNAVAILABLE"
+            return result
+    result["status"] = "ready"
+    result["stage"] = "broker_reads"
+    return result
+
+
+def _read_live_orders(broker: Any) -> None:
+    from alpaca.trading.enums import QueryOrderStatus
+    from alpaca.trading.requests import GetOrdersRequest
+    broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, limit=100))
+
+
+def _read_live_clock(broker: Any) -> None:
+    clock = broker.get_clock()
+    if getattr(clock, "timestamp", None) is None or clock.timestamp.tzinfo is None:
+        raise RuntimeError("Broker clock timestamp is unavailable.")
