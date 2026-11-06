@@ -7,6 +7,9 @@ from pymongo import ReturnDocument
 
 from ..infrastructure.persistence.mongo_repository import utc_now
 from ..infrastructure.trading.alpaca_live import live_credentials
+from ..infrastructure.trading.canonical_live_oauth import (
+    canonical_live_auth_mode, create_canonical_live_oauth_client,
+)
 
 LIVE_CONTROL_COLLECTION = "live_trader_control"
 LIVE_CONTROL_HISTORY_COLLECTION = "live_trader_control_history"
@@ -62,9 +65,12 @@ def set_live_control_mode(
     if not actor_email:
         raise ValueError("An authenticated administrator is required.")
     if mode in {"active", "exit_only"}:
-        # Validate presence of an independent Live account configuration.
-        # Never look up Paper API keys as a fallback.
-        live_credentials()
+        # The operator must have a valid connection for the selected transport.
+        # In OAuth mode, never authorize a Live transition from API keys.
+        if canonical_live_auth_mode() == "oauth":
+            create_canonical_live_oauth_client(db)
+        else:
+            live_credentials()
     previous = _current(db)
     if int(previous.get("revision", 0)) != int(expected_revision):
         raise LiveControlConflict("Live mode revision changed. Refresh and retry.")
