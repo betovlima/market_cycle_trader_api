@@ -112,7 +112,7 @@ def _oauth_winner_operational(db, saved) -> bool:
     if canonical and str(saved.get("account_id") or "") == canonical:
         # The canonical account only uses OAuth when the migration is opted in.
         # The fan-out scheduler always excludes the canonical account.
-        if canonical_live_auth_mode() != "oauth":
+        if canonical_live_auth_mode(db) != "oauth":
             return False
     control = live_control_status(db)
     return bool(control.get("order_submission_enabled", False))
@@ -123,7 +123,7 @@ def _status(db, identity):
                                       {"encrypted_token": 0})
     authorized = bool(saved and saved.get("trading_authorized") is True)
     return {"configured": True, "connected": bool(saved),
-            "canonical_live_auth_mode": canonical_live_auth_mode(),
+            "canonical_live_auth_mode": canonical_live_auth_mode(db),
             "environment": "live", "read_only": not authorized,
             "trading_authorized": authorized,
             "trading_consent_available": _trading_consent_enabled(),
