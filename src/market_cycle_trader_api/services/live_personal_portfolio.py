@@ -62,3 +62,42 @@ def personal_live_portfolio_snapshot(broker: Any) -> dict[str, Any]:
             "next_close": _timestamp(getattr(clock, "next_close", None)),
         },
     }
+
+
+# Least-privilege response for invited Traders. The full Alpaca snapshot is
+# still collected for the request, but only owner-specific display fields
+# leave the API. The administrative Live API remains unchanged.
+_TRADER_POSITION_FIELDS = frozenset({
+    "symbol", "quantity", "average_entry_price", "current_price",
+    "market_value", "unrealized_pnl", "unrealized_return",
+})
+_TRADER_ORDER_FIELDS = frozenset({
+    "created_at", "symbol", "side", "status",
+    "filled_quantity", "filled_average_price",
+})
+_TRADER_ACCOUNT_FIELDS = frozenset({
+    "status", "environment", "account_id_suffix", "recorded_at",
+    "portfolio_value", "strategy_cash", "unrealized_pnl",
+})
+
+
+def trader_personal_live_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Only an OAuth owner's position, price, performance and order summary."""
+    return {
+        **{key: snapshot[key] for key in _TRADER_ACCOUNT_FIELDS if key in snapshot},
+        "positions": [
+            {key: value for key, value in position.items()
+             if key in _TRADER_POSITION_FIELDS}
+            for position in (snapshot.get("positions") or [])
+            if isinstance(position, dict)
+        ],
+        "recent_orders": [
+            {key: value for key, value in order.items()
+             if key in _TRADER_ORDER_FIELDS}
+            for order in (snapshot.get("recent_orders") or [])
+            if isinstance(order, dict)
+        ],
+        "market_clock": {
+            "is_open": bool((snapshot.get("market_clock") or {}).get("is_open", False)),
+        },
+    }
