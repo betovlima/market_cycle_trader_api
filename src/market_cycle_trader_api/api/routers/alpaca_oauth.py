@@ -122,6 +122,16 @@ def _status(db, identity):
     saved = db[CONNECTIONS].find_one({"_id": _key(identity.subject)},
                                       {"encrypted_token": 0})
     authorized = bool(saved and saved.get("trading_authorized") is True)
+    if getattr(identity, "role", None) == "trader":
+        # Do not expose canonical broker settings or shared Winner runtime
+        # status to individual account owners.
+        return {
+            "configured": True, "connected": bool(saved),
+            "environment": "live", "read_only": not authorized,
+            "trading_authorized": authorized,
+            "trading_consent_available": _trading_consent_enabled(),
+            "account_id_suffix": str(saved.get("account_id") or "")[-6:] if saved else None,
+        }
     return {"configured": True, "connected": bool(saved),
             "canonical_live_auth_mode": canonical_live_auth_mode(db),
             "environment": "live", "read_only": not authorized,
@@ -367,13 +377,18 @@ def personal_portfolio(
     identity: Annotated[SessionIdentity, Depends(require_portfolio_session)],
 ):
     """Individual Alpaca portfolio, with NO API-key fallback and no MCT balance writes."""
-    from ...services.live_personal_portfolio import personal_live_portfolio_snapshot
+    from ...services.live_personal_portfolio import (
+        personal_live_portfolio_snapshot, trader_personal_live_projection,
+    )
     try:
         db = database()
         broker = connected_readonly_client(db, identity)
         if broker is None:
             raise HTTPException(404, "Connect your Alpaca account first.")
-        return personal_live_portfolio_snapshot(broker)
+        snapshot = personal_live_portfolio_snapshot(broker)
+        if getattr(identity, "role", None) == "trader":
+            return trader_personal_live_projection(snapshot)
+        return snapshot
     except HTTPException:
         raise
     except RuntimeError as exc:
