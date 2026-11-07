@@ -13,7 +13,6 @@ _ALLOWED_GET = frozenset({
     "/api/alpaca-oauth/status",
     "/api/alpaca-oauth/verify",
     "/api/alpaca-oauth/portfolio",
-    "/api/alpaca-oauth/winner/readiness",
     "/api/alpaca-oauth/callback",
 })
 _ALLOWED_POST = frozenset({
